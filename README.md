@@ -21,7 +21,7 @@ Quay Format aims to define a shared spec for:
 - **query-engine-friendly storage** with dictionaries, encoded arrays, section metadata, checksums, and optional acceleration artifacts
 - **engine-neutral interchange** where logical values stay portable while engines remain free to map them into their own execution model
 
-In short: QF is trying to be an **open spec for queryable offline data**, especially where engine optimisation is a first-class concern.
+In short: QF is trying to be an **open spec for queryable offline data**, especially where engine optimization is a first-class concern.
 
 ## Why it exists
 
