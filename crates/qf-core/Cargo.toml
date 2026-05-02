@@ -1,0 +1,11 @@
+[package]
+name = "qf-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core primitives for the Quay Format (QF) v1.0"
+license = "MIT"
+
+[dependencies]
+crc32c = "0.6"
+
+[dev-dependencies]
