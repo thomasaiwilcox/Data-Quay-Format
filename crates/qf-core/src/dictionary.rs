@@ -70,7 +70,18 @@ impl FileDictionaryHeaderV1 {
         let entry_count = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let flags = u32::from_le_bytes(buf[4..8].try_into().unwrap());
         let index_entry_len = u16::from_le_bytes(buf[8..10].try_into().unwrap());
+        if index_entry_len != Self::INDEX_ENTRY_LEN {
+            return Err(QfError::BadSection(format!(
+                "index_entry_len is {index_entry_len}, expected {}",
+                Self::INDEX_ENTRY_LEN
+            )));
+        }
         let value_hash_algorithm = u16::from_le_bytes(buf[10..12].try_into().unwrap());
+        if value_hash_algorithm > 2 {
+            return Err(QfError::BadSection(format!(
+                "unknown value_hash_algorithm {value_hash_algorithm}"
+            )));
+        }
         let payload_length = u64::from_le_bytes(buf[12..20].try_into().unwrap());
         let mut reserved = [0u8; 24];
         reserved.copy_from_slice(&buf[20..44]);
@@ -200,6 +211,18 @@ impl FileDictionaryIndexEntryV1 {
             canonical_hash64,
             reserved1,
         })
+    }
+
+    /// Validate payload offset/length against the dictionary payload section size.
+    pub fn validate_payload_bounds(&self, payload_total_len: u64) -> Result<(), QfError> {
+        let end = self
+            .payload_offset
+            .checked_add(self.payload_length as u64)
+            .ok_or(QfError::ArithOverflow)?;
+        if end > payload_total_len {
+            return Err(QfError::OffsetRange);
+        }
+        Ok(())
     }
 }
 

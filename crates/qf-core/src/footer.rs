@@ -14,7 +14,8 @@
 use crate::{
     checksum,
     constants::{
-        FOOTER_HEADER_LEN, FOOTER_VERSION_V1, MAGIC_FOOTER, METADATA_LEN_MAX, SECTION_ENTRY_LEN,
+        CompressionCodec, PrimaryProfile, SectionKind, FOOTER_HEADER_LEN, FOOTER_VERSION_V1,
+        KNOWN_FEATURE_BITS_MASK, MAGIC_FOOTER, METADATA_LEN_MAX, SECTION_ENTRY_LEN,
     },
     error::QfError,
 };
@@ -78,6 +79,11 @@ impl QfFooterHeaderV1 {
         }
 
         let header_len = u16::from_le_bytes(buf[6..8].try_into().unwrap());
+        if header_len != FOOTER_HEADER_LEN as u16 {
+            return Err(QfError::BadSection(format!(
+                "footer header_len is {header_len}, expected {FOOTER_HEADER_LEN}"
+            )));
+        }
         let section_count = u32::from_le_bytes(buf[8..12].try_into().unwrap());
 
         let section_entry_len = u16::from_le_bytes(buf[12..14].try_into().unwrap());
@@ -205,7 +211,17 @@ impl QfSectionEntryV1 {
         }
         let section_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let section_kind = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+        if SectionKind::from_u16(section_kind).is_none() {
+            return Err(QfError::BadSection(format!(
+                "unknown section_kind {section_kind}"
+            )));
+        }
         let profile = buf[6];
+        if PrimaryProfile::from_u8(profile).is_none() {
+            return Err(QfError::BadSection(format!(
+                "unknown section profile {profile}"
+            )));
+        }
         let flags = buf[7];
         let offset = u64::from_le_bytes(buf[8..16].try_into().unwrap());
         let length = u64::from_le_bytes(buf[16..24].try_into().unwrap());
@@ -221,13 +237,27 @@ impl QfSectionEntryV1 {
         let crc32c = u32::from_le_bytes(buf[68..72].try_into().unwrap());
         let reserved1 = u32::from_le_bytes(buf[72..76].try_into().unwrap());
 
+        if CompressionCodec::from_u8(compression).is_none() {
+            return Err(QfError::BadSection(format!(
+                "unknown compression codec {compression}"
+            )));
+        }
         if encryption != 0 {
             return Err(QfError::BadSection(format!(
                 "section {section_id}: encryption must be 0 in v1, got {encryption}"
             )));
         }
+        let unknown_required = required_features & !KNOWN_FEATURE_BITS_MASK;
+        if unknown_required != 0 {
+            return Err(QfError::UnknownRequiredFeature(unknown_required));
+        }
         if reserved0 != 0 || reserved1 != 0 {
             return Err(QfError::ReservedNotZero);
+        }
+        if compression == CompressionCodec::None as u8 && length != uncompressed_length {
+            return Err(QfError::BadSection(format!(
+                "section {section_id}: uncompressed_length must equal length when uncompressed"
+            )));
         }
 
         Ok(Self {
@@ -307,6 +337,11 @@ impl QfFooter {
 
         let meta_start = entries_start + header.section_count as usize * entry_size;
         let metadata_json = buf[meta_start..meta_start + header.metadata_len as usize].to_vec();
+        if std::str::from_utf8(&metadata_json).is_err() {
+            return Err(QfError::BadSection(
+                "metadata_json must be valid UTF-8".to_string(),
+            ));
+        }
 
         Ok(Self {
             header,

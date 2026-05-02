@@ -66,6 +66,7 @@ pub mod error;
 pub mod footer;
 pub mod header;
 pub mod postscript;
+pub mod reader;
 pub mod writer;
 
 pub use error::QfError;
