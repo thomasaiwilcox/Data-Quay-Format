@@ -47,16 +47,9 @@ QF is designed to help engines:
 
 - `Spec.md`: the main Quay Format specification
 - `crates/qf-core`: core format primitives and a minimal writer
-- `crates/qf-validate`: validates QF files
+- `crates/qf-validate`: validates QF files (headers, footers, section CRCs, and feature consistency)
 - `crates/qf-inspect`: prints a readable layout summary for QF files
 - `crates/qf-dump`: dumps metadata or section bytes as hex for debugging
-
-## Included reference crates
-
-- `qf-core`: core format primitives and minimal writer.
-- `qf-validate`: validates QF files (headers, footers, section CRCs, and feature consistency).
-- `qf-inspect`: prints a readable layout summary for QF files.
-- `qf-dump`: dumps metadata or section bytes as hex for debugging.
 
 ## Read the spec
 
