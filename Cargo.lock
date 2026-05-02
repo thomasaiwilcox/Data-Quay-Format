@@ -19,6 +19,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "qf-inspect"
+version = "0.1.0"
+dependencies = [
+ "qf-core",
+]
+
+[[package]]
 name = "qf-validate"
 version = "0.1.0"
 dependencies = [
