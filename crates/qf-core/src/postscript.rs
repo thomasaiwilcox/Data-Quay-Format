@@ -18,7 +18,8 @@
 use crate::{
     checksum,
     constants::{
-        CompressionCodec, MAGIC_QF, POSTSCRIPT_LEN, POSTSCRIPT_VERSION_V1, SECTION_SPEC_LEN,
+        CompressionCodec, KNOWN_FEATURE_BITS_MASK, MAGIC_QF, POSTSCRIPT_LEN, POSTSCRIPT_VERSION_V1,
+        SECTION_SPEC_LEN,
     },
     error::QfError,
 };
@@ -223,6 +224,11 @@ impl QfPostscriptV1 {
             return Err(QfError::BadVersion);
         }
         let ps_len_usize = ps_len as usize;
+        if ps_len_usize != POSTSCRIPT_SIZE {
+            return Err(QfError::BadSection(format!(
+                "postscript_len is {ps_len_usize}, expected {POSTSCRIPT_SIZE}"
+            )));
+        }
 
         if ps_len_usize > file_len.saturating_sub(POSTSCRIPT_TAIL_SIZE) {
             return Err(QfError::OffsetRange);
@@ -255,6 +261,10 @@ impl QfPostscriptV1 {
 
         let required_features = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let optional_features = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let unknown_required = required_features & !KNOWN_FEATURE_BITS_MASK;
+        if unknown_required != 0 {
+            return Err(QfError::UnknownRequiredFeature(unknown_required));
+        }
         let file_len = u64::from_le_bytes(buf[16..24].try_into().unwrap());
         let footer = QfSectionSpecV1::parse(&buf[24..60])?;
 
@@ -386,17 +396,17 @@ mod tests {
     }
 
     #[test]
-    fn truncated_postscript_len_rejected() {
+    fn invalid_postscript_len_rejected() {
         let file_len: u64 = 244;
         let ps = minimal_postscript(file_len);
         let mut tail = ps.serialize_tail();
         tail[POSTSCRIPT_SIZE + 2..POSTSCRIPT_SIZE + 4].copy_from_slice(&32u16.to_le_bytes());
         let mut file = vec![0u8; file_len as usize];
         file[file_len as usize - POSTSCRIPT_TOTAL_SIZE..].copy_from_slice(&tail);
-        assert_eq!(
+        assert!(matches!(
             QfPostscriptV1::parse_from_tail(&file),
-            Err(QfError::BufferTooShort)
-        );
+            Err(QfError::BadSection(_))
+        ));
     }
 
     #[test]

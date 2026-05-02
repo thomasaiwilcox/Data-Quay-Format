@@ -8,8 +8,8 @@
 use crate::{
     checksum,
     constants::{
-        ENDIANNESS_LITTLE, HEADER_LEN_V1, KNOWN_FEATURE_BITS_MASK, MAGIC_LEGACY_DRAFT, MAGIC_QF,
-        VERSION_MAJOR_V1,
+        PrimaryProfile, ProducerScopeKind, ENDIANNESS_LITTLE, HEADER_LEN_V1,
+        KNOWN_FEATURE_BITS_MASK, MAGIC_LEGACY_DRAFT, MAGIC_QF, VERSION_MAJOR_V1,
     },
     error::QfError,
 };
@@ -133,6 +133,11 @@ impl QfHeaderV1 {
         let version_minor = u16::from_le_bytes(buf[8..10].try_into().unwrap());
 
         let primary_profile = buf[10];
+        if PrimaryProfile::from_u8(primary_profile).is_none() {
+            return Err(QfError::BadSection(format!(
+                "unknown primary_profile {primary_profile}"
+            )));
+        }
         let endianness = buf[11];
         if endianness != ENDIANNESS_LITTLE {
             return Err(QfError::BadSection(format!(
@@ -157,7 +162,15 @@ impl QfHeaderV1 {
         producer_scope_id.copy_from_slice(&buf[48..64]);
 
         let producer_scope_kind = u16::from_le_bytes(buf[64..66].try_into().unwrap());
+        if ProducerScopeKind::from_u16(producer_scope_kind).is_none() {
+            return Err(QfError::BadSection(format!(
+                "unknown producer_scope_kind {producer_scope_kind}"
+            )));
+        }
         let reserved_scope_flags = u16::from_le_bytes(buf[66..68].try_into().unwrap());
+        if reserved_scope_flags != 0 {
+            return Err(QfError::ReservedNotZero);
+        }
         let created_at_us = i64::from_le_bytes(buf[68..76].try_into().unwrap());
 
         let mut reserved = [0u8; 48];
@@ -323,7 +336,8 @@ mod tests {
         let mut hdr = minimal_header();
         hdr.optional_features = 0x0000_0001_0000_0000;
         let bytes = hdr.serialize();
-        let parsed = QfHeaderV1::parse(&bytes, false).expect("unknown optional feature should be accepted");
+        let parsed =
+            QfHeaderV1::parse(&bytes, false).expect("unknown optional feature should be accepted");
         assert_eq!(parsed.optional_features, 0x0000_0001_0000_0000);
     }
 }

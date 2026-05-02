@@ -15,7 +15,8 @@
 use crate::{
     checksum,
     constants::{
-        PrimaryProfile, ENDIANNESS_LITTLE, FEATURE_TABLE_PROFILE, FOOTER_VERSION_V1, HEADER_LEN_V1,
+        CompressionCodec, PrimaryProfile, ProducerScopeKind, SectionKind, ENDIANNESS_LITTLE,
+        FEATURE_TABLE_PROFILE, FOOTER_VERSION_V1, HEADER_LEN_V1, KNOWN_FEATURE_BITS_MASK,
         MAGIC_FOOTER, MAGIC_QF, METADATA_LEN_MAX, SECTION_ENTRY_LEN, VERSION_MAJOR_V1,
     },
     footer::{QfFooterHeaderV1, QfSectionEntryV1, FOOTER_HEADER_SIZE},
@@ -76,9 +77,50 @@ impl MinimalQfWriter {
             METADATA_LEN_MAX
         );
         assert!(
+            std::str::from_utf8(&self.metadata_json).is_ok(),
+            "metadata_json must be valid UTF-8"
+        );
+        assert!(
             self.sections.len() <= u32::MAX as usize,
             "section count exceeds u32::MAX"
         );
+        assert!(
+            PrimaryProfile::from_u8(self.primary_profile).is_some(),
+            "unknown primary_profile {}",
+            self.primary_profile
+        );
+        assert!(
+            ProducerScopeKind::from_u16(self.producer_scope_kind).is_some(),
+            "unknown producer_scope_kind {}",
+            self.producer_scope_kind
+        );
+        assert!(
+            self.required_features & !KNOWN_FEATURE_BITS_MASK == 0,
+            "unknown required feature bits 0x{:016x}",
+            self.required_features & !KNOWN_FEATURE_BITS_MASK
+        );
+        for section in &self.sections {
+            assert!(
+                SectionKind::from_u16(section.section_kind).is_some(),
+                "unknown section_kind {}",
+                section.section_kind
+            );
+            assert!(
+                PrimaryProfile::from_u8(section.profile).is_some(),
+                "unknown section profile {}",
+                section.profile
+            );
+            assert!(
+                CompressionCodec::from_u8(section.compression).is_some(),
+                "unknown compression codec {}",
+                section.compression
+            );
+            assert!(
+                section.required_features & !KNOWN_FEATURE_BITS_MASK == 0,
+                "unknown section required feature bits 0x{:016x}",
+                section.required_features & !KNOWN_FEATURE_BITS_MASK
+            );
+        }
     }
 
     /// Create a writer with all-zero defaults (empty table-scan file).
@@ -244,6 +286,14 @@ mod tests {
     fn write_rejects_oversized_metadata() {
         let mut w = MinimalQfWriter::new();
         w.metadata_json = vec![0u8; (METADATA_LEN_MAX as usize) + 1];
+        let _ = w.write();
+    }
+
+    #[test]
+    #[should_panic(expected = "metadata_json must be valid UTF-8")]
+    fn write_rejects_invalid_metadata_utf8() {
+        let mut w = MinimalQfWriter::new();
+        w.metadata_json = vec![0xff];
         let _ = w.write();
     }
 
