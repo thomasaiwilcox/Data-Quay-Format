@@ -116,7 +116,9 @@ impl QfSectionSpecV1 {
 
     /// Return the end offset (exclusive) of this section, checking for overflow.
     pub fn end_offset(&self) -> Result<u64, QfError> {
-        self.offset.checked_add(self.length).ok_or(QfError::ArithOverflow)
+        self.offset
+            .checked_add(self.length)
+            .ok_or(QfError::ArithOverflow)
     }
 }
 
@@ -202,7 +204,9 @@ impl QfPostscriptV1 {
         }
 
         let tail_start = file_len - POSTSCRIPT_TAIL_SIZE;
-        let magic: [u8; 4] = file_data[tail_start + 4..tail_start + 8].try_into().unwrap();
+        let magic: [u8; 4] = file_data[tail_start + 4..tail_start + 8]
+            .try_into()
+            .unwrap();
         if magic != MAGIC_QF {
             return Err(QfError::BadMagic);
         }
@@ -210,7 +214,9 @@ impl QfPostscriptV1 {
         let ps_version =
             u16::from_le_bytes(file_data[tail_start..tail_start + 2].try_into().unwrap());
         let ps_len = u16::from_le_bytes(
-            file_data[tail_start + 2..tail_start + 4].try_into().unwrap(),
+            file_data[tail_start + 2..tail_start + 4]
+                .try_into()
+                .unwrap(),
         );
 
         if ps_version != POSTSCRIPT_VERSION_V1 {
@@ -235,8 +241,11 @@ impl QfPostscriptV1 {
         let buf = &buf[..POSTSCRIPT_SIZE];
 
         // Verify checksum first.
-        let stored_crc =
-            u32::from_le_bytes(buf[PS_CHECKSUM_OFFSET..PS_CHECKSUM_OFFSET + 4].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(
+            buf[PS_CHECKSUM_OFFSET..PS_CHECKSUM_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
         let mut check_buf = [0u8; POSTSCRIPT_SIZE];
         check_buf.copy_from_slice(buf);
         check_buf[PS_CHECKSUM_OFFSET..PS_CHECKSUM_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);
@@ -316,6 +325,78 @@ mod tests {
         assert_eq!(parsed.file_len, file_len);
         assert_eq!(parsed.footer.offset, 128);
         assert_eq!(parsed.footer.length, 44);
+    }
+
+    #[test]
+    fn section_spec_reserved_nonzero_rejected() {
+        let mut bytes = minimal_spec().serialize();
+        bytes[32..36].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            QfSectionSpecV1::parse(&bytes),
+            Err(QfError::ReservedNotZero)
+        );
+    }
+
+    #[test]
+    fn section_spec_unknown_compression_rejected() {
+        let mut bytes = minimal_spec().serialize();
+        bytes[24] = 255;
+        assert!(matches!(
+            QfSectionSpecV1::parse(&bytes),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn section_spec_end_offset_overflow_rejected() {
+        let spec = QfSectionSpecV1 {
+            offset: u64::MAX,
+            length: 1,
+            ..minimal_spec()
+        };
+        assert_eq!(spec.end_offset(), Err(QfError::ArithOverflow));
+    }
+
+    #[test]
+    fn bad_postscript_version_rejected() {
+        let file_len: u64 = 244;
+        let ps = minimal_postscript(file_len);
+        let mut tail = ps.serialize_tail();
+        tail[POSTSCRIPT_SIZE..POSTSCRIPT_SIZE + 2].copy_from_slice(&2u16.to_le_bytes());
+        let mut file = vec![0u8; file_len as usize];
+        file[file_len as usize - POSTSCRIPT_TOTAL_SIZE..].copy_from_slice(&tail);
+        assert_eq!(
+            QfPostscriptV1::parse_from_tail(&file),
+            Err(QfError::BadVersion)
+        );
+    }
+
+    #[test]
+    fn bad_postscript_checksum_rejected() {
+        let file_len: u64 = 244;
+        let ps = minimal_postscript(file_len);
+        let mut tail = ps.serialize_tail();
+        tail[0] ^= 0x01;
+        let mut file = vec![0u8; file_len as usize];
+        file[file_len as usize - POSTSCRIPT_TOTAL_SIZE..].copy_from_slice(&tail);
+        assert_eq!(
+            QfPostscriptV1::parse_from_tail(&file),
+            Err(QfError::ChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn truncated_postscript_len_rejected() {
+        let file_len: u64 = 244;
+        let ps = minimal_postscript(file_len);
+        let mut tail = ps.serialize_tail();
+        tail[POSTSCRIPT_SIZE + 2..POSTSCRIPT_SIZE + 4].copy_from_slice(&32u16.to_le_bytes());
+        let mut file = vec![0u8; file_len as usize];
+        file[file_len as usize - POSTSCRIPT_TOTAL_SIZE..].copy_from_slice(&tail);
+        assert_eq!(
+            QfPostscriptV1::parse_from_tail(&file),
+            Err(QfError::BufferTooShort)
+        );
     }
 
     #[test]

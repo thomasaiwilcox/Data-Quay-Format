@@ -16,7 +16,10 @@ fn validate_empty_file() {
         .status()
         .expect("qf-validate binary should be runnable");
 
-    assert!(status.success(), "qf-validate should return exit code 0 for a valid file");
+    assert!(
+        status.success(),
+        "qf-validate should return exit code 0 for a valid file"
+    );
     // Cleanup is best-effort; if removal fails the test OS will clean up temp files.
     let _ = std::fs::remove_file(&path);
 }
@@ -39,7 +42,10 @@ fn validate_corrupted_file() {
         .status()
         .expect("qf-validate binary should be runnable");
 
-    assert!(!status.success(), "qf-validate should return non-zero for a corrupt file");
+    assert!(
+        !status.success(),
+        "qf-validate should return non-zero for a corrupt file"
+    );
     // Cleanup is best-effort; if removal fails the test OS will clean up temp files.
     let _ = std::fs::remove_file(&path);
 }

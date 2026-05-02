@@ -19,19 +19,11 @@
 //! - 1 — one or more validation errors were found.
 //! - 2 — usage error (no files specified).
 
-use std::{
-    io::Read,
-    path::Path,
-    process,
-};
+use std::{io::Read, path::Path, process};
 
 use qf_core::{
-    checksum,
-    constants::MAGIC_QF,
-    footer::QfFooter,
-    header::QfHeaderV1,
-    postscript::QfPostscriptV1,
-    QfError,
+    checksum, constants::MAGIC_QF, footer::QfFooter, header::QfHeaderV1,
+    postscript::QfPostscriptV1, QfError,
 };
 
 fn main() {
@@ -74,7 +66,10 @@ fn validate_file(path: &Path) -> bool {
             println!("  primary_profile : {}", info.primary_profile);
             println!("  section_count   : {}", info.section_count);
             if !info.metadata_json_preview.is_empty() {
-                println!("  metadata (first 120 chars): {}", &info.metadata_json_preview);
+                println!(
+                    "  metadata (first 120 chars): {}",
+                    &info.metadata_json_preview
+                );
             }
             true
         }

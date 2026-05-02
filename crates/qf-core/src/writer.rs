@@ -15,13 +15,12 @@
 use crate::{
     checksum,
     constants::{
-        ENDIANNESS_LITTLE, FEATURE_TABLE_PROFILE, FOOTER_VERSION_V1, HEADER_LEN_V1,
-        MAGIC_FOOTER, MAGIC_QF, PrimaryProfile, SECTION_ENTRY_LEN,
-        VERSION_MAJOR_V1,
+        PrimaryProfile, ENDIANNESS_LITTLE, FEATURE_TABLE_PROFILE, FOOTER_VERSION_V1, HEADER_LEN_V1,
+        MAGIC_FOOTER, MAGIC_QF, METADATA_LEN_MAX, SECTION_ENTRY_LEN, VERSION_MAJOR_V1,
     },
-    footer::{FOOTER_HEADER_SIZE, QfFooterHeaderV1, QfSectionEntryV1},
-    header::{HEADER_SIZE, QfHeaderV1},
-    postscript::{POSTSCRIPT_SIZE, QfPostscriptV1, QfSectionSpecV1},
+    footer::{QfFooterHeaderV1, QfSectionEntryV1, FOOTER_HEADER_SIZE},
+    header::{QfHeaderV1, HEADER_SIZE},
+    postscript::{QfPostscriptV1, QfSectionSpecV1, POSTSCRIPT_SIZE},
 };
 
 /// A simple builder for minimal valid QF files.
@@ -69,6 +68,19 @@ pub struct SectionPayload {
 }
 
 impl MinimalQfWriter {
+    /// Validate builder inputs that have strict on-disk bounds in v1.
+    fn validate_inputs(&self) {
+        assert!(
+            self.metadata_json.len() <= METADATA_LEN_MAX as usize,
+            "metadata_json exceeds v1 limit of {} bytes",
+            METADATA_LEN_MAX
+        );
+        assert!(
+            self.sections.len() <= u32::MAX as usize,
+            "section count exceeds u32::MAX"
+        );
+    }
+
     /// Create a writer with all-zero defaults (empty table-scan file).
     pub fn new() -> Self {
         Self {
@@ -99,6 +111,8 @@ impl MinimalQfWriter {
     /// [Magic: "QYF1"]
     /// ```
     pub fn write(&self) -> Vec<u8> {
+        self.validate_inputs();
+
         let mut buf: Vec<u8> = Vec::new();
 
         // ── 1. Reserve space for header (filled in at the end) ─────────────
@@ -223,11 +237,15 @@ impl Default for MinimalQfWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        footer::QfFooter,
-        header::QfHeaderV1,
-        postscript::QfPostscriptV1,
-    };
+    use crate::{footer::QfFooter, header::QfHeaderV1, postscript::QfPostscriptV1};
+
+    #[test]
+    #[should_panic(expected = "metadata_json exceeds v1 limit")]
+    fn write_rejects_oversized_metadata() {
+        let mut w = MinimalQfWriter::new();
+        w.metadata_json = vec![0u8; (METADATA_LEN_MAX as usize) + 1];
+        let _ = w.write();
+    }
 
     #[test]
     fn empty_file_is_valid() {
@@ -240,8 +258,7 @@ mod tests {
         assert_eq!(header.required_features, FEATURE_TABLE_PROFILE);
 
         // Parse and validate postscript.
-        let ps = QfPostscriptV1::parse_from_tail(&bytes)
-            .expect("postscript parse should succeed");
+        let ps = QfPostscriptV1::parse_from_tail(&bytes).expect("postscript parse should succeed");
         assert_eq!(ps.file_len, bytes.len() as u64);
 
         // Verify footer CRC.
@@ -285,7 +302,10 @@ mod tests {
             &bytes[ps.footer.offset as usize..(ps.footer.offset + ps.footer.length) as usize];
         let footer = QfFooter::parse(footer_bytes).unwrap();
         assert_eq!(footer.sections.len(), 1);
-        assert_eq!(footer.sections[0].section_kind, crate::constants::SectionKind::FileDictionaryIndex as u16);
+        assert_eq!(
+            footer.sections[0].section_kind,
+            crate::constants::SectionKind::FileDictionaryIndex as u16
+        );
 
         // Validate section CRC.
         let s = &footer.sections[0];

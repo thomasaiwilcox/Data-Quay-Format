@@ -7,9 +7,7 @@
 
 use crate::{
     checksum,
-    constants::{
-        ENDIANNESS_LITTLE, HEADER_LEN_V1, MAGIC_LEGACY_DRAFT, MAGIC_QF, VERSION_MAJOR_V1,
-    },
+    constants::{ENDIANNESS_LITTLE, HEADER_LEN_V1, MAGIC_LEGACY_DRAFT, MAGIC_QF, VERSION_MAJOR_V1},
     error::QfError,
 };
 
@@ -100,7 +98,11 @@ impl QfHeaderV1 {
         let buf = &buf[..HEADER_SIZE];
 
         // 1. Verify checksum before trusting any other field (Section 10 rule).
-        let stored_crc = u32::from_le_bytes(buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(
+            buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
         let mut check_buf = [0u8; HEADER_SIZE];
         check_buf.copy_from_slice(buf);
         check_buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);
@@ -179,7 +181,7 @@ impl QfHeaderV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::{FEATURE_TABLE_PROFILE, PrimaryProfile};
+    use crate::constants::{PrimaryProfile, FEATURE_TABLE_PROFILE};
 
     fn minimal_header() -> QfHeaderV1 {
         QfHeaderV1 {
@@ -232,7 +234,10 @@ mod tests {
         let hdr = minimal_header();
         let mut bytes = hdr.serialize();
         bytes[0] = b'X'; // corrupt magic without updating CRC
-        assert_eq!(QfHeaderV1::parse(&bytes, false), Err(QfError::ChecksumMismatch));
+        assert_eq!(
+            QfHeaderV1::parse(&bytes, false),
+            Err(QfError::ChecksumMismatch)
+        );
     }
 
     #[test]
@@ -240,10 +245,13 @@ mod tests {
         let hdr = minimal_header();
         let mut bytes = hdr.serialize();
         bytes[80] = 1; // inside reserved[4..52] (offset 76+4 = 80)
-        // Recompute CRC.
+                       // Recompute CRC.
         bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);
         let crc = checksum::crc32c(&bytes);
         bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
-        assert_eq!(QfHeaderV1::parse(&bytes, false), Err(QfError::ReservedNotZero));
+        assert_eq!(
+            QfHeaderV1::parse(&bytes, false),
+            Err(QfError::ReservedNotZero)
+        );
     }
 }
