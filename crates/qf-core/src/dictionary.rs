@@ -251,4 +251,156 @@ mod tests {
         assert_eq!(parsed.inline_len, 6);
         assert_eq!(&parsed.inline_data[..6], b"active");
     }
+
+    #[test]
+    fn dict_header_reserved_nonzero_rejected() {
+        let hdr = FileDictionaryHeaderV1 {
+            entry_count: 1,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0u8; 24],
+        };
+        let mut bytes = hdr.serialize();
+        bytes[20] = 1; // first byte of reserved field
+        assert_eq!(
+            FileDictionaryHeaderV1::parse(&bytes),
+            Err(QfError::ReservedNotZero)
+        );
+    }
+
+    #[test]
+    fn dict_index_entry_payload_storage_class() {
+        // Payload storage class: inline_len may be 0; payload_offset/length point elsewhere.
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Binary as u16,
+            storage_class: StorageClass::Payload as u8,
+            flags: 0,
+            inline_len: 0,
+            reserved0: [0; 3],
+            inline_data: [0u8; 16],
+            payload_offset: 1024,
+            payload_length: 256,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let bytes = entry.serialize();
+        let parsed = FileDictionaryIndexEntryV1::parse(&bytes).expect("parse should succeed");
+        assert_eq!(parsed.storage_class, StorageClass::Payload as u8);
+        assert_eq!(parsed.payload_offset, 1024);
+        assert_eq!(parsed.payload_length, 256);
+    }
+
+    #[test]
+    fn dict_index_entry_redacted_storage_class() {
+        // Redacted storage class: value is present but access-restricted.
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Utf8 as u16,
+            storage_class: StorageClass::Redacted as u8,
+            flags: 0,
+            inline_len: 0,
+            reserved0: [0; 3],
+            inline_data: [0u8; 16],
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let bytes = entry.serialize();
+        let parsed = FileDictionaryIndexEntryV1::parse(&bytes).expect("parse should succeed");
+        assert_eq!(parsed.storage_class, StorageClass::Redacted as u8);
+    }
+
+    #[test]
+    fn dict_index_entry_unknown_value_tag_rejected() {
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Utf8 as u16,
+            storage_class: StorageClass::Inline as u8,
+            flags: 0,
+            inline_len: 0,
+            reserved0: [0; 3],
+            inline_data: [0u8; 16],
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let mut bytes = entry.serialize();
+        // Overwrite value_tag with an unknown value.
+        bytes[0..2].copy_from_slice(&999u16.to_le_bytes());
+        assert!(matches!(
+            FileDictionaryIndexEntryV1::parse(&bytes),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn dict_index_entry_unknown_storage_class_rejected() {
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Utf8 as u16,
+            storage_class: StorageClass::Inline as u8,
+            flags: 0,
+            inline_len: 0,
+            reserved0: [0; 3],
+            inline_data: [0u8; 16],
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let mut bytes = entry.serialize();
+        // Overwrite storage_class with an unknown value.
+        bytes[2] = 99;
+        assert!(matches!(
+            FileDictionaryIndexEntryV1::parse(&bytes),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn dict_index_entry_inline_len_too_large_rejected() {
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Utf8 as u16,
+            storage_class: StorageClass::Inline as u8,
+            flags: 0,
+            inline_len: 0,
+            reserved0: [0; 3],
+            inline_data: [0u8; 16],
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let mut bytes = entry.serialize();
+        // Overwrite inline_len with 17 (> 16 capacity).
+        bytes[4] = 17;
+        assert!(matches!(
+            FileDictionaryIndexEntryV1::parse(&bytes),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn dict_index_entry_reserved1_nonzero_rejected() {
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Int64 as u16,
+            storage_class: StorageClass::Inline as u8,
+            flags: 0,
+            inline_len: 0,
+            reserved0: [0; 3],
+            inline_data: [0u8; 16],
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let mut bytes = entry.serialize();
+        // Overwrite reserved1 with a non-zero value (bytes [44..48]).
+        bytes[44..48].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            FileDictionaryIndexEntryV1::parse(&bytes),
+            Err(QfError::ReservedNotZero)
+        );
+    }
 }

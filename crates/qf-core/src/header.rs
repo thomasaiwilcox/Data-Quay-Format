@@ -7,7 +7,10 @@
 
 use crate::{
     checksum,
-    constants::{ENDIANNESS_LITTLE, HEADER_LEN_V1, MAGIC_LEGACY_DRAFT, MAGIC_QF, VERSION_MAJOR_V1},
+    constants::{
+        ENDIANNESS_LITTLE, HEADER_LEN_V1, KNOWN_FEATURE_BITS_MASK, MAGIC_LEGACY_DRAFT, MAGIC_QF,
+        VERSION_MAJOR_V1,
+    },
     error::QfError,
 };
 
@@ -141,6 +144,12 @@ impl QfHeaderV1 {
         let required_features = u64::from_le_bytes(buf[16..24].try_into().unwrap());
         let optional_features = u64::from_le_bytes(buf[24..32].try_into().unwrap());
 
+        // Section 11: Readers MUST reject unknown required feature bits.
+        let unknown_required = required_features & !KNOWN_FEATURE_BITS_MASK;
+        if unknown_required != 0 {
+            return Err(QfError::UnknownRequiredFeature(unknown_required));
+        }
+
         let mut file_id = [0u8; 16];
         file_id.copy_from_slice(&buf[32..48]);
 
@@ -253,5 +262,68 @@ mod tests {
             QfHeaderV1::parse(&bytes, false),
             Err(QfError::ReservedNotZero)
         );
+    }
+
+    #[test]
+    fn legacy_magic_accepted_in_compatibility_mode() {
+        let mut hdr = minimal_header();
+        hdr.magic = MAGIC_LEGACY_DRAFT;
+        let bytes = hdr.serialize();
+        // Rejected in strict mode.
+        assert_eq!(QfHeaderV1::parse(&bytes, false), Err(QfError::BadMagic));
+        // Accepted in compatibility mode.
+        let parsed = QfHeaderV1::parse(&bytes, true).expect("should accept HQF1 in compat mode");
+        assert_eq!(parsed.magic, MAGIC_LEGACY_DRAFT);
+    }
+
+    #[test]
+    fn bad_version_rejected() {
+        let hdr = minimal_header();
+        let mut bytes = hdr.serialize();
+        // Overwrite version_major with 2.
+        bytes[6..8].copy_from_slice(&2u16.to_le_bytes());
+        // Recompute CRC.
+        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);
+        let crc = checksum::crc32c(&bytes);
+        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(QfHeaderV1::parse(&bytes, false), Err(QfError::BadVersion));
+    }
+
+    #[test]
+    fn bad_endianness_rejected() {
+        let hdr = minimal_header();
+        let mut bytes = hdr.serialize();
+        // Overwrite endianness with 2 (not little-endian).
+        bytes[11] = 2;
+        // Recompute CRC.
+        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);
+        let crc = checksum::crc32c(&bytes);
+        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            QfHeaderV1::parse(&bytes, false),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_required_feature_rejected() {
+        let mut hdr = minimal_header();
+        // Set a bit far beyond the defined range.
+        hdr.required_features = FEATURE_TABLE_PROFILE | 0x0000_0001_0000_0000;
+        let bytes = hdr.serialize();
+        assert_eq!(
+            QfHeaderV1::parse(&bytes, false),
+            Err(QfError::UnknownRequiredFeature(0x0000_0001_0000_0000))
+        );
+    }
+
+    #[test]
+    fn unknown_optional_feature_accepted() {
+        // Unknown optional feature bits MUST be accepted (Section 11).
+        let mut hdr = minimal_header();
+        hdr.optional_features = 0x0000_0001_0000_0000;
+        let bytes = hdr.serialize();
+        let parsed = QfHeaderV1::parse(&bytes, false).expect("unknown optional feature should be accepted");
+        assert_eq!(parsed.optional_features, 0x0000_0001_0000_0000);
     }
 }

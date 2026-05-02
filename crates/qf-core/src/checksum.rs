@@ -25,3 +25,45 @@ pub fn crc32c_combine(a: &[u8], b: &[u8]) -> u32 {
 pub fn verify_crc32c(data: &[u8], expected: u32) -> bool {
     crc32c(data) == expected
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crc32c_empty() {
+        // CRC32C of empty input is 0.
+        assert_eq!(crc32c(&[]), 0);
+    }
+
+    #[test]
+    fn crc32c_known_value() {
+        // CRC32C("123456789") == 0xe3069283 (standard test vector).
+        assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+    }
+
+    #[test]
+    fn crc32c_combine_matches_contiguous() {
+        let a = b"hello, ";
+        let b = b"quay format";
+        let mut combined_buf = Vec::new();
+        combined_buf.extend_from_slice(a);
+        combined_buf.extend_from_slice(b);
+        let combined_direct = crc32c(&combined_buf);
+        let combined_split = crc32c_combine(a, b);
+        assert_eq!(combined_direct, combined_split);
+    }
+
+    #[test]
+    fn verify_crc32c_passes_correct_checksum() {
+        let data = b"some data bytes";
+        let expected = crc32c(data);
+        assert!(verify_crc32c(data, expected));
+    }
+
+    #[test]
+    fn verify_crc32c_fails_wrong_checksum() {
+        let data = b"some data bytes";
+        assert!(!verify_crc32c(data, 0xdeadbeef));
+    }
+}
