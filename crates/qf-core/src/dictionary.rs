@@ -30,7 +30,7 @@ pub struct FileDictionaryHeaderV1 {
     pub entry_count: u32,
     /// Dictionary-level flags.
     pub flags: u32,
-    /// Byte length of each index entry (fixed at 40 for v1).
+    /// Byte length of each index entry (fixed at 48 for v1).
     pub index_entry_len: u16,
     /// Hash algorithm used for `canonical_hash64`.
     /// 0 = None, 1 = xxh3_64, 2 = sha256_truncated64.

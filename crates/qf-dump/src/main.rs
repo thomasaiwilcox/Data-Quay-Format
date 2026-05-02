@@ -1,6 +1,6 @@
 use std::{fs, path::Path, process};
 
-use qf_core::{footer::QfFooter, postscript::QfPostscriptV1};
+use qf_core::{checksum, footer::QfFooter, postscript::QfPostscriptV1};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -70,6 +70,15 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
     let postscript =
         QfPostscriptV1::parse_from_tail(&data).map_err(|e| format!("postscript parse: {e}"))?;
 
+    // Spec §12: file_len MUST equal actual file length.
+    if postscript.file_len != data.len() as u64 {
+        return Err(format!(
+            "postscript.file_len {} does not match actual file size {}",
+            postscript.file_len,
+            data.len()
+        ));
+    }
+
     let footer_start = postscript.footer.offset as usize;
     let footer_end = postscript
         .footer
@@ -78,7 +87,18 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
     if footer_end > data.len() {
         return Err("footer outside file bounds".to_string());
     }
-    let footer = QfFooter::parse(&data[footer_start..footer_end])
+
+    // Spec §12: footer CRC32C MUST validate before footer contents are trusted.
+    let footer_bytes = &data[footer_start..footer_end];
+    let computed_crc = checksum::crc32c(footer_bytes);
+    if computed_crc != postscript.footer.crc32c {
+        return Err(format!(
+            "footer CRC mismatch: stored 0x{:08x}, computed 0x{:08x}",
+            postscript.footer.crc32c, computed_crc
+        ));
+    }
+
+    let footer = QfFooter::parse(footer_bytes)
         .map_err(|e| format!("footer parse: {e}"))?;
 
     match mode {
