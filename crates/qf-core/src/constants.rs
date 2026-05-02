@@ -98,6 +98,36 @@ pub const FEATURE_EXTENSION_REGISTRY: u64 = 0x0000_0000_0020_0000;
 pub const FEATURE_CODEC_LZ4: u64 = 0x0000_0000_0040_0000;
 pub const FEATURE_CODEC_ZSTD: u64 = 0x0000_0000_0080_0000;
 
+/// Bitmask of all feature bits defined in QF v1.0 (Section 11).
+///
+/// Any required feature bit that is NOT in this mask is unknown to this
+/// implementation.  Readers MUST reject files whose `required_features`
+/// field contains unknown bits (Section 11 rule).
+pub const KNOWN_FEATURE_BITS_MASK: u64 = FEATURE_OBJECT_PROFILE
+    | FEATURE_TABLE_PROFILE
+    | FEATURE_ARCHIVE_PROFILE
+    | FEATURE_ENGINE_PROFILE
+    | FEATURE_HARBOR_PROFILE
+    | FEATURE_FILE_DICTIONARY
+    | FEATURE_NUMCODES
+    | FEATURE_COLUMN_DOMAINS
+    | FEATURE_EXACT_SETS
+    | FEATURE_BLOOM_FILTERS
+    | FEATURE_INVERTED_INDEXES
+    | FEATURE_LOOKUP_INDEXES
+    | FEATURE_AGGREGATE_SYNOPSES
+    | FEATURE_COMPOSITE_ZONES
+    | FEATURE_TOPN_SUMMARIES
+    | FEATURE_TRUST_CHAIN
+    | FEATURE_REDACTIONS
+    | FEATURE_NESTED_COLUMNS
+    | FEATURE_DIGEST_MANIFEST
+    | FEATURE_ARROW_INTEROP_HINTS
+    | FEATURE_LAKEHOUSE_HINTS
+    | FEATURE_EXTENSION_REGISTRY
+    | FEATURE_CODEC_LZ4
+    | FEATURE_CODEC_ZSTD;
+
 // ── Primary profile (header field) ──────────────────────────────────────────
 
 /// Profile identifier used in the header `primary_profile` field and section `profile` field.
@@ -559,5 +589,324 @@ impl RecordKind {
             4 => Some(Self::Tombstone),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── PrimaryProfile ────────────────────────────────────────────────────────
+
+    #[test]
+    fn primary_profile_from_u8_all_known() {
+        assert_eq!(PrimaryProfile::from_u8(0), Some(PrimaryProfile::Mixed));
+        assert_eq!(PrimaryProfile::from_u8(1), Some(PrimaryProfile::ObjectTemporal));
+        assert_eq!(PrimaryProfile::from_u8(2), Some(PrimaryProfile::TableScan));
+        assert_eq!(PrimaryProfile::from_u8(3), Some(PrimaryProfile::ArchiveAcceleration));
+        assert_eq!(PrimaryProfile::from_u8(4), Some(PrimaryProfile::EngineExecution));
+        assert_eq!(PrimaryProfile::from_u8(5), Some(PrimaryProfile::HarborExecution));
+    }
+
+    #[test]
+    fn primary_profile_from_u8_unknown() {
+        assert_eq!(PrimaryProfile::from_u8(6), None);
+        assert_eq!(PrimaryProfile::from_u8(255), None);
+    }
+
+    // ── ProducerScopeKind ─────────────────────────────────────────────────────
+
+    #[test]
+    fn producer_scope_kind_from_u16_all_known() {
+        assert_eq!(ProducerScopeKind::from_u16(0), Some(ProducerScopeKind::None));
+        assert_eq!(ProducerScopeKind::from_u16(1), Some(ProducerScopeKind::Tenant));
+        assert_eq!(ProducerScopeKind::from_u16(2), Some(ProducerScopeKind::Account));
+        assert_eq!(ProducerScopeKind::from_u16(3), Some(ProducerScopeKind::Organisation));
+        assert_eq!(ProducerScopeKind::from_u16(4), Some(ProducerScopeKind::Workspace));
+        assert_eq!(ProducerScopeKind::from_u16(5), Some(ProducerScopeKind::Catalog));
+        assert_eq!(ProducerScopeKind::from_u16(6), Some(ProducerScopeKind::Dataset));
+        assert_eq!(ProducerScopeKind::from_u16(255), Some(ProducerScopeKind::EngineSpecific));
+    }
+
+    #[test]
+    fn producer_scope_kind_from_u16_unknown() {
+        assert_eq!(ProducerScopeKind::from_u16(7), None);
+        assert_eq!(ProducerScopeKind::from_u16(100), None);
+    }
+
+    // ── SectionKind ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn section_kind_from_u16_shared_sections() {
+        assert_eq!(SectionKind::from_u16(1), Some(SectionKind::FileDictionaryIndex));
+        assert_eq!(SectionKind::from_u16(2), Some(SectionKind::FileDictionaryPayload));
+        assert_eq!(SectionKind::from_u16(3), Some(SectionKind::CollationRegistry));
+        assert_eq!(SectionKind::from_u16(4), Some(SectionKind::DigestManifest));
+        assert_eq!(SectionKind::from_u16(5), Some(SectionKind::RedactionManifest));
+        assert_eq!(SectionKind::from_u16(6), Some(SectionKind::ArrowInteropHints));
+        assert_eq!(SectionKind::from_u16(7), Some(SectionKind::LakehouseHints));
+        assert_eq!(SectionKind::from_u16(8), Some(SectionKind::ExtensionRegistry));
+        assert_eq!(SectionKind::from_u16(9), Some(SectionKind::ProfileCapabilityMatrix));
+    }
+
+    #[test]
+    fn section_kind_from_u16_qf_t_sections() {
+        assert_eq!(SectionKind::from_u16(10), Some(SectionKind::TableCatalog));
+        assert_eq!(SectionKind::from_u16(11), Some(SectionKind::TableSegmentIndex));
+        assert_eq!(SectionKind::from_u16(12), Some(SectionKind::TableSegmentData));
+        assert_eq!(SectionKind::from_u16(13), Some(SectionKind::ColumnDomain));
+        assert_eq!(SectionKind::from_u16(14), Some(SectionKind::ZoneStats));
+        assert_eq!(SectionKind::from_u16(15), Some(SectionKind::ExactSetIndex));
+        assert_eq!(SectionKind::from_u16(16), Some(SectionKind::BloomIndex));
+        assert_eq!(SectionKind::from_u16(17), Some(SectionKind::InvertedMorselIndex));
+        assert_eq!(SectionKind::from_u16(18), Some(SectionKind::LookupIndex));
+        assert_eq!(SectionKind::from_u16(19), Some(SectionKind::AggregateSynopsis));
+        assert_eq!(SectionKind::from_u16(20), Some(SectionKind::CompositeZoneIndex));
+        assert_eq!(SectionKind::from_u16(21), Some(SectionKind::TopNZoneSummary));
+        assert_eq!(SectionKind::from_u16(22), Some(SectionKind::KernelCapabilities));
+    }
+
+    #[test]
+    fn section_kind_from_u16_qf_e_sections() {
+        assert_eq!(SectionKind::from_u16(30), Some(SectionKind::EngineProfileRegistry));
+        assert_eq!(SectionKind::from_u16(31), Some(SectionKind::ExecutionCodeDescriptor));
+        assert_eq!(SectionKind::from_u16(32), Some(SectionKind::ExecutionScopeDescriptor));
+        assert_eq!(SectionKind::from_u16(33), Some(SectionKind::CodeSpaceDescriptor));
+        assert_eq!(SectionKind::from_u16(34), Some(SectionKind::EngineMountPolicy));
+    }
+
+    #[test]
+    fn section_kind_from_u16_qf_o_sections() {
+        assert_eq!(SectionKind::from_u16(40), Some(SectionKind::ObjectTypeCatalog));
+        assert_eq!(SectionKind::from_u16(41), Some(SectionKind::TemporalSegmentIndex));
+        assert_eq!(SectionKind::from_u16(42), Some(SectionKind::TemporalSegmentData));
+        assert_eq!(SectionKind::from_u16(43), Some(SectionKind::TemporalBloomIndex));
+        assert_eq!(SectionKind::from_u16(44), Some(SectionKind::TrustManifest));
+    }
+
+    #[test]
+    fn section_kind_from_u16_qf_h_and_vendor() {
+        assert_eq!(SectionKind::from_u16(50), Some(SectionKind::HarborMountHints));
+        assert_eq!(SectionKind::from_u16(255), Some(SectionKind::VendorExtension));
+    }
+
+    #[test]
+    fn section_kind_from_u16_unknown() {
+        assert_eq!(SectionKind::from_u16(0), None);
+        assert_eq!(SectionKind::from_u16(23), None);
+        assert_eq!(SectionKind::from_u16(100), None);
+    }
+
+    // ── CompressionCodec ─────────────────────────────────────────────────────
+
+    #[test]
+    fn compression_codec_from_u8_all_known() {
+        assert_eq!(CompressionCodec::from_u8(0), Some(CompressionCodec::None));
+        assert_eq!(CompressionCodec::from_u8(1), Some(CompressionCodec::Lz4));
+        assert_eq!(CompressionCodec::from_u8(2), Some(CompressionCodec::Zstd));
+    }
+
+    #[test]
+    fn compression_codec_from_u8_unknown() {
+        assert_eq!(CompressionCodec::from_u8(3), None);
+        assert_eq!(CompressionCodec::from_u8(255), None);
+    }
+
+    // ── QfLogicalType ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn logical_type_from_u16_all_known() {
+        assert_eq!(QfLogicalType::from_u16(0), Some(QfLogicalType::Null));
+        assert_eq!(QfLogicalType::from_u16(1), Some(QfLogicalType::Bool));
+        assert_eq!(QfLogicalType::from_u16(5), Some(QfLogicalType::Int64));
+        assert_eq!(QfLogicalType::from_u16(9), Some(QfLogicalType::UInt64));
+        assert_eq!(QfLogicalType::from_u16(11), Some(QfLogicalType::Float64));
+        assert_eq!(QfLogicalType::from_u16(14), Some(QfLogicalType::DateDays));
+        assert_eq!(QfLogicalType::from_u16(15), Some(QfLogicalType::TimestampMicros));
+        assert_eq!(QfLogicalType::from_u16(16), Some(QfLogicalType::TimestampNanos));
+        assert_eq!(QfLogicalType::from_u16(17), Some(QfLogicalType::Utf8));
+        assert_eq!(QfLogicalType::from_u16(19), Some(QfLogicalType::Uuid));
+        assert_eq!(QfLogicalType::from_u16(20), Some(QfLogicalType::Json));
+        assert_eq!(QfLogicalType::from_u16(21), Some(QfLogicalType::List));
+        assert_eq!(QfLogicalType::from_u16(22), Some(QfLogicalType::Struct));
+        assert_eq!(QfLogicalType::from_u16(23), Some(QfLogicalType::Map));
+    }
+
+    #[test]
+    fn logical_type_from_u16_unknown() {
+        assert_eq!(QfLogicalType::from_u16(24), None);
+        assert_eq!(QfLogicalType::from_u16(1000), None);
+    }
+
+    // ── QfPhysicalKind ────────────────────────────────────────────────────────
+
+    #[test]
+    fn physical_kind_from_u8_all_known() {
+        assert_eq!(QfPhysicalKind::from_u8(0), Some(QfPhysicalKind::FileCode));
+        assert_eq!(QfPhysicalKind::from_u8(1), Some(QfPhysicalKind::NumCode));
+        assert_eq!(QfPhysicalKind::from_u8(2), Some(QfPhysicalKind::Boolean));
+        assert_eq!(QfPhysicalKind::from_u8(3), Some(QfPhysicalKind::FixedBytes));
+        assert_eq!(QfPhysicalKind::from_u8(4), Some(QfPhysicalKind::VarBytes));
+        assert_eq!(QfPhysicalKind::from_u8(5), Some(QfPhysicalKind::List));
+        assert_eq!(QfPhysicalKind::from_u8(6), Some(QfPhysicalKind::Struct));
+        assert_eq!(QfPhysicalKind::from_u8(7), Some(QfPhysicalKind::Map));
+    }
+
+    #[test]
+    fn physical_kind_from_u8_unknown() {
+        assert_eq!(QfPhysicalKind::from_u8(8), None);
+        assert_eq!(QfPhysicalKind::from_u8(255), None);
+    }
+
+    // ── ValueTag ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn value_tag_from_u16_all_known() {
+        assert_eq!(ValueTag::from_u16(0), Some(ValueTag::Null));
+        assert_eq!(ValueTag::from_u16(1), Some(ValueTag::BoolFalse));
+        assert_eq!(ValueTag::from_u16(2), Some(ValueTag::BoolTrue));
+        assert_eq!(ValueTag::from_u16(3), Some(ValueTag::Int64));
+        assert_eq!(ValueTag::from_u16(4), Some(ValueTag::UInt64));
+        assert_eq!(ValueTag::from_u16(5), Some(ValueTag::Float32Bits));
+        assert_eq!(ValueTag::from_u16(6), Some(ValueTag::Float64Bits));
+        assert_eq!(ValueTag::from_u16(7), Some(ValueTag::Decimal64));
+        assert_eq!(ValueTag::from_u16(8), Some(ValueTag::Decimal128));
+        assert_eq!(ValueTag::from_u16(9), Some(ValueTag::DateDays));
+        assert_eq!(ValueTag::from_u16(10), Some(ValueTag::TimestampMicros));
+        assert_eq!(ValueTag::from_u16(11), Some(ValueTag::TimestampNanos));
+        assert_eq!(ValueTag::from_u16(12), Some(ValueTag::Utf8));
+        assert_eq!(ValueTag::from_u16(13), Some(ValueTag::Binary));
+        assert_eq!(ValueTag::from_u16(14), Some(ValueTag::Uuid));
+        assert_eq!(ValueTag::from_u16(15), Some(ValueTag::Json));
+        assert_eq!(ValueTag::from_u16(16), Some(ValueTag::List));
+        assert_eq!(ValueTag::from_u16(17), Some(ValueTag::Struct));
+        assert_eq!(ValueTag::from_u16(18), Some(ValueTag::Map));
+    }
+
+    #[test]
+    fn value_tag_from_u16_unknown() {
+        assert_eq!(ValueTag::from_u16(19), None);
+        assert_eq!(ValueTag::from_u16(1000), None);
+    }
+
+    // ── StorageClass ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn storage_class_from_u8_all_known() {
+        assert_eq!(StorageClass::from_u8(0), Some(StorageClass::Inline));
+        assert_eq!(StorageClass::from_u8(1), Some(StorageClass::Payload));
+        assert_eq!(StorageClass::from_u8(2), Some(StorageClass::Redacted));
+    }
+
+    #[test]
+    fn storage_class_from_u8_unknown() {
+        assert_eq!(StorageClass::from_u8(3), None);
+        assert_eq!(StorageClass::from_u8(255), None);
+    }
+
+    // ── QfEncodingKind ───────────────────────────────────────────────────────
+
+    #[test]
+    fn encoding_kind_from_u16_all_known() {
+        assert_eq!(QfEncodingKind::from_u16(0), Some(QfEncodingKind::Canonical));
+        assert_eq!(QfEncodingKind::from_u16(1), Some(QfEncodingKind::Validity));
+        assert_eq!(QfEncodingKind::from_u16(2), Some(QfEncodingKind::Constant));
+        assert_eq!(QfEncodingKind::from_u16(3), Some(QfEncodingKind::FileCode));
+        assert_eq!(QfEncodingKind::from_u16(4), Some(QfEncodingKind::NumCode));
+        assert_eq!(QfEncodingKind::from_u16(5), Some(QfEncodingKind::LocalCodebook));
+        assert_eq!(QfEncodingKind::from_u16(6), Some(QfEncodingKind::Rle));
+        assert_eq!(QfEncodingKind::from_u16(7), Some(QfEncodingKind::RunEnd));
+        assert_eq!(QfEncodingKind::from_u16(8), Some(QfEncodingKind::BitPacked));
+        assert_eq!(QfEncodingKind::from_u16(9), Some(QfEncodingKind::Delta));
+        assert_eq!(QfEncodingKind::from_u16(10), Some(QfEncodingKind::FrameOfReference));
+        assert_eq!(QfEncodingKind::from_u16(11), Some(QfEncodingKind::PatchedBase));
+        assert_eq!(QfEncodingKind::from_u16(12), Some(QfEncodingKind::Sparse));
+        assert_eq!(QfEncodingKind::from_u16(13), Some(QfEncodingKind::Sequence));
+        assert_eq!(QfEncodingKind::from_u16(14), Some(QfEncodingKind::PlainFixed));
+        assert_eq!(QfEncodingKind::from_u16(15), Some(QfEncodingKind::PlainVarint));
+        assert_eq!(QfEncodingKind::from_u16(16), Some(QfEncodingKind::VarBytes));
+        assert_eq!(QfEncodingKind::from_u16(17), Some(QfEncodingKind::Lz4Block));
+        assert_eq!(QfEncodingKind::from_u16(18), Some(QfEncodingKind::ZstdBlock));
+    }
+
+    #[test]
+    fn encoding_kind_from_u16_unknown() {
+        assert_eq!(QfEncodingKind::from_u16(19), None);
+        assert_eq!(QfEncodingKind::from_u16(1000), None);
+    }
+
+    // ── DigestAlgorithm ──────────────────────────────────────────────────────
+
+    #[test]
+    fn digest_algorithm_from_u16_all_known() {
+        assert_eq!(DigestAlgorithm::from_u16(0), Some(DigestAlgorithm::None));
+        assert_eq!(DigestAlgorithm::from_u16(1), Some(DigestAlgorithm::Sha256));
+        assert_eq!(DigestAlgorithm::from_u16(2), Some(DigestAlgorithm::Blake3));
+    }
+
+    #[test]
+    fn digest_algorithm_from_u16_unknown() {
+        assert_eq!(DigestAlgorithm::from_u16(3), None);
+        assert_eq!(DigestAlgorithm::from_u16(255), None);
+    }
+
+    // ── RecordKind ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn record_kind_from_u8_all_known() {
+        assert_eq!(RecordKind::from_u8(0), Some(RecordKind::Delta));
+        assert_eq!(RecordKind::from_u8(1), Some(RecordKind::Snapshot));
+        assert_eq!(RecordKind::from_u8(2), Some(RecordKind::ReservedLegacyMaterializedDelta));
+        assert_eq!(RecordKind::from_u8(3), Some(RecordKind::Baseline));
+        assert_eq!(RecordKind::from_u8(4), Some(RecordKind::Tombstone));
+    }
+
+    #[test]
+    fn record_kind_from_u8_unknown() {
+        assert_eq!(RecordKind::from_u8(5), None);
+        assert_eq!(RecordKind::from_u8(255), None);
+    }
+
+    // ── KNOWN_FEATURE_BITS_MASK ──────────────────────────────────────────────
+
+    #[test]
+    fn known_feature_bits_mask_covers_all_defined_bits() {
+        // Every defined feature constant must be covered by the mask.
+        let defined = [
+            FEATURE_OBJECT_PROFILE,
+            FEATURE_TABLE_PROFILE,
+            FEATURE_ARCHIVE_PROFILE,
+            FEATURE_ENGINE_PROFILE,
+            FEATURE_HARBOR_PROFILE,
+            FEATURE_FILE_DICTIONARY,
+            FEATURE_NUMCODES,
+            FEATURE_COLUMN_DOMAINS,
+            FEATURE_EXACT_SETS,
+            FEATURE_BLOOM_FILTERS,
+            FEATURE_INVERTED_INDEXES,
+            FEATURE_LOOKUP_INDEXES,
+            FEATURE_AGGREGATE_SYNOPSES,
+            FEATURE_COMPOSITE_ZONES,
+            FEATURE_TOPN_SUMMARIES,
+            FEATURE_TRUST_CHAIN,
+            FEATURE_REDACTIONS,
+            FEATURE_NESTED_COLUMNS,
+            FEATURE_DIGEST_MANIFEST,
+            FEATURE_ARROW_INTEROP_HINTS,
+            FEATURE_LAKEHOUSE_HINTS,
+            FEATURE_EXTENSION_REGISTRY,
+            FEATURE_CODEC_LZ4,
+            FEATURE_CODEC_ZSTD,
+        ];
+        for bit in &defined {
+            assert_eq!(KNOWN_FEATURE_BITS_MASK & bit, *bit, "bit 0x{bit:016x} not in mask");
+        }
+    }
+
+    #[test]
+    fn known_feature_bits_mask_does_not_contain_future_bits() {
+        // Bits beyond the defined range should not be in the mask.
+        let future_bit: u64 = 0x0000_0001_0000_0000;
+        assert_eq!(KNOWN_FEATURE_BITS_MASK & future_bit, 0);
     }
 }

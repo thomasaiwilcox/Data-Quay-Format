@@ -384,4 +384,58 @@ mod tests {
         assert_eq!(parsed.length, 512);
         assert_eq!(parsed.crc32c, 0xdeadbeef);
     }
+
+    #[test]
+    fn section_entry_encryption_nonzero_rejected() {
+        let entry = QfSectionEntryV1 {
+            section_id: 1,
+            section_kind: 1,
+            profile: 0,
+            flags: 0,
+            offset: 256,
+            length: 512,
+            uncompressed_length: 512,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_features: 0,
+            optional_features: 0,
+            crc32c: 0,
+            reserved1: 0,
+        };
+        let mut bytes = entry.serialize();
+        // Overwrite encryption field (byte 49) with a non-zero value.
+        bytes[49] = 1;
+        assert!(matches!(
+            QfSectionEntryV1::parse(&bytes),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn section_entry_end_offset_overflow_rejected() {
+        let entry = QfSectionEntryV1 {
+            section_id: 1,
+            section_kind: 1,
+            profile: 0,
+            flags: 0,
+            offset: u64::MAX,
+            length: 1,
+            uncompressed_length: 1,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_features: 0,
+            optional_features: 0,
+            crc32c: 0,
+            reserved1: 0,
+        };
+        assert_eq!(entry.end_offset(), Err(QfError::ArithOverflow));
+    }
 }
