@@ -1,0 +1,13 @@
+[package]
+name = "qf-dump"
+version = "0.1.0"
+edition = "2021"
+description = "CLI dumper for Quay Format (QF) v1.0 files"
+license = "MIT"
+
+[[bin]]
+name = "qf-dump"
+path = "src/main.rs"
+
+[dependencies]
+qf-core = { path = "../qf-core" }
