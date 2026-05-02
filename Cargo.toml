@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/qf-core",
+    "crates/qf-validate",
+]
+resolver = "2"
