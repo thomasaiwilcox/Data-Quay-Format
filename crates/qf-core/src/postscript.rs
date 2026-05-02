@@ -116,7 +116,9 @@ impl QfSectionSpecV1 {
 
     /// Return the end offset (exclusive) of this section, checking for overflow.
     pub fn end_offset(&self) -> Result<u64, QfError> {
-        self.offset.checked_add(self.length).ok_or(QfError::ArithOverflow)
+        self.offset
+            .checked_add(self.length)
+            .ok_or(QfError::ArithOverflow)
     }
 }
 
@@ -202,7 +204,9 @@ impl QfPostscriptV1 {
         }
 
         let tail_start = file_len - POSTSCRIPT_TAIL_SIZE;
-        let magic: [u8; 4] = file_data[tail_start + 4..tail_start + 8].try_into().unwrap();
+        let magic: [u8; 4] = file_data[tail_start + 4..tail_start + 8]
+            .try_into()
+            .unwrap();
         if magic != MAGIC_QF {
             return Err(QfError::BadMagic);
         }
@@ -210,7 +214,9 @@ impl QfPostscriptV1 {
         let ps_version =
             u16::from_le_bytes(file_data[tail_start..tail_start + 2].try_into().unwrap());
         let ps_len = u16::from_le_bytes(
-            file_data[tail_start + 2..tail_start + 4].try_into().unwrap(),
+            file_data[tail_start + 2..tail_start + 4]
+                .try_into()
+                .unwrap(),
         );
 
         if ps_version != POSTSCRIPT_VERSION_V1 {
@@ -235,8 +241,11 @@ impl QfPostscriptV1 {
         let buf = &buf[..POSTSCRIPT_SIZE];
 
         // Verify checksum first.
-        let stored_crc =
-            u32::from_le_bytes(buf[PS_CHECKSUM_OFFSET..PS_CHECKSUM_OFFSET + 4].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(
+            buf[PS_CHECKSUM_OFFSET..PS_CHECKSUM_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
         let mut check_buf = [0u8; POSTSCRIPT_SIZE];
         check_buf.copy_from_slice(buf);
         check_buf[PS_CHECKSUM_OFFSET..PS_CHECKSUM_OFFSET + 4].copy_from_slice(&[0, 0, 0, 0]);

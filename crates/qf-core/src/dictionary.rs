@@ -221,7 +221,10 @@ mod tests {
         assert_eq!(bytes.len(), DICT_HEADER_SIZE);
         let parsed = FileDictionaryHeaderV1::parse(&bytes).expect("parse should succeed");
         assert_eq!(parsed.entry_count, 3);
-        assert_eq!(parsed.index_entry_len, FileDictionaryHeaderV1::INDEX_ENTRY_LEN);
+        assert_eq!(
+            parsed.index_entry_len,
+            FileDictionaryHeaderV1::INDEX_ENTRY_LEN
+        );
     }
 
     #[test]

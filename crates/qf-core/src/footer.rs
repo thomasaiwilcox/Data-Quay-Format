@@ -13,7 +13,9 @@
 
 use crate::{
     checksum,
-    constants::{FOOTER_HEADER_LEN, FOOTER_VERSION_V1, MAGIC_FOOTER, METADATA_LEN_MAX, SECTION_ENTRY_LEN},
+    constants::{
+        FOOTER_HEADER_LEN, FOOTER_VERSION_V1, MAGIC_FOOTER, METADATA_LEN_MAX, SECTION_ENTRY_LEN,
+    },
     error::QfError,
 };
 
@@ -117,7 +119,9 @@ impl QfFooterHeaderV1 {
             .checked_mul(SECTION_ENTRY_LEN as u64)
             .ok_or(QfError::ArithOverflow)?;
         let base = FOOTER_HEADER_SIZE as u64;
-        let with_entries = base.checked_add(entries_len).ok_or(QfError::ArithOverflow)?;
+        let with_entries = base
+            .checked_add(entries_len)
+            .ok_or(QfError::ArithOverflow)?;
         with_entries
             .checked_add(self.metadata_len as u64)
             .ok_or(QfError::ArithOverflow)
@@ -249,7 +253,9 @@ impl QfSectionEntryV1 {
 
     /// Return the end offset (exclusive) of this section, checking for overflow.
     pub fn end_offset(&self) -> Result<u64, QfError> {
-        self.offset.checked_add(self.length).ok_or(QfError::ArithOverflow)
+        self.offset
+            .checked_add(self.length)
+            .ok_or(QfError::ArithOverflow)
     }
 }
 
@@ -302,7 +308,11 @@ impl QfFooter {
         let meta_start = entries_start + header.section_count as usize * entry_size;
         let metadata_json = buf[meta_start..meta_start + header.metadata_len as usize].to_vec();
 
-        Ok(Self { header, sections, metadata_json })
+        Ok(Self {
+            header,
+            sections,
+            metadata_json,
+        })
     }
 
     /// Compute the CRC32C of the footer bytes as produced by [`serialize`].
