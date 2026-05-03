@@ -6,7 +6,8 @@ use crate::{
     checksum,
     constants::{
         PrimaryProfile, SectionKind, FEATURE_ARCHIVE_PROFILE, FEATURE_ENGINE_PROFILE,
-        FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE, MAGIC_QF,
+        FEATURE_CODEC_LZ4, FEATURE_CODEC_ZSTD, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
+        FEATURE_TABLE_PROFILE, MAGIC_QF,
     },
     footer::QfFooter,
     header::{QfHeaderV1, HEADER_SIZE},
@@ -108,6 +109,8 @@ fn validate_sections(data: &[u8], footer_start: usize, footer: &QfFooter) -> Res
         expected_section_id = expected_section_id.saturating_add(1);
 
         validate_section_profile(entry.section_kind, entry.profile)?;
+        validate_section_profile_feature_bit(entry.profile, header.required_features)?;
+        validate_codec_feature_advertisement(entry.compression, header, entry)?;
 
         let section_end = entry.end_offset()?;
         if entry.offset < HEADER_SIZE as u64 || section_end > footer_start as u64 {
@@ -130,6 +133,58 @@ fn validate_sections(data: &[u8], footer_start: usize, footer: &QfFooter) -> Res
         ranges.push((entry.offset, section_end, entry.section_id));
     }
 
+    Ok(())
+}
+
+fn validate_section_profile_feature_bit(profile: u8, file_required_features: u64) -> Result<(), QfError> {
+    let required_profile_bit = match profile {
+        0 => return Ok(()),
+        1 => FEATURE_OBJECT_PROFILE,
+        2 => FEATURE_TABLE_PROFILE,
+        3 => FEATURE_ARCHIVE_PROFILE,
+        4 => FEATURE_ENGINE_PROFILE,
+        5 => FEATURE_HARBOR_PROFILE,
+        _ => {
+            return Err(QfError::BadSection(format!(
+                "unknown profile {profile} in section directory"
+            )))
+        }
+    };
+    if file_required_features & required_profile_bit == 0 {
+        return Err(QfError::BadSection(format!(
+            "section profile {profile} requires missing file feature bit 0x{required_profile_bit:016x}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_codec_feature_advertisement(
+    compression: u8,
+    header: &QfHeaderV1,
+    entry: &crate::footer::QfSectionEntryV1,
+) -> Result<(), QfError> {
+    let advertised = header.required_features | header.optional_features;
+    let section_advertised = entry.required_features | entry.optional_features;
+    match compression {
+        1 => {
+            if advertised & FEATURE_CODEC_LZ4 == 0 || section_advertised & FEATURE_CODEC_LZ4 == 0 {
+                return Err(QfError::BadSection(format!(
+                    "section {} uses LZ4 compression but codec feature bit is not advertised",
+                    entry.section_id
+                )));
+            }
+        }
+        2 => {
+            if advertised & FEATURE_CODEC_ZSTD == 0 || section_advertised & FEATURE_CODEC_ZSTD == 0
+            {
+                return Err(QfError::BadSection(format!(
+                    "section {} uses ZSTD compression but codec feature bit is not advertised",
+                    entry.section_id
+                )));
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -206,7 +261,10 @@ fn validate_section_profile(section_kind: u16, profile: u8) -> Result<(), QfErro
 mod tests {
     use super::*;
     use crate::{
-        constants::{SectionKind, FEATURE_FILE_DICTIONARY, FEATURE_TABLE_PROFILE},
+        constants::{
+            CompressionCodec, SectionKind, FEATURE_CODEC_LZ4, FEATURE_FILE_DICTIONARY,
+            FEATURE_TABLE_PROFILE,
+        },
         postscript::POSTSCRIPT_TOTAL_SIZE,
         writer::{MinimalQfWriter, SectionPayload},
     };
@@ -355,3 +413,59 @@ mod tests {
         assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
     }
 }
+
+    #[test]
+    fn rejects_section_profile_feature_missing_from_header() {
+        let mut writer = MinimalQfWriter::new();
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::TableCatalog as u16,
+            profile: 2,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: b"x".to_vec(),
+        });
+        writer.required_features = 0;
+        let bytes = writer.write();
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+    }
+
+    #[test]
+    fn rejects_lz4_section_without_codec_feature_advertised() {
+        let mut writer = MinimalQfWriter::new();
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: CompressionCodec::Lz4 as u8,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: b"lz4-ish".to_vec(),
+        });
+        let bytes = writer.write();
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+
+        let mut good_writer = MinimalQfWriter::new();
+        good_writer.optional_features = FEATURE_CODEC_LZ4;
+        good_writer.sections.push(SectionPayload {
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: CompressionCodec::Lz4 as u8,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: FEATURE_CODEC_LZ4,
+            data: b"lz4-ish".to_vec(),
+        });
+        let good_bytes = good_writer.write();
+        assert!(validate_bytes(&good_bytes).is_ok());
+    }
