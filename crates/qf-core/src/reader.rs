@@ -4,7 +4,10 @@ use std::{collections::HashSet, fs, path::Path};
 
 use crate::{
     checksum,
-    constants::MAGIC_QF,
+    constants::{
+        PrimaryProfile, SectionKind, FEATURE_ARCHIVE_PROFILE, FEATURE_ENGINE_PROFILE,
+        FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE, MAGIC_QF,
+    },
     footer::QfFooter,
     header::{QfHeaderV1, HEADER_SIZE},
     postscript::{QfPostscriptV1, POSTSCRIPT_TOTAL_SIZE},
@@ -68,6 +71,7 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedQfFile, QfError> {
     validate_sections(data, footer_start, &footer)?;
 
     let header = QfHeaderV1::parse(data, false)?;
+    validate_primary_profile_features(&header)?;
     if header.required_features != postscript.required_features
         || header.optional_features != postscript.optional_features
     {
@@ -86,6 +90,7 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedQfFile, QfError> {
 fn validate_sections(data: &[u8], footer_start: usize, footer: &QfFooter) -> Result<(), QfError> {
     let mut section_ids_seen = HashSet::new();
     let mut ranges: Vec<(u64, u64, u32)> = Vec::new();
+    let mut expected_section_id: u32 = 1;
 
     for entry in &footer.sections {
         if !section_ids_seen.insert(entry.section_id) {
@@ -94,6 +99,15 @@ fn validate_sections(data: &[u8], footer_start: usize, footer: &QfFooter) -> Res
                 entry.section_id
             )));
         }
+        if entry.section_id != expected_section_id {
+            return Err(QfError::BadSection(format!(
+                "section_id {} out of sequence, expected {}",
+                entry.section_id, expected_section_id
+            )));
+        }
+        expected_section_id = expected_section_id.saturating_add(1);
+
+        validate_section_profile(entry.section_kind, entry.profile)?;
 
         let section_end = entry.end_offset()?;
         if entry.offset < HEADER_SIZE as u64 || section_end > footer_start as u64 {
@@ -116,6 +130,75 @@ fn validate_sections(data: &[u8], footer_start: usize, footer: &QfFooter) -> Res
         ranges.push((entry.offset, section_end, entry.section_id));
     }
 
+    Ok(())
+}
+
+fn validate_primary_profile_features(header: &QfHeaderV1) -> Result<(), QfError> {
+    let profile = PrimaryProfile::from_u8(header.primary_profile)
+        .ok_or_else(|| QfError::BadSection("unknown primary profile".to_string()))?;
+
+    let required_bit = match profile {
+        PrimaryProfile::Mixed => return Ok(()),
+        PrimaryProfile::ObjectTemporal => FEATURE_OBJECT_PROFILE,
+        PrimaryProfile::TableScan => FEATURE_TABLE_PROFILE,
+        PrimaryProfile::ArchiveAcceleration => FEATURE_ARCHIVE_PROFILE,
+        PrimaryProfile::EngineExecution => FEATURE_ENGINE_PROFILE,
+        PrimaryProfile::HarborExecution => FEATURE_HARBOR_PROFILE,
+    };
+
+    if header.required_features & required_bit == 0 {
+        return Err(QfError::BadSection(format!(
+            "primary_profile {:?} requires feature bit 0x{required_bit:016x}",
+            profile
+        )));
+    }
+    Ok(())
+}
+
+fn validate_section_profile(section_kind: u16, profile: u8) -> Result<(), QfError> {
+    let section = SectionKind::from_u16(section_kind)
+        .ok_or_else(|| QfError::BadSection(format!("unknown section_kind {section_kind}")));
+    let expected = match section? {
+        SectionKind::FileDictionaryIndex
+        | SectionKind::FileDictionaryPayload
+        | SectionKind::CollationRegistry
+        | SectionKind::DigestManifest
+        | SectionKind::RedactionManifest
+        | SectionKind::ArrowInteropHints
+        | SectionKind::LakehouseHints
+        | SectionKind::ExtensionRegistry
+        | SectionKind::ProfileCapabilityMatrix
+        | SectionKind::VendorExtension => 0,
+        SectionKind::TableCatalog
+        | SectionKind::TableSegmentIndex
+        | SectionKind::TableSegmentData
+        | SectionKind::ColumnDomain
+        | SectionKind::ZoneStats
+        | SectionKind::ExactSetIndex
+        | SectionKind::BloomIndex
+        | SectionKind::InvertedMorselIndex
+        | SectionKind::LookupIndex
+        | SectionKind::AggregateSynopsis
+        | SectionKind::CompositeZoneIndex
+        | SectionKind::TopNZoneSummary
+        | SectionKind::KernelCapabilities => 2,
+        SectionKind::EngineProfileRegistry
+        | SectionKind::ExecutionCodeDescriptor
+        | SectionKind::ExecutionScopeDescriptor
+        | SectionKind::CodeSpaceDescriptor
+        | SectionKind::EngineMountPolicy => 4,
+        SectionKind::ObjectTypeCatalog
+        | SectionKind::TemporalSegmentIndex
+        | SectionKind::TemporalSegmentData
+        | SectionKind::TemporalBloomIndex
+        | SectionKind::TrustManifest => 1,
+        SectionKind::HarborMountHints => 5,
+    };
+    if profile != expected {
+        return Err(QfError::BadSection(format!(
+            "section_kind {section_kind} must use profile {expected}, got {profile}"
+        )));
+    }
     Ok(())
 }
 
@@ -227,5 +310,48 @@ mod tests {
             validate_bytes(&bytes),
             Err(QfError::BadSection(_))
         ));
+    }
+
+    #[test]
+    fn rejects_out_of_order_section_ids() {
+        let mut writer = MinimalQfWriter::new();
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: b"first".to_vec(),
+        });
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::FileDictionaryPayload as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: b"second".to_vec(),
+        });
+        let mut bytes = writer.write();
+        let ps = QfPostscriptV1::parse_from_tail(&bytes).unwrap();
+        let footer_start = ps.footer.offset as usize;
+        let entries_start = footer_start + 44;
+        bytes[entries_start + 76..entries_start + 80].copy_from_slice(&3u32.to_le_bytes());
+
+        let footer_len = ps.footer.length as usize;
+        let footer_crc = checksum::crc32c(&bytes[footer_start..footer_start + footer_len]);
+        let mut fixed_ps = ps;
+        fixed_ps.footer.crc32c = footer_crc;
+        let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
+        bytes[tail_start..].copy_from_slice(&fixed_ps.serialize_tail());
+
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
     }
 }
