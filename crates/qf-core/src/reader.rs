@@ -62,6 +62,11 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedQfFile, QfError> {
     if checksum::crc32c(footer_bytes) != postscript.footer.crc32c {
         return Err(QfError::ChecksumMismatch);
     }
+    if postscript.footer.compression != 0 {
+        return Err(QfError::UnsupportedEncoding(
+            "compressed footer is not supported in this build".to_string(),
+        ));
+    }
 
     let footer = QfFooter::parse(footer_bytes)?;
     if footer.header.total_len()? != postscript.footer.length {
@@ -72,6 +77,7 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedQfFile, QfError> {
 
     let header = QfHeaderV1::parse(data, false)?;
     validate_sections(data, footer_start, &footer, &header)?;
+    validate_required_feature_implementation(&header)?;
     validate_primary_profile_features(&header)?;
     if header.required_features != postscript.required_features
         || header.optional_features != postscript.optional_features
@@ -86,6 +92,17 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedQfFile, QfError> {
         postscript,
         footer,
     })
+}
+
+fn validate_required_feature_implementation(header: &QfHeaderV1) -> Result<(), QfError> {
+    let unsupported_required = header.required_features
+        & (FEATURE_CODEC_LZ4 | FEATURE_CODEC_ZSTD | crate::constants::FEATURE_DIGEST_MANIFEST);
+    if unsupported_required != 0 {
+        return Err(QfError::UnsupportedEncoding(format!(
+            "required feature bits are known but unsupported by this build: 0x{unsupported_required:016x}"
+        )));
+    }
+    Ok(())
 }
 
 /// Options controlling the depth of validation.
