@@ -66,6 +66,8 @@ pub enum QfError {
     ReservedNotZero,
     /// I/O error during file reading or writing.
     Io(String),
+    /// Encoding kind is not supported by this implementation (QF_E_UNSUPPORTED_ENCODING).
+    UnsupportedEncoding(String),
 }
 
 impl fmt::Display for QfError {
@@ -141,6 +143,7 @@ impl fmt::Display for QfError {
             QfError::BufferTooShort => write!(f, "buffer too short to parse structure"),
             QfError::ReservedNotZero => write!(f, "reserved field is non-zero"),
             QfError::Io(s) => write!(f, "I/O error: {s}"),
+            QfError::UnsupportedEncoding(s) => write!(f, "QF_E_UNSUPPORTED_ENCODING: {s}"),
         }
     }
 }

@@ -79,6 +79,16 @@ impl<'a> ValidityBitmap<'a> {
         self.is_null(row).map(|null| !null)
     }
 
+    /// Validates that `self.bytes` is long enough to cover `row_count` rows.
+    /// Returns `QfError::ArithOverflow` on arithmetic overflow, `QfError::BufferTooShort` if too small.
+    pub fn validate_len(&self, row_count: u64) -> Result<(), QfError> {
+        let needed_bytes = row_count.checked_add(7).ok_or(QfError::ArithOverflow)? / 8;
+        if self.bytes.len() < needed_bytes as usize {
+            return Err(QfError::BufferTooShort);
+        }
+        Ok(())
+    }
+
     /// Returns the null count by counting set bits over the entire bitmap.
     ///
     /// # Errors
@@ -109,6 +119,51 @@ impl<'a> ValidityBitmap<'a> {
             count += (byte & mask).count_ones() as u64;
         }
         Ok(count)
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Builder for constructing a null bitmap incrementally.
+pub struct ValidityBitmapBuilder {
+    bytes: Vec<u8>,
+    row_count: u64,
+}
+
+impl ValidityBitmapBuilder {
+    /// Creates a zeroed bitmap for `row_count` rows.
+    /// Returns [`QfError::ArithOverflow`] if the byte count overflows.
+    pub fn new(row_count: u64) -> Result<Self, QfError> {
+        let needed_bytes = row_count.checked_add(7).ok_or(QfError::ArithOverflow)? / 8;
+        let bytes = vec![0u8; needed_bytes as usize];
+        Ok(Self { bytes, row_count })
+    }
+
+    /// Marks `row` as null (sets bit to 1).
+    /// Returns [`QfError::OffsetRange`] if `row >= row_count`.
+    pub fn set_null(&mut self, row: u64) -> Result<(), QfError> {
+        if row >= self.row_count {
+            return Err(QfError::OffsetRange);
+        }
+        let byte_idx = (row / 8) as usize;
+        let bit_idx = (row % 8) as u32;
+        self.bytes[byte_idx] |= 1 << bit_idx;
+        Ok(())
+    }
+
+    /// Borrows the builder as a read-only [`ValidityBitmap`].
+    pub fn as_bitmap(&self) -> ValidityBitmap<'_> {
+        ValidityBitmap::new(&self.bytes, self.row_count)
+    }
+
+    /// Consumes the builder and returns the raw bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Consumes the builder and returns `(row_count, bytes)`.
+    pub fn finish(self) -> (u64, Vec<u8>) {
+        (self.row_count, self.bytes)
     }
 }
 
@@ -230,5 +285,43 @@ mod tests {
         assert_eq!(bm.is_null(6).unwrap(), false);
         // Row 9: byte 1, bit 1 → unset → non-null
         assert_eq!(bm.is_null(9).unwrap(), false);
+    }
+
+    #[test]
+    fn validate_len_accepts_sufficient_buffer() {
+        // 10 rows needs ceil(10/8)=2 bytes
+        let bytes = [0u8; 2];
+        let bm = ValidityBitmap::new(&bytes, 10);
+        assert!(bm.validate_len(10).is_ok());
+    }
+
+    #[test]
+    fn validate_len_rejects_short_buffer() {
+        // 10 rows needs 2 bytes, but only 1 provided
+        let bytes = [0u8; 1];
+        let bm = ValidityBitmap::new(&bytes, 10);
+        assert_eq!(bm.validate_len(10), Err(QfError::BufferTooShort));
+    }
+
+    #[test]
+    fn builder_sets_nulls_correctly() {
+        let mut builder = ValidityBitmapBuilder::new(16).unwrap();
+        builder.set_null(0).unwrap();
+        builder.set_null(5).unwrap();
+        builder.set_null(15).unwrap();
+        let bm = builder.as_bitmap();
+        assert_eq!(bm.is_null(0).unwrap(), true);
+        assert_eq!(bm.is_null(1).unwrap(), false);
+        assert_eq!(bm.is_null(5).unwrap(), true);
+        assert_eq!(bm.is_null(15).unwrap(), true);
+        assert_eq!(bm.is_null(14).unwrap(), false);
+    }
+
+    #[test]
+    fn filecode_zero_and_numcode_zero_are_non_null_values() {
+        // FileCode 0 and NumCode 0 are ordinary values — not null sentinels — per spec §6.4
+        let bytes = [0u8; 1]; // all bits = 0, so no nulls
+        let bm = ValidityBitmap::new(&bytes, 8);
+        assert_eq!(bm.is_null(0).unwrap(), false);
     }
 }

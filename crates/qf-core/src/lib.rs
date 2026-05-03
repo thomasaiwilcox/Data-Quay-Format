@@ -17,6 +17,11 @@
 //! | [`types`] | Logical/physical type compatibility and NumCode interpretation helpers. |
 //! | [`validity`] | [`validity::ValidityBitmap`] — null bitmap helpers (bit 1 = null). |
 //! | [`writer`] | [`MinimalQfWriter`] — writes minimal valid QF files. |
+//! | [`array`]      | [`array::EncodedArray`] — single-row decoder for encoded column arrays. |
+//! | [`compression`] | Section decompression layer (None/LZ4/Zstd). |
+//! | [`extensions`] | [`extensions::ExtensionRegistry`] — extension registry skeleton. |
+//! | [`collation`]  | [`collation::CollationRegistry`] — collation registry skeleton. |
+//! | [`digest`]     | [`digest::DigestManifest`] — digest manifest skeleton. |
 //!
 //! ## Quick start
 //!
@@ -61,10 +66,15 @@
 //! println!("Section count: {}", footer.sections.len());
 //! ```
 
+pub mod array;
 pub mod checksum;
+pub mod collation;
+pub mod compression;
 pub mod constants;
 pub mod dictionary;
+pub mod digest;
 pub mod error;
+pub mod extensions;
 pub mod footer;
 pub mod header;
 pub mod postscript;
