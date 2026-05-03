@@ -729,7 +729,9 @@ mod tests {
         footer.metadata_json = b"{not-json".to_vec();
         footer.header.metadata_len = footer.metadata_json.len() as u32;
         let bytes = footer.serialize();
-        assert!(matches!(QfFooter::parse(&bytes), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            QfFooter::parse(&bytes),
+            Err(QfError::BadSection(_))
+        ));
     }
-
 }

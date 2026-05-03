@@ -6,10 +6,12 @@ use crate::{
     checksum, compression,
     constants::{
         PrimaryProfile, SectionKind, FEATURE_ARCHIVE_PROFILE, FEATURE_CODEC_LZ4,
-        FEATURE_CODEC_ZSTD, FEATURE_ENGINE_PROFILE, FEATURE_FILE_DICTIONARY,
-        FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE, MAGIC_QF,
+        FEATURE_CODEC_ZSTD, FEATURE_ENGINE_PROFILE, FEATURE_EXTENSION_REGISTRY,
+        FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
+        FEATURE_TABLE_PROFILE, MAGIC_QF,
     },
     dictionary::FileDictionary,
+    extensions::ExtensionRegistry,
     footer::QfFooter,
     header::{QfHeaderV1, HEADER_SIZE},
     postscript::{QfPostscriptV1, POSTSCRIPT_TOTAL_SIZE},
@@ -181,6 +183,35 @@ pub fn validate_bytes_with_options(
                     };
                     let dict = FileDictionary::parse(&index_bytes, &payload_bytes)?;
                     dict_entry_count = Some(dict.len());
+                }
+            }
+        }
+
+        let ext_registry_is_required =
+            validated.header.required_features & FEATURE_EXTENSION_REGISTRY != 0;
+        let ext_registry_is_optional =
+            validated.header.optional_features & FEATURE_EXTENSION_REGISTRY != 0;
+        if ext_registry_is_required || ext_registry_is_optional {
+            let ext_entry = validated
+                .footer
+                .sections
+                .iter()
+                .find(|s| s.section_kind == SectionKind::ExtensionRegistry as u16);
+            match (ext_registry_is_required, ext_entry) {
+                (true, None) => {
+                    return Err(QfError::BadSection(
+                        "FEATURE_EXTENSION_REGISTRY set in required_features but \
+                         EXTENSION_REGISTRY section missing"
+                            .into(),
+                    ));
+                }
+                (_, Some(entry)) => {
+                    let ext_bytes = compression::section_payload(data, entry)?;
+                    let registry = ExtensionRegistry::parse(&ext_bytes)?;
+                    registry.validate_known(opts.allow_unknown_optional_extensions)?;
+                }
+                (false, None) => {
+                    // Feature advertised in optional_features only and no section present — OK.
                 }
             }
         }
@@ -383,8 +414,8 @@ mod tests {
     use super::*;
     use crate::{
         constants::{
-            CompressionCodec, SectionKind, FEATURE_CODEC_LZ4, FEATURE_FILE_DICTIONARY,
-            FEATURE_HARBOR_PROFILE, FEATURE_TABLE_PROFILE,
+            CompressionCodec, SectionKind, FEATURE_CODEC_LZ4, FEATURE_EXTENSION_REGISTRY,
+            FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_TABLE_PROFILE,
         },
         postscript::POSTSCRIPT_TOTAL_SIZE,
         writer::{MinimalQfWriter, SectionPayload},
@@ -946,6 +977,148 @@ mod tests {
         let report = validate_bytes_with_options(&bytes, opts).expect("should validate");
         assert!(report.semantic_checked);
         assert!(report.dict_entry_count.is_none());
+    }
+
+    #[test]
+    fn semantic_validation_rejects_required_unknown_extension_registry() {
+        let mut writer = MinimalQfWriter::new();
+        writer.required_features |= FEATURE_EXTENSION_REGISTRY;
+        // Build a Spec §45 registry payload with one required unknown extension.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&1u32.to_le_bytes()); // extension_count
+        ext.extend_from_slice(&0u32.to_le_bytes()); // flags
+                                                    // ExtensionEntryV1
+        ext.extend_from_slice(&1u32.to_le_bytes()); // extension_id
+        ext.extend_from_slice(&3u16.to_le_bytes()); // namespace_len
+        ext.extend_from_slice(b"org"); // namespace
+        ext.extend_from_slice(&4u16.to_le_bytes()); // name_len
+        ext.extend_from_slice(b"test"); // name
+        ext.extend_from_slice(&1u16.to_le_bytes()); // version_major
+        ext.extend_from_slice(&0u16.to_le_bytes()); // version_minor
+        ext.extend_from_slice(&0u16.to_le_bytes()); // extension_kind
+        ext.extend_from_slice(&0x0020_0000u64.to_le_bytes()); // required_feature_bit (non-zero → required)
+        ext.extend_from_slice(&0u64.to_le_bytes()); // optional_feature_bit
+        ext.extend_from_slice(&0u16.to_le_bytes()); // fallback_kind
+        ext.extend_from_slice(&0u32.to_le_bytes()); // fallback_ref
+        ext.extend_from_slice(&0u32.to_le_bytes()); // payload_ref
+        ext.extend_from_slice(&0u32.to_le_bytes()); // checksum
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::ExtensionRegistry as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_EXTENSION_REGISTRY,
+            optional_features: 0,
+            data: ext,
+        });
+        let bytes = writer.write();
+        let opts = ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+        };
+        assert_eq!(
+            validate_bytes_with_options(&bytes, opts).unwrap_err(),
+            QfError::BadExtension
+        );
+    }
+
+    #[test]
+    fn semantic_validation_rejects_missing_extension_registry_section_when_required() {
+        let mut writer = MinimalQfWriter::new();
+        writer.required_features |= FEATURE_EXTENSION_REGISTRY;
+        let bytes = writer.write();
+        let opts = ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+        };
+        assert!(matches!(
+            validate_bytes_with_options(&bytes, opts),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn semantic_validation_validates_extension_registry_when_in_optional_features() {
+        let mut writer = MinimalQfWriter::new();
+        // Extension registry advertised as optional, not required.
+        writer.optional_features |= FEATURE_EXTENSION_REGISTRY;
+        // Build an empty Spec §45 registry payload (no entries).
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&0u32.to_le_bytes()); // extension_count = 0
+        ext.extend_from_slice(&0u32.to_le_bytes()); // flags
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::ExtensionRegistry as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: FEATURE_EXTENSION_REGISTRY,
+            data: ext,
+        });
+        let bytes = writer.write();
+        let opts = ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+        };
+        // Should succeed: empty registry, no required extensions.
+        assert!(validate_bytes_with_options(&bytes, opts).is_ok());
+    }
+
+    #[test]
+    fn semantic_validation_rejects_required_extension_when_in_optional_features_section() {
+        let mut writer = MinimalQfWriter::new();
+        // Feature advertised as optional in the file header.
+        writer.optional_features |= FEATURE_EXTENSION_REGISTRY;
+        // Build a Spec §45 registry payload with one required unknown extension.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&1u32.to_le_bytes()); // extension_count
+        ext.extend_from_slice(&0u32.to_le_bytes()); // flags
+        ext.extend_from_slice(&1u32.to_le_bytes()); // extension_id
+        ext.extend_from_slice(&3u16.to_le_bytes()); // namespace_len
+        ext.extend_from_slice(b"org"); // namespace
+        ext.extend_from_slice(&4u16.to_le_bytes()); // name_len
+        ext.extend_from_slice(b"test"); // name
+        ext.extend_from_slice(&1u16.to_le_bytes()); // version_major
+        ext.extend_from_slice(&0u16.to_le_bytes()); // version_minor
+        ext.extend_from_slice(&0u16.to_le_bytes()); // extension_kind
+        ext.extend_from_slice(&0x0020_0000u64.to_le_bytes()); // required_feature_bit (non-zero)
+        ext.extend_from_slice(&0u64.to_le_bytes()); // optional_feature_bit
+        ext.extend_from_slice(&0u16.to_le_bytes()); // fallback_kind
+        ext.extend_from_slice(&0u32.to_le_bytes()); // fallback_ref
+        ext.extend_from_slice(&0u32.to_le_bytes()); // payload_ref
+        ext.extend_from_slice(&0u32.to_le_bytes()); // checksum
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::ExtensionRegistry as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: FEATURE_EXTENSION_REGISTRY,
+            data: ext,
+        });
+        let bytes = writer.write();
+        let opts = ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+        };
+        // The registry section is present and contains a required unknown extension — must reject.
+        assert_eq!(
+            validate_bytes_with_options(&bytes, opts).unwrap_err(),
+            QfError::BadExtension
+        );
     }
 
     #[test]
