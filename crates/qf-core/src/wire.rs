@@ -29,6 +29,13 @@ pub fn decode_u64_leb128(bytes: &[u8]) -> Result<(u64, usize), QfError> {
     for (i, &byte) in bytes.iter().enumerate() {
         let low = u64::from(byte & 0x7f);
 
+        // Guard the shift count before use: shift is maintained < 64 by the
+        // end-of-iteration check below, but we assert it explicitly here so the
+        // invariant is visible at the point of use.
+        if shift >= 64 {
+            return Err(QfError::ArithOverflow);
+        }
+
         // When fewer than 7 bits remain in u64, the 7-bit chunk must fit in
         // those remaining bits. This is the case on the 10th byte (shift == 63)
         // where only bit 63 is available, so `low` must be 0 or 1.
