@@ -432,7 +432,6 @@ mod tests {
 
     // ── NumCode interpretation helpers ────────────────────────────────────────
 
-
     #[test]
     fn numcode_bool_allowed_when_explicitly_declared_numeric() {
         assert!(validate_numcode_logical_type(QfLogicalType::Bool, true).is_ok());

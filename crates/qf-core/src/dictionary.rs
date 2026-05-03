@@ -398,7 +398,9 @@ fn validate_canonical_value_bytes(value_tag: ValueTag, bytes: &[u8]) -> Result<(
     match value_tag {
         ValueTag::Null | ValueTag::BoolFalse | ValueTag::BoolTrue => {
             if !bytes.is_empty() {
-                return Err(QfError::BadSection("null/bool tags must have empty payload".into()));
+                return Err(QfError::BadSection(
+                    "null/bool tags must have empty payload".into(),
+                ));
             }
         }
         ValueTag::Int64
@@ -414,7 +416,9 @@ fn validate_canonical_value_bytes(value_tag: ValueTag, bytes: &[u8]) -> Result<(
         }
         ValueTag::Float32Bits => {
             if bytes.len() != 4 {
-                return Err(QfError::BadSection("Float32Bits requires 4-byte payload".into()));
+                return Err(QfError::BadSection(
+                    "Float32Bits requires 4-byte payload".into(),
+                ));
             }
         }
         ValueTag::Decimal128 | ValueTag::Uuid => {
@@ -424,7 +428,9 @@ fn validate_canonical_value_bytes(value_tag: ValueTag, bytes: &[u8]) -> Result<(
         }
         ValueTag::Utf8 => {
             if std::str::from_utf8(bytes).is_err() {
-                return Err(QfError::BadSection("Utf8 tag payload must be valid UTF-8".into()));
+                return Err(QfError::BadSection(
+                    "Utf8 tag payload must be valid UTF-8".into(),
+                ));
             }
         }
         ValueTag::Json => {
@@ -810,7 +816,10 @@ mod tests {
         };
         let mut index = header.serialize().to_vec();
         index.extend_from_slice(&entry.serialize());
-        assert!(matches!(FileDictionary::parse(&index, &[]), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            FileDictionary::parse(&index, &[]),
+            Err(QfError::BadSection(_))
+        ));
     }
 
     #[test]
@@ -837,7 +846,9 @@ mod tests {
         };
         let mut index = header.serialize().to_vec();
         index.extend_from_slice(&entry.serialize());
-        assert!(matches!(FileDictionary::parse(&index, b"{x}"), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            FileDictionary::parse(&index, b"{x}"),
+            Err(QfError::BadSection(_))
+        ));
     }
-
 }
