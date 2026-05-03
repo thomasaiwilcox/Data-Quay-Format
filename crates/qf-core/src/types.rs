@@ -38,10 +38,12 @@ pub fn validate_logical_physical_pair(
         ),
 
         // NumCode is restricted to numeric/temporal types only.
+        // Bool is excluded: Spec §19.1 only permits Bool with NumCode when it
+        // is "explicitly declared numeric", a constraint that cannot be enforced
+        // from logical/physical kinds alone.
         QfPhysicalKind::NumCode => matches!(
             logical,
-            QfLogicalType::Bool
-                | QfLogicalType::Int8
+            QfLogicalType::Int8
                 | QfLogicalType::Int16
                 | QfLogicalType::Int32
                 | QfLogicalType::Int64
@@ -88,12 +90,14 @@ pub fn validate_logical_physical_pair(
 /// or `Err(QfError::BadNumCode)` for unsupported types (e.g. Utf8, Binary,
 /// Json, List, Struct, Map).
 ///
+/// `Bool` is excluded: Spec §19.1 only permits it when "explicitly declared
+/// numeric", a condition that cannot be expressed through logical type alone.
+///
 /// Per Spec §19.1, NumCode MUST NOT be dictionary-resolved and NumCode(0) is
 /// an ordinary value — it MUST NOT be treated as null.
 pub fn validate_numcode_logical_type(logical: QfLogicalType) -> Result<(), QfError> {
     match logical {
-        QfLogicalType::Bool
-        | QfLogicalType::Int8
+        QfLogicalType::Int8
         | QfLogicalType::Int16
         | QfLogicalType::Int32
         | QfLogicalType::Int64
@@ -183,13 +187,14 @@ pub fn numcode_as_f64(code: u64) -> f64 {
     f64::from_bits(code)
 }
 
-/// Returns the raw `u64` bits for a `Decimal64` value.
+/// Interprets all 64 bits of `code` as a signed `i64` for a `Decimal64` value.
 ///
-/// The caller is responsible for applying precision/scale metadata from the
-/// column schema to interpret the numeric value.
+/// Decimal64 stores a signed unscaled integer. The caller is responsible for
+/// applying precision/scale metadata from the column schema to produce the
+/// final decimal value.
 #[inline]
-pub fn numcode_as_decimal64(code: u64) -> u64 {
-    code
+pub fn numcode_as_decimal64(code: u64) -> i64 {
+    code as i64
 }
 
 /// Interprets the low 32 bits of `code` as a signed day offset from the Unix
@@ -224,7 +229,6 @@ mod tests {
     #[test]
     fn numcode_allows_numeric_and_temporal_types() {
         let allowed = [
-            QfLogicalType::Bool,
             QfLogicalType::Int8,
             QfLogicalType::Int16,
             QfLogicalType::Int32,
@@ -252,6 +256,7 @@ mod tests {
     fn numcode_rejects_unsupported_logical_types() {
         let rejected = [
             QfLogicalType::Null,
+            QfLogicalType::Bool,
             QfLogicalType::Utf8,
             QfLogicalType::Binary,
             QfLogicalType::Json,
@@ -375,7 +380,6 @@ mod tests {
     #[test]
     fn numcode_logical_allowed() {
         let allowed = [
-            QfLogicalType::Bool,
             QfLogicalType::Int8,
             QfLogicalType::Int16,
             QfLogicalType::Int32,
@@ -403,6 +407,7 @@ mod tests {
     fn numcode_logical_rejected() {
         let rejected = [
             QfLogicalType::Null,
+            QfLogicalType::Bool,
             QfLogicalType::Utf8,
             QfLogicalType::Binary,
             QfLogicalType::Json,
@@ -436,7 +441,7 @@ mod tests {
         assert_eq!(numcode_as_u64(0), 0u64);
         assert_eq!(numcode_as_f32(0), 0.0f32);
         assert_eq!(numcode_as_f64(0), 0.0f64);
-        assert_eq!(numcode_as_decimal64(0), 0u64);
+        assert_eq!(numcode_as_decimal64(0), 0i64);
         assert_eq!(numcode_as_date_days(0), 0i32);
         assert_eq!(numcode_as_timestamp_micros(0), 0i64);
         assert_eq!(numcode_as_timestamp_nanos(0), 0i64);
@@ -512,8 +517,13 @@ mod tests {
     }
 
     #[test]
-    fn decimal64_raw_bits_round_trip() {
-        let raw = 0x0001_2345_6789_ABCDu64;
-        assert_eq!(numcode_as_decimal64(raw), raw);
+    fn decimal64_interprets_as_signed() {
+        // A positive unscaled value round-trips through the signed interpretation.
+        let pos: u64 = 0x0001_2345_6789_ABCD;
+        assert_eq!(numcode_as_decimal64(pos), pos as i64);
+
+        // A negative unscaled value is correctly reconstructed from two's complement.
+        let neg_raw = (-1_000_000_i64) as u64;
+        assert_eq!(numcode_as_decimal64(neg_raw), -1_000_000_i64);
     }
 }

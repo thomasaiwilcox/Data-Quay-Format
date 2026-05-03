@@ -86,7 +86,12 @@ impl<'a> ValidityBitmap<'a> {
     /// Returns [`QfError::BufferTooShort`] if `bytes` is too short to cover
     /// `row_count` rows.
     pub fn null_count(&self) -> Result<u64, QfError> {
-        let needed_bytes = ((self.row_count + 7) / 8) as usize;
+        let needed_bytes = self
+            .row_count
+            .checked_add(7)
+            .ok_or(QfError::ArithOverflow)?
+            / 8;
+        let needed_bytes = needed_bytes as usize;
         if self.bytes.len() < needed_bytes {
             return Err(QfError::BufferTooShort);
         }
