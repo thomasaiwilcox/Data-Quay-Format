@@ -95,8 +95,12 @@ pub fn validate_logical_physical_pair(
 ///
 /// Per Spec §19.1, NumCode MUST NOT be dictionary-resolved and NumCode(0) is
 /// an ordinary value — it MUST NOT be treated as null.
-pub fn validate_numcode_logical_type(logical: QfLogicalType) -> Result<(), QfError> {
+pub fn validate_numcode_logical_type(
+    logical: QfLogicalType,
+    bool_declared_numeric: bool,
+) -> Result<(), QfError> {
     match logical {
+        QfLogicalType::Bool if bool_declared_numeric => Ok(()),
         QfLogicalType::Int8
         | QfLogicalType::Int16
         | QfLogicalType::Int32
@@ -397,7 +401,7 @@ mod tests {
         ];
         for &lt in &allowed {
             assert!(
-                validate_numcode_logical_type(lt).is_ok(),
+                validate_numcode_logical_type(lt, false).is_ok(),
                 "expected NumCode logical type to accept {lt:?}"
             );
         }
@@ -419,7 +423,7 @@ mod tests {
         ];
         for &lt in &rejected {
             assert_eq!(
-                validate_numcode_logical_type(lt),
+                validate_numcode_logical_type(lt, false),
                 Err(QfError::BadNumCode),
                 "expected NumCode logical type to reject {lt:?}"
             );
@@ -428,6 +432,11 @@ mod tests {
 
     // ── NumCode interpretation helpers ────────────────────────────────────────
 
+
+    #[test]
+    fn numcode_bool_allowed_when_explicitly_declared_numeric() {
+        assert!(validate_numcode_logical_type(QfLogicalType::Bool, true).is_ok());
+    }
     #[test]
     fn numcode_zero_is_ordinary_value() {
         // Spec §6.4: NumCode(0) is an ordinary value — MUST NOT be treated as null.

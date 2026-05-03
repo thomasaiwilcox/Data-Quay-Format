@@ -304,6 +304,12 @@ impl FileDictionary {
                             "inline storage must not use payload bytes".into(),
                         ));
                     }
+                    let bytes = &e.inline_data[..e.inline_len as usize];
+                    validate_canonical_value_bytes(
+                        ValueTag::from_u16(e.value_tag)
+                            .ok_or_else(|| QfError::BadSection("invalid value tag".into()))?,
+                        bytes,
+                    )?;
                 }
                 StorageClass::Payload => {
                     if e.inline_len != 0 {
@@ -311,6 +317,18 @@ impl FileDictionary {
                             "payload storage must not use inline bytes".into(),
                         ));
                     }
+                    let start =
+                        usize::try_from(e.payload_offset).map_err(|_| QfError::ArithOverflow)?;
+                    let bytes = crate::wire::read_range_checked(
+                        payload_section,
+                        start,
+                        e.payload_length as usize,
+                    )?;
+                    validate_canonical_value_bytes(
+                        ValueTag::from_u16(e.value_tag)
+                            .ok_or_else(|| QfError::BadSection("invalid value tag".into()))?,
+                        bytes,
+                    )?;
                 }
                 StorageClass::Redacted => {
                     if ValueTag::from_u16(e.value_tag) == Some(ValueTag::Null) {
@@ -374,6 +392,51 @@ impl FileDictionary {
             }
         }
     }
+}
+
+fn validate_canonical_value_bytes(value_tag: ValueTag, bytes: &[u8]) -> Result<(), QfError> {
+    match value_tag {
+        ValueTag::Null | ValueTag::BoolFalse | ValueTag::BoolTrue => {
+            if !bytes.is_empty() {
+                return Err(QfError::BadSection("null/bool tags must have empty payload".into()));
+            }
+        }
+        ValueTag::Int64
+        | ValueTag::UInt64
+        | ValueTag::Float64Bits
+        | ValueTag::Decimal64
+        | ValueTag::DateDays
+        | ValueTag::TimestampMicros
+        | ValueTag::TimestampNanos => {
+            if bytes.len() != 8 {
+                return Err(QfError::BadSection("tag requires 8-byte payload".into()));
+            }
+        }
+        ValueTag::Float32Bits => {
+            if bytes.len() != 4 {
+                return Err(QfError::BadSection("Float32Bits requires 4-byte payload".into()));
+            }
+        }
+        ValueTag::Decimal128 | ValueTag::Uuid => {
+            if bytes.len() != 16 {
+                return Err(QfError::BadSection("tag requires 16-byte payload".into()));
+            }
+        }
+        ValueTag::Utf8 => {
+            if std::str::from_utf8(bytes).is_err() {
+                return Err(QfError::BadSection("Utf8 tag payload must be valid UTF-8".into()));
+            }
+        }
+        ValueTag::Json => {
+            if serde_json::from_slice::<serde_json::Value>(bytes).is_err() {
+                return Err(QfError::BadSection(
+                    "Json tag payload must be syntactically valid JSON".into(),
+                ));
+            }
+        }
+        ValueTag::Binary | ValueTag::List | ValueTag::Struct | ValueTag::Map => {}
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -721,4 +784,60 @@ mod tests {
             Err(QfError::OffsetRange)
         );
     }
+
+    #[test]
+    fn canonical_utf8_payload_must_be_valid_utf8() {
+        let mut entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Utf8 as u16,
+            storage_class: StorageClass::Inline as u8,
+            flags: 0,
+            inline_len: 1,
+            reserved0: [0; 3],
+            inline_data: [0; 16],
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        entry.inline_data[0] = 0xff;
+        let header = FileDictionaryHeaderV1 {
+            entry_count: 1,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        };
+        let mut index = header.serialize().to_vec();
+        index.extend_from_slice(&entry.serialize());
+        assert!(matches!(FileDictionary::parse(&index, &[]), Err(QfError::BadSection(_))));
+    }
+
+    #[test]
+    fn canonical_json_payload_must_be_valid_json() {
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Json as u16,
+            storage_class: StorageClass::Payload as u8,
+            flags: 0,
+            inline_len: 0,
+            reserved0: [0; 3],
+            inline_data: [0; 16],
+            payload_offset: 0,
+            payload_length: 3,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let header = FileDictionaryHeaderV1 {
+            entry_count: 1,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 3,
+            reserved: [0; 24],
+        };
+        let mut index = header.serialize().to_vec();
+        index.extend_from_slice(&entry.serialize());
+        assert!(matches!(FileDictionary::parse(&index, b"{x}"), Err(QfError::BadSection(_))));
+    }
+
 }

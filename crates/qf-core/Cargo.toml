@@ -7,5 +7,6 @@ license = "MIT"
 
 [dependencies]
 crc32c = "0.6"
+serde_json = "1"
 
 [dev-dependencies]

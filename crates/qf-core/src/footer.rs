@@ -342,6 +342,13 @@ impl QfFooter {
                 "metadata_json must be valid UTF-8".to_string(),
             ));
         }
+        if !metadata_json.is_empty()
+            && serde_json::from_slice::<serde_json::Value>(&metadata_json).is_err()
+        {
+            return Err(QfError::BadSection(
+                "metadata_json must be syntactically valid JSON".to_string(),
+            ));
+        }
 
         Ok(Self {
             header,
@@ -716,4 +723,13 @@ mod tests {
             Err(QfError::BadSection(_))
         ));
     }
+    #[test]
+    fn footer_parse_rejects_invalid_json_metadata() {
+        let mut footer = empty_footer();
+        footer.metadata_json = b"{not-json".to_vec();
+        footer.header.metadata_len = footer.metadata_json.len() as u32;
+        let bytes = footer.serialize();
+        assert!(matches!(QfFooter::parse(&bytes), Err(QfError::BadSection(_))));
+    }
+
 }

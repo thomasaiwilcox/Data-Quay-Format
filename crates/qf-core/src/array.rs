@@ -20,7 +20,7 @@ pub enum QfArrayValue<'a> {
     /// A decoded LEB128 varint (PlainVarint).
     Varint(u64),
     /// A raw FileCode before dictionary resolution.
-    FileCode(u64),
+    FileCode(u32),
     /// A resolved dictionary value.
     DictValue(DictionaryValue),
     /// A raw NumCode.
@@ -121,16 +121,15 @@ impl<'a> EncodedArray<'a> {
                 Ok(QfArrayValue::Bytes(slice))
             }
             QfEncodingKind::FileCode => {
-                let code = read_u64_le(
+                let code = read_u32_le(
                     self.data,
                     (row as usize)
-                        .checked_mul(8)
+                        .checked_mul(4)
                         .ok_or(QfError::ArithOverflow)?,
                 )?;
                 match self.dictionary {
                     Some(dict) => {
-                        let code32 = u32::try_from(code).map_err(|_| QfError::BadFileCode)?;
-                        let val = dict.decode_value(code32)?;
+                        let val = dict.decode_value(code)?;
                         Ok(QfArrayValue::DictValue(val))
                     }
                     None => Ok(QfArrayValue::FileCode(code)),
@@ -271,8 +270,8 @@ mod tests {
 
     #[test]
     fn filecode_zero_decodes_as_raw_filecode_without_dictionary() {
-        // FileCode 0 stored as LE u64 = [0,0,0,0,0,0,0,0]
-        let data = 0u64.to_le_bytes();
+        // FileCode 0 stored as LE u32 = [0,0,0,0]
+        let data = 0u32.to_le_bytes();
         let arr = EncodedArray::new(
             QfLogicalType::UInt64,
             QfPhysicalKind::FileCode,
@@ -454,10 +453,10 @@ mod tests {
         index_bytes.extend_from_slice(&entry.serialize());
         let dict = FileDictionary::parse(&index_bytes, &[]).unwrap();
 
-        // Two rows: [0, 1] as u64 LE
+        // Two rows: [0, 1] as u32 LE
         let mut data = Vec::new();
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
 
         let arr = EncodedArray::new(
             QfLogicalType::Utf8,
