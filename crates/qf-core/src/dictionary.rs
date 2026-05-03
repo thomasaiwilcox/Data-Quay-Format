@@ -10,7 +10,6 @@
 //!   and payload-class values.
 
 use crate::{
-    canonical::{canonical_bytes, decode_payload, CanonicalValue},
     constants::{StorageClass, ValueTag},
     error::QfError,
 };
@@ -227,89 +226,151 @@ impl FileDictionaryIndexEntryV1 {
     }
 }
 
-
-
-#[derive(Debug, Clone, PartialEq)]
+/// A resolved dictionary value returned by [`FileDictionary::decode_value`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DictionaryValue {
-    Canonical(CanonicalValue),
+    /// Raw value bytes copied from inline or payload storage.
+    RawBytes(Vec<u8>),
+    /// Value is present but access-restricted by the file's redaction policy.
     RedactedPresent,
 }
 
+/// A fully parsed file dictionary, combining the index section and payload
+/// section into a queryable structure.
+///
+/// Corresponds to the `FILE_DICTIONARY_INDEX` and `FILE_DICTIONARY_PAYLOAD`
+/// sections described in Section 16 of the QF v1.0 specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDictionary {
+    /// Parsed dictionary header.
     pub header: FileDictionaryHeaderV1,
+    /// All index entries, indexed by FileCode.
     pub entries: Vec<FileDictionaryIndexEntryV1>,
+    /// Raw bytes of the payload section.
     pub payload: Vec<u8>,
 }
 
 impl FileDictionary {
+    /// Parses a [`FileDictionary`] from the raw `index_section` and
+    /// `payload_section` byte slices.
+    ///
+    /// Validates section lengths, entry storage-class constraints, and payload
+    /// bounds for every entry.  Returns [`QfError::BufferTooShort`] if the
+    /// index section is too small, [`QfError::BadSection`] on structural
+    /// violations, and [`QfError::ArithOverflow`] or [`QfError::OffsetRange`]
+    /// on arithmetic or bounds failures.
     pub fn parse(index_section: &[u8], payload_section: &[u8]) -> Result<Self, QfError> {
-        if index_section.len() < DICT_HEADER_SIZE { return Err(QfError::BufferTooShort); }
+        if index_section.len() < DICT_HEADER_SIZE {
+            return Err(QfError::BufferTooShort);
+        }
         let header = FileDictionaryHeaderV1::parse(&index_section[..DICT_HEADER_SIZE])?;
-        let entries_bytes = usize::try_from(header.entry_count).map_err(|_| QfError::ArithOverflow)?
-            .checked_mul(header.index_entry_len as usize).ok_or(QfError::ArithOverflow)?;
-        let expected = DICT_HEADER_SIZE.checked_add(entries_bytes).ok_or(QfError::ArithOverflow)?;
-        if index_section.len() != expected { return Err(QfError::BadSection("dictionary index section length mismatch".into())); }
-        if payload_section.len() != usize::try_from(header.payload_length).map_err(|_| QfError::ArithOverflow)? {
-            return Err(QfError::BadSection("dictionary payload section length mismatch".into()));
+        let entries_bytes = usize::try_from(header.entry_count)
+            .map_err(|_| QfError::ArithOverflow)?
+            .checked_mul(header.index_entry_len as usize)
+            .ok_or(QfError::ArithOverflow)?;
+        let expected = DICT_HEADER_SIZE
+            .checked_add(entries_bytes)
+            .ok_or(QfError::ArithOverflow)?;
+        if index_section.len() != expected {
+            return Err(QfError::BadSection(
+                "dictionary index section length mismatch".into(),
+            ));
+        }
+        if payload_section.len()
+            != usize::try_from(header.payload_length).map_err(|_| QfError::ArithOverflow)?
+        {
+            return Err(QfError::BadSection(
+                "dictionary payload section length mismatch".into(),
+            ));
         }
         let mut entries = Vec::with_capacity(header.entry_count as usize);
         for i in 0..header.entry_count as usize {
-            let off = DICT_HEADER_SIZE.checked_add(i.checked_mul(DICT_INDEX_ENTRY_SIZE).ok_or(QfError::ArithOverflow)?).ok_or(QfError::ArithOverflow)?;
-            let e = FileDictionaryIndexEntryV1::parse(&index_section[off..off+DICT_INDEX_ENTRY_SIZE])?;
+            let off = DICT_HEADER_SIZE
+                .checked_add(
+                    i.checked_mul(DICT_INDEX_ENTRY_SIZE)
+                        .ok_or(QfError::ArithOverflow)?,
+                )
+                .ok_or(QfError::ArithOverflow)?;
+            let e = FileDictionaryIndexEntryV1::parse(
+                &index_section[off..off + DICT_INDEX_ENTRY_SIZE],
+            )?;
             e.validate_payload_bounds(header.payload_length)?;
-            match StorageClass::from_u8(e.storage_class).ok_or_else(|| QfError::BadSection("invalid storage class".into()))? {
+            match StorageClass::from_u8(e.storage_class)
+                .ok_or_else(|| QfError::BadSection("invalid storage class".into()))?
+            {
                 StorageClass::Inline => {
-                    if e.payload_length != 0 { return Err(QfError::BadSection("inline storage must not use payload bytes".into())); }
+                    if e.payload_length != 0 {
+                        return Err(QfError::BadSection(
+                            "inline storage must not use payload bytes".into(),
+                        ));
+                    }
                 }
                 StorageClass::Payload => {
-                    if e.inline_len != 0 { return Err(QfError::BadSection("payload storage must not use inline bytes".into())); }
+                    if e.inline_len != 0 {
+                        return Err(QfError::BadSection(
+                            "payload storage must not use inline bytes".into(),
+                        ));
+                    }
                 }
                 StorageClass::Redacted => {
-                    if ValueTag::from_u16(e.value_tag) == Some(ValueTag::Null) { return Err(QfError::BadSection("redacted value must not be null".into())); }
+                    if ValueTag::from_u16(e.value_tag) == Some(ValueTag::Null) {
+                        return Err(QfError::BadSection(
+                            "redacted value must not be null".into(),
+                        ));
+                    }
                 }
             }
             entries.push(e);
         }
-        Ok(Self { header, entries, payload: payload_section.to_vec() })
+        Ok(Self {
+            header,
+            entries,
+            payload: payload_section.to_vec(),
+        })
     }
 
-    pub fn len(&self) -> u32 { self.header.entry_count }
+    /// Returns the number of entries in the dictionary.
+    pub fn len(&self) -> u32 {
+        self.header.entry_count
+    }
 
+    /// Returns `true` if the dictionary contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.header.entry_count == 0
+    }
+
+    /// Returns the index entry for the given `file_code`, or
+    /// [`QfError::BadFileCode`] if it is out of range.
     pub fn get_entry(&self, file_code: u32) -> Result<&FileDictionaryIndexEntryV1, QfError> {
-        self.entries.get(file_code as usize).ok_or(QfError::BadFileCode)
+        self.entries
+            .get(file_code as usize)
+            .ok_or(QfError::BadFileCode)
     }
 
-    pub fn canonical_bytes_for_code(&self, file_code: u32) -> Result<Vec<u8>, QfError> {
-        let entry = self.get_entry(file_code)?;
-        let tag = ValueTag::from_u16(entry.value_tag).ok_or_else(|| QfError::BadSection("invalid value tag".into()))?;
-        match StorageClass::from_u8(entry.storage_class).ok_or_else(|| QfError::BadSection("invalid storage class".into()))? {
-            StorageClass::Redacted => Err(QfError::RedactionPolicy),
-            StorageClass::Inline => {
-                let payload = &entry.inline_data[..entry.inline_len as usize];
-                let v = decode_payload(tag, payload)?;
-                canonical_bytes(tag, &v)
-            }
-            StorageClass::Payload => {
-                let start = usize::try_from(entry.payload_offset).map_err(|_| QfError::ArithOverflow)?;
-                let len = entry.payload_length as usize;
-                let payload = crate::wire::read_range_checked(&self.payload, start, len)?;
-                let v = decode_payload(tag, payload)?;
-                canonical_bytes(tag, &v)
-            }
-        }
-    }
-
+    /// Resolves the raw value bytes for a given `file_code`.
+    ///
+    /// For inline entries the bytes are copied from the `inline_data` field;
+    /// for payload entries they are read from the payload section using checked
+    /// arithmetic.  Redacted entries return [`DictionaryValue::RedactedPresent`]
+    /// without exposing any bytes.
     pub fn decode_value(&self, file_code: u32) -> Result<DictionaryValue, QfError> {
         let entry = self.get_entry(file_code)?;
-        let tag = ValueTag::from_u16(entry.value_tag).ok_or_else(|| QfError::BadSection("invalid value tag".into()))?;
-        match StorageClass::from_u8(entry.storage_class).ok_or_else(|| QfError::BadSection("invalid storage class".into()))? {
+        match StorageClass::from_u8(entry.storage_class)
+            .ok_or_else(|| QfError::BadSection("invalid storage class".into()))?
+        {
             StorageClass::Redacted => Ok(DictionaryValue::RedactedPresent),
-            StorageClass::Inline => Ok(DictionaryValue::Canonical(decode_payload(tag, &entry.inline_data[..entry.inline_len as usize])?)),
+            StorageClass::Inline => Ok(DictionaryValue::RawBytes(
+                entry.inline_data[..entry.inline_len as usize].to_vec(),
+            )),
             StorageClass::Payload => {
-                let start = usize::try_from(entry.payload_offset).map_err(|_| QfError::ArithOverflow)?;
-                let payload = crate::wire::read_range_checked(&self.payload, start, entry.payload_length as usize)?;
-                Ok(DictionaryValue::Canonical(decode_payload(tag, payload)?))
+                let start =
+                    usize::try_from(entry.payload_offset).map_err(|_| QfError::ArithOverflow)?;
+                let payload = crate::wire::read_range_checked(
+                    &self.payload,
+                    start,
+                    entry.payload_length as usize,
+                )?;
+                Ok(DictionaryValue::RawBytes(payload.to_vec()))
             }
         }
     }
@@ -515,32 +576,84 @@ mod tests {
         );
     }
 
-
     #[test]
-    fn file_dictionary_inline_utf8_decodes_and_filecode_zero_works() {
-        let mut inline = [0u8;16];
+    fn file_dictionary_inline_raw_bytes_and_filecode_zero_works() {
+        let mut inline = [0u8; 16];
         inline[..4].copy_from_slice(&[3, b'a', b'b', b'c']);
-        let entry = FileDictionaryIndexEntryV1 { value_tag: ValueTag::Utf8 as u16, storage_class: StorageClass::Inline as u8, flags:0, inline_len:4, reserved0:[0;3], inline_data:inline, payload_offset:0, payload_length:0, canonical_hash64:0, reserved1:0 };
-        let hdr = FileDictionaryHeaderV1 { entry_count:1, flags:0, index_entry_len:FileDictionaryHeaderV1::INDEX_ENTRY_LEN, value_hash_algorithm:0, payload_length:0, reserved:[0;24] };
-        let mut idx = Vec::new(); idx.extend_from_slice(&hdr.serialize()); idx.extend_from_slice(&entry.serialize());
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Utf8 as u16,
+            storage_class: StorageClass::Inline as u8,
+            flags: 0,
+            inline_len: 4,
+            reserved0: [0; 3],
+            inline_data: inline,
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let hdr = FileDictionaryHeaderV1 {
+            entry_count: 1,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        };
+        let mut idx = Vec::new();
+        idx.extend_from_slice(&hdr.serialize());
+        idx.extend_from_slice(&entry.serialize());
         let dict = FileDictionary::parse(&idx, &[]).unwrap();
         assert_eq!(dict.len(), 1);
-        match dict.decode_value(0).unwrap() { DictionaryValue::Canonical(CanonicalValue::Utf8(v)) => assert_eq!(v, "abc"), _ => panic!("unexpected value") }
+        assert_eq!(
+            dict.decode_value(0).unwrap(),
+            DictionaryValue::RawBytes(vec![3, b'a', b'b', b'c'])
+        );
     }
 
     #[test]
-    fn file_dictionary_payload_binary_decodes() {
-        let payload = vec![4u8,1,2,3,4];
-        let entry = FileDictionaryIndexEntryV1 { value_tag: ValueTag::Binary as u16, storage_class: StorageClass::Payload as u8, flags:0, inline_len:0, reserved0:[0;3], inline_data:[0;16], payload_offset:0, payload_length:5, canonical_hash64:0, reserved1:0 };
-        let hdr = FileDictionaryHeaderV1 { entry_count:1, flags:0, index_entry_len:FileDictionaryHeaderV1::INDEX_ENTRY_LEN, value_hash_algorithm:0, payload_length:5, reserved:[0;24] };
-        let mut idx = Vec::new(); idx.extend_from_slice(&hdr.serialize()); idx.extend_from_slice(&entry.serialize());
+    fn file_dictionary_payload_raw_bytes_returned() {
+        let payload = vec![4u8, 1, 2, 3, 4];
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Binary as u16,
+            storage_class: StorageClass::Payload as u8,
+            flags: 0,
+            inline_len: 0,
+            reserved0: [0; 3],
+            inline_data: [0; 16],
+            payload_offset: 0,
+            payload_length: 5,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let hdr = FileDictionaryHeaderV1 {
+            entry_count: 1,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 5,
+            reserved: [0; 24],
+        };
+        let mut idx = Vec::new();
+        idx.extend_from_slice(&hdr.serialize());
+        idx.extend_from_slice(&entry.serialize());
         let dict = FileDictionary::parse(&idx, &payload).unwrap();
-        match dict.decode_value(0).unwrap() { DictionaryValue::Canonical(CanonicalValue::Binary(v)) => assert_eq!(v, vec![1,2,3,4]), _ => panic!("unexpected value") }
+        assert_eq!(
+            dict.decode_value(0).unwrap(),
+            DictionaryValue::RawBytes(vec![4, 1, 2, 3, 4])
+        );
     }
 
     #[test]
     fn file_dictionary_out_of_range_filecode_rejected() {
-        let hdr = FileDictionaryHeaderV1 { entry_count:0, flags:0, index_entry_len:FileDictionaryHeaderV1::INDEX_ENTRY_LEN, value_hash_algorithm:0, payload_length:0, reserved:[0;24] };
+        let hdr = FileDictionaryHeaderV1 {
+            entry_count: 0,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        };
         let idx = hdr.serialize().to_vec();
         let dict = FileDictionary::parse(&idx, &[]).unwrap();
         assert_eq!(dict.get_entry(0), Err(QfError::BadFileCode));
@@ -548,18 +661,64 @@ mod tests {
 
     #[test]
     fn file_dictionary_redacted_returns_present_not_null() {
-        let entry = FileDictionaryIndexEntryV1 { value_tag: ValueTag::Utf8 as u16, storage_class: StorageClass::Redacted as u8, flags:0, inline_len:0, reserved0:[0;3], inline_data:[0;16], payload_offset:0, payload_length:0, canonical_hash64:0, reserved1:0 };
-        let hdr = FileDictionaryHeaderV1 { entry_count:1, flags:0, index_entry_len:FileDictionaryHeaderV1::INDEX_ENTRY_LEN, value_hash_algorithm:0, payload_length:0, reserved:[0;24] };
-        let mut idx = Vec::new(); idx.extend_from_slice(&hdr.serialize()); idx.extend_from_slice(&entry.serialize());
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Utf8 as u16,
+            storage_class: StorageClass::Redacted as u8,
+            flags: 0,
+            inline_len: 0,
+            reserved0: [0; 3],
+            inline_data: [0; 16],
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let hdr = FileDictionaryHeaderV1 {
+            entry_count: 1,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        };
+        let mut idx = Vec::new();
+        idx.extend_from_slice(&hdr.serialize());
+        idx.extend_from_slice(&entry.serialize());
         let dict = FileDictionary::parse(&idx, &[]).unwrap();
-        assert_eq!(dict.decode_value(0).unwrap(), DictionaryValue::RedactedPresent);
+        assert_eq!(
+            dict.decode_value(0).unwrap(),
+            DictionaryValue::RedactedPresent
+        );
     }
 
     #[test]
     fn file_dictionary_payload_overflow_rejected() {
-        let entry = FileDictionaryIndexEntryV1 { value_tag: ValueTag::Binary as u16, storage_class: StorageClass::Payload as u8, flags:0, inline_len:0, reserved0:[0;3], inline_data:[0;16], payload_offset:1, payload_length:4, canonical_hash64:0, reserved1:0 };
-        let hdr = FileDictionaryHeaderV1 { entry_count:1, flags:0, index_entry_len:FileDictionaryHeaderV1::INDEX_ENTRY_LEN, value_hash_algorithm:0, payload_length:4, reserved:[0;24] };
-        let mut idx = Vec::new(); idx.extend_from_slice(&hdr.serialize()); idx.extend_from_slice(&entry.serialize());
-        assert_eq!(FileDictionary::parse(&idx, &[1,2,3,4]), Err(QfError::OffsetRange));
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Binary as u16,
+            storage_class: StorageClass::Payload as u8,
+            flags: 0,
+            inline_len: 0,
+            reserved0: [0; 3],
+            inline_data: [0; 16],
+            payload_offset: 1,
+            payload_length: 4,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let hdr = FileDictionaryHeaderV1 {
+            entry_count: 1,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 4,
+            reserved: [0; 24],
+        };
+        let mut idx = Vec::new();
+        idx.extend_from_slice(&hdr.serialize());
+        idx.extend_from_slice(&entry.serialize());
+        assert_eq!(
+            FileDictionary::parse(&idx, &[1, 2, 3, 4]),
+            Err(QfError::OffsetRange)
+        );
     }
 }

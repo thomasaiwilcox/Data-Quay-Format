@@ -507,7 +507,10 @@ mod tests {
             optional_features: 0,
             data: b"zstd-ish".to_vec(),
         });
-        assert!(matches!(validate_bytes(&writer.write()), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            validate_bytes(&writer.write()),
+            Err(QfError::BadSection(_))
+        ));
     }
 
     #[test]
@@ -515,7 +518,10 @@ mod tests {
         let mut writer = MinimalQfWriter::new();
         writer.primary_profile = PrimaryProfile::HarborExecution as u8;
         writer.required_features = FEATURE_TABLE_PROFILE;
-        assert!(matches!(validate_bytes(&writer.write()), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            validate_bytes(&writer.write()),
+            Err(QfError::BadSection(_))
+        ));
     }
 
     #[test]
@@ -541,7 +547,10 @@ mod tests {
             optional_features: 0,
             data: vec![1],
         });
-        assert!(matches!(validate_bytes(&writer.write()), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            validate_bytes(&writer.write()),
+            Err(QfError::BadSection(_))
+        ));
     }
 
     #[test]
@@ -560,7 +569,10 @@ mod tests {
             optional_features: 0,
             data: vec![1],
         });
-        assert!(matches!(validate_bytes(&writer.write()), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            validate_bytes(&writer.write()),
+            Err(QfError::BadSection(_))
+        ));
     }
 
     #[test]
@@ -608,7 +620,10 @@ mod tests {
         let mut ps = QfPostscriptV1::parse_from_tail(&bytes).unwrap();
         ps.optional_features = FEATURE_CODEC_LZ4;
         rewrite_postscript(&mut bytes, ps);
-        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(QfError::BadSection(_))
+        ));
     }
 
     #[test]
@@ -633,7 +648,8 @@ mod tests {
         let entries_start = footer_start + 44;
         let bad_offset = (footer_start as u64) + 1;
         bytes[entries_start + 8..entries_start + 16].copy_from_slice(&bad_offset.to_le_bytes());
-        let footer_crc = checksum::crc32c(&bytes[footer_start..footer_start + ps.footer.length as usize]);
+        let footer_crc =
+            checksum::crc32c(&bytes[footer_start..footer_start + ps.footer.length as usize]);
         let mut fixed_ps = ps;
         fixed_ps.footer.crc32c = footer_crc;
         rewrite_postscript(&mut bytes, fixed_ps);
@@ -661,11 +677,15 @@ mod tests {
         let footer_start = ps.footer.offset as usize;
         let entries_start = footer_start + 44;
         bytes[entries_start + 6] = 99;
-        let footer_crc = checksum::crc32c(&bytes[footer_start..footer_start + ps.footer.length as usize]);
+        let footer_crc =
+            checksum::crc32c(&bytes[footer_start..footer_start + ps.footer.length as usize]);
         let mut fixed_ps = ps;
         fixed_ps.footer.crc32c = footer_crc;
         rewrite_postscript(&mut bytes, fixed_ps);
-        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(QfError::BadSection(_))
+        ));
     }
 
     #[test]
@@ -689,21 +709,41 @@ mod tests {
         let footer_start = ps.footer.offset as usize;
         let entries_start = footer_start + 44;
         bytes[entries_start + 4..entries_start + 6].copy_from_slice(&999u16.to_le_bytes());
-        let footer_crc = checksum::crc32c(&bytes[footer_start..footer_start + ps.footer.length as usize]);
+        let footer_crc =
+            checksum::crc32c(&bytes[footer_start..footer_start + ps.footer.length as usize]);
         let mut fixed_ps = ps;
         fixed_ps.footer.crc32c = footer_crc;
         rewrite_postscript(&mut bytes, fixed_ps);
-        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(QfError::BadSection(_))
+        ));
     }
 
     #[test]
     fn enforces_profile_feature_bit_for_every_non_mixed_profile() {
         let cases: &[(u8, u16, u64)] = &[
-            (1, SectionKind::ObjectTypeCatalog as u16, crate::constants::FEATURE_OBJECT_PROFILE),
+            (
+                1,
+                SectionKind::ObjectTypeCatalog as u16,
+                crate::constants::FEATURE_OBJECT_PROFILE,
+            ),
             (2, SectionKind::TableCatalog as u16, FEATURE_TABLE_PROFILE),
-            (3, SectionKind::LookupIndex as u16, crate::constants::FEATURE_ARCHIVE_PROFILE),
-            (4, SectionKind::EngineProfileRegistry as u16, crate::constants::FEATURE_ENGINE_PROFILE),
-            (5, SectionKind::HarborMountHints as u16, FEATURE_HARBOR_PROFILE),
+            (
+                3,
+                SectionKind::LookupIndex as u16,
+                crate::constants::FEATURE_ARCHIVE_PROFILE,
+            ),
+            (
+                4,
+                SectionKind::EngineProfileRegistry as u16,
+                crate::constants::FEATURE_ENGINE_PROFILE,
+            ),
+            (
+                5,
+                SectionKind::HarborMountHints as u16,
+                FEATURE_HARBOR_PROFILE,
+            ),
         ];
 
         for (profile, kind, required_bit) in cases {
@@ -722,7 +762,10 @@ mod tests {
                 optional_features: 0,
                 data: b"x".to_vec(),
             });
-            assert!(matches!(validate_bytes(&writer.write()), Err(QfError::BadSection(_))));
+            assert!(matches!(
+                validate_bytes(&writer.write()),
+                Err(QfError::BadSection(_))
+            ));
 
             writer.required_features = *required_bit;
             assert!(
@@ -735,7 +778,10 @@ mod tests {
     #[test]
     fn rejects_too_short_file() {
         let bytes = vec![0u8; HEADER_SIZE + POSTSCRIPT_TOTAL_SIZE - 1];
-        assert!(matches!(validate_bytes(&bytes), Err(QfError::BufferTooShort)));
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(QfError::BufferTooShort)
+        ));
     }
 
     #[test]
@@ -745,11 +791,15 @@ mod tests {
         let footer_start = ps.footer.offset as usize;
         // footer.header.section_entry_len @ offset 12 in footer header
         bytes[footer_start + 12..footer_start + 14].copy_from_slice(&0u16.to_le_bytes());
-        let footer_crc = checksum::crc32c(&bytes[footer_start..footer_start + ps.footer.length as usize]);
+        let footer_crc =
+            checksum::crc32c(&bytes[footer_start..footer_start + ps.footer.length as usize]);
         let mut fixed_ps = ps;
         fixed_ps.footer.crc32c = footer_crc;
         rewrite_postscript(&mut bytes, fixed_ps);
-        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(QfError::BadSection(_))
+        ));
     }
 
     #[test]

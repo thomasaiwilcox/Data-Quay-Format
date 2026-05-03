@@ -28,7 +28,18 @@ pub fn decode_u64_leb128(bytes: &[u8]) -> Result<(u64, usize), QfError> {
 
     for (i, &byte) in bytes.iter().enumerate() {
         let low = u64::from(byte & 0x7f);
-        value |= low.checked_shl(shift).ok_or(QfError::ArithOverflow)?;
+
+        // When fewer than 7 bits remain in u64, the 7-bit chunk must fit in
+        // those remaining bits. This is the case on the 10th byte (shift == 63)
+        // where only bit 63 is available, so `low` must be 0 or 1.
+        // `checked_shl` only validates the shift count, not whether significant
+        // bits would be discarded, so we must guard explicitly.
+        let remaining_bits = 64u32 - shift;
+        if remaining_bits < 7 && low >= (1u64 << remaining_bits) {
+            return Err(QfError::ArithOverflow);
+        }
+
+        value |= low << shift;
 
         if byte & 0x80 == 0 {
             return Ok((value, i + 1));
@@ -54,7 +65,11 @@ pub fn zigzag_decode_i64(value: u64) -> i64 {
 }
 
 /// Reads a bounded range from `bytes` using checked offset arithmetic.
-pub fn read_range_checked<'a>(bytes: &'a [u8], offset: usize, len: usize) -> Result<&'a [u8], QfError> {
+pub fn read_range_checked<'a>(
+    bytes: &'a [u8],
+    offset: usize,
+    len: usize,
+) -> Result<&'a [u8], QfError> {
     let end = offset.checked_add(len).ok_or(QfError::ArithOverflow)?;
     if end > bytes.len() {
         return Err(QfError::OffsetRange);
@@ -117,8 +132,32 @@ mod tests {
 
     #[test]
     fn malformed_and_truncated_varints() {
+        // 10 continuation bytes — shift overflows past 63 after byte 9.
         let malformed = [0x80u8; 10];
         assert_eq!(decode_u64_leb128(&malformed), Err(QfError::ArithOverflow));
+
+        // 10th byte has low=2 at shift=63: 2 << 63 would discard significant
+        // bits, so the decoder must reject this before accepting the value.
+        let overflow_high = {
+            let b = [0xffu8; 9];
+            let mut v = b.to_vec();
+            v.push(0x02); // low=2, continuation=0; shift=63, remaining=1, 2 >= 2^1 → overflow
+            v
+        };
+        assert_eq!(
+            decode_u64_leb128(&overflow_high),
+            Err(QfError::ArithOverflow)
+        );
+
+        // 10th byte has low=1 at shift=63: exactly bit 63 — this is u64::MAX.
+        let max_valid = {
+            let mut v = vec![0xffu8; 9];
+            v.push(0x01);
+            v
+        };
+        let (val, consumed) = decode_u64_leb128(&max_valid).unwrap();
+        assert_eq!(val, u64::MAX);
+        assert_eq!(consumed, 10);
 
         let truncated = [0x80u8, 0x80u8, 0x80u8];
         assert_eq!(decode_u64_leb128(&truncated), Err(QfError::BufferTooShort));
@@ -147,6 +186,9 @@ mod tests {
         let data = [1u8, 2, 3, 4];
         assert_eq!(read_range_checked(&data, 1, 2).unwrap(), &[2, 3]);
         assert_eq!(read_range_checked(&data, 3, 2), Err(QfError::OffsetRange));
-        assert_eq!(read_range_checked(&data, usize::MAX, 1), Err(QfError::ArithOverflow));
+        assert_eq!(
+            read_range_checked(&data, usize::MAX, 1),
+            Err(QfError::ArithOverflow)
+        );
     }
 }
