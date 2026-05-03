@@ -6,9 +6,11 @@ use crate::{
     checksum, compression,
     constants::{
         PrimaryProfile, SectionKind, FEATURE_ARCHIVE_PROFILE, FEATURE_CODEC_LZ4,
-        FEATURE_CODEC_ZSTD, FEATURE_ENGINE_PROFILE, FEATURE_FILE_DICTIONARY,
-        FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE, MAGIC_QF,
+        FEATURE_CODEC_ZSTD, FEATURE_ENGINE_PROFILE, FEATURE_EXTENSION_REGISTRY,
+        FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
+        FEATURE_TABLE_PROFILE, MAGIC_QF,
     },
+    extensions::ExtensionRegistry,
     dictionary::FileDictionary,
     footer::QfFooter,
     header::{QfHeaderV1, HEADER_SIZE},
@@ -183,6 +185,25 @@ pub fn validate_bytes_with_options(
                     dict_entry_count = Some(dict.len());
                 }
             }
+        }
+
+        let has_extension_registry_feature =
+            validated.header.required_features & FEATURE_EXTENSION_REGISTRY != 0;
+        if has_extension_registry_feature {
+            let ext_entry = validated
+                .footer
+                .sections
+                .iter()
+                .find(|s| s.section_kind == SectionKind::ExtensionRegistry as u16)
+                .ok_or_else(|| {
+                    QfError::BadSection(
+                        "FEATURE_EXTENSION_REGISTRY set but EXTENSION_REGISTRY section missing"
+                            .into(),
+                    )
+                })?;
+            let ext_bytes = compression::section_payload(data, ext_entry)?;
+            let registry = ExtensionRegistry::parse(&ext_bytes)?;
+            registry.validate_known(opts.allow_unknown_optional_extensions)?;
         }
 
         if opts.verify_digests {
@@ -383,8 +404,8 @@ mod tests {
     use super::*;
     use crate::{
         constants::{
-            CompressionCodec, SectionKind, FEATURE_CODEC_LZ4, FEATURE_FILE_DICTIONARY,
-            FEATURE_HARBOR_PROFILE, FEATURE_TABLE_PROFILE,
+            CompressionCodec, SectionKind, FEATURE_CODEC_LZ4, FEATURE_EXTENSION_REGISTRY,
+            FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_TABLE_PROFILE,
         },
         postscript::POSTSCRIPT_TOTAL_SIZE,
         writer::{MinimalQfWriter, SectionPayload},
@@ -946,6 +967,57 @@ mod tests {
         let report = validate_bytes_with_options(&bytes, opts).expect("should validate");
         assert!(report.semantic_checked);
         assert!(report.dict_entry_count.is_none());
+    }
+
+    #[test]
+    fn semantic_validation_rejects_required_unknown_extension_registry() {
+        let mut writer = MinimalQfWriter::new();
+        writer.required_features |= FEATURE_EXTENSION_REGISTRY;
+        // One required unknown extension entry.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&1u32.to_le_bytes()); // entry_count
+        ext.push(1); // required
+        ext.extend_from_slice(&3u16.to_le_bytes()); // id_len
+        ext.extend_from_slice(b"abc");
+        ext.extend_from_slice(&0u16.to_le_bytes()); // meta_len
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::ExtensionRegistry as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_EXTENSION_REGISTRY,
+            optional_features: 0,
+            data: ext,
+        });
+        let bytes = writer.write();
+        let opts = ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+        };
+        assert_eq!(
+            validate_bytes_with_options(&bytes, opts).unwrap_err(),
+            QfError::BadExtension
+        );
+    }
+
+    #[test]
+    fn semantic_validation_rejects_missing_extension_registry_section_when_required() {
+        let mut writer = MinimalQfWriter::new();
+        writer.required_features |= FEATURE_EXTENSION_REGISTRY;
+        let bytes = writer.write();
+        let opts = ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+        };
+        assert!(matches!(
+            validate_bytes_with_options(&bytes, opts),
+            Err(QfError::BadSection(_))
+        ));
     }
 
     #[test]
