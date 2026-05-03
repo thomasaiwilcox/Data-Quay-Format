@@ -362,6 +362,7 @@ impl QfFooter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{CompressionCodec, FEATURE_FILE_DICTIONARY};
 
     fn empty_footer() -> QfFooter {
         QfFooter {
@@ -472,5 +473,244 @@ mod tests {
             reserved1: 0,
         };
         assert_eq!(entry.end_offset(), Err(QfError::ArithOverflow));
+    }
+
+    #[test]
+    fn footer_header_reserved_nonzero_rejected() {
+        let mut footer = empty_footer();
+        footer.header.reserved[0] = 1;
+        let bytes = footer.serialize();
+        assert!(matches!(
+            QfFooter::parse(&bytes),
+            Err(QfError::ReservedNotZero)
+        ));
+    }
+
+    #[test]
+    fn footer_header_bad_version_rejected() {
+        let mut footer = empty_footer();
+        footer.header.footer_version = 2;
+        let bytes = footer.serialize();
+        assert!(matches!(QfFooter::parse(&bytes), Err(QfError::BadVersion)));
+    }
+
+    #[test]
+    fn footer_header_bad_entry_len_rejected() {
+        let mut footer = empty_footer();
+        footer.header.section_entry_len = 12;
+        let bytes = footer.serialize();
+        assert!(matches!(
+            QfFooter::parse(&bytes),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn footer_header_metadata_too_large_rejected() {
+        let mut footer = empty_footer();
+        footer.header.metadata_len = METADATA_LEN_MAX + 1;
+        let bytes = footer.header.serialize();
+        assert!(matches!(
+            QfFooterHeaderV1::parse(&bytes),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn footer_parse_rejects_truncated_entries() {
+        let mut footer = empty_footer();
+        footer.header.section_count = 1;
+        footer.header.metadata_len = 0;
+        let bytes = footer.header.serialize().to_vec();
+        assert!(matches!(QfFooter::parse(&bytes), Err(QfError::BufferTooShort)));
+    }
+
+    #[test]
+    fn footer_parse_rejects_non_utf8_metadata() {
+        let mut footer = empty_footer();
+        footer.header.metadata_len = 1;
+        let mut bytes = footer.serialize();
+        bytes.push(0xff);
+        assert!(matches!(
+            QfFooter::parse(&bytes),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn footer_compute_crc_matches_serialized_bytes() {
+        let mut footer = empty_footer();
+        footer.metadata_json = br#"{"spec":"qf"}"#.to_vec();
+        footer.header.metadata_len = footer.metadata_json.len() as u32;
+        assert_eq!(footer.compute_crc(), checksum::crc32c(&footer.serialize()));
+    }
+
+    #[test]
+    fn section_entry_rejects_unknown_section_kind() {
+        let mut entry = QfSectionEntryV1 {
+            section_id: 1,
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            offset: 0,
+            length: 1,
+            uncompressed_length: 1,
+            item_count: 0,
+            row_count: 0,
+            compression: CompressionCodec::None as u8,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_features: 0,
+            optional_features: 0,
+            crc32c: 0,
+            reserved1: 0,
+        };
+        entry.section_kind = 999;
+        assert!(matches!(
+            QfSectionEntryV1::parse(&entry.serialize()),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn section_entry_rejects_unknown_profile() {
+        let entry = QfSectionEntryV1 {
+            section_id: 1,
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 99,
+            flags: 0,
+            offset: 0,
+            length: 1,
+            uncompressed_length: 1,
+            item_count: 0,
+            row_count: 0,
+            compression: CompressionCodec::None as u8,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_features: 0,
+            optional_features: 0,
+            crc32c: 0,
+            reserved1: 0,
+        };
+        assert!(matches!(
+            QfSectionEntryV1::parse(&entry.serialize()),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn section_entry_rejects_unknown_compression() {
+        let entry = QfSectionEntryV1 {
+            section_id: 1,
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            offset: 0,
+            length: 1,
+            uncompressed_length: 1,
+            item_count: 0,
+            row_count: 0,
+            compression: 9,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_features: 0,
+            optional_features: 0,
+            crc32c: 0,
+            reserved1: 0,
+        };
+        assert!(matches!(
+            QfSectionEntryV1::parse(&entry.serialize()),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn section_entry_rejects_unknown_required_feature_bit() {
+        let entry = QfSectionEntryV1 {
+            section_id: 1,
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            offset: 0,
+            length: 1,
+            uncompressed_length: 1,
+            item_count: 0,
+            row_count: 0,
+            compression: CompressionCodec::None as u8,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_features: FEATURE_FILE_DICTIONARY | 0x0100_0000_0000_0000,
+            optional_features: 0,
+            crc32c: 0,
+            reserved1: 0,
+        };
+        assert!(matches!(
+            QfSectionEntryV1::parse(&entry.serialize()),
+            Err(QfError::UnknownRequiredFeature(_))
+        ));
+    }
+
+    #[test]
+    fn section_entry_rejects_reserved_nonzero() {
+        let mut entry = QfSectionEntryV1 {
+            section_id: 1,
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            offset: 0,
+            length: 1,
+            uncompressed_length: 1,
+            item_count: 0,
+            row_count: 0,
+            compression: CompressionCodec::None as u8,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 1,
+            required_features: 0,
+            optional_features: 0,
+            crc32c: 0,
+            reserved1: 0,
+        };
+        assert!(matches!(
+            QfSectionEntryV1::parse(&entry.serialize()),
+            Err(QfError::ReservedNotZero)
+        ));
+        entry.reserved0 = 0;
+        entry.reserved1 = 1;
+        assert!(matches!(
+            QfSectionEntryV1::parse(&entry.serialize()),
+            Err(QfError::ReservedNotZero)
+        ));
+    }
+
+    #[test]
+    fn section_entry_rejects_uncompressed_length_mismatch_when_codec_none() {
+        let entry = QfSectionEntryV1 {
+            section_id: 1,
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            offset: 0,
+            length: 10,
+            uncompressed_length: 11,
+            item_count: 0,
+            row_count: 0,
+            compression: CompressionCodec::None as u8,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_features: 0,
+            optional_features: 0,
+            crc32c: 0,
+            reserved1: 0,
+        };
+        assert!(matches!(
+            QfSectionEntryV1::parse(&entry.serialize()),
+            Err(QfError::BadSection(_))
+        ));
     }
 }

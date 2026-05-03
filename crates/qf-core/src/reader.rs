@@ -272,11 +272,16 @@ mod tests {
     use crate::{
         constants::{
             CompressionCodec, SectionKind, FEATURE_CODEC_LZ4, FEATURE_FILE_DICTIONARY,
-            FEATURE_TABLE_PROFILE,
+            FEATURE_HARBOR_PROFILE, FEATURE_TABLE_PROFILE,
         },
         postscript::POSTSCRIPT_TOTAL_SIZE,
         writer::{MinimalQfWriter, SectionPayload},
     };
+
+    fn rewrite_postscript(bytes: &mut [u8], postscript: QfPostscriptV1) {
+        let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
+        bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+    }
 
     #[test]
     fn validates_empty_file() {
@@ -485,5 +490,277 @@ mod tests {
         });
         let good_bytes = good_writer.write();
         assert!(validate_bytes(&good_bytes).is_ok());
+    }
+
+    #[test]
+    fn rejects_zstd_section_without_codec_feature_advertised() {
+        let mut writer = MinimalQfWriter::new();
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: CompressionCodec::Zstd as u8,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: b"zstd-ish".to_vec(),
+        });
+        assert!(matches!(validate_bytes(&writer.write()), Err(QfError::BadSection(_))));
+    }
+
+    #[test]
+    fn rejects_primary_profile_missing_required_feature() {
+        let mut writer = MinimalQfWriter::new();
+        writer.primary_profile = PrimaryProfile::HarborExecution as u8;
+        writer.required_features = FEATURE_TABLE_PROFILE;
+        assert!(matches!(validate_bytes(&writer.write()), Err(QfError::BadSection(_))));
+    }
+
+    #[test]
+    fn accepts_primary_profile_when_required_feature_present() {
+        let mut writer = MinimalQfWriter::new();
+        writer.primary_profile = PrimaryProfile::HarborExecution as u8;
+        writer.required_features = FEATURE_HARBOR_PROFILE;
+        assert!(validate_bytes(&writer.write()).is_ok());
+    }
+
+    #[test]
+    fn rejects_table_catalog_with_wrong_profile() {
+        let mut writer = MinimalQfWriter::new();
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::TableCatalog as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: vec![1],
+        });
+        assert!(matches!(validate_bytes(&writer.write()), Err(QfError::BadSection(_))));
+    }
+
+    #[test]
+    fn rejects_harbor_mount_hints_with_wrong_profile() {
+        let mut writer = MinimalQfWriter::new();
+        writer.required_features = FEATURE_HARBOR_PROFILE;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::HarborMountHints as u16,
+            profile: 4,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: vec![1],
+        });
+        assert!(matches!(validate_bytes(&writer.write()), Err(QfError::BadSection(_))));
+    }
+
+    #[test]
+    fn rejects_bad_trailing_magic() {
+        let mut bytes = MinimalQfWriter::write_empty_file();
+        let len = bytes.len();
+        bytes[len - 1] = b'X';
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadMagic)));
+    }
+
+    #[test]
+    fn rejects_postscript_file_length_mismatch() {
+        let mut bytes = MinimalQfWriter::write_empty_file();
+        let mut ps = QfPostscriptV1::parse_from_tail(&bytes).unwrap();
+        ps.file_len += 1;
+        rewrite_postscript(&mut bytes, ps);
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::OffsetRange)));
+    }
+
+    #[test]
+    fn rejects_footer_crc_mismatch() {
+        let mut writer = MinimalQfWriter::new();
+        writer.metadata_json = br#"{"k":"v"}"#.to_vec();
+        let mut bytes = writer.write();
+        let ps = QfPostscriptV1::parse_from_tail(&bytes).unwrap();
+        bytes[ps.footer.offset as usize] ^= 1;
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(QfError::ChecksumMismatch)
+        ));
+    }
+
+    #[test]
+    fn rejects_postscript_footer_range_before_header() {
+        let mut bytes = MinimalQfWriter::write_empty_file();
+        let mut ps = QfPostscriptV1::parse_from_tail(&bytes).unwrap();
+        ps.footer.offset = (HEADER_SIZE - 1) as u64;
+        rewrite_postscript(&mut bytes, ps);
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::OffsetRange)));
+    }
+
+    #[test]
+    fn rejects_header_and_postscript_feature_mismatch() {
+        let mut bytes = MinimalQfWriter::write_empty_file();
+        let mut ps = QfPostscriptV1::parse_from_tail(&bytes).unwrap();
+        ps.optional_features = FEATURE_CODEC_LZ4;
+        rewrite_postscript(&mut bytes, ps);
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+    }
+
+    #[test]
+    fn rejects_section_outside_data_region() {
+        let mut writer = MinimalQfWriter::new();
+        writer.required_features = FEATURE_TABLE_PROFILE | FEATURE_FILE_DICTIONARY;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_FILE_DICTIONARY,
+            optional_features: 0,
+            data: b"abcdef".to_vec(),
+        });
+        let mut bytes = writer.write();
+        let ps = QfPostscriptV1::parse_from_tail(&bytes).unwrap();
+        let footer_start = ps.footer.offset as usize;
+        let entries_start = footer_start + 44;
+        let bad_offset = (footer_start as u64) + 1;
+        bytes[entries_start + 8..entries_start + 16].copy_from_slice(&bad_offset.to_le_bytes());
+        let footer_crc = checksum::crc32c(&bytes[footer_start..footer_start + ps.footer.length as usize]);
+        let mut fixed_ps = ps;
+        fixed_ps.footer.crc32c = footer_crc;
+        rewrite_postscript(&mut bytes, fixed_ps);
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::OffsetRange)));
+    }
+
+    #[test]
+    fn rejects_unknown_section_profile_in_directory() {
+        let mut writer = MinimalQfWriter::new();
+        writer.required_features = FEATURE_TABLE_PROFILE | FEATURE_FILE_DICTIONARY;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_FILE_DICTIONARY,
+            optional_features: 0,
+            data: b"abcdef".to_vec(),
+        });
+        let mut bytes = writer.write();
+        let ps = QfPostscriptV1::parse_from_tail(&bytes).unwrap();
+        let footer_start = ps.footer.offset as usize;
+        let entries_start = footer_start + 44;
+        bytes[entries_start + 6] = 99;
+        let footer_crc = checksum::crc32c(&bytes[footer_start..footer_start + ps.footer.length as usize]);
+        let mut fixed_ps = ps;
+        fixed_ps.footer.crc32c = footer_crc;
+        rewrite_postscript(&mut bytes, fixed_ps);
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+    }
+
+    #[test]
+    fn rejects_unknown_section_kind_in_directory() {
+        let mut writer = MinimalQfWriter::new();
+        writer.required_features = FEATURE_TABLE_PROFILE | FEATURE_FILE_DICTIONARY;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_FILE_DICTIONARY,
+            optional_features: 0,
+            data: b"abcdef".to_vec(),
+        });
+        let mut bytes = writer.write();
+        let ps = QfPostscriptV1::parse_from_tail(&bytes).unwrap();
+        let footer_start = ps.footer.offset as usize;
+        let entries_start = footer_start + 44;
+        bytes[entries_start + 4..entries_start + 6].copy_from_slice(&999u16.to_le_bytes());
+        let footer_crc = checksum::crc32c(&bytes[footer_start..footer_start + ps.footer.length as usize]);
+        let mut fixed_ps = ps;
+        fixed_ps.footer.crc32c = footer_crc;
+        rewrite_postscript(&mut bytes, fixed_ps);
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+    }
+
+    #[test]
+    fn enforces_profile_feature_bit_for_every_non_mixed_profile() {
+        let cases: &[(u8, u16, u64)] = &[
+            (1, SectionKind::ObjectTypeCatalog as u16, crate::constants::FEATURE_OBJECT_PROFILE),
+            (2, SectionKind::TableCatalog as u16, FEATURE_TABLE_PROFILE),
+            (3, SectionKind::LookupIndex as u16, crate::constants::FEATURE_ARCHIVE_PROFILE),
+            (4, SectionKind::EngineProfileRegistry as u16, crate::constants::FEATURE_ENGINE_PROFILE),
+            (5, SectionKind::HarborMountHints as u16, FEATURE_HARBOR_PROFILE),
+        ];
+
+        for (profile, kind, required_bit) in cases {
+            let mut writer = MinimalQfWriter::new();
+            writer.primary_profile = 0; // mixed; avoid primary-profile gating noise
+            writer.required_features = 0;
+            writer.sections.push(SectionPayload {
+                section_kind: *kind,
+                profile: *profile,
+                flags: 0,
+                item_count: 0,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: 0,
+                data: b"x".to_vec(),
+            });
+            assert!(matches!(validate_bytes(&writer.write()), Err(QfError::BadSection(_))));
+
+            writer.required_features = *required_bit;
+            assert!(
+                validate_bytes(&writer.write()).is_ok(),
+                "profile {profile} should validate when feature bit is present"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_too_short_file() {
+        let bytes = vec![0u8; HEADER_SIZE + POSTSCRIPT_TOTAL_SIZE - 1];
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::BufferTooShort)));
+    }
+
+    #[test]
+    fn rejects_invalid_footer_header_shape() {
+        let mut bytes = MinimalQfWriter::write_empty_file();
+        let ps = QfPostscriptV1::parse_from_tail(&bytes).unwrap();
+        let footer_start = ps.footer.offset as usize;
+        // footer.header.section_entry_len @ offset 12 in footer header
+        bytes[footer_start + 12..footer_start + 14].copy_from_slice(&0u16.to_le_bytes());
+        let footer_crc = checksum::crc32c(&bytes[footer_start..footer_start + ps.footer.length as usize]);
+        let mut fixed_ps = ps;
+        fixed_ps.footer.crc32c = footer_crc;
+        rewrite_postscript(&mut bytes, fixed_ps);
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+    }
+
+    #[test]
+    fn rejects_bad_header_after_all_tail_checks_pass() {
+        let mut bytes = MinimalQfWriter::write_empty_file();
+        // Corrupt header magic, then recompute header checksum so header parse fails on magic,
+        // not checksum mismatch.
+        bytes[0..4].copy_from_slice(b"BAD!");
+        bytes[124..128].copy_from_slice(&[0, 0, 0, 0]);
+        let crc = checksum::crc32c(&bytes[..HEADER_SIZE]);
+        bytes[124..128].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadMagic)));
     }
 }
