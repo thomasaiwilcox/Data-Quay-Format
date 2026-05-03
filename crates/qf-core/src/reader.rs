@@ -1,12 +1,12 @@
 //! Quay Format (QF) v1.0 — reference reader and structural validator.
 
-use std::{collections::HashSet, fs, path::Path};
+use std::{fs, path::Path};
 
 use crate::{
     checksum,
     constants::{
-        PrimaryProfile, SectionKind, FEATURE_ARCHIVE_PROFILE, FEATURE_ENGINE_PROFILE,
-        FEATURE_CODEC_LZ4, FEATURE_CODEC_ZSTD, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
+        PrimaryProfile, SectionKind, FEATURE_ARCHIVE_PROFILE, FEATURE_CODEC_LZ4,
+        FEATURE_CODEC_ZSTD, FEATURE_ENGINE_PROFILE, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
         FEATURE_TABLE_PROFILE, MAGIC_QF,
     },
     footer::QfFooter,
@@ -69,9 +69,8 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedQfFile, QfError> {
         ));
     }
 
-    validate_sections(data, footer_start, &footer)?;
-
     let header = QfHeaderV1::parse(data, false)?;
+    validate_sections(data, footer_start, &footer, &header)?;
     validate_primary_profile_features(&header)?;
     if header.required_features != postscript.required_features
         || header.optional_features != postscript.optional_features
@@ -88,25 +87,25 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedQfFile, QfError> {
     })
 }
 
-fn validate_sections(data: &[u8], footer_start: usize, footer: &QfFooter) -> Result<(), QfError> {
-    let mut section_ids_seen = HashSet::new();
+fn validate_sections(
+    data: &[u8],
+    footer_start: usize,
+    footer: &QfFooter,
+    header: &QfHeaderV1,
+) -> Result<(), QfError> {
     let mut ranges: Vec<(u64, u64, u32)> = Vec::new();
-    let mut expected_section_id: u32 = 1;
+    let mut last_section_id: Option<u32> = None;
 
     for entry in &footer.sections {
-        if !section_ids_seen.insert(entry.section_id) {
-            return Err(QfError::BadSection(format!(
-                "duplicate section_id {}",
-                entry.section_id
-            )));
+        if let Some(last) = last_section_id {
+            if entry.section_id <= last {
+                return Err(QfError::BadSection(format!(
+                    "section_id {} is not greater than previous id {}",
+                    entry.section_id, last
+                )));
+            }
         }
-        if entry.section_id != expected_section_id {
-            return Err(QfError::BadSection(format!(
-                "section_id {} out of sequence, expected {}",
-                entry.section_id, expected_section_id
-            )));
-        }
-        expected_section_id = expected_section_id.saturating_add(1);
+        last_section_id = Some(entry.section_id);
 
         validate_section_profile(entry.section_kind, entry.profile)?;
         validate_section_profile_feature_bit(entry.profile, header.required_features)?;
@@ -136,7 +135,10 @@ fn validate_sections(data: &[u8], footer_start: usize, footer: &QfFooter) -> Res
     Ok(())
 }
 
-fn validate_section_profile_feature_bit(profile: u8, file_required_features: u64) -> Result<(), QfError> {
+fn validate_section_profile_feature_bit(
+    profile: u8,
+    file_required_features: u64,
+) -> Result<(), QfError> {
     let required_profile_bit = match profile {
         0 => return Ok(()),
         1 => FEATURE_OBJECT_PROFILE,
@@ -213,7 +215,8 @@ fn validate_primary_profile_features(header: &QfHeaderV1) -> Result<(), QfError>
 fn validate_section_profile(section_kind: u16, profile: u8) -> Result<(), QfError> {
     let section = SectionKind::from_u16(section_kind)
         .ok_or_else(|| QfError::BadSection(format!("unknown section_kind {section_kind}")));
-    let expected = match section? {
+    let allowed: &[u8] = match section? {
+        // shared (profile 0)
         SectionKind::FileDictionaryIndex
         | SectionKind::FileDictionaryPayload
         | SectionKind::CollationRegistry
@@ -223,35 +226,41 @@ fn validate_section_profile(section_kind: u16, profile: u8) -> Result<(), QfErro
         | SectionKind::LakehouseHints
         | SectionKind::ExtensionRegistry
         | SectionKind::ProfileCapabilityMatrix
-        | SectionKind::VendorExtension => 0,
+        | SectionKind::VendorExtension => &[0],
+        // QF-T only (profile 2)
         SectionKind::TableCatalog
         | SectionKind::TableSegmentIndex
         | SectionKind::TableSegmentData
         | SectionKind::ColumnDomain
-        | SectionKind::ZoneStats
-        | SectionKind::ExactSetIndex
+        | SectionKind::ZoneStats => &[2],
+        // QF-T/QF-A (profiles 2 or 3)
+        SectionKind::ExactSetIndex
         | SectionKind::BloomIndex
         | SectionKind::InvertedMorselIndex
-        | SectionKind::LookupIndex
+        | SectionKind::KernelCapabilities => &[2, 3],
+        // QF-A only (profile 3)
+        SectionKind::LookupIndex
         | SectionKind::AggregateSynopsis
         | SectionKind::CompositeZoneIndex
-        | SectionKind::TopNZoneSummary
-        | SectionKind::KernelCapabilities => 2,
+        | SectionKind::TopNZoneSummary => &[3],
+        // QF-E (profile 4)
         SectionKind::EngineProfileRegistry
         | SectionKind::ExecutionCodeDescriptor
         | SectionKind::ExecutionScopeDescriptor
         | SectionKind::CodeSpaceDescriptor
-        | SectionKind::EngineMountPolicy => 4,
+        | SectionKind::EngineMountPolicy => &[4],
+        // QF-O (profile 1)
         SectionKind::ObjectTypeCatalog
         | SectionKind::TemporalSegmentIndex
         | SectionKind::TemporalSegmentData
         | SectionKind::TemporalBloomIndex
-        | SectionKind::TrustManifest => 1,
-        SectionKind::HarborMountHints => 5,
+        | SectionKind::TrustManifest => &[1],
+        // QF-H (profile 5)
+        SectionKind::HarborMountHints => &[5],
     };
-    if profile != expected {
+    if !allowed.contains(&profile) {
         return Err(QfError::BadSection(format!(
-            "section_kind {section_kind} must use profile {expected}, got {profile}"
+            "section_kind {section_kind} must use one of profiles {allowed:?}, got {profile}"
         )));
     }
     Ok(())
@@ -401,7 +410,7 @@ mod tests {
         let ps = QfPostscriptV1::parse_from_tail(&bytes).unwrap();
         let footer_start = ps.footer.offset as usize;
         let entries_start = footer_start + 44;
-        bytes[entries_start + 76..entries_start + 80].copy_from_slice(&3u32.to_le_bytes());
+        bytes[entries_start + 76..entries_start + 80].copy_from_slice(&1u32.to_le_bytes());
 
         let footer_len = ps.footer.length as usize;
         let footer_crc = checksum::crc32c(&bytes[footer_start..footer_start + footer_len]);
@@ -410,9 +419,11 @@ mod tests {
         let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
         bytes[tail_start..].copy_from_slice(&fixed_ps.serialize_tail());
 
-        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(QfError::BadSection(_))
+        ));
     }
-}
 
     #[test]
     fn rejects_section_profile_feature_missing_from_header() {
@@ -431,7 +442,10 @@ mod tests {
         });
         writer.required_features = 0;
         let bytes = writer.write();
-        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(QfError::BadSection(_))
+        ));
     }
 
     #[test]
@@ -450,7 +464,10 @@ mod tests {
             data: b"lz4-ish".to_vec(),
         });
         let bytes = writer.write();
-        assert!(matches!(validate_bytes(&bytes), Err(QfError::BadSection(_))));
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(QfError::BadSection(_))
+        ));
 
         let mut good_writer = MinimalQfWriter::new();
         good_writer.optional_features = FEATURE_CODEC_LZ4;
@@ -469,3 +486,4 @@ mod tests {
         let good_bytes = good_writer.write();
         assert!(validate_bytes(&good_bytes).is_ok());
     }
+}
