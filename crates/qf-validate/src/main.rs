@@ -11,7 +11,7 @@
 //!
 //! Usage:
 //! ```text
-//! qf-validate <file.quay> [<file2.quay> ...]
+//! qf-validate [--semantic] [--verify-digests] <file.quay> [<file2.quay> ...]
 //! ```
 //!
 //! Exit codes:
@@ -21,18 +21,49 @@
 
 use std::{path::Path, process};
 
-use qf_core::reader;
+use qf_core::reader::{self, ValidationOptions};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: qf-validate <file.quay> [<file2.quay> ...]");
+
+    let mut semantic = false;
+    let mut verify_digests = false;
+    let mut file_paths: Vec<&str> = Vec::new();
+
+    // Flags must come before files
+    let mut parsing_flags = true;
+    for arg in &args[1..] {
+        if parsing_flags && arg.starts_with("--") {
+            match arg.as_str() {
+                "--semantic" => semantic = true,
+                "--verify-digests" => verify_digests = true,
+                other => {
+                    eprintln!("Unknown flag: {other}");
+                    process::exit(2);
+                }
+            }
+        } else {
+            parsing_flags = false;
+            file_paths.push(arg.as_str());
+        }
+    }
+
+    if file_paths.is_empty() {
+        eprintln!(
+            "Usage: qf-validate [--semantic] [--verify-digests] <file.quay> [<file2.quay> ...]"
+        );
         process::exit(2);
     }
 
+    let opts = ValidationOptions {
+        semantic,
+        verify_digests,
+        allow_unknown_optional_extensions: true,
+    };
+
     let mut all_ok = true;
-    for path in &args[1..] {
-        let ok = validate_file(Path::new(path));
+    for path in &file_paths {
+        let ok = validate_file(Path::new(path), opts.clone());
         if !ok {
             all_ok = false;
         }
@@ -41,8 +72,8 @@ fn main() {
     process::exit(if all_ok { 0 } else { 1 });
 }
 
-/// Validate a single QF file.  Returns `true` if valid.
-fn validate_file(path: &Path) -> bool {
+/// Validate a single QF file. Returns `true` if valid.
+fn validate_file(path: &Path, opts: ValidationOptions) -> bool {
     let display = path.display();
     print!("Validating {display} ... ");
 
@@ -55,9 +86,15 @@ fn validate_file(path: &Path) -> bool {
         }
     };
 
-    match reader::validate_bytes(&data) {
-        Ok(info) => {
-            println!("OK");
+    match reader::validate_bytes_with_options(&data, opts) {
+        Ok(report) => {
+            let mode = if report.semantic_checked {
+                "semantic"
+            } else {
+                "structural"
+            };
+            println!("OK [{mode}]");
+            let info = &report.validated;
             println!(
                 "  QF v{}.{}",
                 info.header.version_major, info.header.version_minor
@@ -68,6 +105,9 @@ fn validate_file(path: &Path) -> bool {
                 profile_name(info.header.primary_profile)
             );
             println!("  section_count   : {}", info.footer.sections.len());
+            if let Some(n) = report.dict_entry_count {
+                println!("  dict_entries    : {n}");
+            }
             let metadata_json_preview = String::from_utf8_lossy(&info.footer.metadata_json)
                 .chars()
                 .take(120)

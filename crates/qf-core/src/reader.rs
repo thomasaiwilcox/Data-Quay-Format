@@ -3,12 +3,13 @@
 use std::{fs, path::Path};
 
 use crate::{
-    checksum,
+    checksum, compression,
     constants::{
         PrimaryProfile, SectionKind, FEATURE_ARCHIVE_PROFILE, FEATURE_CODEC_LZ4,
-        FEATURE_CODEC_ZSTD, FEATURE_ENGINE_PROFILE, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
-        FEATURE_TABLE_PROFILE, MAGIC_QF,
+        FEATURE_CODEC_ZSTD, FEATURE_ENGINE_PROFILE, FEATURE_FILE_DICTIONARY,
+        FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE, MAGIC_QF,
     },
+    dictionary::FileDictionary,
     footer::QfFooter,
     header::{QfHeaderV1, HEADER_SIZE},
     postscript::{QfPostscriptV1, POSTSCRIPT_TOTAL_SIZE},
@@ -84,6 +85,100 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedQfFile, QfError> {
         header,
         postscript,
         footer,
+    })
+}
+
+/// Options controlling the depth of validation.
+#[derive(Debug, Clone)]
+pub struct ValidationOptions {
+    /// When true, validates dictionary semantics (entry bounds, redaction).
+    pub semantic: bool,
+    /// When true, verifies section digests if a DigestManifest is present (not yet implemented).
+    pub verify_digests: bool,
+    /// When true, unknown optional extension registry entries are allowed.
+    pub allow_unknown_optional_extensions: bool,
+}
+
+impl Default for ValidationOptions {
+    fn default() -> Self {
+        Self {
+            semantic: false,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+        }
+    }
+}
+
+/// Result of [`validate_bytes_with_options`].
+#[derive(Debug, Clone)]
+pub struct ValidationReport {
+    /// The structurally validated file.
+    pub validated: ValidatedQfFile,
+    /// Whether semantic checks were performed.
+    pub semantic_checked: bool,
+    /// Number of dictionary entries, if the dictionary was parsed.
+    pub dict_entry_count: Option<u32>,
+}
+
+/// Validate a QF file with configurable options.
+///
+/// Always performs structural validation (equivalent to [`validate_bytes`]).
+/// When `opts.semantic` is true, additionally parses any file dictionary.
+/// When `opts.verify_digests` is true, returns an error (not yet implemented).
+pub fn validate_bytes_with_options(
+    data: &[u8],
+    opts: ValidationOptions,
+) -> Result<ValidationReport, QfError> {
+    let validated = validate_bytes(data)?;
+
+    let mut dict_entry_count: Option<u32> = None;
+
+    if opts.semantic {
+        let has_dict_feature = validated.header.required_features & FEATURE_FILE_DICTIONARY != 0;
+
+        if has_dict_feature {
+            // Find index and payload sections
+            let index_entry = validated
+                .footer
+                .sections
+                .iter()
+                .find(|s| s.section_kind == SectionKind::FileDictionaryIndex as u16);
+            let payload_entry = validated
+                .footer
+                .sections
+                .iter()
+                .find(|s| s.section_kind == SectionKind::FileDictionaryPayload as u16);
+
+            match index_entry {
+                None => {
+                    return Err(QfError::BadSection(
+                        "FEATURE_FILE_DICTIONARY set but FILE_DICTIONARY_INDEX section missing"
+                            .into(),
+                    ));
+                }
+                Some(idx_entry) => {
+                    let index_bytes = compression::section_payload(data, idx_entry)?;
+                    let payload_bytes = match payload_entry {
+                        Some(pay_entry) => compression::section_payload(data, pay_entry)?,
+                        None => std::borrow::Cow::Borrowed(&[][..]),
+                    };
+                    let dict = FileDictionary::parse(&index_bytes, &payload_bytes)?;
+                    dict_entry_count = Some(dict.len());
+                }
+            }
+        }
+
+        if opts.verify_digests {
+            return Err(QfError::UnsupportedEncoding(
+                "digest verification not yet implemented".into(),
+            ));
+        }
+    }
+
+    Ok(ValidationReport {
+        validated,
+        semantic_checked: opts.semantic,
+        dict_entry_count,
     })
 }
 
@@ -812,5 +907,41 @@ mod tests {
         let crc = checksum::crc32c(&bytes[..HEADER_SIZE]);
         bytes[124..128].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(validate_bytes(&bytes), Err(QfError::BadMagic)));
+    }
+
+    #[test]
+    fn structural_validation_defaults_work() {
+        let bytes = MinimalQfWriter::write_empty_file();
+        let opts = ValidationOptions::default();
+        let report = validate_bytes_with_options(&bytes, opts).expect("should validate");
+        assert!(!report.semantic_checked);
+        assert!(report.dict_entry_count.is_none());
+    }
+
+    #[test]
+    fn semantic_validation_on_empty_file_no_dict() {
+        let bytes = MinimalQfWriter::write_empty_file();
+        let opts = ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+        };
+        let report = validate_bytes_with_options(&bytes, opts).expect("should validate");
+        assert!(report.semantic_checked);
+        assert!(report.dict_entry_count.is_none());
+    }
+
+    #[test]
+    fn verify_digests_stub_returns_unsupported() {
+        let bytes = MinimalQfWriter::write_empty_file();
+        let opts = ValidationOptions {
+            semantic: true,
+            verify_digests: true,
+            allow_unknown_optional_extensions: true,
+        };
+        assert!(matches!(
+            validate_bytes_with_options(&bytes, opts),
+            Err(QfError::UnsupportedEncoding(_))
+        ));
     }
 }

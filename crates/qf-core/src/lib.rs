@@ -14,7 +14,14 @@
 //! | [`postscript`] | [`QfPostscriptV1`] and [`QfSectionSpecV1`] (Section 12). |
 //! | [`footer`] | [`QfFooter`], [`QfFooterHeaderV1`], [`QfSectionEntryV1`] (Section 13). |
 //! | [`dictionary`] | File dictionary types (Section 16). |
+//! | [`types`] | Logical/physical type compatibility and NumCode interpretation helpers. |
+//! | [`validity`] | [`validity::ValidityBitmap`] — null bitmap helpers (bit 1 = null). |
 //! | [`writer`] | [`MinimalQfWriter`] — writes minimal valid QF files. |
+//! | [`array`]      | [`array::EncodedArray`] — single-row decoder for encoded column arrays. |
+//! | [`compression`] | Section decompression layer (None/LZ4/Zstd). |
+//! | [`extensions`] | [`extensions::ExtensionRegistry`] — extension registry skeleton. |
+//! | [`collation`]  | [`collation::CollationRegistry`] — collation registry skeleton. |
+//! | [`digest`]     | [`digest::DigestManifest`] — digest manifest skeleton. |
 //!
 //! ## Quick start
 //!
@@ -59,14 +66,21 @@
 //! println!("Section count: {}", footer.sections.len());
 //! ```
 
+pub mod array;
 pub mod checksum;
+pub mod collation;
+pub mod compression;
 pub mod constants;
 pub mod dictionary;
+pub mod digest;
 pub mod error;
+pub mod extensions;
 pub mod footer;
 pub mod header;
 pub mod postscript;
 pub mod reader;
+pub mod types;
+pub mod validity;
 pub mod wire;
 pub mod writer;
 
