@@ -187,15 +187,17 @@ pub fn validate_bytes_with_options(
             }
         }
 
-        let ext_in_required = validated.header.required_features & FEATURE_EXTENSION_REGISTRY != 0;
-        let ext_in_optional = validated.header.optional_features & FEATURE_EXTENSION_REGISTRY != 0;
-        if ext_in_required || ext_in_optional {
+        let ext_registry_is_required =
+            validated.header.required_features & FEATURE_EXTENSION_REGISTRY != 0;
+        let ext_registry_is_optional =
+            validated.header.optional_features & FEATURE_EXTENSION_REGISTRY != 0;
+        if ext_registry_is_required || ext_registry_is_optional {
             let ext_entry = validated
                 .footer
                 .sections
                 .iter()
                 .find(|s| s.section_kind == SectionKind::ExtensionRegistry as u16);
-            match (ext_in_required, ext_entry) {
+            match (ext_registry_is_required, ext_entry) {
                 (true, None) => {
                     return Err(QfError::BadSection(
                         "FEATURE_EXTENSION_REGISTRY set in required_features but \

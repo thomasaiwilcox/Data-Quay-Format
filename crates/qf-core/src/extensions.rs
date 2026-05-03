@@ -172,9 +172,11 @@ impl ExtensionRegistry {
 mod tests {
     use super::*;
 
-    /// Build a Spec §45 EXTENSION_REGISTRY section payload.
+    /// Build a Spec §45 EXTENSION_REGISTRY section payload for testing.
     ///
     /// Each entry tuple: `(required_feature_bit, optional_feature_bit, namespace, name)`.
+    /// Other fields (`extension_id`, `version_major`, etc.) are set to fixed
+    /// placeholder values sufficient for parse/validate round-trip tests.
     fn make_registry_bytes(entries: &[(u64, u64, &[u8], &[u8])]) -> Vec<u8> {
         // Header: extension_count (u32) + flags (u32)
         let mut out = (entries.len() as u32).to_le_bytes().to_vec();
