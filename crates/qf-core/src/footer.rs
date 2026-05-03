@@ -522,7 +522,10 @@ mod tests {
         footer.header.section_count = 1;
         footer.header.metadata_len = 0;
         let bytes = footer.header.serialize().to_vec();
-        assert!(matches!(QfFooter::parse(&bytes), Err(QfError::BufferTooShort)));
+        assert!(matches!(
+            QfFooter::parse(&bytes),
+            Err(QfError::BufferTooShort)
+        ));
     }
 
     #[test]
