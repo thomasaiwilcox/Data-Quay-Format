@@ -237,11 +237,12 @@ fn verify_digest_manifests(data: &[u8], footer: &QfFooter) -> Result<(), QfError
     {
         let digest_bytes = compression::section_payload(data, digest_section)?;
         let manifest = DigestManifest::parse(&digest_bytes)?;
-        for entry in manifest.entries {
+        for entry in &manifest.entries {
             let target_section = footer
                 .sections
-                .iter()
-                .find(|s| s.section_id == entry.section_id)
+                .binary_search_by_key(&entry.section_id, |s| s.section_id)
+                .ok()
+                .and_then(|idx| footer.sections.get(idx))
                 .ok_or_else(|| {
                     QfError::BadSection(format!(
                         "digest manifest references missing section_id {}",
@@ -252,10 +253,7 @@ fn verify_digest_manifests(data: &[u8], footer: &QfFooter) -> Result<(), QfError
             let section_start = target_section.offset as usize;
             let section_end = target_section.end_offset()? as usize;
             let section_bytes = &data[section_start..section_end];
-            DigestManifest {
-                entries: vec![entry.clone()],
-            }
-            .verify_section(entry.section_id, section_bytes)?;
+            manifest.verify_section(entry.section_id, section_bytes)?;
         }
     }
     Ok(())
