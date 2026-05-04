@@ -11,6 +11,7 @@ use crate::{
         FEATURE_TABLE_PROFILE, MAGIC_QF,
     },
     dictionary::FileDictionary,
+    digest::DigestManifest,
     extensions::ExtensionRegistry,
     footer::QfFooter,
     header::{QfHeaderV1, HEADER_SIZE},
@@ -143,7 +144,7 @@ pub struct ValidationReport {
 ///
 /// Always performs structural validation (equivalent to [`validate_bytes`]).
 /// When `opts.semantic` is true, additionally parses any file dictionary.
-/// When `opts.verify_digests` is true, returns an error (not yet implemented).
+/// When `opts.verify_digests` is true, verifies any `DIGEST_MANIFEST` section against section bytes.
 pub fn validate_bytes_with_options(
     data: &[u8],
     opts: ValidationOptions,
@@ -217,9 +218,7 @@ pub fn validate_bytes_with_options(
         }
 
         if opts.verify_digests {
-            return Err(QfError::UnsupportedEncoding(
-                "digest verification not yet implemented".into(),
-            ));
+            verify_digest_manifests(data, &validated.footer)?;
         }
     }
 
@@ -228,6 +227,36 @@ pub fn validate_bytes_with_options(
         semantic_checked: opts.semantic,
         dict_entry_count,
     })
+}
+
+fn verify_digest_manifests(data: &[u8], footer: &QfFooter) -> Result<(), QfError> {
+    for digest_section in footer
+        .sections
+        .iter()
+        .filter(|s| s.section_kind == SectionKind::DigestManifest as u16)
+    {
+        let digest_bytes = compression::section_payload(data, digest_section)?;
+        let manifest = DigestManifest::parse(&digest_bytes)?;
+        for entry in &manifest.entries {
+            let target_section = footer
+                .sections
+                .binary_search_by_key(&entry.section_id, |s| s.section_id)
+                .ok()
+                .and_then(|idx| footer.sections.get(idx))
+                .ok_or_else(|| {
+                    QfError::BadSection(format!(
+                        "digest manifest references missing section_id {}",
+                        entry.section_id
+                    ))
+                })?;
+
+            let section_start = target_section.offset as usize;
+            let section_end = target_section.end_offset()? as usize;
+            let section_bytes = &data[section_start..section_end];
+            manifest.verify_section(entry.section_id, section_bytes)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_sections(
@@ -1122,8 +1151,37 @@ mod tests {
     }
 
     #[test]
-    fn verify_digests_stub_returns_unsupported() {
+    fn verify_digests_without_manifest_is_noop() {
         let bytes = MinimalQfWriter::write_empty_file();
+        let opts = ValidationOptions {
+            semantic: true,
+            verify_digests: true,
+            allow_unknown_optional_extensions: true,
+        };
+        assert!(validate_bytes_with_options(&bytes, opts).is_ok());
+    }
+
+    #[test]
+    fn verify_digests_rejects_missing_referenced_section() {
+        let mut writer = MinimalQfWriter::new();
+        let mut digest = Vec::new();
+        digest.extend_from_slice(&1u32.to_le_bytes()); // entry count
+        digest.extend_from_slice(&99u32.to_le_bytes()); // section_id
+        digest.extend_from_slice(&0u16.to_le_bytes()); // algorithm: None
+        digest.extend_from_slice(&0u16.to_le_bytes()); // digest length
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::DigestManifest as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: digest,
+        });
+        let bytes = writer.write();
         let opts = ValidationOptions {
             semantic: true,
             verify_digests: true,
@@ -1131,7 +1189,7 @@ mod tests {
         };
         assert!(matches!(
             validate_bytes_with_options(&bytes, opts),
-            Err(QfError::UnsupportedEncoding(_))
+            Err(QfError::BadSection(_))
         ));
     }
 }
