@@ -12,20 +12,29 @@ cargo run -p cove-conformance --bin cove-conformance -- conformance/
 Each manifest line is one JSON object:
 - `path`     — relative path from this directory
 - `kind`     — parser to run; omitted means `cove`. Current generated kinds are:
-    `cove`, `covx`, `covm`, `metadata_json`, `collation_registry`,
+    `cove`, `covx`, `covm`, `metadata_json`, `file_dictionary`, `collation_registry`,
     `digest_manifest`, `redaction_manifest`, `io_hints`, `lakehouse_hints`,
-    `kernel_capabilities`, `page_index`, `column_domain`, `table_catalog`,
-    `table_segment_index`, `table_segment_header`, `row_morsel_directory`,
-    `exact_set_index`, `bloom_index`, `inverted_morsel_index`, `lookup_index`,
-    `aggregate_synopsis`, `composite_zone_index`, `topn_summary`, `sort_key`,
-    `clustering_key`, `cove_e_engine_registry`, `cove_e_execution_code`,
-    `cove_e_mount_policy`, `cove_h_mount_hints`, `cove_o_object_catalog`, and
+    `encoding_case`,
+    `nested_case`,
+    `arrow_bitmap_case`, `suite_contract_case`, `kernel_capabilities`, `page_index`, `column_domain`,
+    `table_catalog`, `table_segment_index`, `table_segment_header`,
+    `row_morsel_directory`, `row_ref`, `exact_set_index`, `bloom_index`,
+    `inverted_morsel_index`, `lookup_index`, `aggregate_synopsis`,
+    `composite_zone_index`, `topn_summary`, `sort_key`, `clustering_key`,
+        `pruning_case`, `error_surface_case`, `cove_e_engine_registry`, `cove_e_execution_code`,
+    `cove_e_execution_scope`, `cove_e_code_space`, `cove_e_mount_policy`,
+    `cove_h_mount_hints`, `cove_o_object_catalog`, and
     `cove_o_temporal_segment_index`
 - `expect`   — `"accept"` or `"reject"`
 - `error_code` — (preferred when `expect=reject`) stable Spec §75 error code
+    Fixtures with `error_code` are automatically tagged as `§75` evidence by `gen-corpus`.
 - `error`    — optional fallback substring match for ad hoc cases
 - `sections` — list of `"§N.M"` markers from `Spec.md`
 - `morsel_count` — required only for `row_morsel_directory` fixtures
+
+`suite_contract_case` fixtures are repo-level meta checks used for Spec §78. They
+verify the generated manifest breadth plus the release-gate and workspace binary
+contract that keeps the conformance and benchmark suite executable.
 
 ## Capability Evidence
 

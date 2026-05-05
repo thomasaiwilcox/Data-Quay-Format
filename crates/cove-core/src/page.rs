@@ -6,7 +6,147 @@
 //! to drive the canonical / fast / kernel decode path triad described in
 //! Spec §20.
 
-use crate::{checksum::crc32c, constants::CoveEncodingKind, CoveError};
+use crate::{
+    checksum::crc32c,
+    constants::{CompressionCodec, CoveEncodingKind},
+    CoveError,
+};
+
+pub const COLUMN_PAGE_INDEX_ENTRY_LEN: usize = 60;
+
+/// Spec §27.2 / §66: the low byte of `ColumnPageIndexEntryV1.flags` carries
+/// the page-level [`CompressionCodec`] identifier. The remaining 24 bits are
+/// reserved for future use and MUST be zero in v1.0.
+pub const PAGE_FLAG_CODEC_MASK: u32 = 0x0000_00FF;
+pub const PAGE_FLAG_RESERVED_MASK: u32 = !PAGE_FLAG_CODEC_MASK;
+
+/// Returns the [`CompressionCodec`] encoded in `flags`, or an error if the
+/// codec value is unknown or any reserved bit is set.
+pub fn page_flag_codec(flags: u32) -> Result<CompressionCodec, CoveError> {
+    if flags & PAGE_FLAG_RESERVED_MASK != 0 {
+        return Err(CoveError::BadSection(format!(
+            "page flags reserved bits must be zero (flags=0x{flags:08x})"
+        )));
+    }
+    let raw = (flags & PAGE_FLAG_CODEC_MASK) as u8;
+    CompressionCodec::from_u8(raw)
+        .ok_or_else(|| CoveError::BadSection(format!("unknown page compression codec {raw}")))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnPageIndexEntryV1 {
+    pub column_id: u32,
+    pub morsel_id: u32,
+    pub row_count: u32,
+    pub non_null_count: u32,
+    pub null_count: u32,
+    pub encoding_root: u32,
+    pub page_offset: u64,
+    pub page_length: u64,
+    pub uncompressed_length: u64,
+    pub stats_ref: u32,
+    pub flags: u32,
+    pub checksum: u32,
+}
+
+impl ColumnPageIndexEntryV1 {
+    pub fn serialize(&self) -> [u8; COLUMN_PAGE_INDEX_ENTRY_LEN] {
+        let mut out = [0u8; COLUMN_PAGE_INDEX_ENTRY_LEN];
+        out[0..4].copy_from_slice(&self.column_id.to_le_bytes());
+        out[4..8].copy_from_slice(&self.morsel_id.to_le_bytes());
+        out[8..12].copy_from_slice(&self.row_count.to_le_bytes());
+        out[12..16].copy_from_slice(&self.non_null_count.to_le_bytes());
+        out[16..20].copy_from_slice(&self.null_count.to_le_bytes());
+        out[20..24].copy_from_slice(&self.encoding_root.to_le_bytes());
+        out[24..32].copy_from_slice(&self.page_offset.to_le_bytes());
+        out[32..40].copy_from_slice(&self.page_length.to_le_bytes());
+        out[40..48].copy_from_slice(&self.uncompressed_length.to_le_bytes());
+        out[48..52].copy_from_slice(&self.stats_ref.to_le_bytes());
+        out[52..56].copy_from_slice(&self.flags.to_le_bytes());
+        out[56..60].copy_from_slice(&self.checksum.to_le_bytes());
+        out
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < COLUMN_PAGE_INDEX_ENTRY_LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let bytes = &bytes[..COLUMN_PAGE_INDEX_ENTRY_LEN];
+        let checksum = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
+        let row_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let non_null_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let null_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        if non_null_count
+            .checked_add(null_count)
+            .ok_or(CoveError::ArithOverflow)?
+            != row_count
+        {
+            return Err(CoveError::PageCorrupt);
+        }
+
+        let page_length = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+        let uncompressed_length = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+        let flags = u32::from_le_bytes(bytes[52..56].try_into().unwrap());
+        let codec = page_flag_codec(flags)?;
+        // Spec §13.2 / §66: codec=None requires page_length == uncompressed_length.
+        // Compressed codecs require uncompressed_length > 0 whenever page_length
+        // > 0 (a compressed payload cannot decode to zero bytes), and an empty
+        // page (page_length == 0) MUST also have uncompressed_length == 0.
+        if codec == CompressionCodec::None && page_length != uncompressed_length {
+            return Err(CoveError::BadSection(
+                "uncompressed_length must equal page_length when page codec=None".into(),
+            ));
+        }
+        if page_length == 0 && uncompressed_length != 0 {
+            return Err(CoveError::BadSection(
+                "page_length=0 requires uncompressed_length=0".into(),
+            ));
+        }
+        if page_length != 0 && codec != CompressionCodec::None && uncompressed_length == 0 {
+            return Err(CoveError::BadSection(
+                "compressed page must declare non-zero uncompressed_length".into(),
+            ));
+        }
+
+        Ok(Self {
+            column_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            morsel_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            row_count,
+            non_null_count,
+            null_count,
+            encoding_root: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+            page_offset: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            page_length,
+            uncompressed_length,
+            stats_ref: u32::from_le_bytes(bytes[48..52].try_into().unwrap()),
+            flags,
+            checksum,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColumnPageIndex {
+    pub entries: Vec<ColumnPageIndexEntryV1>,
+}
+
+impl ColumnPageIndex {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.is_empty() {
+            return Ok(Self {
+                entries: Vec::new(),
+            });
+        }
+        if !bytes.len().is_multiple_of(COLUMN_PAGE_INDEX_ENTRY_LEN) {
+            return Err(CoveError::PageCorrupt);
+        }
+        let mut entries = Vec::with_capacity(bytes.len() / COLUMN_PAGE_INDEX_ENTRY_LEN);
+        for chunk in bytes.chunks_exact(COLUMN_PAGE_INDEX_ENTRY_LEN) {
+            entries.push(ColumnPageIndexEntryV1::parse(chunk)?);
+        }
+        Ok(Self { entries })
+    }
+}
 
 /// One column page entry in the page index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,5 +316,133 @@ mod tests {
     fn rejects_oversized_entry_count_before_allocating() {
         let bytes = u32::MAX.to_le_bytes().to_vec();
         assert_eq!(PageIndex::parse(&bytes), Err(CoveError::BufferTooShort));
+    }
+
+    #[test]
+    fn column_page_index_entry_round_trip() {
+        let bytes = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 2,
+            row_count: 10,
+            non_null_count: 8,
+            null_count: 2,
+            encoding_root: 3,
+            page_offset: 100,
+            page_length: 50,
+            uncompressed_length: 50,
+            stats_ref: 4,
+            flags: 0,
+            checksum: 0,
+        }
+        .serialize();
+        let entry = ColumnPageIndexEntryV1::parse(&bytes).unwrap();
+        assert_eq!(entry.column_id, 1);
+        assert_eq!(entry.row_count, 10);
+    }
+
+    #[test]
+    fn column_page_index_entry_rejects_bad_counts() {
+        let mut bytes = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 2,
+            row_count: 10,
+            non_null_count: 8,
+            null_count: 2,
+            encoding_root: 3,
+            page_offset: 100,
+            page_length: 50,
+            uncompressed_length: 50,
+            stats_ref: 4,
+            flags: 0,
+            checksum: 0,
+        }
+        .serialize();
+        bytes[16..20].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(
+            ColumnPageIndexEntryV1::parse(&bytes),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    fn page_entry(
+        page_length: u64,
+        uncompressed_length: u64,
+        flags: u32,
+    ) -> ColumnPageIndexEntryV1 {
+        ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 2,
+            row_count: 4,
+            non_null_count: 4,
+            null_count: 0,
+            encoding_root: 0,
+            page_offset: 0,
+            page_length,
+            uncompressed_length,
+            stats_ref: 0,
+            flags,
+            checksum: 0,
+        }
+    }
+
+    #[test]
+    fn page_codec_none_requires_matching_lengths() {
+        // codec=None but uncompressed_length != page_length is rejected.
+        let bytes = page_entry(10, 12, 0).serialize();
+        assert!(matches!(
+            ColumnPageIndexEntryV1::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn page_compressed_requires_nonzero_uncompressed_length() {
+        // codec=Lz4 with page_length>0 but uncompressed_length=0 is rejected.
+        let bytes = page_entry(10, 0, CompressionCodec::Lz4 as u32).serialize();
+        assert!(matches!(
+            ColumnPageIndexEntryV1::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn page_empty_must_have_zero_uncompressed_length() {
+        let bytes = page_entry(0, 5, 0).serialize();
+        assert!(matches!(
+            ColumnPageIndexEntryV1::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn page_unknown_codec_rejected() {
+        // Codec value 0xFF is not a known CompressionCodec.
+        let bytes = page_entry(10, 10, 0xFF).serialize();
+        assert!(matches!(
+            ColumnPageIndexEntryV1::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn page_reserved_flag_bits_must_be_zero() {
+        // Setting any bit above the codec byte is rejected (forward-compat lock).
+        let bytes = page_entry(10, 10, 0x0000_0100).serialize();
+        assert!(matches!(
+            ColumnPageIndexEntryV1::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn page_lz4_round_trip_accepted() {
+        // codec=Lz4 with consistent lengths parses cleanly.
+        let bytes = page_entry(20, 50, CompressionCodec::Lz4 as u32).serialize();
+        let entry = ColumnPageIndexEntryV1::parse(&bytes).unwrap();
+        assert_eq!(
+            entry.flags & PAGE_FLAG_CODEC_MASK,
+            CompressionCodec::Lz4 as u32
+        );
+        assert_eq!(entry.uncompressed_length, 50);
     }
 }

@@ -10,6 +10,7 @@
 //!   and payload-class values.
 
 use crate::{
+    canonical,
     constants::{StorageClass, ValueTag},
     error::CoveError,
 };
@@ -395,54 +396,7 @@ impl FileDictionary {
 }
 
 fn validate_canonical_value_bytes(value_tag: ValueTag, bytes: &[u8]) -> Result<(), CoveError> {
-    match value_tag {
-        ValueTag::Null | ValueTag::BoolFalse | ValueTag::BoolTrue => {
-            if !bytes.is_empty() {
-                return Err(CoveError::BadSection(
-                    "null/bool tags must have empty payload".into(),
-                ));
-            }
-        }
-        ValueTag::Int64
-        | ValueTag::UInt64
-        | ValueTag::Float64Bits
-        | ValueTag::Decimal64
-        | ValueTag::DateDays
-        | ValueTag::TimestampMicros
-        | ValueTag::TimestampNanos => {
-            if bytes.len() != 8 {
-                return Err(CoveError::BadSection("tag requires 8-byte payload".into()));
-            }
-        }
-        ValueTag::Float32Bits => {
-            if bytes.len() != 4 {
-                return Err(CoveError::BadSection(
-                    "Float32Bits requires 4-byte payload".into(),
-                ));
-            }
-        }
-        ValueTag::Decimal128 | ValueTag::Uuid => {
-            if bytes.len() != 16 {
-                return Err(CoveError::BadSection("tag requires 16-byte payload".into()));
-            }
-        }
-        ValueTag::Utf8 => {
-            if std::str::from_utf8(bytes).is_err() {
-                return Err(CoveError::BadSection(
-                    "Utf8 tag payload must be valid UTF-8".into(),
-                ));
-            }
-        }
-        ValueTag::Json => {
-            if serde_json::from_slice::<serde_json::Value>(bytes).is_err() {
-                return Err(CoveError::BadSection(
-                    "Json tag payload must be syntactically valid JSON".into(),
-                ));
-            }
-        }
-        ValueTag::Binary | ValueTag::List | ValueTag::Struct | ValueTag::Map => {}
-    }
-    Ok(())
+    canonical::validate_canonical_payload(value_tag, bytes)
 }
 #[cfg(test)]
 mod tests {
@@ -841,14 +795,45 @@ mod tests {
             flags: 0,
             index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
             value_hash_algorithm: 0,
-            payload_length: 3,
+            payload_length: 4,
             reserved: [0; 24],
         };
         let mut index = header.serialize().to_vec();
         index.extend_from_slice(&entry.serialize());
         assert!(matches!(
-            FileDictionary::parse(&index, b"{x}"),
+            FileDictionary::parse(&index, &[3, b'{', b'x', b'}']),
             Err(CoveError::BadSection(_))
         ));
+    }
+
+    #[test]
+    fn canonical_date_days_payload_uses_4_bytes() {
+        let entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::DateDays as u16,
+            storage_class: StorageClass::Inline as u8,
+            flags: 0,
+            inline_len: 4,
+            reserved0: [0; 3],
+            inline_data: {
+                let mut inline = [0u8; 16];
+                inline[..4].copy_from_slice(&12i32.to_le_bytes());
+                inline
+            },
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let header = FileDictionaryHeaderV1 {
+            entry_count: 1,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        };
+        let mut index = header.serialize().to_vec();
+        index.extend_from_slice(&entry.serialize());
+        FileDictionary::parse(&index, &[]).unwrap();
     }
 }

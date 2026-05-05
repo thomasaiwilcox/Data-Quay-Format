@@ -1,0 +1,22 @@
+{
+  "columns": [
+    {
+      "column_id": 13,
+      "lookup": {
+        "fail_open": true,
+        "keys": [
+          10
+        ]
+      }
+    }
+  ],
+  "expect_evidence": [
+    "FallbackToScan"
+  ],
+  "expect_outcome": "unknown",
+  "predicate": {
+    "column_id": 13,
+    "key": 10,
+    "op": "lookup_point"
+  }
+}

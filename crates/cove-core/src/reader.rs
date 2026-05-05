@@ -1,13 +1,13 @@
 //! Cove Format (COVE) v1.0 — reference reader and structural validator.
 
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 use crate::{
     checksum,
     collation::CollationRegistry,
     compression,
     constants::{
-        PrimaryProfile, SectionKind, FEATURE_ARCHIVE_PROFILE, FEATURE_CODEC_LZ4,
+        PrimaryProfile, SectionKind, StorageClass, FEATURE_ARCHIVE_PROFILE, FEATURE_CODEC_LZ4,
         FEATURE_CODEC_ZSTD, FEATURE_ENGINE_PROFILE, FEATURE_EXTENSION_REGISTRY,
         FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
         FEATURE_TABLE_PROFILE, MAGIC_COVE,
@@ -32,12 +32,16 @@ use crate::{
             ExecutionCodeDescriptorV1, ExecutionScopeDescriptorV1,
         },
         cove_h::HarborMountHintsV1,
-        cove_o::{ObjectTypeCatalog, TemporalSegmentIndex},
+        cove_o::{
+            validate_self_contained, ObjectTypeCatalog, TemporalBloomIndex, TemporalSegmentData,
+            TemporalSegmentIndex, TrustManifest,
+        },
     },
     redaction::RedactionManifest,
     registry,
-    segment::TableSegmentIndex,
+    segment::{TableSegmentIndex, TableSegmentPayloadV1},
     table::TableCatalog,
+    zone_stats::ZoneStatsSection,
     CoveError,
 };
 
@@ -337,6 +341,9 @@ fn validate_shared_semantics(
 ) -> Result<(), CoveError> {
     let footer = &validated.footer;
     let mut checked = 0u32;
+    let mut parsed_dict: Option<FileDictionary> = None;
+    let mut dict_section_id: Option<u32> = None;
+    let mut redaction_manifest_refs = BTreeSet::new();
 
     let has_dict_feature = validated.header.required_features & FEATURE_FILE_DICTIONARY != 0;
     if has_dict_feature {
@@ -363,6 +370,8 @@ fn validate_shared_semantics(
                 };
                 let dict = FileDictionary::parse(&index_bytes, &payload_bytes)?;
                 *dict_entry_count = Some(dict.len());
+                dict_section_id = Some(idx_entry.section_id);
+                parsed_dict = Some(dict);
                 checked += 1 + u32::from(payload_entry.is_some());
             }
         }
@@ -409,7 +418,13 @@ fn validate_shared_semantics(
                 checked += 1;
             }
             SectionKind::RedactionManifest => {
-                RedactionManifest::parse(&payload)?;
+                let manifest = RedactionManifest::parse(&payload)?;
+                redaction_manifest_refs.extend(
+                    manifest
+                        .entries
+                        .iter()
+                        .map(|entry| (entry.section_id, entry.local_ref)),
+                );
                 checked += 1;
             }
             SectionKind::LakehouseHints => {
@@ -452,12 +467,71 @@ fn validate_shared_semantics(
         }
     }
 
+    validate_redaction_manifest_links(
+        parsed_dict.as_ref(),
+        dict_section_id,
+        &redaction_manifest_refs,
+    )?;
+
     push_stage(
         stages,
         ValidationStage::SharedSemantic,
         ValidationStageStatus::Checked,
         checked,
     );
+    Ok(())
+}
+
+fn validate_redaction_manifest_links(
+    dict: Option<&FileDictionary>,
+    dict_section_id: Option<u32>,
+    manifest_refs: &BTreeSet<(u32, u64)>,
+) -> Result<(), CoveError> {
+    let (Some(dict), Some(dict_section_id)) = (dict, dict_section_id) else {
+        return Ok(());
+    };
+
+    let redacted_codes = dict
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(file_code, entry)| {
+            matches!(
+                StorageClass::from_u8(entry.storage_class),
+                Some(StorageClass::Redacted)
+            )
+            .then_some(file_code as u64)
+        })
+        .collect::<BTreeSet<_>>();
+
+    for file_code in &redacted_codes {
+        if !manifest_refs.contains(&(dict_section_id, *file_code)) {
+            return Err(CoveError::BadSchema(format!(
+                "redacted FileCode {file_code} is missing a redaction manifest entry"
+            )));
+        }
+    }
+
+    for (_, file_code) in manifest_refs
+        .iter()
+        .filter(|(section_id, _)| *section_id == dict_section_id)
+    {
+        let file_code_index = usize::try_from(*file_code).map_err(|_| CoveError::ArithOverflow)?;
+        let Some(entry) = dict.entries.get(file_code_index) else {
+            return Err(CoveError::BadSchema(format!(
+                "redaction manifest references out-of-range FileCode {file_code}"
+            )));
+        };
+        if !matches!(
+            StorageClass::from_u8(entry.storage_class),
+            Some(StorageClass::Redacted)
+        ) {
+            return Err(CoveError::BadSchema(format!(
+                "redaction manifest references non-redacted FileCode {file_code}"
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -478,6 +552,10 @@ fn validate_cove_t_semantics(
             }
             SectionKind::TableSegmentIndex => {
                 TableSegmentIndex::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::TableSegmentData => {
+                TableSegmentPayloadV1::parse(&payload)?;
                 checked += 1;
             }
             SectionKind::ColumnDomain => {
@@ -512,6 +590,10 @@ fn validate_cove_t_semantics(
                 TopNSummary::parse(&payload)?;
                 checked += 1;
             }
+            SectionKind::ZoneStats => {
+                ZoneStatsSection::parse(&payload)?;
+                checked += 1;
+            }
             SectionKind::FileDictionaryIndex
             | SectionKind::FileDictionaryPayload
             | SectionKind::CollationRegistry
@@ -521,8 +603,6 @@ fn validate_cove_t_semantics(
             | SectionKind::LakehouseHints
             | SectionKind::ExtensionRegistry
             | SectionKind::ProfileCapabilityMatrix
-            | SectionKind::TableSegmentData
-            | SectionKind::ZoneStats
             | SectionKind::KernelCapabilities
             | SectionKind::EngineProfileRegistry
             | SectionKind::ExecutionCodeDescriptor
@@ -553,6 +633,8 @@ fn validate_cove_o_semantics(
     stages: &mut Vec<ValidationStageReport>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
+    let mut temporal_segments = Vec::new();
+    let mut trust_manifests = Vec::new();
     for entry in &validated.footer.sections {
         let kind = SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
             CoveError::BadSection(format!("unknown section_kind {}", entry.section_kind))
@@ -566,9 +648,22 @@ fn validate_cove_o_semantics(
                 let payload = compression::section_payload(data, entry)?;
                 TemporalSegmentIndex::parse(&payload).map(|_| ())
             }
-            SectionKind::TemporalSegmentData
-            | SectionKind::TemporalBloomIndex
-            | SectionKind::TrustManifest => Ok(()),
+            SectionKind::TemporalSegmentData => {
+                let payload = compression::section_payload(data, entry)?;
+                TemporalSegmentData::parse(&payload).map(|segment| {
+                    temporal_segments.push(segment);
+                })
+            }
+            SectionKind::TemporalBloomIndex => {
+                let payload = compression::section_payload(data, entry)?;
+                TemporalBloomIndex::parse(&payload).map(|_| ())
+            }
+            SectionKind::TrustManifest => {
+                let payload = compression::section_payload(data, entry)?;
+                TrustManifest::parse(&payload).map(|manifest| {
+                    trust_manifests.push(manifest);
+                })
+            }
             _ => continue,
         };
         checked += 1;
@@ -577,6 +672,27 @@ fn validate_cove_o_semantics(
                 return Err(err);
             }
         }
+    }
+    let file_local_record_ids = temporal_segments
+        .iter()
+        .flat_map(|segment| {
+            (0..segment.rows.len())
+                .map(move |row_index| ((segment.header.segment_id as u64) << 32) | row_index as u64)
+        })
+        .collect::<Vec<_>>();
+    let file_prev_refs = temporal_segments
+        .iter()
+        .flat_map(|segment| {
+            segment.rows.iter().map(|row| {
+                row.prev_ref.map(|prev_ref| {
+                    ((prev_ref.segment_id as u64) << 32) | prev_ref.row_index as u64
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    validate_self_contained(&file_prev_refs, &file_local_record_ids)?;
+    for manifest in trust_manifests {
+        manifest.verify_against(&temporal_segments)?;
     }
     push_stage(
         stages,
@@ -593,6 +709,11 @@ fn validate_cove_e_semantics(
     stages: &mut Vec<ValidationStageReport>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
+    let mut registries = Vec::new();
+    let mut execution_descriptors = Vec::new();
+    let mut scope_descriptors = Vec::new();
+    let mut code_space_descriptors = Vec::new();
+    let mut mount_policies = Vec::new();
     for entry in &validated.footer.sections {
         let kind = SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
             CoveError::BadSection(format!("unknown section_kind {}", entry.section_kind))
@@ -600,23 +721,33 @@ fn validate_cove_e_semantics(
         let result = match kind {
             SectionKind::EngineProfileRegistry => {
                 let payload = compression::section_payload(data, entry)?;
-                EngineProfileRegistry::parse(&payload).map(|_| ())
+                EngineProfileRegistry::parse(&payload).map(|registry| {
+                    registries.push(registry);
+                })
             }
             SectionKind::ExecutionCodeDescriptor => {
                 let payload = compression::section_payload(data, entry)?;
-                ExecutionCodeDescriptorV1::parse(&payload).map(|_| ())
+                ExecutionCodeDescriptorV1::parse(&payload).map(|descriptor| {
+                    execution_descriptors.push(descriptor);
+                })
             }
             SectionKind::ExecutionScopeDescriptor => {
                 let payload = compression::section_payload(data, entry)?;
-                ExecutionScopeDescriptorV1::parse(&payload).map(|_| ())
+                ExecutionScopeDescriptorV1::parse(&payload).map(|descriptor| {
+                    scope_descriptors.push(descriptor);
+                })
             }
             SectionKind::CodeSpaceDescriptor => {
                 let payload = compression::section_payload(data, entry)?;
-                CodeSpaceDescriptorV1::parse(&payload).map(|_| ())
+                CodeSpaceDescriptorV1::parse(&payload).map(|descriptor| {
+                    code_space_descriptors.push(descriptor);
+                })
             }
             SectionKind::EngineMountPolicy => {
                 let payload = compression::section_payload(data, entry)?;
-                EngineMountPolicyV1::parse(&payload).map(|_| ())
+                EngineMountPolicyV1::parse(&payload).map(|policy| {
+                    mount_policies.push(policy);
+                })
             }
             _ => continue,
         };
@@ -627,12 +758,97 @@ fn validate_cove_e_semantics(
             }
         }
     }
+    if let Err(err) = validate_cove_e_cross_references(
+        &registries,
+        &execution_descriptors,
+        &scope_descriptors,
+        &code_space_descriptors,
+        &mount_policies,
+    ) {
+        let engine_required = validated.header.required_features & FEATURE_ENGINE_PROFILE != 0
+            || validated
+                .footer
+                .sections
+                .iter()
+                .any(|entry| entry.required_features & FEATURE_ENGINE_PROFILE != 0);
+        if engine_required {
+            return Err(err);
+        }
+    }
     push_stage(
         stages,
         ValidationStage::CoveEngine,
         ValidationStageStatus::Checked,
         checked,
     );
+    Ok(())
+}
+
+fn validate_cove_e_cross_references(
+    registries: &[EngineProfileRegistry],
+    execution_descriptors: &[ExecutionCodeDescriptorV1],
+    scope_descriptors: &[ExecutionScopeDescriptorV1],
+    code_space_descriptors: &[CodeSpaceDescriptorV1],
+    mount_policies: &[EngineMountPolicyV1],
+) -> Result<(), CoveError> {
+    use std::collections::HashSet;
+
+    let mut execution_ids = HashSet::new();
+    for descriptor in execution_descriptors {
+        if !execution_ids.insert(descriptor.descriptor_id) {
+            return Err(CoveError::BadEngineProfile);
+        }
+    }
+
+    let mut scope_ids = HashSet::new();
+    for descriptor in scope_descriptors {
+        if !scope_ids.insert(descriptor.scope_id) {
+            return Err(CoveError::BadEngineProfile);
+        }
+    }
+
+    let mut code_space_ids = HashSet::new();
+    for descriptor in code_space_descriptors {
+        if !code_space_ids.insert(descriptor.code_space_id) {
+            return Err(CoveError::BadEngineProfile);
+        }
+    }
+
+    let mut policy_ids = HashSet::new();
+    for policy in mount_policies {
+        if !policy_ids.insert(policy.policy_id) {
+            return Err(CoveError::BadEngineProfile);
+        }
+    }
+
+    for registry in registries {
+        for profile in &registry.profiles {
+            if profile.execution_descriptor_ref != 0
+                && !execution_ids.contains(&profile.execution_descriptor_ref)
+            {
+                return Err(CoveError::BadEngineProfile);
+            }
+            if profile.mount_policy_ref != 0 && !policy_ids.contains(&profile.mount_policy_ref) {
+                return Err(CoveError::BadEngineProfile);
+            }
+        }
+    }
+
+    for descriptor in execution_descriptors {
+        if descriptor.scope_ref != 0 && !scope_ids.contains(&descriptor.scope_ref) {
+            return Err(CoveError::BadEngineProfile);
+        }
+        if descriptor.code_space_ref != 0 && !code_space_ids.contains(&descriptor.code_space_ref) {
+            return Err(CoveError::BadEngineProfile);
+        }
+    }
+
+    for policy in mount_policies {
+        if policy.code_space_ref != 0 && !code_space_ids.contains(&policy.code_space_ref) {
+            return Err(CoveError::BadEngineProfile);
+        }
+    }
+
     Ok(())
 }
 
@@ -1750,6 +1966,229 @@ mod tests {
                 .unwrap()
                 .sections_checked,
             1
+        );
+    }
+
+    fn valid_engine_profile_registry_payload(
+        execution_descriptor_ref: u32,
+        mount_policy_ref: u32,
+    ) -> Vec<u8> {
+        crate::profile::cove_e::EngineProfileRegistry {
+            flags: 0,
+            profiles: vec![crate::profile::cove_e::EngineProfileEntryV1 {
+                profile_id: 1,
+                namespace: "org.example".into(),
+                profile_name: "engine-dictionary-code".into(),
+                version_major: 1,
+                version_minor: 0,
+                required_features: 0,
+                optional_features: 0,
+                execution_descriptor_ref,
+                mount_policy_ref,
+                private_payload_ref: 0,
+                checksum: 0,
+            }],
+        }
+        .serialize()
+        .unwrap()
+    }
+
+    fn valid_code_space_descriptor_payload(code_space_id: u32) -> Vec<u8> {
+        crate::profile::cove_e::CodeSpaceDescriptorV1 {
+            code_space_id,
+            namespace: "org.example.engine".into(),
+            stable_id: b"space-1".to_vec(),
+            epoch: 7,
+            flags: 0,
+            private_payload_ref: 0,
+        }
+        .serialize()
+        .unwrap()
+    }
+
+    fn valid_execution_descriptor_payload_with_refs(
+        descriptor_id: u32,
+        scope_ref: u32,
+        code_space_ref: u32,
+    ) -> Vec<u8> {
+        crate::profile::cove_e::ExecutionCodeDescriptorV1 {
+            descriptor_id,
+            code_kind: crate::profile::cove_e::ExecutionCodeKind::DictionaryKey,
+            code_width_bits: 32,
+            byte_order: 0,
+            lifetime: crate::profile::cove_e::ExecutionCodeLifetime::Scan,
+            comparison_scope: crate::profile::cove_e::ExecutionCodeComparisonScope::File,
+            canonicality: crate::profile::cove_e::ExecutionCodeCanonicality::Transient,
+            null_code_policy: crate::profile::cove_e::NullCodePolicy::NullBitmapOnly,
+            flags: 0,
+            scope_ref,
+            code_space_ref,
+            checksum: 0,
+        }
+        .serialize()
+        .to_vec()
+    }
+
+    fn valid_mount_policy_payload_with_refs(policy_id: u32, code_space_ref: u32) -> Vec<u8> {
+        crate::profile::cove_e::EngineMountPolicyV1 {
+            policy_id,
+            filecode_mapping_kind: crate::profile::cove_e::FileCodeMappingKind::MapToExecutionCode,
+            missing_value_policy: crate::profile::cove_e::MissingValuePolicy::DecodeValueOnly,
+            stale_mapping_policy: crate::profile::cove_e::StaleMappingPolicy::IgnoreIfOptional,
+            reverse_lookup_policy: crate::profile::cove_e::ReverseLookupPolicy::BuildFromDictionary,
+            flags: 0,
+            dictionary_digest_ref: 0,
+            code_space_ref,
+            cache_key_ref: 0,
+            private_payload_ref: 0,
+            checksum: 0,
+        }
+        .serialize()
+        .to_vec()
+    }
+
+    #[test]
+    fn semantic_validation_rejects_required_cove_e_missing_scope_reference() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.required_features = FEATURE_ENGINE_PROFILE;
+        writer.sections.extend([
+            SectionPayload {
+                section_kind: SectionKind::EngineProfileRegistry as u16,
+                profile: 4,
+                flags: 0,
+                item_count: 1,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: FEATURE_ENGINE_PROFILE,
+                optional_features: 0,
+                data: valid_engine_profile_registry_payload(11, 21),
+            },
+            SectionPayload {
+                section_kind: SectionKind::ExecutionCodeDescriptor as u16,
+                profile: 4,
+                flags: 0,
+                item_count: 1,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: FEATURE_ENGINE_PROFILE,
+                optional_features: 0,
+                data: valid_execution_descriptor_payload_with_refs(11, 31, 41),
+            },
+            SectionPayload {
+                section_kind: SectionKind::CodeSpaceDescriptor as u16,
+                profile: 4,
+                flags: 0,
+                item_count: 1,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: FEATURE_ENGINE_PROFILE,
+                optional_features: 0,
+                data: valid_code_space_descriptor_payload(41),
+            },
+            SectionPayload {
+                section_kind: SectionKind::EngineMountPolicy as u16,
+                profile: 4,
+                flags: 0,
+                item_count: 1,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: FEATURE_ENGINE_PROFILE,
+                optional_features: 0,
+                data: valid_mount_policy_payload_with_refs(21, 41),
+            },
+        ]);
+        assert_eq!(
+            validate_bytes_with_options(
+                &writer.write(),
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                },
+            )
+            .unwrap_err(),
+            CoveError::BadEngineProfile
+        );
+    }
+
+    #[test]
+    fn semantic_validation_ignores_optional_cove_e_missing_scope_reference() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.required_features = 0;
+        writer.optional_features = FEATURE_ENGINE_PROFILE;
+        writer.sections.extend([
+            SectionPayload {
+                section_kind: SectionKind::EngineProfileRegistry as u16,
+                profile: 4,
+                flags: 0,
+                item_count: 1,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: FEATURE_ENGINE_PROFILE,
+                data: valid_engine_profile_registry_payload(11, 21),
+            },
+            SectionPayload {
+                section_kind: SectionKind::ExecutionCodeDescriptor as u16,
+                profile: 4,
+                flags: 0,
+                item_count: 1,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: FEATURE_ENGINE_PROFILE,
+                data: valid_execution_descriptor_payload_with_refs(11, 31, 41),
+            },
+            SectionPayload {
+                section_kind: SectionKind::CodeSpaceDescriptor as u16,
+                profile: 4,
+                flags: 0,
+                item_count: 1,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: FEATURE_ENGINE_PROFILE,
+                data: valid_code_space_descriptor_payload(41),
+            },
+            SectionPayload {
+                section_kind: SectionKind::EngineMountPolicy as u16,
+                profile: 4,
+                flags: 0,
+                item_count: 1,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: FEATURE_ENGINE_PROFILE,
+                data: valid_mount_policy_payload_with_refs(21, 41),
+            },
+        ]);
+        let report = validate_bytes_with_options(
+            &writer.write(),
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            report
+                .stages
+                .iter()
+                .find(|s| s.stage == ValidationStage::CoveEngine)
+                .unwrap()
+                .sections_checked,
+            4
         );
     }
 

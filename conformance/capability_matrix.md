@@ -7,52 +7,55 @@ Evidence key: `yes` = implemented and exercised, `partial` = incomplete, `helper
 | Spec | Capability | Modeled | Parsed | Validated | Written | Corpus | Notes |
 |------|------------|---------|--------|-----------|---------|--------|-------|
 | §9 | COVE header | yes | yes | yes | yes | yes | header.rs; accept/reject bootstrap fixtures |
-| §10 | Wire primitives | yes | yes | yes | yes | partial | wire.rs, checksum.rs; fixture coverage is bootstrap-focused |
+| §10 | Wire primitives | yes | yes | yes | yes | yes | wire.rs, checksum.rs; bootstrap fixtures plus `wire_primitive_case` corpus covering varint LEB128 boundary round-trips, malformed/overflow rejection, ZigZag i64 boundaries, and strict bool accept/reject |
 | §13 | Postscript + footer | yes | yes | yes | yes | yes | postscript.rs, footer.rs |
 | §15 | Metadata JSON | yes | yes | yes | yes | yes | metadata.rs; accept/reject JSON corpus |
-| §16 | File dictionary | yes | yes | partial | partial | no | dictionary.rs; semantic dictionary parsing exists |
-| §17 | Canonical value encoding | yes | n/a | unit | n/a | no | canonical.rs |
-| §20 | Encoding cascades | yes | partial | unit | no | no | encoding/* helpers; deterministic parity harness; writer integration pending |
-| §21 | Kernel capability declarations | yes | yes | yes | no | yes | kernel.rs; accept/reject corpus |
-| §22 | Collations | yes | yes | yes | no | yes | collation.rs; accept/reject registry corpus |
-| §23 | ColumnDomain | yes | yes | yes | helper | yes | domain.rs; accept/reject corpus plus cove-validate negative integration |
+| §16 | File dictionary | yes | yes | yes | yes | yes | dictionary.rs; standalone dictionary corpus plus semantic reader integration; header serializer round-trips with parser |
+| §17 | Canonical value encoding | yes | yes | yes | yes | yes | canonical.rs `validate_canonical_payload` is a structural parser that consumes encoded payloads, paired with `CanonicalValue::encode` and the recursive `canonicalize_*` helpers; round-trip exercised by spec_17 unit tests and the dictionary corpus |
+| §20 | Encoding cascades | yes | yes | yes | yes | yes | encoding_case corpus covers constant, LocalCodebook (BitPacked/RLE child cascades), RLE, run-end, plain, bit-packed, delta, FoR, patched-base, and sparse; `ScanProfileCoveWriter` emits compressed page payloads through `encode_page_payload`, exercised by writer tests plus `accept/cove_t_local_codebook_lz4.cove` |
+| §21 | Kernel capability declarations | yes | yes | yes | yes | yes | kernel.rs; accept/reject corpus; `KernelCapabilities::serialize` round-trips with the parser |
+| §22 | Collations | yes | yes | yes | yes | yes | collation.rs; accept/reject registry corpus; `CollationRegistry::serialize` round-trips with parser |
+| §23 | ColumnDomain | yes | yes | yes | yes | yes | domain.rs; accept/reject corpus plus cove-validate negative integration; `ColumnDomain::serialize` round-trips with parser |
 | §24 | Table catalog | yes | yes | yes | yes | yes | table.rs; ScanProfileCoveWriter emits it; accept/reject corpus |
 | §25 | Segment index/header | yes | yes | yes | yes | yes | segment.rs; ScanProfileCoveWriter emits index and data header; corpus covered |
 | §26 | Morsel directory | yes | yes | yes | yes | yes | segment.rs; ScanProfileCoveWriter emits row morsels; corpus covered |
-| §27 | Page entry + CRC | yes | yes | unit | no | yes | page.rs; accept/reject page-index corpus; scan writer page payload integration pending |
-| §28 | Zone statistics | yes | no | unit | no | no | zone_stats.rs helper-level validation |
-| §29 | Predicate truth tables | yes | n/a | unit | n/a | no | predicate.rs |
-| §30 | Exact-set index | yes | yes | yes | no | yes | index/exact_set.rs; accept/reject corpus |
-| §31 | Bloom-filter index | yes | yes | yes | no | yes | index/bloom.rs; accept/reject corpus |
-| §32 | Inverted morsel index | yes | yes | yes | no | yes | index/inverted.rs; accept/reject corpus |
-| §33 | Lookup index (RowRef) | yes | yes | yes | no | yes | index/lookup.rs; accept/reject corpus |
-| §34 | Aggregate synopsis | yes | yes | yes | no | yes | index/aggregate.rs; accept/reject corpus |
-| §35 | Composite zone index | yes | yes | yes | no | yes | index/composite.rs; accept/reject corpus |
-| §36 | Top-N summary | yes | yes | yes | no | yes | index/topn.rs; accept/reject corpus |
-| §37 | Pruning evidence + explain | yes | n/a | unit | n/a | no | pruning.rs |
-| §40 | ExecutionCode descriptors | yes | yes | yes | helper | yes | profile/cove_e.rs; descriptor/registry/policy plus required/optional corpus |
-| §44 | Harbor mount hints | yes | yes | yes | helper | yes | profile/cove_h.rs; mount-hints plus required/optional corpus |
-| §49 | Arrow null↔validity inversion | yes | n/a | unit | n/a | no | interop/arrow.rs |
-| §50 | Lakehouse hints | yes | yes | yes | no | yes | interop/lakehouse.rs; accept/reject corpus |
-| §51 | Parquet conversion | plan | no | no | no | no | interop/parquet.rs is design scaffolding only |
-| §52 | Nested layouts | yes | partial | unit | no | no | encoding/nested.rs |
-| §53 | Sort + clustering keys | yes | yes | yes | helper | yes | sort.rs fixed-size §53 entries; accept/reject corpus |
-| §54 | RowRef | yes | yes | unit | yes | partial | row_ref.rs; exercised through lookup-index corpus |
-| §56 | COVE-O object type catalog | yes | yes | yes | helper | yes | profile/cove_o.rs; accept/reject catalog plus required/optional corpus |
-| §57 | COVE-O temporal segment index | yes | yes | yes | helper | yes | profile/cove_o.rs; accept/reject temporal-index corpus |
-| §58 | COVE-O lex row order | yes | helper | unit | n/a | no | profile/cove_o.rs helper; temporal data parser pending |
-| §60 | COVE-O self-containment | yes | helper | unit | n/a | no | profile/cove_o.rs helper; prev_ref wire integration pending |
-| §63 | Trust chain | yes | no | unit | no | no | trust_chain.rs helper; TrustManifest reader integration pending |
-| §64 | Redaction manifest | yes | yes | yes | no | yes | redaction.rs; accept/reject corpus |
-| §65 | Digest manifest | yes | yes | yes | no | yes | digest.rs; accept/reject manifest corpus plus --verify-digests coverage |
-| §66 | Compression | yes | yes | yes | partial | no | compression.rs feature-gated; writer emits uncompressed |
-| §67 | I/O hints | yes | helper | unit | no | yes | io_hints.rs; accept/reject corpus |
-| §68 | COVX sidecar | yes | yes | yes | helper | yes | artifact/covx.rs; accept/reject artifact corpus |
-| §69 | COVM manifest | yes | yes | yes | helper | yes | artifact/covm.rs; accept/reject manifest corpus |
-| §71 | Writer profiles | yes | n/a | yes | partial | partial | Minimal writer plus ScanProfileCoveWriter; generated COVE-T fixture; page payload writer pending |
-| §72 | Validation model | yes | n/a | partial | n/a | yes | reader stages + cove-validate; required/optional profile corpus; COVE-O temporal data invariants pending |
-| §74 | Durable replace | yes | n/a | unit | yes | no | durable.rs |
-| §75 | Error-code surface | yes | n/a | unit | n/a | partial | error.rs; bootstrap reject fixtures |
-| §78 | Conformance/benchmark suite | yes | n/a | partial | partial | partial | 78-fixture cove-conformance corpus, cove-bench smoke, and deterministic robustness harness |
+| §27 | Page entry + CRC | yes | yes | yes | yes | yes | page.rs plus segment.rs; standalone page-index corpus and ScanProfileCoveWriter emit validated page-index/data regions |
+| §28 | Zone statistics | yes | yes | yes | yes | yes | zone_stats.rs parser plus semantic reader integration; full-file accept/reject corpus and CLI coverage; `ZoneStatsEntry::serialize` / `ZoneStatsSection::serialize` round-trip with the parser |
+| §29 | Predicate truth tables | yes | n/a | yes | n/a | yes | predicate.rs plus pruning_case corpus for AND/OR/NOT outcome composition |
+| §30 | Exact-set index | yes | yes | yes | yes | yes | index/exact_set.rs; accept/reject corpus; `ExactSetIndex::serialize` round-trips with parser |
+| §31 | Bloom-filter index | yes | yes | yes | yes | yes | index/bloom.rs; accept/reject corpus plus pruning_case bloom_membership accept and fail-open fixtures; `BloomFilterIndex::serialize` round-trips with parser |
+| §32 | Inverted morsel index | yes | yes | yes | yes | yes | index/inverted.rs; accept/reject corpus plus pruning_case inverted_lookup accept and fail-open fixtures; `InvertedMorselIndex::serialize` round-trips with parser |
+| §33 | Lookup index (RowRef) | yes | yes | yes | yes | yes | index/lookup.rs; accept/reject corpus plus pruning_case lookup_point accept and fail-open fixtures; `LookupIndex::serialize` round-trips with parser |
+| §34 | Aggregate synopsis | yes | yes | yes | yes | yes | index/aggregate.rs; accept/reject corpus plus pruning_case aggregate_synopsis accept and fail-open fixtures; `AggregateSynopsis::serialize` round-trips with parser |
+| §35 | Composite zone index | yes | yes | yes | yes | yes | index/composite.rs; accept/reject corpus plus pruning_case composite_zone accept and fail-open fixtures; `CompositeIndex::serialize` round-trips with parser |
+| §36 | Top-N summary | yes | yes | yes | yes | yes | index/topn.rs; accept/reject corpus; `TopNSummary::serialize` round-trips with parser |
+| §37 | Pruning evidence + explain | yes | n/a | yes | n/a | yes | pruning.rs leaf proofs for null, FileCode equality, FileCode domain-range, typed NumCode range, bloom membership, inverted/lookup point, aggregate synopsis, and composite zone with §73 fail-open fallback evidence and §37.5 AND/OR reorder-invariance proofs backed by pruning_case corpus |
+| §40 | ExecutionCode descriptors | yes | yes | yes | yes | yes | profile/cove_e.rs plus reader.rs; descriptor/registry/scope/code-space/policy and required/optional full-file corpus; `ExecutionCodeDescriptorV1::serialize` round-trips with parser |
+| §41 | Execution scope descriptors | yes | yes | yes | yes | yes | profile/cove_e.rs plus reader.rs; standalone and integrated full-file scope descriptor corpus; `ExecutionScopeDescriptorV1::serialize` round-trips with parser |
+| §42 | Code-space descriptors | yes | yes | yes | yes | yes | profile/cove_e.rs plus reader.rs; standalone and integrated full-file code-space corpus; `CodeSpaceDescriptorV1::serialize` round-trips with parser |
+| §43 | Engine mount policy | yes | yes | yes | yes | yes | profile/cove_e.rs plus reader.rs; mount-policy plus required/optional full-file bundle corpus; `EngineMountPolicyV1::serialize` round-trips with parser |
+| §44 | Harbor mount hints | yes | yes | yes | yes | yes | profile/cove_h.rs; mount-hints plus required/optional corpus; `HarborMountHintsV1::serialize` round-trips with parser |
+| §49 | Arrow null↔validity inversion | yes | n/a | yes | n/a | yes | interop/arrow.rs plus arrow_bitmap_case accept/reject corpus |
+| §50 | Lakehouse hints | yes | yes | yes | yes | yes | interop/lakehouse.rs; accept/reject corpus; `LakehouseHints::serialize` round-trips with parser |
+| §51 | Parquet conversion | yes | yes | yes | yes | yes | interop/parquet.rs now converts primitive/temporal/utf8/binary parquet batches into COVE-T scan-profile files with machine-readable reports; parquet_conversion_case corpus covers accept plus null/nested reject cases |
+| §52 | Nested layouts | yes | yes | yes | yes | yes | encoding/nested.rs payload parsers plus ScanProfileCoveWriter explicit nested page specs, semantic TableSegmentData validation, nested_case JSON fixtures, and accept/reject nested .cove files for list/struct/map invariants |
+| §53 | Sort + clustering keys | yes | yes | yes | yes | yes | sort.rs fixed-size §53 entries; accept/reject corpus; `SortKey::serialize` round-trips with parser |
+| §54 | RowRef | yes | yes | yes | yes | yes | row_ref.rs; standalone accept/reject corpus plus lookup-index integration |
+| §56 | COVE-O object type catalog | yes | yes | yes | yes | yes | profile/cove_o.rs; accept/reject catalog plus required/optional corpus; ObjectTypeCatalog serializer round-trips with parser |
+| §57 | COVE-O temporal segment index | yes | yes | yes | yes | yes | profile/cove_o.rs; accept/reject temporal-index corpus; TemporalSegmentIndex serializer round-trips with parser |
+| §58 | COVE-O lex row order | yes | yes | yes | yes | yes | profile/cove_o.rs temporal segment parser plus semantic reader integration; full-file accept/reject corpus; segment serializer enforces lex order on round-trip |
+| §60 | COVE-O self-containment | yes | yes | yes | yes | yes | profile/cove_o.rs prev_ref parsing plus semantic reader integration; full-file accept/reject corpus; segment serializer enforces prev_ref on round-trip |
+| §63 | Trust chain | yes | yes | yes | yes | yes | TrustManifest parser plus trust_chain.rs reader integration; full-file accept/reject corpus; `TrustManifest::serialize` round-trips with parser |
+| §64 | Redaction manifest | yes | yes | yes | yes | yes | redaction.rs; accept/reject corpus; `RedactionManifest::serialize` round-trips with parser |
+| §65 | Digest manifest | yes | yes | yes | yes | yes | digest.rs; accept/reject manifest corpus plus --verify-digests coverage; `DigestManifest::serialize` round-trips with parser |
+| §66 | Compression | yes | yes | yes | yes | yes | compression.rs plus writer.rs and page.rs; section LZ4/Zstd payloads, page-level codec dispatch with codec/length/reserved-bit invariants, and `page_codec_case` round-trip plus rejection corpus |
+| §67 | I/O hints | yes | yes | yes | yes | yes | io_hints.rs; accept/reject corpus; `IoHints::encode` round-trips with parser |
+| §68 | COVX sidecar | yes | yes | yes | yes | yes | artifact/covx.rs; accept/reject artifact corpus; `CovxFile::serialize` round-trips with parser |
+| §69 | COVM manifest | yes | yes | yes | yes | yes | artifact/covm.rs; accept/reject manifest corpus; `CovmFile::serialize` round-trips with parser |
+| §71 | Writer profiles | yes | n/a | yes | yes | yes | Minimal writer plus ScanProfileCoveWriter; generated COVE-T scan fixture now includes column/page regions |
+| §72 | Validation model | yes | n/a | yes | n/a | yes | reader stages + cove-validate; required/optional profile corpus; shared, COVE-T, and COVE-O semantic invariants exercised end to end |
+| §74 | Durable replace | yes | n/a | yes | yes | yes | durable.rs plus writer.rs; tempdir failure-injection coverage and writer-facing publish API |
+| §75 | Error-code surface | yes | n/a | yes | n/a | yes | error.rs spec_code()/ALL_SPEC_CODES, cove-validate JSON output, and generated reject fixtures including error_surface_case coverage |
+| §78 | Conformance/benchmark suite | yes | n/a | yes | yes | yes | suite_contract_case corpus, CLI smoke tests, release-gate bench smoke, and deterministic robustness harness |
 
-**Fully gated capabilities:** 6 / 48
+**Fully gated capabilities:** 51 / 51

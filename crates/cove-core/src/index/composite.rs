@@ -122,6 +122,22 @@ impl CompositeIndex {
             entries: entries.to_vec(),
         })
     }
+
+    /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut header = self.header.clone();
+        header.key_column_count = self.key_columns.len() as u16;
+        header.key_columns_offset = COMPOSITE_ZONE_INDEX_HEADER_LEN as u64;
+        header.entries_offset =
+            (COMPOSITE_ZONE_INDEX_HEADER_LEN + self.key_columns.len() * 4) as u64;
+        header.entries_length = self.entries.len() as u64;
+        let mut out = header.serialize().to_vec();
+        for column in &self.key_columns {
+            out.extend_from_slice(&column.to_le_bytes());
+        }
+        out.extend_from_slice(&self.entries);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -190,5 +206,29 @@ mod tests {
             CompositeIndex::parse(&bytes),
             Err(CoveError::ChecksumMismatch)
         );
+    }
+
+    #[test]
+    fn serialize_round_trip_full_index() {
+        let header = CompositeZoneIndexHeaderV1 {
+            table_id: 1,
+            key_column_count: 2,
+            transform_kind: CompositeTransformKind::Tuple,
+            flags: 0,
+            zone_count: 1,
+            key_columns_offset: COMPOSITE_ZONE_INDEX_HEADER_LEN as u64,
+            entries_offset: (COMPOSITE_ZONE_INDEX_HEADER_LEN + 8) as u64,
+            entries_length: 12,
+            checksum: 0,
+        };
+        let idx = CompositeIndex {
+            header,
+            key_columns: vec![1, 2],
+            entries: vec![0xAB; 12],
+        };
+        let bytes = idx.serialize();
+        let parsed = CompositeIndex::parse(&bytes).unwrap();
+        assert_eq!(parsed.key_columns, vec![1, 2]);
+        assert_eq!(parsed.entries, vec![0xAB; 12]);
     }
 }

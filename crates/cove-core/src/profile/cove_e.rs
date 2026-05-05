@@ -408,6 +408,17 @@ impl ExecutionScopeDescriptorV1 {
             private_payload_ref,
         })
     }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.scope_id.to_le_bytes());
+        out.extend_from_slice(&(self.scope_kind as u16).to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        write_bytes(&mut out, &self.stable_id, "execution scope stable_id")?;
+        write_str(&mut out, &self.display_name, "execution scope display name")?;
+        out.extend_from_slice(&self.private_payload_ref.to_le_bytes());
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,6 +456,17 @@ impl CodeSpaceDescriptorV1 {
             flags,
             private_payload_ref,
         })
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.code_space_id.to_le_bytes());
+        write_str(&mut out, &self.namespace, "code-space namespace")?;
+        write_bytes(&mut out, &self.stable_id, "code-space stable_id")?;
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        out.extend_from_slice(&self.private_payload_ref.to_le_bytes());
+        Ok(out)
     }
 }
 
@@ -637,6 +659,14 @@ fn write_str(out: &mut Vec<u8>, s: &str, what: &str) -> Result<(), CoveError> {
     Ok(())
 }
 
+fn write_bytes(out: &mut Vec<u8>, bytes: &[u8], what: &str) -> Result<(), CoveError> {
+    let len = u16::try_from(bytes.len())
+        .map_err(|_| CoveError::BadSection(format!("{what} exceeds u16::MAX")))?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,6 +752,75 @@ mod tests {
         assert_eq!(
             ExecutionCodeDescriptorV1::parse(&bytes),
             Err(CoveError::BadEngineProfile)
+        );
+    }
+
+    #[test]
+    fn execution_scope_descriptor_roundtrip() {
+        let scope = ExecutionScopeDescriptorV1 {
+            scope_id: 11,
+            scope_kind: ExecutionScopeKind::Catalog,
+            flags: 0,
+            stable_id: b"catalog-123".to_vec(),
+            display_name: "primary catalog".into(),
+            private_payload_ref: 9,
+        };
+        let parsed = ExecutionScopeDescriptorV1::parse(&scope.serialize().unwrap()).unwrap();
+        assert_eq!(parsed, scope);
+    }
+
+    #[test]
+    fn execution_scope_descriptor_rejects_bad_kind() {
+        let mut bytes = ExecutionScopeDescriptorV1 {
+            scope_id: 1,
+            scope_kind: ExecutionScopeKind::Catalog,
+            flags: 0,
+            stable_id: b"catalog-123".to_vec(),
+            display_name: "primary catalog".into(),
+            private_payload_ref: 0,
+        }
+        .serialize()
+        .unwrap();
+        bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
+        assert_eq!(
+            ExecutionScopeDescriptorV1::parse(&bytes),
+            Err(CoveError::BadEngineProfile)
+        );
+    }
+
+    #[test]
+    fn code_space_descriptor_roundtrip() {
+        let space = CodeSpaceDescriptorV1 {
+            code_space_id: 12,
+            namespace: "org.example.engine".into(),
+            stable_id: b"space-abc".to_vec(),
+            epoch: 42,
+            flags: 0,
+            private_payload_ref: 3,
+        };
+        let parsed = CodeSpaceDescriptorV1::parse(&space.serialize().unwrap()).unwrap();
+        assert_eq!(parsed, space);
+    }
+
+    #[test]
+    fn code_space_descriptor_rejects_bad_utf8_namespace() {
+        let mut bytes = CodeSpaceDescriptorV1 {
+            code_space_id: 12,
+            namespace: "org.example.engine".into(),
+            stable_id: b"space-abc".to_vec(),
+            epoch: 42,
+            flags: 0,
+            private_payload_ref: 3,
+        }
+        .serialize()
+        .unwrap();
+        bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+        bytes[6] = 0xff;
+        assert_eq!(
+            CodeSpaceDescriptorV1::parse(&bytes),
+            Err(CoveError::BadSection(
+                "code-space namespace is not valid UTF-8".into()
+            ))
         );
     }
 

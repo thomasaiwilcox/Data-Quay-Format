@@ -1,0 +1,5 @@
+{
+  "codec": "none",
+  "expect": "round_trip",
+  "payload": "uncompressed page bytes"
+}

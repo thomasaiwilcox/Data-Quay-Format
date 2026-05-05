@@ -170,6 +170,36 @@ impl fmt::Display for CoveError {
 }
 
 impl CoveError {
+    /// Complete Spec §75 code inventory surfaced by [`Self::spec_code`].
+    pub const ALL_SPEC_CODES: [&'static str; 26] = [
+        "COVE_E_BAD_MAGIC",
+        "COVE_E_BAD_VERSION",
+        "COVE_E_UNKNOWN_REQUIRED_FEATURE",
+        "COVE_E_CHECKSUM_MISMATCH",
+        "COVE_E_DIGEST_MISMATCH",
+        "COVE_E_OFFSET_RANGE",
+        "COVE_E_ARITH_OVERFLOW",
+        "COVE_E_BAD_SECTION",
+        "COVE_E_BAD_SCHEMA",
+        "COVE_E_BAD_LOGICAL_PHYSICAL_PAIR",
+        "COVE_E_DICT_MISS",
+        "COVE_E_BAD_FILECODE",
+        "COVE_E_BAD_NUMCODE",
+        "COVE_E_BAD_DOMAIN",
+        "COVE_E_BAD_STATS",
+        "COVE_E_BAD_INDEX",
+        "COVE_E_BAD_EXTENSION",
+        "COVE_E_BAD_ENGINE_PROFILE",
+        "COVE_E_EXECUTION_CODE_MAP",
+        "COVE_E_HARBOR_MOUNT_LEASE",
+        "COVE_E_REF_INVALID",
+        "COVE_E_NOT_SELF_CONTAINED",
+        "COVE_E_SEGMENT_CORRUPT",
+        "COVE_E_PAGE_CORRUPT",
+        "COVE_E_REDACTION_POLICY",
+        "COVE_E_SIDECAR_STALE",
+    ];
+
     /// Return the closest Spec §75 error code for this error.
     ///
     /// Some implementation-level errors such as [`CoveError::BufferTooShort`] and
@@ -211,6 +241,7 @@ impl CoveError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn spec_75_errors_expose_stable_codes() {
@@ -240,6 +271,16 @@ mod tests {
             CoveError::ReservedNotZero.to_string(),
             "COVE_E_BAD_SECTION: reserved field is non-zero"
         );
+    }
+
+    #[test]
+    fn spec_75_code_inventory_is_unique() {
+        let unique = CoveError::ALL_SPEC_CODES
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), CoveError::ALL_SPEC_CODES.len());
+        assert!(unique.contains("COVE_E_BAD_MAGIC"));
+        assert!(unique.contains("COVE_E_SIDECAR_STALE"));
     }
 }
 

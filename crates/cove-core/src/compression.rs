@@ -8,9 +8,27 @@
 use std::borrow::Cow;
 
 use crate::{
-    constants::CompressionCodec, footer::CoveSectionEntryV1, postscript::CoveSectionSpecV1,
+    checksum,
+    constants::CompressionCodec,
+    footer::CoveSectionEntryV1,
+    page::{page_flag_codec, ColumnPageIndexEntryV1},
+    postscript::CoveSectionSpecV1,
     CoveError,
 };
+
+/// Returns the on-disk payload bytes for a writer-side section payload.
+///
+/// This mirrors the read-side codec dispatch so section writers can produce the
+/// exact raw bytes that readers later validate and decompress.
+pub fn encode_payload_for_codec(payload: &[u8], compression: u8) -> Result<Vec<u8>, CoveError> {
+    let codec = CompressionCodec::from_u8(compression)
+        .ok_or_else(|| CoveError::BadSection(format!("unknown compression codec {compression}")))?;
+    match codec {
+        CompressionCodec::None => Ok(payload.to_vec()),
+        CompressionCodec::Lz4 => lz4_compress(payload),
+        CompressionCodec::Zstd => zstd_compress(payload),
+    }
+}
 
 /// Returns the decompressed payload bytes for a section.
 ///
@@ -89,6 +107,52 @@ fn payload_raw_bytes<'a>(
     Ok(&file_data[offset as usize..end as usize])
 }
 
+/// Returns the on-disk wire bytes for a column page payload (Spec §27.3 /
+/// §66). Mirrors [`encode_payload_for_codec`] but is named for callers that
+/// are working at the page level rather than the section level.
+pub fn encode_page_payload(payload: &[u8], codec: CompressionCodec) -> Result<Vec<u8>, CoveError> {
+    encode_payload_for_codec(payload, codec as u8)
+}
+
+/// Returns the decompressed payload bytes for a column page (Spec §27.3 /
+/// §66). The caller passes the page-relative payload slice (already isolated
+/// out of the section) so that this routine handles only codec dispatch and
+/// length validation against `entry.uncompressed_length`.
+pub fn column_page_payload<'a>(
+    page_bytes: &'a [u8],
+    entry: &ColumnPageIndexEntryV1,
+) -> Result<Cow<'a, [u8]>, CoveError> {
+    if page_bytes.len() as u64 != entry.page_length {
+        return Err(CoveError::BadSection(format!(
+            "page payload length {} does not match page_length {}",
+            page_bytes.len(),
+            entry.page_length
+        )));
+    }
+    if checksum::crc32c(page_bytes) != entry.checksum {
+        return Err(CoveError::ChecksumMismatch);
+    }
+    let codec = page_flag_codec(entry.flags)?;
+    match codec {
+        CompressionCodec::None => {
+            // §13.2 mirror: parse() already enforces equal lengths, but
+            // re-verify defensively to keep this routine total.
+            if entry.uncompressed_length != entry.page_length {
+                return Err(CoveError::BadSection(
+                    "uncompressed_length must equal page_length when page codec=None".into(),
+                ));
+            }
+            Ok(Cow::Borrowed(page_bytes))
+        }
+        CompressionCodec::Lz4 => {
+            lz4_decompress(page_bytes, entry.uncompressed_length).map(Cow::Owned)
+        }
+        CompressionCodec::Zstd => {
+            zstd_decompress(page_bytes, entry.uncompressed_length).map(Cow::Owned)
+        }
+    }
+}
+
 #[cfg(feature = "compression-lz4")]
 fn lz4_decompress(raw: &[u8], expected_len: u64) -> Result<Vec<u8>, CoveError> {
     let expected = usize::try_from(expected_len).map_err(|_| CoveError::ArithOverflow)?;
@@ -96,10 +160,22 @@ fn lz4_decompress(raw: &[u8], expected_len: u64) -> Result<Vec<u8>, CoveError> {
         .map_err(|e| CoveError::BadSection(format!("LZ4 decompression failed: {e}")))
 }
 
+#[cfg(feature = "compression-lz4")]
+fn lz4_compress(payload: &[u8]) -> Result<Vec<u8>, CoveError> {
+    Ok(lz4_flex::block::compress(payload))
+}
+
 #[cfg(not(feature = "compression-lz4"))]
 fn lz4_decompress(_raw: &[u8], _expected_len: u64) -> Result<Vec<u8>, CoveError> {
     Err(CoveError::UnsupportedEncoding(
         "LZ4 decompression is not enabled in this build (enable feature `compression-lz4`)".into(),
+    ))
+}
+
+#[cfg(not(feature = "compression-lz4"))]
+fn lz4_compress(_payload: &[u8]) -> Result<Vec<u8>, CoveError> {
+    Err(CoveError::UnsupportedEncoding(
+        "LZ4 compression is not enabled in this build (enable feature `compression-lz4`)".into(),
     ))
 }
 
@@ -123,11 +199,24 @@ fn zstd_decompress(raw: &[u8], expected_len: u64) -> Result<Vec<u8>, CoveError> 
     Ok(out)
 }
 
+#[cfg(feature = "compression-zstd")]
+fn zstd_compress(payload: &[u8]) -> Result<Vec<u8>, CoveError> {
+    zstd::stream::encode_all(std::io::Cursor::new(payload), 0)
+        .map_err(|e| CoveError::BadSection(format!("Zstd compression failed: {e}")))
+}
+
 #[cfg(not(feature = "compression-zstd"))]
 fn zstd_decompress(_raw: &[u8], _expected_len: u64) -> Result<Vec<u8>, CoveError> {
     Err(CoveError::UnsupportedEncoding(
         "Zstd decompression is not enabled in this build (enable feature `compression-zstd`)"
             .into(),
+    ))
+}
+
+#[cfg(not(feature = "compression-zstd"))]
+fn zstd_compress(_payload: &[u8]) -> Result<Vec<u8>, CoveError> {
+    Err(CoveError::UnsupportedEncoding(
+        "Zstd compression is not enabled in this build (enable feature `compression-zstd`)".into(),
     ))
 }
 
@@ -238,5 +327,145 @@ mod tests {
             section_payload(&bytes, &entry),
             Err(CoveError::BadSection(_))
         ));
+    }
+
+    #[cfg(feature = "compression-lz4")]
+    #[test]
+    fn lz4_writer_payload_round_trip() {
+        let payload = b"Cove compression round-trip payload";
+        let compressed = encode_payload_for_codec(payload, CompressionCodec::Lz4 as u8).unwrap();
+        let mut file = vec![0u8; 8];
+        let offset = file.len() as u64;
+        file.extend_from_slice(&compressed);
+        let entry = make_entry(offset, compressed.len() as u64, payload.len() as u64, 1);
+        let decoded = section_payload(&file, &entry).unwrap();
+        assert_eq!(&*decoded, payload);
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn zstd_writer_payload_round_trip() {
+        let payload = b"Cove zstd compression round-trip payload";
+        let compressed = encode_payload_for_codec(payload, CompressionCodec::Zstd as u8).unwrap();
+        let mut file = vec![0u8; 8];
+        let offset = file.len() as u64;
+        file.extend_from_slice(&compressed);
+        let entry = make_entry(offset, compressed.len() as u64, payload.len() as u64, 2);
+        let decoded = section_payload(&file, &entry).unwrap();
+        assert_eq!(&*decoded, payload);
+    }
+
+    fn page_entry(
+        page_length: u64,
+        uncompressed_length: u64,
+        codec: CompressionCodec,
+        checksum: u32,
+    ) -> ColumnPageIndexEntryV1 {
+        ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 0,
+            row_count: 1,
+            non_null_count: 1,
+            null_count: 0,
+            encoding_root: 0,
+            page_offset: 0,
+            page_length,
+            uncompressed_length,
+            stats_ref: 0,
+            flags: codec as u32,
+            checksum,
+        }
+    }
+
+    #[test]
+    fn page_payload_none_returns_borrowed_slice() {
+        let payload = b"raw page bytes";
+        let entry = page_entry(
+            payload.len() as u64,
+            payload.len() as u64,
+            CompressionCodec::None,
+            checksum::crc32c(payload),
+        );
+        let decoded = column_page_payload(payload, &entry).unwrap();
+        assert_eq!(&*decoded, payload);
+    }
+
+    #[test]
+    fn page_payload_length_mismatch_rejected() {
+        let payload = b"raw page bytes";
+        let entry = page_entry(
+            payload.len() as u64 + 1,
+            payload.len() as u64 + 1,
+            CompressionCodec::None,
+            checksum::crc32c(payload),
+        );
+        assert!(matches!(
+            column_page_payload(payload, &entry),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[cfg(feature = "compression-lz4")]
+    #[test]
+    fn page_payload_lz4_round_trip() {
+        let payload =
+            b"Cove page-level LZ4 round trip payload Cove page-level LZ4 round trip payload";
+        let wire = encode_page_payload(payload, CompressionCodec::Lz4).unwrap();
+        let entry = page_entry(
+            wire.len() as u64,
+            payload.len() as u64,
+            CompressionCodec::Lz4,
+            checksum::crc32c(&wire),
+        );
+        let decoded = column_page_payload(&wire, &entry).unwrap();
+        assert_eq!(&*decoded, payload);
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn page_payload_zstd_round_trip() {
+        let payload = b"Cove page-level Zstd round trip payload";
+        let wire = encode_page_payload(payload, CompressionCodec::Zstd).unwrap();
+        let entry = page_entry(
+            wire.len() as u64,
+            payload.len() as u64,
+            CompressionCodec::Zstd,
+            checksum::crc32c(&wire),
+        );
+        let decoded = column_page_payload(&wire, &entry).unwrap();
+        assert_eq!(&*decoded, payload);
+    }
+
+    #[cfg(feature = "compression-lz4")]
+    #[test]
+    fn page_payload_lz4_truncated_rejected() {
+        let payload = b"Cove page-level LZ4 corruption sentinel sentinel sentinel";
+        let mut wire = encode_page_payload(payload, CompressionCodec::Lz4).unwrap();
+        // Truncate the compressed wire bytes; the entry still claims the full
+        // uncompressed length so decompression must fail rather than silently
+        // produce a short payload (Spec §66 robustness requirement).
+        wire.truncate(wire.len().saturating_sub(2));
+        let entry = page_entry(
+            wire.len() as u64,
+            payload.len() as u64,
+            CompressionCodec::Lz4,
+            checksum::crc32c(&wire),
+        );
+        assert!(column_page_payload(&wire, &entry).is_err());
+    }
+
+    #[test]
+    fn page_payload_checksum_mismatch_rejected() {
+        let payload = b"raw page bytes";
+        let entry = page_entry(
+            payload.len() as u64,
+            payload.len() as u64,
+            CompressionCodec::None,
+            checksum::crc32c(b"different"),
+        );
+        assert_eq!(
+            column_page_payload(payload, &entry),
+            Err(CoveError::ChecksumMismatch)
+        );
     }
 }

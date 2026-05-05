@@ -209,6 +209,20 @@ impl CollationRegistry {
         Ok(Self { entries })
     }
 
+    /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.entries.len() * 8);
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for entry in &self.entries {
+            let name_bytes = entry.name.as_bytes();
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(&(entry.metadata.len() as u16).to_le_bytes());
+            out.extend_from_slice(&entry.metadata);
+        }
+        out
+    }
+
     /// Returns true if every named collation is one of the six v1 collations.
     pub fn all_known(&self) -> bool {
         self.entries.iter().all(|e| e.kind.is_some())
@@ -217,6 +231,42 @@ impl CollationRegistry {
     /// Whether a given collation name is recognised by this v1 reader.
     pub fn is_known_collation(name: &str) -> bool {
         CollationKind::from_name(name).is_some()
+    }
+}
+
+#[cfg(test)]
+mod serialize_tests {
+    use super::*;
+
+    #[test]
+    fn serialize_round_trip() {
+        let reg = CollationRegistry {
+            entries: vec![
+                CollationEntry {
+                    name: "utf8-bytewise".into(),
+                    metadata: vec![],
+                    kind: Some(CollationKind::Utf8Bytewise),
+                },
+                CollationEntry {
+                    name: "vendor-x".into(),
+                    metadata: vec![1, 2, 3, 4],
+                    kind: None,
+                },
+            ],
+        };
+        let bytes = reg.serialize();
+        let back = CollationRegistry::parse(&bytes).unwrap();
+        assert_eq!(back.entries.len(), 2);
+        assert_eq!(back.entries[0].name, "utf8-bytewise");
+        assert_eq!(back.entries[1].metadata, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn serialize_empty() {
+        let reg = CollationRegistry::default();
+        let bytes = reg.serialize();
+        assert_eq!(bytes, vec![0u8; 4]);
+        assert!(CollationRegistry::parse(&bytes).unwrap().entries.is_empty());
     }
 }
 

@@ -11,9 +11,10 @@
 //!   input. The trait-level [`assert_parity`] helper exists so each
 //!   submodule can prove this with a property-style test.
 //!
-//! All encoders here operate on `i64` for clarity; production
-//! implementations specialise on the page's physical type. The cascade
-//! kinds (Constant, RLE, RunEnd, BitPacked, Delta, FrameOfReference,
+//! The shared trait operates on `i64` for compact conformance fixtures;
+//! encodings that need a wider physical surface, such as LocalCodebook, expose
+//! typed decode APIs alongside this compatibility path. The cascade kinds
+//! (Constant, LocalCodebook, RLE, RunEnd, BitPacked, Delta, FrameOfReference,
 //! PatchedBase, Sparse, PlainFixed, PlainVarint) are listed in
 //! [`crate::constants::CoveEncodingKind`].
 
@@ -21,6 +22,7 @@ pub mod bit_packed;
 pub mod constant;
 pub mod delta;
 pub mod frame_of_reference;
+pub mod local_codebook;
 pub mod nested;
 pub mod patched_base;
 pub mod plain;

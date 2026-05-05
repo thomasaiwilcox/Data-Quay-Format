@@ -1,0 +1,5 @@
+{
+  "byte": 0,
+  "expect": false,
+  "op": "bool_strict"
+}

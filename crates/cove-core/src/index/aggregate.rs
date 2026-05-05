@@ -159,6 +159,15 @@ impl AggregateSynopsis {
         }
         Ok(Self { entries })
     }
+
+    /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.entries.len() * AGGREGATE_SYNOPSIS_ENTRY_LEN);
+        for entry in &self.entries {
+            out.extend_from_slice(&entry.serialize());
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +271,31 @@ mod tests {
         bytes.extend_from_slice(&payload);
         let synopsis = AggregateSynopsis::parse(&bytes).unwrap();
         assert_eq!(synopsis.entries[0].payload_length, payload.len() as u64);
+    }
+
+    #[test]
+    fn serialize_round_trip_multiple_entries() {
+        let mk = |morsel_id| AggregateEntry {
+            table_id: 1,
+            segment_id: 2,
+            morsel_id,
+            column_id: 3,
+            synopsis_kind: SynopsisKind::Count,
+            key_kind: 0,
+            accuracy: SynopsisAccuracy::Exact,
+            flags: 0,
+            row_count: morsel_id,
+            null_count: 0,
+            payload_offset: 0,
+            payload_length: 0,
+            checksum: 0,
+        };
+        let synopsis = AggregateSynopsis {
+            entries: vec![mk(10), mk(20), mk(30)],
+        };
+        let bytes = synopsis.serialize();
+        let parsed = AggregateSynopsis::parse(&bytes).unwrap();
+        assert_eq!(parsed.entries.len(), 3);
+        assert_eq!(parsed.entries[2].row_count, 30);
     }
 }

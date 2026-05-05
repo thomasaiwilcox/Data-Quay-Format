@@ -9,42 +9,45 @@
 use crate::{
     checksum,
     constants::{CoveLogicalType, CovePhysicalKind},
+    trust_chain,
     types::validate_logical_physical_pair,
     CoveError,
 };
 
+pub const TEMPORAL_SEGMENT_HEADER_LEN: usize = 96;
 pub const TEMPORAL_SEGMENT_INDEX_ENTRY_LEN: usize = 112;
+pub const TEMPORAL_ROW_ENTRY_LEN: usize = 68;
+pub const TEMPORAL_BLOOM_ENTRY_LEN: usize = 40;
+pub const TRUST_MANIFEST_ENTRY_LEN: usize = 40;
 
 /// Record kinds (Spec §59.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordKind {
-    Create,
-    Update,
-    Delete,
+    Delta,
     Snapshot,
+    ReservedLegacyMaterializedDelta,
     Baseline,
-    /// Staging placeholder — MUST be rejected by readers (Spec §59.4).
-    StagingPlaceholder,
+    Tombstone,
 }
 
 impl RecordKind {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(RecordKind::Create),
-            1 => Some(RecordKind::Update),
-            2 => Some(RecordKind::Delete),
-            3 => Some(RecordKind::Snapshot),
-            4 => Some(RecordKind::Baseline),
-            5 => Some(RecordKind::StagingPlaceholder),
+            0 => Some(RecordKind::Delta),
+            1 => Some(RecordKind::Snapshot),
+            2 => Some(RecordKind::ReservedLegacyMaterializedDelta),
+            3 => Some(RecordKind::Baseline),
+            4 => Some(RecordKind::Tombstone),
             _ => None,
         }
     }
 
-    /// Spec §59.4: staging placeholders must never appear in a published file.
+    /// Reserved legacy materialized-delta records are not valid published rows.
     pub fn validate_published(self) -> Result<(), CoveError> {
-        if matches!(self, RecordKind::StagingPlaceholder) {
+        if matches!(self, RecordKind::ReservedLegacyMaterializedDelta) {
             Err(CoveError::BadSchema(
-                "staging placeholder leaked into published file (Spec §59.4)".into(),
+                "reserved legacy materialized delta is not valid in published files (Spec §59.1)"
+                    .into(),
             ))
         } else {
             Ok(())
@@ -58,8 +61,8 @@ pub struct TemporalRowKey {
     pub timestamp_us: i64,
     pub csn: u64,
     pub branch_key: u64,
-    pub goid: u64,
-    pub record_id: u64,
+    pub goid: [u8; 16],
+    pub record_id: [u8; 16],
 }
 
 impl TemporalRowKey {
@@ -490,6 +493,438 @@ impl TemporalSegmentIndexEntryV1 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalSegmentHeaderV1 {
+    pub segment_id: u32,
+    pub object_type_id: u32,
+    pub time_range_start_us: i64,
+    pub time_range_end_us: i64,
+    pub csn_min: u64,
+    pub csn_max: u64,
+    pub row_count: u32,
+    pub morsel_count: u32,
+    pub morsel_row_count: u32,
+    pub column_count: u32,
+    pub row_directory_offset: u64,
+    pub column_directory_offset: u64,
+    pub page_index_offset: u64,
+    pub data_offset: u64,
+    pub flags: u32,
+    pub checksum: u32,
+}
+
+impl TemporalSegmentHeaderV1 {
+    pub fn serialize(&self) -> [u8; TEMPORAL_SEGMENT_HEADER_LEN] {
+        let mut out = [0u8; TEMPORAL_SEGMENT_HEADER_LEN];
+        out[0..4].copy_from_slice(&self.segment_id.to_le_bytes());
+        out[4..8].copy_from_slice(&self.object_type_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.time_range_start_us.to_le_bytes());
+        out[16..24].copy_from_slice(&self.time_range_end_us.to_le_bytes());
+        out[24..32].copy_from_slice(&self.csn_min.to_le_bytes());
+        out[32..40].copy_from_slice(&self.csn_max.to_le_bytes());
+        out[40..44].copy_from_slice(&self.row_count.to_le_bytes());
+        out[44..48].copy_from_slice(&self.morsel_count.to_le_bytes());
+        out[48..52].copy_from_slice(&self.morsel_row_count.to_le_bytes());
+        out[52..56].copy_from_slice(&self.column_count.to_le_bytes());
+        out[56..64].copy_from_slice(&self.row_directory_offset.to_le_bytes());
+        out[64..72].copy_from_slice(&self.column_directory_offset.to_le_bytes());
+        out[72..80].copy_from_slice(&self.page_index_offset.to_le_bytes());
+        out[80..88].copy_from_slice(&self.data_offset.to_le_bytes());
+        out[88..92].copy_from_slice(&self.flags.to_le_bytes());
+        let crc = checksum::crc32c(&out);
+        out[92..96].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < TEMPORAL_SEGMENT_HEADER_LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let bytes = &bytes[..TEMPORAL_SEGMENT_HEADER_LEN];
+        let checksum_field = u32::from_le_bytes(bytes[92..96].try_into().unwrap());
+        let mut for_crc = [0u8; TEMPORAL_SEGMENT_HEADER_LEN];
+        for_crc.copy_from_slice(bytes);
+        for_crc[92..96].fill(0);
+        if checksum::crc32c(&for_crc) != checksum_field {
+            return Err(CoveError::ChecksumMismatch);
+        }
+
+        Ok(Self {
+            segment_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            object_type_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            time_range_start_us: i64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            time_range_end_us: i64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            csn_min: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            csn_max: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+            row_count: u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+            morsel_count: u32::from_le_bytes(bytes[44..48].try_into().unwrap()),
+            morsel_row_count: u32::from_le_bytes(bytes[48..52].try_into().unwrap()),
+            column_count: u32::from_le_bytes(bytes[52..56].try_into().unwrap()),
+            row_directory_offset: u64::from_le_bytes(bytes[56..64].try_into().unwrap()),
+            column_directory_offset: u64::from_le_bytes(bytes[64..72].try_into().unwrap()),
+            page_index_offset: u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
+            data_offset: u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
+            flags: u32::from_le_bytes(bytes[88..92].try_into().unwrap()),
+            checksum: checksum_field,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoveRecordRefV1 {
+    pub segment_id: u32,
+    pub row_index: u32,
+    pub target_kind: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalRowEntryV1 {
+    pub timestamp_us: i64,
+    pub csn: u64,
+    pub branch_key: u64,
+    pub goid: [u8; 16],
+    pub record_id: [u8; 16],
+    pub record_kind: RecordKind,
+    pub prev_ref: Option<CoveRecordRefV1>,
+}
+
+impl TemporalRowEntryV1 {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < TEMPORAL_ROW_ENTRY_LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let bytes = &bytes[..TEMPORAL_ROW_ENTRY_LEN];
+        let timestamp_us = i64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let csn = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let branch_key = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let mut goid = [0u8; 16];
+        goid.copy_from_slice(&bytes[24..40]);
+        let mut record_id = [0u8; 16];
+        record_id.copy_from_slice(&bytes[40..56]);
+        let record_kind = RecordKind::from_u8(bytes[56]).ok_or_else(|| {
+            CoveError::BadSchema(format!("unknown temporal record kind {}", bytes[56]))
+        })?;
+        let prev_present = bytes[57];
+        let target_kind = bytes[58];
+        if bytes[59] != 0 {
+            return Err(CoveError::ReservedNotZero);
+        }
+        if target_kind > 1 {
+            return Err(CoveError::RefInvalid);
+        }
+        let prev_segment_id = u32::from_le_bytes(bytes[60..64].try_into().unwrap());
+        let prev_row_index = u32::from_le_bytes(bytes[64..68].try_into().unwrap());
+        let prev_ref = match prev_present {
+            0 => {
+                if target_kind != 0 || prev_segment_id != 0 || prev_row_index != 0 {
+                    return Err(CoveError::RefInvalid);
+                }
+                None
+            }
+            1 => Some(CoveRecordRefV1 {
+                segment_id: prev_segment_id,
+                row_index: prev_row_index,
+                target_kind,
+            }),
+            _ => return Err(CoveError::RefInvalid),
+        };
+        record_kind.validate_published()?;
+        Ok(Self {
+            timestamp_us,
+            csn,
+            branch_key,
+            goid,
+            record_id,
+            record_kind,
+            prev_ref,
+        })
+    }
+
+    pub fn serialize(&self) -> [u8; TEMPORAL_ROW_ENTRY_LEN] {
+        let mut out = [0u8; TEMPORAL_ROW_ENTRY_LEN];
+        out[0..8].copy_from_slice(&self.timestamp_us.to_le_bytes());
+        out[8..16].copy_from_slice(&self.csn.to_le_bytes());
+        out[16..24].copy_from_slice(&self.branch_key.to_le_bytes());
+        out[24..40].copy_from_slice(&self.goid);
+        out[40..56].copy_from_slice(&self.record_id);
+        out[56] = match self.record_kind {
+            RecordKind::Delta => 0,
+            RecordKind::Snapshot => 1,
+            RecordKind::ReservedLegacyMaterializedDelta => 2,
+            RecordKind::Baseline => 3,
+            RecordKind::Tombstone => 4,
+        };
+        if let Some(prev_ref) = self.prev_ref {
+            out[57] = 1;
+            out[58] = prev_ref.target_kind;
+            out[60..64].copy_from_slice(&prev_ref.segment_id.to_le_bytes());
+            out[64..68].copy_from_slice(&prev_ref.row_index.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn row_key(&self) -> TemporalRowKey {
+        TemporalRowKey {
+            timestamp_us: self.timestamp_us,
+            csn: self.csn,
+            branch_key: self.branch_key,
+            goid: self.goid,
+            record_id: self.record_id,
+        }
+    }
+
+    pub fn trust_payload(&self) -> Vec<u8> {
+        self.serialize().to_vec()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalSegmentData {
+    pub header: TemporalSegmentHeaderV1,
+    pub rows: Vec<TemporalRowEntryV1>,
+}
+
+impl TemporalSegmentData {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let header = TemporalSegmentHeaderV1::parse(bytes)?;
+        if header.row_count == 0 && header.morsel_count != 0 {
+            return Err(CoveError::BadSchema(
+                "temporal segment with zero rows cannot have morsels".into(),
+            ));
+        }
+        if header.row_count != 0 && header.morsel_row_count == 0 {
+            return Err(CoveError::BadSchema(
+                "temporal segment with rows must declare morsel_row_count".into(),
+            ));
+        }
+        let row_directory_offset =
+            usize::try_from(header.row_directory_offset).map_err(|_| CoveError::OffsetRange)?;
+        let column_directory_offset =
+            usize::try_from(header.column_directory_offset).map_err(|_| CoveError::OffsetRange)?;
+        let page_index_offset =
+            usize::try_from(header.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
+        let data_offset =
+            usize::try_from(header.data_offset).map_err(|_| CoveError::OffsetRange)?;
+        if row_directory_offset < TEMPORAL_SEGMENT_HEADER_LEN
+            || column_directory_offset < row_directory_offset
+            || page_index_offset < column_directory_offset
+            || data_offset < page_index_offset
+            || data_offset > bytes.len()
+        {
+            return Err(CoveError::BadSchema(
+                "temporal segment offsets are invalid".into(),
+            ));
+        }
+        let row_bytes_len = (header.row_count as usize)
+            .checked_mul(TEMPORAL_ROW_ENTRY_LEN)
+            .ok_or(CoveError::ArithOverflow)?;
+        let row_end = row_directory_offset
+            .checked_add(row_bytes_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        if row_end > column_directory_offset {
+            return Err(CoveError::BadSchema(
+                "temporal row directory exceeds declared boundary".into(),
+            ));
+        }
+        let mut rows = Vec::with_capacity(header.row_count as usize);
+        let mut pos = row_directory_offset;
+        for _ in 0..header.row_count {
+            rows.push(TemporalRowEntryV1::parse(
+                &bytes[pos..pos + TEMPORAL_ROW_ENTRY_LEN],
+            )?);
+            pos += TEMPORAL_ROW_ENTRY_LEN;
+        }
+        let segment = Self { header, rows };
+        segment.validate()?;
+        Ok(segment)
+    }
+
+    pub fn validate(&self) -> Result<(), CoveError> {
+        let row_keys = self
+            .rows
+            .iter()
+            .map(TemporalRowEntryV1::row_key)
+            .collect::<Vec<_>>();
+        validate_temporal_order(&row_keys)?;
+
+        for (row_index, row) in self.rows.iter().enumerate() {
+            if let Some(prev_ref) = row.prev_ref {
+                if prev_ref.segment_id == self.header.segment_id
+                    && prev_ref.row_index >= row_index as u32
+                {
+                    return Err(CoveError::RefInvalid);
+                }
+                if prev_ref.segment_id > self.header.segment_id {
+                    return Err(CoveError::RefInvalid);
+                }
+            }
+        }
+
+        if let Some(first) = self.rows.first() {
+            if first.timestamp_us < self.header.time_range_start_us
+                || first.csn < self.header.csn_min
+            {
+                return Err(CoveError::BadSchema(
+                    "temporal segment row falls before declared min range".into(),
+                ));
+            }
+        }
+        if let Some(last) = self.rows.last() {
+            if last.timestamp_us > self.header.time_range_end_us || last.csn > self.header.csn_max {
+                return Err(CoveError::BadSchema(
+                    "temporal segment row falls after declared max range".into(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalBloomEntryV1 {
+    pub segment_id: u32,
+    pub time_bucket_start_us: i64,
+    pub time_bucket_end_us: i64,
+    pub filter_offset: u64,
+    pub filter_length: u64,
+    pub checksum: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TemporalBloomIndex {
+    pub flags: u32,
+    pub entries: Vec<TemporalBloomEntryV1>,
+}
+
+impl TemporalBloomIndex {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < 8 {
+            return Err(CoveError::BufferTooShort);
+        }
+        let entry_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let entries_len = entry_count
+            .checked_mul(TEMPORAL_BLOOM_ENTRY_LEN)
+            .ok_or(CoveError::ArithOverflow)?;
+        let entries_end = 8usize
+            .checked_add(entries_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        if entries_end > bytes.len() {
+            return Err(CoveError::BufferTooShort);
+        }
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut pos = 8usize;
+        for _ in 0..entry_count {
+            let checksum_field = u32::from_le_bytes(bytes[pos + 36..pos + 40].try_into().unwrap());
+            let mut for_crc = [0u8; TEMPORAL_BLOOM_ENTRY_LEN];
+            for_crc.copy_from_slice(&bytes[pos..pos + TEMPORAL_BLOOM_ENTRY_LEN]);
+            for_crc[36..40].fill(0);
+            if checksum::crc32c(&for_crc) != checksum_field {
+                return Err(CoveError::ChecksumMismatch);
+            }
+            let filter_offset = u64::from_le_bytes(bytes[pos + 20..pos + 28].try_into().unwrap());
+            let filter_length = u64::from_le_bytes(bytes[pos + 28..pos + 36].try_into().unwrap());
+            let filter_end = filter_offset
+                .checked_add(filter_length)
+                .ok_or(CoveError::ArithOverflow)?;
+            if filter_end > bytes.len() as u64 {
+                return Err(CoveError::OffsetRange);
+            }
+            entries.push(TemporalBloomEntryV1 {
+                segment_id: u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()),
+                time_bucket_start_us: i64::from_le_bytes(
+                    bytes[pos + 4..pos + 12].try_into().unwrap(),
+                ),
+                time_bucket_end_us: i64::from_le_bytes(
+                    bytes[pos + 12..pos + 20].try_into().unwrap(),
+                ),
+                filter_offset,
+                filter_length,
+                checksum: checksum_field,
+            });
+            pos += TEMPORAL_BLOOM_ENTRY_LEN;
+        }
+        Ok(Self { flags, entries })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustManifestEntryV1 {
+    pub segment_id: u32,
+    pub row_index: u32,
+    pub expected_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustManifest {
+    pub entries: Vec<TrustManifestEntryV1>,
+}
+
+impl TrustManifest {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < 4 {
+            return Err(CoveError::BufferTooShort);
+        }
+        let entry_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let needed = 4usize
+            .checked_add(
+                entry_count
+                    .checked_mul(TRUST_MANIFEST_ENTRY_LEN)
+                    .ok_or(CoveError::ArithOverflow)?,
+            )
+            .ok_or(CoveError::ArithOverflow)?;
+        if needed > bytes.len() {
+            return Err(CoveError::BufferTooShort);
+        }
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut pos = 4usize;
+        for _ in 0..entry_count {
+            let mut expected_hash = [0u8; 32];
+            expected_hash.copy_from_slice(&bytes[pos + 8..pos + 40]);
+            entries.push(TrustManifestEntryV1 {
+                segment_id: u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()),
+                row_index: u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()),
+                expected_hash,
+            });
+            pos += TRUST_MANIFEST_ENTRY_LEN;
+        }
+        Ok(Self { entries })
+    }
+
+    /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.entries.len() * TRUST_MANIFEST_ENTRY_LEN);
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for e in &self.entries {
+            out.extend_from_slice(&e.segment_id.to_le_bytes());
+            out.extend_from_slice(&e.row_index.to_le_bytes());
+            out.extend_from_slice(&e.expected_hash);
+        }
+        out
+    }
+
+    pub fn verify_against(&self, segments: &[TemporalSegmentData]) -> Result<(), CoveError> {
+        let mut prev = [0u8; 32];
+        for entry in &self.entries {
+            let segment = segments
+                .iter()
+                .find(|segment| segment.header.segment_id == entry.segment_id)
+                .ok_or(CoveError::RefInvalid)?;
+            let row = segment
+                .rows
+                .get(entry.row_index as usize)
+                .ok_or(CoveError::RefInvalid)?;
+            let computed = trust_chain::chain(&prev, &row.trust_payload())?;
+            if computed != entry.expected_hash {
+                return Err(CoveError::DigestMismatch);
+            }
+            prev = computed;
+        }
+        Ok(())
+    }
+}
+
 fn read_str(bytes: &[u8], pos: &mut usize, what: &str) -> Result<String, CoveError> {
     if *pos + 2 > bytes.len() {
         return Err(CoveError::BufferTooShort);
@@ -524,8 +959,8 @@ mod tests {
             timestamp_us: t,
             csn,
             branch_key: 0,
-            goid: 0,
-            record_id: 0,
+            goid: [0; 16],
+            record_id: [0; 16],
         }
     }
 
@@ -545,9 +980,11 @@ mod tests {
     }
 
     #[test]
-    fn spec_59_4_staging_placeholder_rejected() {
-        assert!(RecordKind::StagingPlaceholder.validate_published().is_err());
-        assert!(RecordKind::Create.validate_published().is_ok());
+    fn spec_59_1_reserved_legacy_record_kind_rejected() {
+        assert!(RecordKind::ReservedLegacyMaterializedDelta
+            .validate_published()
+            .is_err());
+        assert!(RecordKind::Delta.validate_published().is_ok());
     }
 
     #[test]
@@ -676,5 +1113,191 @@ mod tests {
             TemporalSegmentIndex::parse(&index.serialize().unwrap()),
             Err(CoveError::BadSchema(_))
         ));
+    }
+
+    fn temporal_row(timestamp_us: i64, csn: u64) -> TemporalRowEntryV1 {
+        TemporalRowEntryV1 {
+            timestamp_us,
+            csn,
+            branch_key: 0,
+            goid: [0; 16],
+            record_id: [0; 16],
+            record_kind: RecordKind::Delta,
+            prev_ref: None,
+        }
+    }
+
+    fn temporal_segment_bytes(rows: &[TemporalRowEntryV1]) -> Vec<u8> {
+        let row_directory_offset = TEMPORAL_SEGMENT_HEADER_LEN as u64;
+        let row_bytes = (rows.len() * TEMPORAL_ROW_ENTRY_LEN) as u64;
+        let row_end = row_directory_offset + row_bytes;
+        let header = TemporalSegmentHeaderV1 {
+            segment_id: 7,
+            object_type_id: 1,
+            time_range_start_us: rows.first().map(|row| row.timestamp_us).unwrap_or(0),
+            time_range_end_us: rows.last().map(|row| row.timestamp_us).unwrap_or(0),
+            csn_min: rows.first().map(|row| row.csn).unwrap_or(0),
+            csn_max: rows.last().map(|row| row.csn).unwrap_or(0),
+            row_count: rows.len() as u32,
+            morsel_count: u32::from(!rows.is_empty()),
+            morsel_row_count: if rows.is_empty() {
+                0
+            } else {
+                rows.len() as u32
+            },
+            column_count: 0,
+            row_directory_offset,
+            column_directory_offset: row_end,
+            page_index_offset: row_end,
+            data_offset: row_end,
+            flags: 0,
+            checksum: 0,
+        };
+        let mut bytes = header.serialize().to_vec();
+        for row in rows {
+            bytes.extend_from_slice(&row.serialize());
+        }
+        bytes
+    }
+
+    #[test]
+    fn temporal_segment_data_roundtrip_validates() {
+        let bytes = temporal_segment_bytes(&[temporal_row(10, 1), temporal_row(20, 2)]);
+        let parsed = TemporalSegmentData::parse(&bytes).unwrap();
+        assert_eq!(parsed.rows.len(), 2);
+        assert_eq!(parsed.header.segment_id, 7);
+    }
+
+    #[test]
+    fn temporal_segment_data_rejects_out_of_order_rows() {
+        let bytes = temporal_segment_bytes(&[temporal_row(20, 2), temporal_row(10, 1)]);
+        assert!(matches!(
+            TemporalSegmentData::parse(&bytes),
+            Err(CoveError::BadSchema(_))
+        ));
+    }
+
+    #[test]
+    fn temporal_segment_data_rejects_forward_prev_ref() {
+        let mut first = temporal_row(10, 1);
+        first.prev_ref = Some(CoveRecordRefV1 {
+            segment_id: 7,
+            row_index: 1,
+            target_kind: 0,
+        });
+        let bytes = temporal_segment_bytes(&[first, temporal_row(20, 2)]);
+        assert_eq!(
+            TemporalSegmentData::parse(&bytes),
+            Err(CoveError::RefInvalid)
+        );
+    }
+
+    #[test]
+    fn temporal_segment_data_allows_backward_cross_segment_prev_ref() {
+        let mut row = temporal_row(20, 2);
+        row.prev_ref = Some(CoveRecordRefV1 {
+            segment_id: 6,
+            row_index: 0,
+            target_kind: 0,
+        });
+        let bytes = temporal_segment_bytes(&[row]);
+        let parsed = TemporalSegmentData::parse(&bytes).unwrap();
+        assert_eq!(parsed.rows[0].prev_ref.unwrap().segment_id, 6);
+    }
+
+    fn temporal_bloom_bytes() -> Vec<u8> {
+        let filter_offset = 8 + TEMPORAL_BLOOM_ENTRY_LEN as u64;
+        let filter = [1u8, 2, 3, 4];
+        let mut entry = [0u8; TEMPORAL_BLOOM_ENTRY_LEN];
+        entry[0..4].copy_from_slice(&7u32.to_le_bytes());
+        entry[4..12].copy_from_slice(&10i64.to_le_bytes());
+        entry[12..20].copy_from_slice(&20i64.to_le_bytes());
+        entry[20..28].copy_from_slice(&filter_offset.to_le_bytes());
+        entry[28..36].copy_from_slice(&(filter.len() as u64).to_le_bytes());
+        let crc = checksum::crc32c(&entry);
+        entry[36..40].copy_from_slice(&crc.to_le_bytes());
+
+        let mut bytes = 1u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&entry);
+        bytes.extend_from_slice(&filter);
+        bytes
+    }
+
+    #[test]
+    fn temporal_bloom_index_roundtrip_validates() {
+        let parsed = TemporalBloomIndex::parse(&temporal_bloom_bytes()).unwrap();
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].segment_id, 7);
+    }
+
+    fn trust_manifest_bytes(segment: &TemporalSegmentData) -> Vec<u8> {
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        let mut prev = [0u8; 32];
+        for (row_index, row) in segment.rows.iter().enumerate() {
+            bytes.extend_from_slice(&segment.header.segment_id.to_le_bytes());
+            bytes.extend_from_slice(&(row_index as u32).to_le_bytes());
+            prev = trust_chain::chain(&prev, &row.trust_payload()).unwrap();
+            bytes.extend_from_slice(&prev);
+        }
+        bytes
+    }
+
+    #[test]
+    fn trust_manifest_verifies_temporal_rows() {
+        let segment = TemporalSegmentData::parse(&temporal_segment_bytes(&[
+            temporal_row(10, 1),
+            temporal_row(20, 2),
+        ]))
+        .unwrap();
+        let manifest = TrustManifest::parse(&trust_manifest_bytes(&segment)).unwrap();
+        assert!(manifest.verify_against(&[segment]).is_ok());
+    }
+
+    #[test]
+    fn trust_manifest_rejects_bad_digest() {
+        let segment = TemporalSegmentData::parse(&temporal_segment_bytes(&[
+            temporal_row(10, 1),
+            temporal_row(20, 2),
+        ]))
+        .unwrap();
+        let mut bytes = trust_manifest_bytes(&segment);
+        *bytes.last_mut().unwrap() ^= 0xFF;
+        let manifest = TrustManifest::parse(&bytes).unwrap();
+        assert_eq!(
+            manifest.verify_against(&[segment]),
+            Err(CoveError::DigestMismatch)
+        );
+    }
+
+    #[test]
+    fn trust_payload_matches_temporal_row_wire_encoding() {
+        let mut row = temporal_row(20, 2);
+        row.prev_ref = Some(CoveRecordRefV1 {
+            segment_id: 7,
+            row_index: 1,
+            target_kind: 1,
+        });
+        assert_eq!(row.trust_payload(), row.serialize());
+    }
+
+    #[test]
+    fn trust_manifest_serialize_round_trip() {
+        let m = TrustManifest {
+            entries: vec![
+                TrustManifestEntryV1 {
+                    segment_id: 1,
+                    row_index: 0,
+                    expected_hash: [0xAA; 32],
+                },
+                TrustManifestEntryV1 {
+                    segment_id: 2,
+                    row_index: 5,
+                    expected_hash: [0xBB; 32],
+                },
+            ],
+        };
+        let bytes = m.serialize();
+        assert_eq!(TrustManifest::parse(&bytes).unwrap(), m);
     }
 }

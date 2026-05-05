@@ -97,6 +97,43 @@ impl LakehouseHints {
             conversion_digest: cd,
         })
     }
+
+    /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(&self.schema_fingerprint);
+        out.extend_from_slice(&(self.partition_values.len() as u32).to_le_bytes());
+        for (k, v) in &self.partition_values {
+            let kb = k.as_bytes();
+            out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+            out.extend_from_slice(kb);
+            let vb = v.as_bytes();
+            out.extend_from_slice(&(vb.len() as u16).to_le_bytes());
+            out.extend_from_slice(vb);
+        }
+        let mut flags = 0u8;
+        if self.source_snapshot.is_some() {
+            flags |= 1;
+        }
+        if self.sequence_number.is_some() {
+            flags |= 2;
+        }
+        out.push(flags);
+        if let Some(v) = self.source_snapshot {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Some(v) = self.sequence_number {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let cb = self.catalog_identifier.as_bytes();
+        out.extend_from_slice(&(cb.len() as u16).to_le_bytes());
+        out.extend_from_slice(cb);
+        let pb = self.provenance.as_bytes();
+        out.extend_from_slice(&(pb.len() as u16).to_le_bytes());
+        out.extend_from_slice(pb);
+        out.extend_from_slice(&self.conversion_digest);
+        out
+    }
 }
 
 fn read_str(bytes: &[u8], pos: &mut usize) -> Result<String, CoveError> {
@@ -145,5 +182,35 @@ mod tests {
             LakehouseHints::parse(&bytes),
             Err(CoveError::BufferTooShort)
         );
+    }
+}
+
+#[cfg(test)]
+mod serialize_tests {
+    use super::*;
+
+    #[test]
+    fn serialize_round_trip_with_optional_fields() {
+        let h = LakehouseHints {
+            schema_fingerprint: [0x11; 32],
+            partition_values: vec![
+                ("year".into(), "2024".into()),
+                ("region".into(), "eu".into()),
+            ],
+            source_snapshot: Some(123),
+            sequence_number: Some(456),
+            catalog_identifier: "glue://prod".into(),
+            provenance: "writer-v1".into(),
+            conversion_digest: [0x22; 32],
+        };
+        let bytes = h.serialize();
+        assert_eq!(LakehouseHints::parse(&bytes).unwrap(), h);
+    }
+
+    #[test]
+    fn serialize_round_trip_minimal() {
+        let h = LakehouseHints::default();
+        let bytes = h.serialize();
+        assert_eq!(LakehouseHints::parse(&bytes).unwrap(), h);
     }
 }

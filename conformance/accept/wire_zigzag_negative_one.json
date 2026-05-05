@@ -1,0 +1,5 @@
+{
+  "expect_zigzag": 1,
+  "op": "zigzag_round_trip",
+  "value": -1
+}

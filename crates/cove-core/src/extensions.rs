@@ -149,6 +149,31 @@ impl ExtensionRegistry {
         Ok(Self { entries })
     }
 
+    /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
+    /// Header `flags` field is emitted as zero (reserved in v1).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.entries.len() * 64);
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags reserved
+        for e in &self.entries {
+            out.extend_from_slice(&e.extension_id.to_le_bytes());
+            out.extend_from_slice(&(e.namespace.len() as u16).to_le_bytes());
+            out.extend_from_slice(&e.namespace);
+            out.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&e.name);
+            out.extend_from_slice(&e.version_major.to_le_bytes());
+            out.extend_from_slice(&e.version_minor.to_le_bytes());
+            out.extend_from_slice(&e.extension_kind.to_le_bytes());
+            out.extend_from_slice(&e.required_feature_bit.to_le_bytes());
+            out.extend_from_slice(&e.optional_feature_bit.to_le_bytes());
+            out.extend_from_slice(&e.fallback_kind.to_le_bytes());
+            out.extend_from_slice(&e.fallback_ref.to_le_bytes());
+            out.extend_from_slice(&e.payload_ref.to_le_bytes());
+            out.extend_from_slice(&e.checksum.to_le_bytes());
+        }
+        out
+    }
+
     /// Validate entries against known extensions.
     ///
     /// This skeleton implementation knows no extensions. Entries with a
@@ -253,5 +278,32 @@ mod tests {
             ExtensionRegistry::parse(&bytes),
             Err(CoveError::BufferTooShort)
         );
+    }
+}
+
+#[cfg(test)]
+mod serialize_tests {
+    use super::*;
+
+    #[test]
+    fn serialize_round_trip() {
+        let reg = ExtensionRegistry {
+            entries: vec![ExtensionRegistryEntry {
+                extension_id: 9,
+                namespace: b"org.example".to_vec(),
+                name: b"feature-x".to_vec(),
+                version_major: 1,
+                version_minor: 2,
+                extension_kind: 3,
+                required_feature_bit: 0x1000,
+                optional_feature_bit: 0,
+                fallback_kind: 0,
+                fallback_ref: 0,
+                payload_ref: 11,
+                checksum: 0xDEADBEEF,
+            }],
+        };
+        let bytes = reg.serialize();
+        assert_eq!(ExtensionRegistry::parse(&bytes).unwrap(), reg);
     }
 }

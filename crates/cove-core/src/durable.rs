@@ -46,38 +46,150 @@ pub fn temp_path_for(final_path: &Path) -> PathBuf {
 /// protocol.
 ///
 /// Returns the [`PathBuf`] of the temporary file used (already renamed away
-/// on success; left in place on error so that callers can clean up).
+/// on success; cleaned up best-effort on error).
 pub fn durable_replace(final_path: &Path, bytes: &[u8]) -> Result<PathBuf, CoveError> {
+    let mut backend = StdDurableReplaceBackend;
+    durable_replace_with_backend(&mut backend, final_path, bytes)
+}
+
+trait DurableReplaceBackend {
+    fn write_new_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), CoveError>;
+    fn sync_file(&mut self, path: &Path) -> Result<(), CoveError>;
+    fn rename(&mut self, from: &Path, to: &Path) -> Result<(), CoveError>;
+    fn remove_file(&mut self, path: &Path) -> Result<(), CoveError>;
+    fn sync_parent_dir_best_effort(&mut self, final_path: &Path);
+}
+
+struct StdDurableReplaceBackend;
+
+impl DurableReplaceBackend for StdDurableReplaceBackend {
+    fn write_new_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), CoveError> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.write_all(bytes)?;
+        Ok(())
+    }
+
+    fn sync_file(&mut self, path: &Path) -> Result<(), CoveError> {
+        File::open(path)?.sync_all()?;
+        Ok(())
+    }
+
+    fn rename(&mut self, from: &Path, to: &Path) -> Result<(), CoveError> {
+        fs::rename(from, to)?;
+        Ok(())
+    }
+
+    fn remove_file(&mut self, path: &Path) -> Result<(), CoveError> {
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    fn sync_parent_dir_best_effort(&mut self, final_path: &Path) {
+        if let Some(parent) = final_path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
+}
+
+fn durable_replace_with_backend<B: DurableReplaceBackend>(
+    backend: &mut B,
+    final_path: &Path,
+    bytes: &[u8],
+) -> Result<PathBuf, CoveError> {
     let tmp = temp_path_for(final_path);
     let result = (|| -> Result<(), CoveError> {
-        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
-
-        fs::rename(&tmp, final_path)?;
-        sync_parent_dir_best_effort(final_path);
+        backend.write_new_file(&tmp, bytes)?;
+        backend.sync_file(&tmp)?;
+        backend.rename(&tmp, final_path)?;
+        backend.sync_parent_dir_best_effort(final_path);
         Ok(())
     })();
 
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = backend.remove_file(&tmp);
     }
     result?;
     Ok(tmp)
 }
 
-fn sync_parent_dir_best_effort(final_path: &Path) {
-    if let Some(parent) = final_path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FailStep {
+        WriteNewFile,
+        SyncFile,
+        Rename,
+        RemoveFile,
+    }
+
+    struct FailingBackend {
+        inner: StdDurableReplaceBackend,
+        fail_at: Option<FailStep>,
+    }
+
+    impl DurableReplaceBackend for FailingBackend {
+        fn write_new_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), CoveError> {
+            if self.fail_at == Some(FailStep::WriteNewFile) {
+                return Err(std::io::Error::other("injected write failure").into());
+            }
+            self.inner.write_new_file(path, bytes)
+        }
+
+        fn sync_file(&mut self, path: &Path) -> Result<(), CoveError> {
+            if self.fail_at == Some(FailStep::SyncFile) {
+                return Err(std::io::Error::other("injected sync failure").into());
+            }
+            self.inner.sync_file(path)
+        }
+
+        fn rename(&mut self, from: &Path, to: &Path) -> Result<(), CoveError> {
+            if self.fail_at == Some(FailStep::Rename) {
+                return Err(std::io::Error::other("injected rename failure").into());
+            }
+            self.inner.rename(from, to)
+        }
+
+        fn remove_file(&mut self, path: &Path) -> Result<(), CoveError> {
+            if self.fail_at == Some(FailStep::RemoveFile) {
+                return Err(std::io::Error::other("injected remove failure").into());
+            }
+            self.inner.remove_file(path)
+        }
+
+        fn sync_parent_dir_best_effort(&mut self, final_path: &Path) {
+            self.inner.sync_parent_dir_best_effort(final_path);
+        }
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cove-durable-{name}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn temp_siblings_for(target: &Path) -> Vec<PathBuf> {
+        let parent = target.parent().unwrap();
+        let prefix = format!(
+            "{}.cove.tmp.",
+            target.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                let file_name = path.file_name()?.to_string_lossy();
+                file_name.starts_with(&prefix).then_some(path)
+            })
+            .collect()
+    }
 
     #[test]
     fn temp_path_is_sibling_with_cove_tmp_suffix() {
@@ -95,20 +207,67 @@ mod tests {
 
     #[test]
     fn durable_replace_writes_full_payload() {
-        let dir = std::env::temp_dir();
-        let target = dir.join(format!("cove-test-{}.cove", std::process::id()));
+        let dir = test_dir("writes-full-payload");
+        let target = dir.join("example.cove");
         // Pre-existing content must be replaced atomically.
         std::fs::write(&target, b"old").unwrap();
         let payload = b"new content";
         durable_replace(&target, payload).unwrap();
         let read_back = std::fs::read(&target).unwrap();
         assert_eq!(read_back, payload);
-        let _ = std::fs::remove_file(&target);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn parent_sync_open_failures_are_ignored() {
         let path = Path::new("/definitely-missing-parent-for-cove-tests/output.cove");
-        sync_parent_dir_best_effort(path);
+        let mut backend = StdDurableReplaceBackend;
+        backend.sync_parent_dir_best_effort(path);
+    }
+
+    #[test]
+    fn durable_replace_preserves_old_file_when_temp_sync_fails() {
+        let dir = test_dir("sync-fail");
+        let target = dir.join("sync-fail.cove");
+        std::fs::write(&target, b"old").unwrap();
+        let mut backend = FailingBackend {
+            inner: StdDurableReplaceBackend,
+            fail_at: Some(FailStep::SyncFile),
+        };
+
+        assert!(durable_replace_with_backend(&mut backend, &target, b"new").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert!(temp_siblings_for(&target).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn durable_replace_preserves_old_file_when_rename_fails() {
+        let dir = test_dir("rename-fail");
+        let target = dir.join("rename-fail.cove");
+        std::fs::write(&target, b"old").unwrap();
+        let mut backend = FailingBackend {
+            inner: StdDurableReplaceBackend,
+            fail_at: Some(FailStep::Rename),
+        };
+
+        assert!(durable_replace_with_backend(&mut backend, &target, b"new").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert!(temp_siblings_for(&target).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn durable_replace_cleans_temp_file_on_failure() {
+        let dir = test_dir("write-fail");
+        let target = dir.join("write-fail.cove");
+        let mut backend = FailingBackend {
+            inner: StdDurableReplaceBackend,
+            fail_at: Some(FailStep::WriteNewFile),
+        };
+
+        assert!(durable_replace_with_backend(&mut backend, &target, b"new").is_err());
+        assert!(temp_siblings_for(&target).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

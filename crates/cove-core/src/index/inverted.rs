@@ -166,6 +166,22 @@ impl InvertedMorselIndex {
             bitmap_data,
         })
     }
+
+    /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut header = self.header.clone();
+        header.entry_count = self.entries.len() as u32;
+        header.entries_offset = INVERTED_MORSEL_INDEX_HEADER_LEN as u64;
+        header.bitmap_data_offset = (INVERTED_MORSEL_INDEX_HEADER_LEN
+            + self.entries.len() * INVERTED_MORSEL_ENTRY_LEN)
+            as u64;
+        let mut out = header.serialize().to_vec();
+        for entry in &self.entries {
+            out.extend_from_slice(&entry.serialize());
+        }
+        out.extend_from_slice(&self.bitmap_data);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -272,5 +288,48 @@ mod tests {
         }
         bytes.push(0);
         assert_eq!(InvertedMorselIndex::parse(&bytes), Err(CoveError::BadIndex));
+    }
+
+    #[test]
+    fn serialize_round_trip_full_index() {
+        let entries = vec![
+            InvertedEntry {
+                key: 5,
+                morsel_bitmap_offset: 0,
+                morsel_bitmap_length: 1,
+                row_bitmap_offset: 0,
+                row_bitmap_length: 0,
+            },
+            InvertedEntry {
+                key: 7,
+                morsel_bitmap_offset: 1,
+                morsel_bitmap_length: 1,
+                row_bitmap_offset: 0,
+                row_bitmap_length: 0,
+            },
+        ];
+        let header = InvertedMorselIndexHeaderV1 {
+            table_id: 1,
+            column_id: 1,
+            key_kind: InvertedKeyKind::FileCode,
+            flags: 0,
+            representation: 0,
+            reserved: 0,
+            entry_count: entries.len() as u32,
+            entries_offset: INVERTED_MORSEL_INDEX_HEADER_LEN as u64,
+            bitmap_data_offset: (INVERTED_MORSEL_INDEX_HEADER_LEN
+                + entries.len() * INVERTED_MORSEL_ENTRY_LEN) as u64,
+            checksum: 0,
+        };
+        let idx = InvertedMorselIndex {
+            header,
+            entries,
+            bitmap_data: vec![0b0000_1001, 0b0000_0100],
+        };
+        let bytes = idx.serialize();
+        let parsed = InvertedMorselIndex::parse(&bytes).unwrap();
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].key, 5);
+        assert_eq!(parsed.bitmap_data, idx.bitmap_data);
     }
 }

@@ -1,0 +1,11 @@
+{
+  "members": [
+    "crates/cove-core",
+    "crates/cove-validate",
+    "crates/cove-inspect",
+    "crates/cove-dump",
+    "crates/cove-conformance",
+    "crates/cove-bench"
+  ],
+  "op": "workspace_members_present"
+}

@@ -1,0 +1,19 @@
+{
+  "columns": [
+    {
+      "column_id": 7,
+      "zone_stats": {
+        "null_count": 10,
+        "row_count": 10
+      }
+    }
+  ],
+  "expect_evidence": [
+    "ZoneStats"
+  ],
+  "expect_outcome": "all_match",
+  "predicate": {
+    "column_id": 7,
+    "op": "is_null"
+  }
+}

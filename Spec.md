@@ -1161,6 +1161,35 @@ VarBytes
 LocalCodebook(VarBytes) only if values are page-local and not globally dictionary encoded
 Writers SHOULD prefer FileCode over VarBytes for repeated strings, categories, UUID-like dimensions, and low/medium-cardinality values.
 
+### 20.4 LocalCodebook Payload
+
+```rust
+struct LocalCodebookPayloadV1 {
+  child_encoding_kind: u16,   // Rle or BitPacked
+  value_physical_kind: u16,   // FileCode, NumCode, Boolean, or VarBytes
+  codebook_len: u32,
+  child_payload_len: u32,
+  codebook_values: [u8],
+  child_payload: [u8],
+}
+```
+
+**Codebook value layout:**
+
+| value_physical_kind | Codebook entry wire layout |
+| --- | --- |
+| FileCode | `u32` little-endian FileCode |
+| NumCode | `u64` little-endian raw NumCode bits |
+| Boolean | `u8`, where `0=false` and `1=true` |
+| VarBytes | `u32 byte_len` followed by `byte_len` bytes |
+
+**Rules:**
+- `child_encoding_kind` MUST be `Rle` or `BitPacked` and decodes local indexes.
+- Each decoded local index MUST be less than `codebook_len`.
+- Boolean codebook entries MUST be either 0 or 1.
+- VarBytes codebook entries are page-local values and MUST NOT be interpreted as FileCode dictionary entries.
+- Readers MUST reject unsupported `value_physical_kind` values and malformed codebook lengths.
+
 ---
 
 ## 21. Kernel Capability Metadata
@@ -1497,6 +1526,22 @@ struct ColumnPageIndexEntryV1 {
 - For non-nullable columns, null_count MUST be zero.
 - Page checksum covers page payload.
 
+**Page flags:**
+
+| Bits | Name | Meaning |
+| --- | --- | --- |
+| 0x0000_00FF | PAGE_FLAG_COMPRESSION_CODEC | Page-level `CompressionCodec` value from Section 66. |
+| 0xFFFF_FF00 | reserved | Reserved for future required page extensions; MUST be zero in v1. |
+
+**Page codec rules:**
+- PAGE_FLAG_COMPRESSION_CODEC applies only to the page payload bytes referenced by `page_offset` and `page_length`.
+- Codec `None` requires `page_length == uncompressed_length`.
+- LZ4 and Zstd page payloads use the same block codec definitions as Section 66 and require `uncompressed_length` to be the exact decoded byte length.
+- If `page_length == 0`, `uncompressed_length` MUST also be zero.
+- If `page_length > 0` and the page codec is not `None`, `uncompressed_length` MUST be non-zero.
+- Writers that use LZ4 or Zstd page codecs MUST advertise the corresponding `FEATURE_CODEC_LZ4` or `FEATURE_CODEC_ZSTD` bit.
+- Readers MUST reject unknown page codec values and any non-zero reserved page flag bits unless a required extension defines the bit and the reader supports that extension.
+
 ### 27.3 Page Payload
 
 **A column page payload contains:**
@@ -1569,6 +1614,31 @@ enum StatKind {
     FixedBytes = 8,
 }
 ```
+
+**StatScalar flags:**
+
+| Bit | Name | Meaning |
+| --- | --- | --- |
+| 0 | STAT_SCALAR_TRUNCATED | This scalar is a truncated bound. |
+| 1-7 | reserved | MUST be zero in v1. |
+
+**StatScalar length rules:**
+
+| StatKind | Required length |
+| --- | --- |
+| None | 0 |
+| Int64 | 8 |
+| UInt64 | 8 |
+| Float64Bits | 8 |
+| Decimal128 | 16 |
+| TimestampMicros | 8 |
+| TimestampNanos | 8 |
+| DateDays | 4 |
+| FixedBytes | 0..16 |
+
+`MINMAX_TRUNCATED` MUST be set if and only if `STAT_SCALAR_TRUNCATED` is set on either the min or max scalar.
+
+Float64 min/max scalars MUST NOT contain NaN. If a zone contains NaN values, writers MUST set `HAS_NAN` and exclude NaN from min/max.
 
 **Stats flags:**
 

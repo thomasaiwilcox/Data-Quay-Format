@@ -108,6 +108,18 @@ impl<'a> CanonicalValue<'a> {
     }
 }
 
+/// Validate that `bytes` are a well-formed canonical payload for `value_tag`
+/// according to Spec §17.
+pub fn validate_canonical_payload(value_tag: ValueTag, bytes: &[u8]) -> Result<(), CoveError> {
+    let consumed = validate_payload_inner(value_tag, bytes)?;
+    if consumed != bytes.len() {
+        return Err(CoveError::BadSection(
+            "canonical payload has trailing bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn encode_i64_width(width: u8, value: i128) -> Result<Vec<u8>, CoveError> {
     let min = match width {
         1 => i8::MIN as i128,
@@ -133,6 +145,173 @@ fn encode_i64_width(width: u8, value: i128) -> Result<Vec<u8>, CoveError> {
         ));
     }
     Ok((value as i64).to_le_bytes().to_vec())
+}
+
+fn validate_tagged_value(bytes: &[u8]) -> Result<(ValueTag, usize), CoveError> {
+    let (raw_tag, tag_len) = decode_canonical_varint(bytes, "canonical value tag")?;
+    let raw_tag_u16 = u16::try_from(raw_tag)
+        .map_err(|_| CoveError::BadSection(format!("unknown canonical value tag {raw_tag}")))?;
+    let value_tag = ValueTag::from_u16(raw_tag_u16)
+        .ok_or_else(|| CoveError::BadSection(format!("unknown canonical value tag {raw_tag}")))?;
+    let payload_len = validate_payload_inner(value_tag, &bytes[tag_len..])?;
+    let consumed = tag_len
+        .checked_add(payload_len)
+        .ok_or(CoveError::ArithOverflow)
+        .map_err(|_| CoveError::BadSection("canonical tagged value length overflow".into()))?;
+    Ok((value_tag, consumed))
+}
+
+fn validate_payload_inner(value_tag: ValueTag, bytes: &[u8]) -> Result<usize, CoveError> {
+    match value_tag {
+        ValueTag::Null | ValueTag::BoolFalse | ValueTag::BoolTrue => Ok(0),
+        ValueTag::Int64
+        | ValueTag::UInt64
+        | ValueTag::Float64Bits
+        | ValueTag::Decimal64
+        | ValueTag::TimestampMicros
+        | ValueTag::TimestampNanos => validate_min_width(bytes, 8, "8-byte canonical payload"),
+        ValueTag::Float32Bits | ValueTag::DateDays => {
+            validate_min_width(bytes, 4, "4-byte canonical payload")
+        }
+        ValueTag::Decimal128 | ValueTag::Uuid => {
+            validate_min_width(bytes, 16, "16-byte canonical payload")
+        }
+        ValueTag::Utf8 => {
+            let (payload, consumed) = decode_length_prefixed(bytes, "canonical UTF-8 payload")?;
+            std::str::from_utf8(payload).map_err(|_| {
+                CoveError::BadSection("Utf8 tag payload must be valid UTF-8".into())
+            })?;
+            Ok(consumed)
+        }
+        ValueTag::Binary => {
+            let (_, consumed) = decode_length_prefixed(bytes, "canonical binary payload")?;
+            Ok(consumed)
+        }
+        ValueTag::Json => {
+            let (payload, consumed) = decode_length_prefixed(bytes, "canonical JSON payload")?;
+            serde_json::from_slice::<serde_json::Value>(payload).map_err(|_| {
+                CoveError::BadSection("Json tag payload must be syntactically valid JSON".into())
+            })?;
+            Ok(consumed)
+        }
+        ValueTag::List => {
+            let (element_count, mut pos) =
+                decode_canonical_varint(bytes, "canonical list element count")?;
+            for _ in 0..element_count {
+                let (_, consumed) = validate_tagged_value(&bytes[pos..])?;
+                pos = pos
+                    .checked_add(consumed)
+                    .ok_or(CoveError::ArithOverflow)
+                    .map_err(|_| CoveError::BadSection("canonical list length overflow".into()))?;
+            }
+            Ok(pos)
+        }
+        ValueTag::Struct => {
+            let (field_count, mut pos) =
+                decode_canonical_varint(bytes, "canonical struct field count")?;
+            let mut prev_field_id = None;
+            for _ in 0..field_count {
+                let (field_id, consumed) =
+                    decode_canonical_varint(&bytes[pos..], "canonical struct field_id")?;
+                pos = pos
+                    .checked_add(consumed)
+                    .ok_or(CoveError::ArithOverflow)
+                    .map_err(|_| {
+                        CoveError::BadSection("canonical struct length overflow".into())
+                    })?;
+                if let Some(prev) = prev_field_id {
+                    if field_id <= prev {
+                        return Err(CoveError::BadSection(
+                            "canonical struct field_ids must be strictly ascending".into(),
+                        ));
+                    }
+                }
+                prev_field_id = Some(field_id);
+                let (_, consumed) = validate_tagged_value(&bytes[pos..])?;
+                pos = pos
+                    .checked_add(consumed)
+                    .ok_or(CoveError::ArithOverflow)
+                    .map_err(|_| {
+                        CoveError::BadSection("canonical struct length overflow".into())
+                    })?;
+            }
+            Ok(pos)
+        }
+        ValueTag::Map => {
+            let (pair_count, mut pos) = decode_canonical_varint(bytes, "canonical map pair count")?;
+            let mut prev_key: Option<Vec<u8>> = None;
+            for _ in 0..pair_count {
+                let key_start = pos;
+                let (key_tag, key_consumed) = validate_tagged_value(&bytes[pos..])?;
+                if !is_scalar_value_tag(key_tag) {
+                    return Err(CoveError::BadSection(
+                        "canonical map key must be scalar".into(),
+                    ));
+                }
+                pos = pos
+                    .checked_add(key_consumed)
+                    .ok_or(CoveError::ArithOverflow)
+                    .map_err(|_| CoveError::BadSection("canonical map length overflow".into()))?;
+                let key_bytes = bytes[key_start..pos].to_vec();
+                if let Some(prev) = &prev_key {
+                    use std::cmp::Ordering;
+                    match key_bytes.as_slice().cmp(prev.as_slice()) {
+                        Ordering::Less => {
+                            return Err(CoveError::BadSection(
+                                "canonical map keys must be sorted by canonical bytes".into(),
+                            ));
+                        }
+                        Ordering::Equal => {
+                            return Err(CoveError::BadSection(
+                                "duplicate key in canonical map encoding".into(),
+                            ));
+                        }
+                        Ordering::Greater => {}
+                    }
+                }
+                prev_key = Some(key_bytes);
+                let (_, value_consumed) = validate_tagged_value(&bytes[pos..])?;
+                pos = pos
+                    .checked_add(value_consumed)
+                    .ok_or(CoveError::ArithOverflow)
+                    .map_err(|_| CoveError::BadSection("canonical map length overflow".into()))?;
+            }
+            Ok(pos)
+        }
+    }
+}
+
+fn validate_min_width(bytes: &[u8], width: usize, what: &str) -> Result<usize, CoveError> {
+    if bytes.len() < width {
+        return Err(CoveError::BadSection(format!(
+            "{what} must be exactly {width} bytes"
+        )));
+    }
+    Ok(width)
+}
+
+fn decode_canonical_varint(bytes: &[u8], what: &str) -> Result<(u64, usize), CoveError> {
+    wire::decode_u64_leb128(bytes).map_err(|_| CoveError::BadSection(format!("invalid {what}")))
+}
+
+fn decode_length_prefixed<'a>(bytes: &'a [u8], what: &str) -> Result<(&'a [u8], usize), CoveError> {
+    let (payload_len, prefix_len) = decode_canonical_varint(bytes, what)?;
+    let payload_len = usize::try_from(payload_len)
+        .map_err(|_| CoveError::BadSection(format!("{what} length exceeds usize")))?;
+    let total = prefix_len
+        .checked_add(payload_len)
+        .ok_or(CoveError::ArithOverflow)
+        .map_err(|_| CoveError::BadSection(format!("{what} length overflow")))?;
+    if total > bytes.len() {
+        return Err(CoveError::BadSection(format!(
+            "{what} length prefix exceeds available bytes"
+        )));
+    }
+    Ok((&bytes[prefix_len..total], total))
+}
+
+fn is_scalar_value_tag(value_tag: ValueTag) -> bool {
+    !matches!(value_tag, ValueTag::List | ValueTag::Struct | ValueTag::Map)
 }
 
 fn encode_u64_width(width: u8, value: u128) -> Result<Vec<u8>, CoveError> {
@@ -337,6 +516,63 @@ mod tests {
         .unwrap();
         assert_eq!(encoded[0], 2);
         assert_eq!(encoded[1], 1);
+    }
+
+    #[test]
+    fn validate_canonical_payload_accepts_date_days_and_nested_payloads() {
+        validate_canonical_payload(
+            ValueTag::DateDays,
+            &CanonicalValue::DateDays(12).encode().unwrap(),
+        )
+        .unwrap();
+
+        let nested = CanonicalValue::Map(vec![
+            (CanonicalValue::Utf8("a"), CanonicalValue::Utf8("1")),
+            (
+                CanonicalValue::Utf8("b"),
+                CanonicalValue::List(vec![CanonicalValue::Bool(true)]),
+            ),
+        ])
+        .encode()
+        .unwrap();
+        validate_canonical_payload(ValueTag::Map, &nested).unwrap();
+    }
+
+    #[test]
+    fn validate_canonical_payload_rejects_bad_utf8_length_prefix() {
+        let bad = vec![5, b'a', b'b', b'c'];
+        assert!(matches!(
+            validate_canonical_payload(ValueTag::Utf8, &bad),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn validate_canonical_payload_rejects_duplicate_map_keys() {
+        let key = encode_tagged(&CanonicalValue::Utf8("k")).unwrap();
+        let value1 = encode_tagged(&CanonicalValue::Utf8("v1")).unwrap();
+        let value2 = encode_tagged(&CanonicalValue::Utf8("v2")).unwrap();
+        let mut bad = wire::encode_u64_leb128(2);
+        bad.extend_from_slice(&key);
+        bad.extend_from_slice(&value1);
+        bad.extend_from_slice(&key);
+        bad.extend_from_slice(&value2);
+
+        assert!(matches!(
+            validate_canonical_payload(ValueTag::Map, &bad),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn validate_canonical_payload_accepts_multiple_tagged_values_in_list() {
+        let list = CanonicalValue::List(vec![
+            CanonicalValue::Bool(true),
+            CanonicalValue::Utf8("next"),
+        ])
+        .encode()
+        .unwrap();
+        validate_canonical_payload(ValueTag::List, &list).unwrap();
     }
 
     #[test]

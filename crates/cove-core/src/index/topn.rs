@@ -79,6 +79,16 @@ impl TopNSummary {
             payload: payload.to_vec(),
         })
     }
+
+    /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut hdr = self.clone();
+        hdr.payload_offset = TOPN_ZONE_SUMMARY_LEN as u64;
+        hdr.payload_length = self.payload.len() as u64;
+        let mut out = hdr.serialize_header().to_vec();
+        out.extend_from_slice(&self.payload);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -149,5 +159,27 @@ mod tests {
         let mut bytes = summary.serialize_header();
         bytes[36] ^= 0xff;
         assert_eq!(TopNSummary::parse(&bytes), Err(CoveError::ChecksumMismatch));
+    }
+
+    #[test]
+    fn serialize_round_trip_with_payload() {
+        let summary = TopNSummary {
+            table_id: 1,
+            column_id: 2,
+            segment_id: 3,
+            morsel_id: 4,
+            direction: TopNDirection::Smallest,
+            value_count: 4,
+            flags: 0,
+            payload_offset: 0,
+            payload_length: 0,
+            checksum: 0,
+            payload: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let bytes = summary.serialize();
+        let parsed = TopNSummary::parse(&bytes).unwrap();
+        assert_eq!(parsed.direction, TopNDirection::Smallest);
+        assert_eq!(parsed.value_count, 4);
+        assert_eq!(parsed.payload, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 }

@@ -436,11 +436,12 @@ mod tests {
             value_tag: 12,    // Utf8
             storage_class: 0, // Inline
             flags: 0,
-            inline_len: 3,
+            inline_len: 4,
             reserved0: [0; 3],
             inline_data: {
                 let mut d = [0u8; 16];
-                d[..3].copy_from_slice(b"foo");
+                // Canonical UTF-8 encoding: varint length prefix + bytes.
+                d[..4].copy_from_slice(&[0x03, b'f', b'o', b'o']);
                 d
             },
             payload_offset: 0,

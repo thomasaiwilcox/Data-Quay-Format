@@ -8,20 +8,20 @@
 //! ```
 
 use cove_core::{
-    durable,
     reader::{self, ValidationOptions},
     writer::MinimalCoveWriter,
 };
 
 fn main() {
     // 1. Build an empty but structurally valid COVE-T file.
-    let bytes = MinimalCoveWriter::write_empty_file();
+    let writer = MinimalCoveWriter::new();
+    let bytes = writer.write();
     println!("wrote {} bytes", bytes.len());
 
     // 2. Publish via Spec §74 durable-replace into a temp dir.
     let dir = std::env::temp_dir();
     let path = dir.join("cove-core-example.cove");
-    durable::durable_replace(&path, &bytes).expect("durable_replace");
+    writer.publish_durable(&path).expect("publish_durable");
     println!("published to {}", path.display());
 
     // 3. Re-read and validate semantically.

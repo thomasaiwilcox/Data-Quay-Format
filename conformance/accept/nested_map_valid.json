@@ -1,0 +1,17 @@
+{
+  "allow_duplicate_keys": false,
+  "canonical_keys": [
+    "a",
+    "b",
+    "a"
+  ],
+  "key_row_count": 3,
+  "keys_are_scalar": true,
+  "layout": "map",
+  "offsets": [
+    0,
+    2,
+    3
+  ],
+  "value_row_count": 3
+}
