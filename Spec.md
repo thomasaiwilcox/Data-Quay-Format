@@ -15,16 +15,18 @@ and engine-local execution mappings.
 | Footer Magic | COVF |
 | Accelerator Sidecar Magic | CVX1 |
 | Dataset Manifest Magic | CVM1 |
+| Semantic Mapping Artifact Magic | CMP1 |
 | Legacy Draft Identifiers | Non-normative pre-COVE draft artifacts; not valid COVE v1 identifiers |
 | Canonical Extension | .cove |
 | Short Extension | None in v1; do not introduce .cov unless later required |
 | Accelerator Sidecar Extension | .covx |
 | Dataset Manifest Extension | .covm |
+| Semantic Mapping Extension | .covemap |
 | MIME Type | application/vnd.cove-format |
 | Version | 1.0 |
-| Byte Order | Little-endian throughout |
+| Byte Order | Little-endian throughout; no byte-order negotiation in v1 |
 | Mutability | Immutable / write-once-read-many |
-| Primary Purpose | Engine-neutral queryable offline/archive format with optional engine execution profiles |
+| Primary Purpose | Engine-neutral queryable offline/archive format with optional engine execution profiles and optional semantic source-to-object/association conversion and projection readback |
 
 ---
 
@@ -38,12 +40,54 @@ COVE means Canonical Offline Value Encoding.
 - **COVE-T:** Engine-neutral table-scan profile.
 - **COVE-A:** Archive acceleration profile for synopses, lookup indexes, composite pruning, manifests, and sidecar acceleration.
 - **COVE-E:** Universal engine execution profile for mapping FileCodes into implementation-local ExecutionCodes.
-- **COVE-H:** Harbor registration under COVE-E. Defines Harbor leased-code execution: FileCode -> Harbor EngineCode.
-- **COVE-O:** Object-temporal profile for Harbor-style object history, deltas, branches, CSNs, baselines, snapshots, tombstones, and trust chains.
+- **COVE-H:** Optional named Harbor registration under COVE-E. Defines Harbor leased-code execution: FileCode -> Harbor EngineCode. COVE-H is not required for generic COVE conformance.
+- **COVE-O:** Optional object-temporal extension profile for committed object history, deltas, branches, CSNs, baselines, snapshots, tombstones, and trust chains. COVE-O is not required for generic COVE conformance.
+- **COVE-MAP:** Optional deterministic semantic mapping profile and companion `.covemap` artifact for converting one or more external source tables/files/streams into paired object-and-association semantic assertions, properties, temporal facts, and evidence that may be materialised as COVE-O and exposed through optional COVE-T/Arrow/SQL table projections. COVE-MAP is not required for generic COVE conformance.
 - **COVX:** Optional accelerator sidecar.
 - **COVM:** Optional dataset manifest.
-A conforming COVE reader MUST be able to validate and read COVE files without COVX or COVM.
-COVX and COVM are optional acceleration and planning artifacts. They MUST NOT change the logical meaning of the referenced COVE files.
+A conforming COVE reader MUST be able to validate and read COVE files without COVX, COVM, or COVE-MAP.
+COVX and COVM are optional acceleration and planning artifacts. They MUST NOT change the logical meaning of the referenced COVE files. COVE-MAP artifacts MUST NOT change the logical meaning of already materialised COVE files; they define how source data is converted, replayed, explained, or re-materialised into new COVE outputs.
+
+### 1.1 Profile Maturity and Conformance Surface
+
+COVE v1 is profile-scoped. Implementers MUST NOT treat the existence of an optional profile in this document as a requirement for baseline COVE conformance.
+**Baseline v1 interoperability target:**
+- COVE-Core structural validation and typed logical decode,
+- COVE-T table scan reading,
+- safe predicate metadata interpretation,
+- Arrow-compatible export for supported logical types,
+- a reproducible binary conformance vector set.
+**Optional v1 profiles and artifacts:**
+- COVE-A archive acceleration,
+- COVE-E engine execution-code mapping,
+- COVX accelerator sidecars,
+- COVM dataset manifests,
+- COVE-MAP semantic mapping artifacts when mapping tooling is claimed.
+**Named engine registrations:**
+- COVE-H is a Harbor-specific COVE-E registration. It demonstrates and standardises one engine profile; it is not a dependency of COVE-Core, COVE-T, COVE-A, or generic COVE-E.
+**Optional extension profiles:**
+- COVE-O is an optional object-temporal profile. It MAY be implemented by temporal-object engines, but general table readers SHOULD ignore COVE-O sections unless the requested operation explicitly requires object-temporal semantics.
+- COVE-MAP is an optional v1 profile with a stable conceptual and conformance boundary: artifact magic, feature bit, validation boundary, identity model, and operation-level rules are part of v1. The reusable `.covemap` artifact framing is defined in this specification. Exact reusable mapping-definition payload schemas and binary `MAP_*` payload schemas SHOULD be defined by a companion COVE-MAP schema specification or by registered required extensions. General COVE readers SHOULD ignore COVE-MAP artifacts or sections unless the requested operation explicitly requires mapping validation, mapping replay, mapping explanation, source-to-object/association conversion, or mapping-defined projection readback.
+
+A file that contains optional profile sections MUST advertise the corresponding feature bits. A reader that does not implement an advertised optional profile MUST either ignore the profile when it is not required for the requested operation, or reject the requested operation with a profile-not-supported error.
+Implementations that claim COVE-MAP support SHOULD state whether they support only the stable v1 profile boundary or also one or more companion reusable-mapping payload schemas.
+
+### 1.2 Named Engine and Product-Specific Terms
+
+COVE is an engine-neutral format. Product-specific names are allowed only in named profiles, examples, registries, or non-normative implementation guidance.
+
+Harbor is a named engine/profile registration that supplied the initial leased-code execution use case. Generic COVE text SHOULD use engine-neutral terms such as engine, scope, ExecutionCode, code-space, mapping, and profile. Harbor-specific concepts such as Harbor tenant UUID, Harbor EngineCode, Harbor lease, and Harbor mount cache apply only to COVE-H or to examples explicitly labelled as Harbor examples.
+
+A COVE-Core, COVE-T, COVE-A, or generic COVE-E implementation MUST NOT require Harbor software, Harbor identity, Harbor tenancy, Harbor leases, or Harbor code spaces.
+
+### 1.3 Standards Boundary
+
+This specification admits only features that define portable wire semantics, validation behaviour, interoperability obligations, conformance levels, or extension contracts. Ecosystem tasks such as engine plugins, UI viewers, orchestration hooks, benchmark dashboards, and language bindings are valuable, but they do not belong in the normative core unless they introduce a stable artifact or reader/writer obligation.
+
+**Rules:**
+- COVE-Core and COVE-T MUST remain implementable without a lakehouse catalog, named engine profile, accelerator sidecar, object-temporal engine, or product-specific integration.
+- New stable profiles MUST define feature bits, fallback behaviour, failure behaviour, security/privacy impact where relevant, and conformance vectors.
+- Optional acceleration and ecosystem integration metadata MUST remain ignorable unless explicitly required by a feature bit or by the requested operation.
 
 ---
 
@@ -72,17 +116,22 @@ COVX and COVM are optional acceleration and planning artifacts. They MUST NOT ch
 - metadata-answerable queries,
 - engine-local dictionary/code execution,
 - Arrow-compatible decoding,
-- optional engine-specific execution mappings,
-- Harbor leased-code execution through COVE-H,
-- optional object-temporal history through COVE-O.
+- optional engine-specific execution mappings through COVE-E,
+- optional named engine execution registrations such as COVE-H,
+- optional object-temporal history through COVE-O,
+- optional deterministic multi-source semantic mapping into object-based COVE through COVE-MAP.
 **COVE is not:**
 - a WAL,
 - a mutable database file,
 - an in-flight transaction recovery log,
 - a lakehouse catalog replacement,
+- a lakehouse/table transaction protocol,
+- a row-level delete or visibility protocol,
+- an access-control system or encryption standard in v1,
 - an Arrow IPC replacement,
 - a generic Parquet clone,
-- a format that persists engine-local ExecutionCodes as authoritative logical data.
+- a format that persists engine-local ExecutionCodes as authoritative logical data,
+- a mandatory ETL orchestrator, master-data-management system, probabilistic entity-resolution system, or AI-based schema matching system.
 **COVE’s guiding principle is:**
 Store portable logical values and engine-shaped physical data.
 Let each engine own its own execution identity at read or mount time.
@@ -99,6 +148,7 @@ Let each engine own its own execution identity at read or mount time.
 
 - **Parquet / ORC:** universal lakehouse interchange and mature analytical columnar storage.
 - **COVE:** high-performance queryable archive and converted-table format for engines that can exploit encoded execution, rich pruning metadata, lookup indexes, aggregate synopses, optional sidecars, and direct dictionary/code-vector execution.
+- **COVE-MAP:** optional deterministic source-row semantics for organisations that want to convert fragmented source tables, files, and streams into portable object-and-association COVE, and optionally expose that object-association truth through deterministic projected tables, without adopting a named runtime engine.
 
 ---
 
@@ -110,8 +160,9 @@ Let each engine own its own execution identity at read or mount time.
 | COVE-T | Table Scan Profile | General engines | Engine-neutral columnar table scan profile. |
 | COVE-A | Archive Acceleration Profile | Archive/query engines | Synopses, lookup indexes, manifests, composite pruning, sidecars. |
 | COVE-E | Engine Execution Profile | All engines | Universal mapping from FileCodes to engine-local ExecutionCodes. |
-| COVE-H | Harbor Execution Registration | Harbor | Harbor leased-code implementation of COVE-E. |
-| COVE-O | Object Temporal Profile | Harbor and temporal-object engines | Object history, deltas, branches, CSNs, trust chains. |
+| COVE-H | Harbor Execution Registration | Harbor implementations | Optional Harbor leased-code implementation of COVE-E. |
+| COVE-O | Object Temporal Profile | Temporal-object engines | Optional object history, deltas, branches, CSNs, trust chains. |
+| COVE-MAP | Semantic Mapping Profile | Conversion/governance/object/projection tools | Optional deterministic multi-source row semantics, identity joins, evidence, materialisation into object-and-association COVE, and deterministic readback as projected tables. |
 
 ---
 
@@ -154,11 +205,11 @@ ExecutionCode is an implementation-local runtime code.
 **Polars:**
   categorical code
 
-**Harbor:**
-  leased Harbor EngineCode
-
 **Custom engine:**
   symbol ID, interned value ID, dictionary key, catalog code, etc.
+
+**COVE-H example:**
+  leased Harbor EngineCode
 COVE-Core does not define the meaning of an ExecutionCode.
 
 COVE-E defines the universal mechanism for describing execution-code mappings.
@@ -168,8 +219,9 @@ FileCode -> Harbor EngineCode
 
 ---
 
-### 6.3 Harbor EngineCode
+### 6.3 Named Engine Example: Harbor EngineCode
 
+This subsection is COVE-H specific. It is not part of COVE-Core, COVE-T, COVE-A, or generic COVE-E conformance.
 **A Harbor EngineCode is:**
 - Harbor-owned,
 - tenant/code-space scoped,
@@ -210,7 +262,7 @@ A scope describes the logical ownership or execution boundary associated with a 
 - engine-specific scope.
 The core header uses producer_scope_id and producer_scope_kind.
 
-**For Harbor:**
+**COVE-H example:**
 producer_scope_kind = Tenant
 producer_scope_id   = Harbor tenant UUID
 **For other engines:**
@@ -232,6 +284,15 @@ bit = 0 means non-null
 - Dictionary ValueTag::Null is not a row-null sentinel.
 ValueTag::Null is valid for nested canonical values, explicit JSON/list/map nulls, and canonical value representation.
 
+**Bitmap layout:**
+- Row i uses bit (i & 7) of byte (i >> 3).
+- Bits are numbered least-significant-bit first within each byte.
+- Unused high bits in the final byte MUST be zero.
+- Implementations SHOULD name this structure null_bitmap or cove_null_bitmap, not validity_bitmap.
+
+**Rationale:**
+COVE stores a nullness bitmap rather than an Arrow-style validity bitmap because null is a structural exception and because all-zero freshly allocated bitmap memory represents the common all-non-null case. This convention also allows a null bitmap to be used directly as a null-rejection mask during predicate evaluation. The tradeoff is intentional: Arrow export requires inversion or materialisation of an Arrow validity bitmap, and conformance vectors MUST cover that conversion.
+
 ---
 
 ### 6.7 Morsel
@@ -250,7 +311,71 @@ All columns in a table segment MUST share the same morsel boundaries.
 **Default:**
 morsel_row_count = 4096
 
+**Motivation:**
+A morsel is an execution and pruning grain, not merely a compression block. It is intentionally smaller and more regular than a large table segment so engines can schedule work, build predicate bitmaps, remap FileCodes, and late-materialise selected columns without opening unrelated data. The 4096-row default balances:
+- low per-morsel metadata overhead,
+- cache-friendly predicate bitmaps and row-selection masks,
+- simple row references with u16 row offsets,
+- vectorised execution in 1024-row or 2048-row engines,
+- practical packing of narrow columns.
+
+**Relationship to other batching concepts:**
+- Table segments may contain many morsels.
+- Column pages are encoded per column and align to morsel row ranges unless an extension explicitly defines a different safe layout.
+- Arrow RecordBatches are an output representation chosen by the reader; a reader MAY expose one morsel per RecordBatch, combine adjacent morsels, or split a morsel for downstream limits, provided logical row order and row-reference semantics are preserved.
+- Morsel boundaries are the default unit for zone statistics, exact sets, bloom membership summaries, lookup row references, and predicate proof bitmaps.
+
+**Vector alignment:**
+- morsel_row_count SHOULD be a power of two.
+- morsel_row_count SHOULD be a whole multiple of any declared execution vector size hint.
+- Engine profiles that promise direct engine-vector materialisation MUST declare their execution vector size, or declare that no fixed vector size is assumed.
+- Except for the final morsel in a segment, writers SHOULD NOT emit partial execution vectors within a morsel.
+- The default 4096-row morsel is intentionally compatible with 2048-row and 1024-row execution vectors.
+
 ---
+
+
+### 6.8 Semantic Object Identity and COVE-MAP Join Keys
+
+COVE-MAP introduces a portable distinction between source-local row identity and semantic object identity.
+
+A **source row identity** identifies a row, record, event, or payload within a declared source snapshot or source load. It is provenance, not object identity.
+
+A **semantic object identity** identifies the destination object that source evidence contributes to. In COVE-MAP, semantic identity is produced only by declared identity rules and deterministic join keys.
+
+A **semantic join key** is an ordered tuple of one or more canonicalised source values used to assert that source rows describe the same destination object. A join-key definition may bind the same semantic roles to columns from different source schemas, but each join key tuple is computed per source row or source record using only that source's declared bindings. Cross-source matching occurs because different source-specific bindings map into the same ordered semantic roles, not because values from multiple sources are combined before identity resolution.
+
+**Example:**
+
+```text
+Customer.name_email_key:
+  object_type: Customer
+  confidence_class: strong_deterministic
+  auto_merge: true
+  components:
+    - semantic_role: Customer.Name
+      source_columns:
+        crm.customers.name
+        support.requester_name
+      normalisation: cove.fn.person_name.v1
+    - semantic_role: Customer.Email
+      source_columns:
+        crm.customers.email
+        orders.customer_email
+        support.requester_email
+      normalisation: cove.fn.email.v1
+  null_policy: all_components_required
+```
+
+Under this rule, a CRM row and a Support row with the same canonical `Customer.Name` and `Customer.Email` values produce the same strong deterministic identity key and may be merged into one `Customer` object. The same name alone would not merge unless a separate rule explicitly allowed it.
+
+**Rules:**
+- COVE-MAP join keys MUST be computed from canonical logical values, not FileCodes, source display bytes, locale defaults, or engine-local ExecutionCodes.
+- Multi-column join keys MUST preserve the declared component order and MUST use length-delimited canonical component bytes before hashing or comparison.
+- A join key that permits automatic object merge MUST declare its object type, component list, normalisation functions, null policy, confidence class, merge policy, and conflict policy.
+- A confidence class in COVE-MAP is a declared deterministic rule class, not a probability. It MUST NOT be produced by hidden probabilistic or AI matching unless the mapping labels the result as candidate-only evidence.
+- Candidate join keys MAY be emitted as evidence, but candidate keys MUST NOT change canonical object identity unless promoted by an explicit deterministic mapping rule in the declared mapping version.
+- If two join keys would merge objects in violation of a declared do-not-merge rule, the mapper MUST apply the declared conflict behaviour: reject, keep separate, or emit conflict evidence.
 
 ## 7. Core Invariants
 
@@ -265,6 +390,15 @@ COVE files are write-once-read-many.
 - No mutable lease maps.
 Compaction, import, export, and conversion produce new COVE files.
 
+**Write finalisation:**
+- A writer MAY stream input records into temporary builder state, temporary files, or uncommitted segment buffers.
+- A .cove object is valid only after the complete section directory, footer, postscript, and covered checksums have been written and validated.
+- COVE v1 does not define partially visible incremental writes, append-in-place, or reader recovery from an unfinished .cove object.
+- Streaming or incremental dataset publication MAY be built above COVE using new immutable COVE files plus COVM or an external catalog, but readers MUST NOT infer visibility from partially written COVE data.
+
+Future versions MAY define appendable or streaming containers, but such containers MUST use new magic, feature bits, or profile rules so v1 readers cannot mistake them for immutable v1 COVE files.
+See Section 50.4 for the v1 append, streaming, CDC, and compaction boundary when COVE files are used inside a dataset or external table system.
+
 ---
 
 ### 7.2 COVE is engine-neutral at the core
@@ -277,6 +411,9 @@ COVE-Core and COVE-T MUST be readable without Harbor.
 **Native execution path:**
   FileCode -> engine-local ExecutionCode -> native vector
 COVE-H is Harbor-specific, but it is registered through the universal COVE-E mechanism.
+
+**Specification style rule:**
+Generic COVE-Core, COVE-T, COVE-A, and COVE-E text SHOULD avoid Harbor terminology except when contrasting a generic rule with the COVE-H registration. This keeps the portable format boundary clear for non-Harbor implementers.
 
 ---
 
@@ -299,6 +436,18 @@ COVE-H is Harbor-specific, but it is registered through the universal COVE-E mec
 - mount state,
 - dictionary arrays.
 Engine profiles MUST NOT be required to recover the logical values of a COVE-T file.
+
+---
+
+### 7.3.1 Semantic mappings do not redefine materialised truth
+
+COVE-MAP definitions describe how external source data is converted into COVE outputs. They do not redefine the logical values already present in a materialised COVE-Core, COVE-T, or COVE-O file.
+
+**Rules:**
+- A COVE-T reader MUST NOT need COVE-MAP to decode table values.
+- A COVE-O reader MUST NOT need COVE-MAP to reconstruct object records that have already been materialised.
+- COVE-MAP may be required for mapping replay, mapping explanation, source-to-object conversion, or audit of source evidence.
+- Mapping identity comparisons MUST use canonical logical values and declared mapping functions. They MUST NOT compare FileCodes across files.
 
 ---
 
@@ -376,6 +525,12 @@ Binary metadata is authoritative.
 ### 8.1 Endianness
 
 All multi-byte integers are little-endian.
+COVE v1 deliberately chooses one canonical byte order instead of storing a byte-order marker or negotiating host endianness. This keeps section parsing, memory-mapped fixed-width fields, checksum coverage, and conformance vectors deterministic.
+**Rules:**
+- Writers MUST emit little-endian values.
+- Readers on big-endian hosts MUST byte-swap multi-byte scalar fields into host order before interpretation.
+- Encoded byte streams whose algorithm defines its own byte order MUST follow that algorithm's registered COVE encoding definition.
+- Future formats that want byte-order negotiation MUST use new magic, a new major version, or an explicitly incompatible required feature bit.
 
 ### 8.2 Boolean
 
@@ -500,6 +655,8 @@ struct CoveHeaderV1 {
     // 3=COVE-A archive acceleration
     // 4=COVE-E engine execution
     // 5=COVE-H Harbor registered execution profile
+    // 6=COVE-MAP evidence/projection carrier inside a .cove file;
+    //   reusable mapping definitions normally live in .covemap
 
     endianness: u8,              // 1=little-endian
 
@@ -586,10 +743,13 @@ enum ProducerScopeKind {
 | 0x0000_0000_0020_0000 | FEATURE_EXTENSION_REGISTRY | File contains extension registry. |
 | 0x0000_0000_0040_0000 | FEATURE_CODEC_LZ4 | File uses LZ4-compressed payloads. |
 | 0x0000_0000_0080_0000 | FEATURE_CODEC_ZSTD | File uses Zstd-compressed payloads. |
+| 0x0000_0000_0100_0000 | FEATURE_SEMANTIC_MAP | File or companion artifact contains COVE-MAP mapping, mapping evidence, identity-equivalence, source-conversion metadata, or object-association projection definitions. |
+| 0x0000_0000_0200_0000 | FEATURE_PAGE_PAYLOAD_ELISION | File may contain stats-only constant pages or value-stream-elided pages whose reconstruction depends on page flags and validated page-level stats. |
 
 **Rules:**
 - Readers MUST reject unknown required feature bits.
 - Readers MAY ignore unknown optional feature bits.
+- FEATURE_SEMANTIC_MAP indicates the presence of COVE-MAP-related metadata. Whether that metadata is required depends on the requested operation and any required embedded profile or extension rules. Ordinary COVE-T or COVE-O reads MAY ignore optional mapping evidence, identity-equivalence, or projection metadata when mapping replay, explanation, conversion, or projection readback is not requested.
 - Readers MUST NOT use unknown optional metadata for skipping.
 
 ---
@@ -680,6 +840,7 @@ struct CoveSectionEntryV1 {
     // 3=COVE-A
     // 4=COVE-E
     // 5=COVE-H
+    // 6=COVE-MAP
 
     flags: u8,
 
@@ -710,6 +871,12 @@ struct CoveSectionEntryV1 {
 - Section ranges MUST NOT overlap unless explicitly permitted by section kind.
 - Arithmetic overflow MUST be checked.
 - JSON metadata MUST NOT override binary metadata.
+**Directory granularity and lazy metadata:**
+- The footer section directory SHOULD remain coarse-grained. Writers SHOULD NOT create one section entry per page or per morsel when a table segment index, column directory, or page index can describe the same data.
+- Detailed table, segment, column, page, and morsel metadata SHOULD be stored in ordered arrays inside their profile sections.
+- Readers MAY load the footer and top-level section directory eagerly, then lazily materialise table segment, column, and page metadata only for referenced tables, projected columns, and candidate morsels.
+- Segment, morsel, and page lookup arrays SHOULD be ordered by table_id, segment_id, column_id, and morsel_id as applicable, so readers can use binary search without tree-shaped metadata structures.
+- Lazy loading MUST NOT weaken validation. Any section or subsection used for pruning, decoding, or planning MUST be bounds-checked and checksum-validated before use.
 
 ---
 
@@ -750,7 +917,18 @@ struct CoveSectionEntryV1 {
 | 43 | TEMPORAL_BLOOM_INDEX | COVE-O | Scope/branch/GOID/time bloom filters. |
 | 44 | TRUST_MANIFEST | COVE-O | Trust-chain metadata. |
 | 50 | HARBOR_MOUNT_HINTS | COVE-H | Harbor-specific lease/mount hints. |
+| 60 | MAP_SOURCE_CATALOG | COVE-MAP | Source system/file/table/stream declarations and source-load fingerprints. |
+| 61 | MAP_FUNCTION_REGISTRY | COVE-MAP | Declared deterministic normalisation, canonicalisation, hashing, and derivation functions. |
+| 62 | MAP_IDENTITY_RULE_CATALOG | COVE-MAP | Object identity, multi-column join-key, confidence-class, merge, and do-not-merge rules. |
+| 63 | MAP_ROW_SEMANTICS_CATALOG | COVE-MAP | Source row semantics: object, event, link, association, composite, dispatch, key/value fragment, projection, and evidence-only rules. |
+| 64 | MAP_ASSERTION_LOG | COVE-MAP | Optional canonical semantic assertion stream produced by applying mapping rules. |
+| 65 | MAP_IDENTITY_EQUIVALENCE_INDEX | COVE-MAP | Deterministic identity-key to destination-GOID/equivalence-set index. |
+| 66 | MAP_EVIDENCE_INDEX | COVE-MAP | Source row, rule, digest, and output assertion evidence. |
+| 67 | MAP_CONVERSION_REPORT | COVE-MAP | Conversion diagnostics, conflicts, candidate matches, rejected rows, and fidelity report. |
+| 68 | MAP_PROJECTION_CATALOG | COVE-MAP | Object-and-association to table projection definitions and read-surface declarations. |
 | 255 | VENDOR_EXTENSION | shared | Reserved extension section. |
+
+MAP_* section payloads are COVE-MAP profile payloads. The authoritative reusable mapping definition normally lives in a `.covemap` artifact. MAP_* sections embedded in a `.cove` file are intended for mapping evidence, projection catalogs, conversion reports, identity-equivalence indexes, or embedded mapping snapshots tied to that file or dataset state; they MUST NOT silently override an explicitly referenced reusable mapping definition unless a required profile or extension defines that authority rule. A writer MUST NOT place MAP_* sections in an ordinary COVE file unless it advertises FEATURE_SEMANTIC_MAP and the payload schema is defined by the referenced COVE-MAP artifact/profile version or by a registered required extension. General COVE readers MUST ignore optional MAP_* sections for ordinary COVE-T or COVE-O reads. COVE-MAP-aware tools MUST validate MAP_* payload schemas, source fingerprints, function registries, and evidence references before using them for conversion, replay, projection, or explanation.
 
 ---
 
@@ -1190,6 +1368,42 @@ struct LocalCodebookPayloadV1 {
 - VarBytes codebook entries are page-local values and MUST NOT be interpreted as FileCode dictionary entries.
 - Readers MUST reject unsupported `value_physical_kind` values and malformed codebook lengths.
 
+### 20.5 Writer Encoding Selection Policy
+
+Encoding selection is writer policy; it does not change file semantics. Readers observe only the emitted encoding tree, buffers, checksums, and validated metadata.
+Writers SHOULD choose encodings per column page, normally one column per morsel. Different morsels of the same column MAY use different approved encoding cascades.
+**Recommended analysis pass:**
+1. collect page-local facts: row_count, null_count, non_null_count, distinct_count estimate or exact count, run_count, min/max, domain range, sortedness, value width, and candidate encoded sizes;
+2. test every approved encoding cascade that is applicable to the page's logical and physical type;
+3. assign each candidate a deterministic score representing estimated stored bytes plus optional read-cost penalties for the writer's declared hot/cold policy;
+4. choose the lowest-score candidate;
+5. emit only the chosen encoding tree and its buffers.
+**Rules:**
+- A candidate encoder MUST NOT be selected unless it has a canonical decode path available to conforming readers for the chosen profile, or is guarded by a required extension feature bit.
+- Writers SHOULD evaluate Constant first. If a page is all-null or all non-null values are equal, Constant or stats-only constant storage SHOULD win unless another representation is proven smaller and equally decodable.
+- Writers SHOULD NOT apply a general block codec to an already compact page when the codec increases size or materially harms the declared hot-scan cost class.
+- Adaptive selection metadata MAY be recorded in non-authoritative writer metadata for observability, but readers MUST NOT require it for decoding.
+
+### 20.6 Constant and Payload-Elided Storage
+
+Constant encoding is a first-class storage optimisation, not only a predicate-statistics hint.
+**Rules:**
+- Constant pages MAY omit value buffers when the value can be reconstructed from Constant parameters or, for stats-only all-non-null pages, from a validated page-level ZoneStatsEntry under the rules in 27.2.
+- Stats-only constant pages are allowed only for all-null pages or all-non-null pages. Mixed null/non-null constant pages MAY elide the value stream but MUST retain enough null-position information to reconstruct logical row order.
+- If the constant value is stored in Constant parameters, the page-level ZoneStatsEntry SHOULD still set IS_CONSTANT and SHOULD use matching min_value and max_value when min/max are valid.
+- If the constant value is stored only in stats, the stats entry is decode-required canonical data for that page. It MUST be checksummed, bounds-checked, type-checked, and collation-checked before decoding.
+- Readers MUST NOT use raw FileCode min/max as the logical constant for comparable FileCode columns. The constant must be a FileCode equality value or a canonical/domain-ranked value according to the column's declared physical kind and domain rules.
+
+### 20.7 Optional Specialized Encoding Gate
+
+FSST-style string encoding and ALP-style floating-point encoding are accepted as high-priority v1 extension candidates, but they are not COVE-Core v1 encodings until their exact wire formats, parameters, canonical decode algorithms, feature bits, and conformance vectors are specified.
+**Rules:**
+- Writers MUST NOT emit FSST, ALP, Chimp, Patas, or similar specialised encodings as core CoveEncodingKind values unless this specification or a registered required extension defines their byte-level format.
+- Optional specialised encodings MUST provide either a canonical fallback encoding for the same logical page or set a required feature bit that causes readers without support to reject safely.
+- FSST-style encodings SHOULD be considered only for variable-byte data that is not already better represented through the file dictionary and FileCode path.
+- ALP-style encodings SHOULD be considered for Float32 and Float64 NumCode columns only when the algorithm is lossless for the exact IEEE bit patterns, including signed zero, infinities, and NaN payload handling as specified by the extension.
+- Chimp/Patas-style encodings remain experimental/vendor-extension candidates for v1 unless COVE adds normative bitstream definitions and float conformance vectors.
+
 ---
 
 ## 21. Kernel Capability Metadata
@@ -1525,13 +1739,16 @@ struct ColumnPageIndexEntryV1 {
 - null_count + non_null_count MUST equal row_count.
 - For non-nullable columns, null_count MUST be zero.
 - Page checksum covers page payload.
-
 **Page flags:**
 
 | Bits | Name | Meaning |
 | --- | --- | --- |
 | 0x0000_00FF | PAGE_FLAG_COMPRESSION_CODEC | Page-level `CompressionCodec` value from Section 66. |
-| 0xFFFF_FF00 | reserved | Reserved for future required page extensions; MUST be zero in v1. |
+| 0x0000_0100 | PAGE_FLAG_STATS_ONLY_CONSTANT | No page payload exists; the page is reconstructed from page index counts and, for all-non-null pages, a validated page-level ZoneStatsEntry. Requires FEATURE_PAGE_PAYLOAD_ELISION. |
+| 0x0000_0200 | PAGE_FLAG_ALL_NULL | Every row in the page is null. Requires FEATURE_PAGE_PAYLOAD_ELISION when used to omit payload or null-position data. |
+| 0x0000_0400 | PAGE_FLAG_ALL_NON_NULL | Every row in the page is non-null. Requires FEATURE_PAGE_PAYLOAD_ELISION when used to omit payload or null-position data. |
+| 0x0000_0800 | PAGE_FLAG_VALUE_STREAM_ELIDED | The non-null value stream is elided because the non-null value is constant. A null bitmap may still be present unless ALL_NULL or ALL_NON_NULL is set. Requires FEATURE_PAGE_PAYLOAD_ELISION. |
+| 0xFFFF_F000 | reserved | Reserved for future required page extensions; MUST be zero in v1 unless a required extension defines the bit and the reader supports that extension. |
 
 **Page codec rules:**
 - PAGE_FLAG_COMPRESSION_CODEC applies only to the page payload bytes referenced by `page_offset` and `page_length`.
@@ -1542,6 +1759,24 @@ struct ColumnPageIndexEntryV1 {
 - Writers that use LZ4 or Zstd page codecs MUST advertise the corresponding `FEATURE_CODEC_LZ4` or `FEATURE_CODEC_ZSTD` bit.
 - Readers MUST reject unknown page codec values and any non-zero reserved page flag bits unless a required extension defines the bit and the reader supports that extension.
 
+**Page flag consistency:**
+- Page-elision flags are decode-affecting metadata. Writers that use PAGE_FLAG_STATS_ONLY_CONSTANT, PAGE_FLAG_ALL_NULL to omit null-position data, PAGE_FLAG_ALL_NON_NULL to omit null-position data, or PAGE_FLAG_VALUE_STREAM_ELIDED MUST set FEATURE_PAGE_PAYLOAD_ELISION in required_features. A reader that does not support FEATURE_PAGE_PAYLOAD_ELISION MUST reject the file before decoding those pages.
+- PAGE_FLAG_ALL_NULL and PAGE_FLAG_ALL_NON_NULL are mutually exclusive.
+- PAGE_FLAG_ALL_NULL requires null_count == row_count and non_null_count == 0. The null bitmap MAY be omitted only when FEATURE_PAGE_PAYLOAD_ELISION is required; any present null bitmap MUST contain only null bits for rows in the page with unused final-byte bits zeroed.
+- PAGE_FLAG_ALL_NON_NULL requires null_count == 0 and non_null_count == row_count. The null bitmap MAY be omitted because every row is non-null; any present null bitmap MUST contain only zero bits with unused final-byte bits zeroed.
+- If neither PAGE_FLAG_ALL_NULL nor PAGE_FLAG_ALL_NON_NULL is set, the counts still determine how much null-position information is required. A mixed null/non-null page MUST include a validated null-position representation; a page with null_count == 0 MAY omit the null bitmap.
+- Page flags MUST be internally consistent with row_count, null_count, non_null_count, page_length, uncompressed_length, encoding_root, checksum, and any referenced stats_ref. A mismatch is page corruption; flags are not hints and MUST NOT override the counts or validated payload metadata.
+- PAGE_FLAG_VALUE_STREAM_ELIDED requires the non-null value to be reconstructable from Constant encoding parameters or, only when PAGE_FLAG_STATS_ONLY_CONSTANT is also set, from the validated page-level ZoneStatsEntry rules below.
+
+**Rules for payload-elided pages:**
+- page_length MAY be zero only when PAGE_FLAG_STATS_ONLY_CONSTANT is set.
+- If PAGE_FLAG_STATS_ONLY_CONSTANT is set, PAGE_FLAG_COMPRESSION_CODEC MUST be `CompressionCodec::None`, page_offset and uncompressed_length MUST be zero, encoding_root MUST be u32::MAX, and checksum MUST be CRC32C of the empty byte string.
+- PAGE_FLAG_STATS_ONLY_CONSTANT requires either PAGE_FLAG_ALL_NULL or PAGE_FLAG_ALL_NON_NULL. Mixed null/non-null constant pages still need a null-position representation and therefore MUST NOT be stats-only.
+- For all-null stats-only pages, null_count MUST equal row_count and non_null_count MUST be zero.
+- For all-non-null stats-only pages, non_null_count MUST equal row_count, null_count MUST be zero, and stats_ref MUST reference a validated page-level ZoneStatsEntry with IS_CONSTANT and min_value == max_value under the declared logical type and collation rules.
+- For Float32 and Float64 stats-only constant pages, the stats entry MUST preserve the exact raw IEEE value bits needed for reconstruction. If exact bits are not represented, including NaN payloads or signed-zero distinctions, the constant value MUST be stored in Constant parameters instead of stats-only storage.
+- When PAGE_FLAG_STATS_ONLY_CONSTANT is set on an all-non-null page, the referenced stats entry is decode-required canonical data for that page, not optional pushdown metadata. A reader that cannot validate it MUST reject the page rather than fail open.
+
 ### 27.3 Page Payload
 
 **A column page payload contains:**
@@ -1550,9 +1785,10 @@ struct ColumnPageIndexEntryV1 {
 [buffer directory]
 [buffers]
 **Logical row reconstruction:**
-1. read null bitmap if present,
-2. decode non-null value stream,
-3. re-expand values into logical row order.
+1. if PAGE_FLAG_STATS_ONLY_CONSTANT is set, reconstruct all rows from page index counts and, for all-non-null pages, the validated page-level stats entry;
+2. otherwise read the null bitmap if present,
+3. decode the non-null value stream,
+4. re-expand values into logical row order.
 
 ---
 
@@ -2170,12 +2406,12 @@ COVE-E allows an engine to map file-local physical values into implementation-lo
 **Universal behaviour:**
 FileCode -> ExecutionCode
 **Examples:**
-FileCode -> Harbor EngineCode
-FileCode -> DuckDB dictionary vector code
-FileCode -> Polars categorical code
 FileCode -> Arrow dictionary key
 FileCode -> DataFusion dictionary array key
+FileCode -> DuckDB dictionary vector code
+FileCode -> Polars categorical code
 FileCode -> custom engine symbol ID
+FileCode -> Harbor EngineCode under the optional COVE-H registration
 **Rules:**
 - COVE-E is optional.
 - COVE-E MUST NOT be required to decode COVE-T logical values.
@@ -2350,16 +2586,16 @@ enum ExecutionScopeKind {
 ```
 
 **Examples:**
-**Harbor:**
-  scope_kind = Tenant
-  stable_id  = Harbor tenant UUID
-
 **Generic lakehouse engine:**
   scope_kind = Catalog
   stable_id  = catalog/table namespace ID
 
 **Single-file reader:**
   scope_kind = None
+
+**COVE-H example:**
+  scope_kind = Tenant
+  stable_id  = Harbor tenant UUID
 
 ---
 
@@ -2384,11 +2620,6 @@ struct CodeSpaceDescriptorV1 {
 ```
 
 **Examples:**
-**Harbor:**
-  namespace = "io.harbor"
-  stable_id = Harbor code-space UUID
-  epoch = Harbor lease/code-space epoch
-
 **Arrow dictionary output:**
   namespace = "org.apache.arrow"
   stable_id = dictionary batch or schema identifier
@@ -2397,6 +2628,11 @@ struct CodeSpaceDescriptorV1 {
 **Custom engine:**
   namespace = globally unique engine namespace
   stable_id = implementation-specific code-space ID
+
+**COVE-H example:**
+  namespace = "io.harbor"
+  stable_id = Harbor code-space UUID
+  epoch = Harbor lease/code-space epoch
 **Rules:**
 - Code spaces are implementation-local.
 - Code-space metadata MUST NOT be required to recover COVE logical values.
@@ -2468,7 +2704,7 @@ enum ReverseLookupPolicy {
   missing_value_policy = DecodeValueOnly
   stale_mapping_policy = IgnoreIfOptional
 
-**Harbor:**
+**COVE-H example:**
   filecode_mapping_kind = MapToExecutionCode
   missing_value_policy = RequestLeaseOrIntern
   stale_mapping_policy = Rebuild
@@ -2625,6 +2861,9 @@ enum ExtensionKind {
     EngineProfile = 7,
     RedactionPolicy = 8,
     TrustPolicy = 9,
+    SemanticMapping = 10,
+    MappingFunction = 11,
+    SourceConnector = 12,
     VendorMetadata = 255,
 }
 ```
@@ -2749,6 +2988,22 @@ COVE-T SHOULD support Arrow-compatible output.
   0 = null
 Therefore, Arrow validity bitmaps require inversion unless a reader materialises a new validity bitmap.
 
+### 49.1 Relationship to Arrow IPC
+
+Arrow IPC is an interchange and transport format for Arrow record batches. COVE is a durable, immutable, query-planning-oriented storage format.
+Use Arrow IPC when the primary requirement is to move or persist already-materialised Arrow arrays or RecordBatches with minimal semantic translation.
+Use COVE when the primary requirement is offline/archive storage with file-level dictionaries, predicate-proof metadata, encoded arrays, optional lookup/synopsis indexes, digests, sidecars, and dataset manifests.
+**Rules:**
+- COVE readers MAY export Arrow arrays, RecordBatches, streams, or files.
+- Arrow IPC is not a canonical serialisation of a COVE file. COVE section metadata, predicate proofs, FileCode domains, digests, and optional acceleration artifacts remain authoritative only in COVE/COVX/COVM.
+- COVE writers MAY ingest Arrow IPC/Feather/RecordBatch streams as source data, but they SHOULD recompute COVE statistics, dictionaries, domains, and indexes from logical values rather than preserving Arrow batch boundaries as COVE morsel boundaries by default.
+- A COVE-to-Arrow conversion MUST report or represent any COVE logical type, collation, extension type, or metadata guarantee that cannot be expressed exactly in Arrow.
+**Zero-copy interop:**
+- Zero-copy Arrow export is an implementation optimisation, not a COVE conformance requirement.
+- A reader MAY expose COVE buffers to Arrow without copying only when the COVE physical layout, offsets, endianness, nullability representation, alignment, lifetime, and dictionary key width are compatible with the Arrow array being produced.
+- When COVE null bitmaps, encoded pages, FileCode widths, nested offsets, or dictionary values do not match the target Arrow layout, the reader MUST materialise compatible Arrow buffers rather than exposing incompatible COVE bytes as Arrow memory.
+- Writers SHOULD NOT weaken COVE encoding, statistics, or predicate metadata solely to maximise zero-copy Arrow export.
+
 **FileCode to Arrow dictionary mapping:**
 **Arrow dictionary keys:**
   MAY reuse FileCode values if key width permits.
@@ -2764,7 +3019,7 @@ Therefore, Arrow validity bitmaps require inversion unless a reader materialises
 
 ## 50. Lakehouse Integration Profile
 
-COVE is a file format, not a catalog.
+COVE is a file format, not a catalog or table format.
 **COVE files MAY be managed by:**
 - COVM native manifests,
 - Iceberg,
@@ -2797,6 +3052,58 @@ COVE is a file format, not a catalog.
 **COVX:**
   Optional acceleration sidecar for immutable COVE files.
 
+### 50.1 COVM vs Lakehouse Catalogs
+
+COVM is not a transaction log, table catalog, or lakehouse protocol. It is a COVE-native planning manifest for a set of immutable COVE files.
+**Rules:**
+- When COVE files are managed by Iceberg, Delta, Hudi, or another table format, that external catalog remains authoritative for table snapshot selection, transactions, schema evolution, deletes, and visibility.
+- COVM MAY mirror catalog-derived file lists and pruning metadata for faster COVE-native planning, but COVM MUST NOT override the external catalog's selected snapshot or visibility rules.
+- Standalone COVM datasets MAY use immutable COVM publication to identify a dataset state, but this is a lightweight archive/dataset mechanism, not a replacement for ACID table protocols.
+- Lakehouse hints inside COVE are descriptive hints. They MUST be validated against the external catalog before being used as authoritative table metadata.
+
+### 50.2 COVE as Data Files in Table Formats
+
+COVE v1 intentionally does not define a COVE Table Layer with ACID commits, catalog state, snapshot isolation, schema evolution, partition evolution, or transaction logs. Those responsibilities belong to an external table format or catalog.
+
+Official integration specifications MAY define how COVE-T files are used as data files inside Iceberg, Delta, Hudi, Hive-style catalogs, Unity-style catalogs, or engine-specific catalogs. Such adapter specifications MUST:
+- keep .cove files immutable,
+- identify data files by URI plus stable file_id, file_len, footer_crc32c, and digest where available,
+- map external table schema fields to COVE table_id/column_id without changing the COVE file schema,
+- apply the external catalog's snapshot, partition, delete, visibility, time-travel, and schema-evolution rules before returning rows,
+- treat LAKEHOUSE_HINTS, COVM entries, and metadata JSON as hints unless the external catalog explicitly accepts them,
+- reject or ignore any COVE hint that conflicts with the selected external snapshot.
+
+A future COVE-native table protocol, if one is ever standardised, MUST be a separate companion specification with its own conformance level, commit protocol, and feature gates. It MUST NOT weaken the immutability or standalone readability of COVE data files.
+
+### 50.3 External Delete and Visibility Overlay Semantics
+
+External row-level deletes, deletion vectors, equality deletes, access filters, and visibility overlays are outside COVE-Core and COVE-T v1. They MAY be referenced by lakehouse hints or manifests, but their semantics are defined by the external table format, catalog, or application protocol.
+
+COVE predicate metadata and indexes describe the physical rows present in the immutable COVE file before external visibility filtering. When an external overlay is active:
+- PredicateZoneOutcome::DefinitelyNo remains safe for pruning because no physical row in the zone satisfies the predicate.
+- PredicateZoneOutcome::DefinitelyYes remains safe only as a claim that every remaining visible row from that physical zone satisfies the predicate; it does not prove that any visible row remains.
+- Unknown remains Unknown.
+- Exact sets, blooms, ColumnDomain ranges, and zone stats MAY be used to reject impossible predicates over the physical file, but they MUST NOT be interpreted as exact visible-table domains unless the overlay is proven empty or overlay-aware metadata is available.
+- Lookup indexes and inverted morsel indexes return physical row candidates. Readers MUST apply the external visibility/delete overlay before returning rows.
+- Aggregate synopses over a COVE file are exact only for the physical COVE rows. They MUST NOT answer visible-table aggregate queries when a non-empty external overlay is active unless an overlay-aware correction or proof is applied.
+
+External overlays that reference physical positions SHOULD identify the target COVE file by file_id plus file length, footer CRC, and cryptographic digest where available. Rewritten or compacted COVE files receive new physical row references; overlays for old files MUST NOT be silently applied to rewritten files.
+
+### 50.4 Append, Streaming, CDC, and Compaction Boundary
+
+**The accepted mutable-data pattern for COVE v1 is immutable-file publication:**
+- append by writing additional complete COVE files and publishing a new COVM state or external table snapshot,
+- update/delete by external table-format overlays or by rewriting affected data into new COVE files,
+- compact by writing replacement COVE files and publishing a new manifest/catalog state,
+- ingest streams by buffering or micro-batching into temporary writer state, then finalising complete COVE files.
+
+**Rules:**
+- A .cove file MUST NOT be appended in place after finalisation.
+- A partially written object MUST NOT be treated as a valid COVE file.
+- Patch, delta, CDC, or operation-log files MAY be represented as ordinary COVE-T data files when an external protocol defines their meaning, but COVE-Core/COVE-T readers MUST treat them as ordinary data unless that external protocol is explicitly in scope.
+- COVM readers MUST select one published dataset state. They MUST NOT merge multiple COVM generations as an implicit transaction log unless a separate protocol says to do so.
+- Compaction MUST preserve logical table semantics according to the governing manifest or catalog; it MUST NOT mutate the replaced COVE files.
+
 ---
 
 ## 51. COVE-T Parquet Conversion Profile
@@ -2823,7 +3130,7 @@ The converter SHOULD rewrite data into COVE-native scan layout, not copy Parquet
 15. Build aggregate synopses for useful low-cardinality and numeric columns.
 16. Build composite zone indexes for declared clustering/filter combinations.
 17. Build Top-N summaries for ordered hot columns where useful.
-18. Encode pages using COVE-approved encodings.
+18. Analyze each column page/morsel and encode using COVE-approved encodings under the writer encoding selection policy.
 19. Write section directory, footer, postscript, and CRCs.
 20. Optionally write COVM/COVX companion artifacts.
 
@@ -2846,6 +3153,44 @@ Json
 or
 Binary
 but MUST be marked pushdown-limited.
+
+### 51.4 Optional Physical Row Reordering
+
+COVE-T writers MAY reorder rows within a table segment to improve compression, clustering, and pruning, but only when row order is not part of the dataset's logical contract.
+**Rules:**
+- Reordering MUST be opt-in writer behaviour.
+- Reordering MUST NOT change the logical multiset of rows or any declared primary/lookup key semantics.
+- Reordering MUST happen before morsel IDs, page indexes, zone stats, exact sets, bloom filters, lookup indexes, aggregate synopses, row references, and digest/trust inputs are generated.
+- Writers MUST NOT apply physical row reordering to COVE-O temporal/object segments unless the profile explicitly proves that object history order, CSNs, baselines, deltas, tombstones, and trust chains remain semantically identical.
+- If source row order is externally observable or needed for reproducibility, the writer SHOULD either disable reordering or materialise a source ordinal column before reordering.
+- Writers SHOULD evaluate the benefit before committing a reorder. A reorder SHOULD be kept only when the estimated encoded size, pruning quality, or declared workload score improves enough to justify the additional write cost.
+- Writer metadata MAY record the reorder policy and sort keys, but this metadata is descriptive and MUST NOT be required for logical decoding.
+**Recommended heuristic:**
+- Prefer stable clustering keys with low or medium cardinality and common predicate use.
+- Avoid high-cardinality timestamp-only ordering unless time filtering is the dominant workload; coarse time buckets followed by other clustering keys are usually safer.
+- Do not reorder nested, temporal, or trust-sensitive data unless the profile explicitly permits it.
+
+### 51.5 Conversion Fidelity and Reporting
+
+Converters are adoption-critical but are not allowed to redefine COVE semantics. A converter MUST NOT claim lossless conversion unless the declared conversion policy preserves logical values, nulls, schema semantics, decimal precision/scale, timestamp units/timezone interpretation, nested structure, map-key rules, and redaction/trust semantics for the supported source features.
+
+**A converter SHOULD produce a machine-readable conversion report containing:**
+- source format, source file identifiers, and source digests where available,
+- source schema fingerprint and target COVE schema fingerprint,
+- row count and column count,
+- conversion policy version,
+- unsupported or lossy source features,
+- nested-shape fallbacks to Json or Binary,
+- timestamp/timezone and decimal policies,
+- collation and canonicalisation policies,
+- row reordering policy, if any,
+- generated COVE feature bits, section kinds, and acceleration artifacts,
+- validation result for the produced COVE/COVX/COVM artifacts.
+
+**Rules:**
+- Source physical encodings, compression codecs, page boundaries, and statistics do not need to be preserved. COVE statistics and indexes SHOULD be recomputed from decoded logical values.
+- Bidirectional tools such as Parquet <-> COVE, ORC <-> COVE, Arrow IPC <-> COVE, and CSV <-> COVE MUST distinguish logical round-trip fidelity from physical-layout preservation.
+- If a source feature cannot be represented exactly in COVE-Core/COVE-T, the converter MUST either use a required extension, use a declared lossy fallback, or reject the conversion.
 
 ---
 
@@ -2888,6 +3233,36 @@ COVE-T uses offset-based nested layouts.
 - Struct child fields MAY support full pushdown.
 - List/Map element bloom indexes MAY be provided.
 - Whole-list/whole-map min/max is usually unsupported.
+
+### 52.4 Fixed-Size Lists, Vectors, Tensors, and Embeddings
+
+COVE-Core v1 does not define Vector, Tensor, or Embedding as additional scalar logical types. Dense vectors SHOULD be represented by existing nested or extension mechanisms rather than by adding ad hoc core scalar types.
+
+**Recommended representation:**
+- For maximum generic compatibility, store a dense fixed-length vector as List<Float32> or List<Float64> with ordinary List offsets and a schema-level fixed-length assertion.
+- For space- and scan-optimised storage, a FixedSizeList or Tensor extension MAY elide offsets or use a specialised physical layout only when it declares a required feature bit or a safe List/Binary fallback.
+
+**A FixedSizeList, Tensor, or Embedding extension MUST declare:**
+- element logical type,
+- dimension count and shape,
+- row-major/column-major or other layout order,
+- nullable element policy,
+- whether vector length is fixed or variable,
+- distance/similarity metrics if indexes depend on them,
+- normalisation policy if cosine/dot-product semantics depend on it,
+- Arrow base type or Arrow extension mapping where exported.
+
+Approximate nearest-neighbour, vector, spatial, learned, or similarity indexes MUST be optional COVX or registered extension indexes. They MAY return candidates, but they MUST NOT be used for predicate exclusion, nearest-neighbour completeness, or metadata-only answers unless their descriptor proves exactness and a no-false-negative policy for the declared metric/query class.
+
+### 52.5 Semi-Structured and Document Values
+
+COVE Json is an opaque UTF-8 JSON payload unless a required extension declares stronger semantics. Core COVE readers MUST NOT assume semantic JSON equality, object-key ordering, numeric normalisation, path typing, or JSON path pushdown from the Json logical type alone.
+
+**Rules:**
+- JSON/path indexes MAY be stored as optional COVX or registered extension indexes. They MUST NOT change the logical Json payload.
+- A semantic JSON/document extension MUST define canonicalisation, duplicate-key policy, missing-vs-null semantics, numeric normalisation, path type rules, and safe predicate outcomes.
+- Without such an extension, Json columns are pushdown-limited to nullness, byte-level equality if declared safe, and indexes that explicitly state their proof semantics.
+- COVE-O object-temporal semantics MUST NOT be used as an implicit replacement for general JSON/document semantics.
 
 ---
 
@@ -2937,14 +3312,19 @@ struct CoveTableRowRefV1 {
 - diagnostics,
 - deferred joins,
 - external visibility overlays.
+**Rules:**
+- CoveTableRowRefV1 identifies a physical row position inside one immutable COVE file.
+- External catalogs, delete vectors, lookup overlays, or audit systems that persist row references SHOULD pair the row reference with file_id and a validating file fingerprint such as file_len, footer_crc32c, or cryptographic digest.
+- Row references are not stable across conversion, row reordering, compaction, or file rewrite unless an external protocol explicitly maps old references to new references.
+- Readers MUST NOT apply row references from one file to another file solely because schemas or paths match.
 If future morsels exceed u16::MAX rows, v2 must widen this field or introduce a new row reference type.
 
 ---
 
 ## 55. COVE-O Object Temporal Profile
 
-COVE-O is an optional object-temporal profile.
-It is designed for Harbor-style committed object history but may be implemented by other engines with similar temporal object models.
+COVE-O is an optional object-temporal extension profile. It is not part of baseline COVE-Core/COVE-T/COVE-A/COVE-E conformance.
+COVE-O is designed for committed object history workloads and may be implemented by any engine with compatible temporal object semantics. Harbor is one possible implementation, not a dependency.
 **COVE-O supports:**
 - object type catalog,
 - scope identity,
@@ -2959,7 +3339,8 @@ It is designed for Harbor-style committed object history but may be implemented 
 - tombstones,
 - prev_ref chains,
 - optional trust chains,
-- optional temporal blooms.
+- optional temporal blooms,
+- optional materialisation of COVE-MAP semantic assertions as object, property, link, association, evidence, or projection records.
 
 ---
 
@@ -2980,6 +3361,8 @@ struct ObjectTypeEntryV1 {
 
     type_name_len: u16,
     type_name: [u8],
+
+    flags: u32,
 
     property_count: u16,
 
@@ -3005,10 +3388,38 @@ struct PropertyEntryV1 {
 }
 ```
 
+**Object type flags:**
+
+| Bit | Name | Meaning |
+| --- | --- | --- |
+| 0x0000_0001 | OBJECT_TYPE_FLAG_ENTITY_OBJECT | Type is primarily an entity/object identity surface. |
+| 0x0000_0002 | OBJECT_TYPE_FLAG_EVENT_OBJECT | Type is primarily an event/transaction object. |
+| 0x0000_0004 | OBJECT_TYPE_FLAG_LINK_OBJECT | Type is a first-class connector/link object. |
+| 0x0000_0008 | OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT | Type materially represents an association between endpoint objects. |
+| 0x0000_0010 | OBJECT_TYPE_FLAG_EVIDENCE_OBJECT | Type primarily carries evidence/provenance materialisation. |
+| 0x0000_0020 | OBJECT_TYPE_FLAG_PROJECTION_OBJECT | Type is a materialised projection/read-surface helper rather than canonical object truth. |
+
+**Property flags:**
+
+| Bit | Name | Meaning |
+| --- | --- | --- |
+| 0x0000_0001 | PROPERTY_FLAG_ASSOCIATION_FROM_GOID | Property is the source/from endpoint GOID. |
+| 0x0000_0002 | PROPERTY_FLAG_ASSOCIATION_TO_GOID | Property is the target/to endpoint GOID. |
+| 0x0000_0004 | PROPERTY_FLAG_ASSOCIATION_TYPE | Property identifies the association type or role family. |
+| 0x0000_0008 | PROPERTY_FLAG_ASSOCIATION_VALID_FROM | Property is the association validity start timestamp. |
+| 0x0000_0010 | PROPERTY_FLAG_ASSOCIATION_VALID_TO | Property is the association validity end timestamp. |
+| 0x0000_0020 | PROPERTY_FLAG_ASSOCIATION_OBSERVED_AT | Property records observation/materialisation time. |
+| 0x0000_0040 | PROPERTY_FLAG_EVIDENCE_REF | Property references evidence/provenance material. |
+| 0x0000_0080 | PROPERTY_FLAG_MAPPING_RULE_REF | Property references the mapping rule or projection rule that produced the materialised value. |
+
 **Rules:**
 - object_type_id MUST be unique.
 - property_id MUST be unique within object_type_id.
 - Top-level property declarations MUST NOT use logical Null.
+- A writer that claims association readback MUST set OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT or OBJECT_TYPE_FLAG_LINK_OBJECT on every materialised association type and MUST flag association endpoint and semantics properties with the corresponding PROPERTY_FLAG_* bits.
+- Readers SHOULD use ObjectTypeEntryV1.flags and PropertyEntryV1.flags, not property names alone, as the authoritative cues for association, evidence, and projection readback. Property names such as `from_goid`, `to_goid`, `association_type`, `source_evidence_id`, and `mapping_rule_id` remain recommended conventions only.
+- An object type flagged OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT SHOULD expose exactly one PROPERTY_FLAG_ASSOCIATION_FROM_GOID property and exactly one PROPERTY_FLAG_ASSOCIATION_TO_GOID property unless a required extension defines a multi-endpoint association form.
+- OBJECT_TYPE_FLAG_LINK_OBJECT and OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT MAY be set together when a type is both a first-class object and an association carrier. Other combinations that materially change readback semantics SHOULD be documented by the profile or extension that emits them.
 
 ---
 
@@ -3081,7 +3492,8 @@ struct TemporalSegmentHeaderV1 {
 
 **Rules:**
 - A temporal segment contains exactly one object_type_id.
-- For Harbor COVE-H/COVE-O use, producer_scope_kind SHOULD be Tenant and producer_scope_id SHOULD be the Harbor tenant UUID.
+- For scope-scoped COVE-O use, producer_scope_kind and producer_scope_id SHOULD identify the scope that owns the object history.
+- COVE-H/COVE-O Harbor deployments commonly use producer_scope_kind = Tenant and producer_scope_id = Harbor tenant UUID.
 - Logical scope values MUST equal producer_scope_id when scope-scoped.
 - Rows MUST be ordered by:
     (timestamp_us, csn, branch_key, goid, record_id)
@@ -3107,8 +3519,9 @@ Every temporal segment has these logical system columns.
 | 7 | record_kind | u8/RLE | Delta/snapshot/baseline/tombstone. |
 | 8 | prev_ref | nullable fixed struct | Previous chain reference. |
 
-**For Harbor COVE-H/COVE-O:**
-scope_id is interpreted as Harbor tenant_id.
+**Profile-specific scope interpretation:**
+- Generic COVE-O readers treat scope_id as the declared producer/object scope.
+- COVE-H/COVE-O Harbor deployments interpret scope_id as Harbor tenant_id.
 
 ### 59.1 Record Kind
 
@@ -3169,6 +3582,38 @@ Object property columns use the same physical and encoded-array machinery as COV
 - FileCodes resolve through the file dictionary.
 - NumCodes are interpreted by declared logical type.
 - Property columns SHOULD be page/morsel aligned with system columns.
+
+---
+
+
+### 61.1 COVE-MAP Association and Evidence Materialisation
+
+COVE-O v1 does not require a dedicated native edge section. When COVE-MAP produces association assertions and the destination is object-based COVE, a writer MUST materialise those associations using declared COVE-O object types unless a future association-capable COVE-O extension is explicitly required.
+
+**Recommended object-type pattern:**
+
+```text
+Object type: CustomerPlacedOrder
+Required properties:
+  association_type        Utf8 or registered enum
+  from_goid              FixedBytes(16)
+  to_goid                FixedBytes(16)
+  valid_from_us          nullable Timestamp
+  valid_to_us            nullable Timestamp
+  observed_at_us         nullable Timestamp
+  source_evidence_id     nullable FixedBytes or Utf8
+  mapping_rule_id        nullable Utf8
+```
+
+The property names above are recommended conventions, not the only interoperable spelling. When association readback is claimed, ObjectTypeEntryV1.flags and PropertyEntryV1.flags are authoritative for identifying association objects, endpoint properties, validity fields, evidence references, and mapping-rule references.
+
+Link objects such as `OrderLine`, `Membership`, `CustomerAddress`, or `AccountManagerAssignment` MAY carry additional properties and MAY create multiple association-like references through `from_goid`, `to_goid`, or named endpoint properties.
+
+**Rules:**
+- Association materialisation MUST be declared in the COVE-MAP row semantics or output profile.
+- Association endpoint GOIDs MUST be produced by the same deterministic identity-resolution run as the objects they connect.
+- Evidence fields SHOULD point to MAP_EVIDENCE_INDEX entries or to declared source row digests when explanation is required.
+- A COVE-O reader that does not understand COVE-MAP may still read the materialised association/link objects as ordinary object records.
 
 ---
 
@@ -3247,6 +3692,17 @@ struct RedactionManifestEntryV1 {
 - Readers MUST NOT silently treat redacted values as null.
 - Query engines MAY compare redacted markers only according to policy.
 
+### 64.1 Security and Privacy Boundary
+
+COVE v1 provides corruption detection, optional cryptographic digests, redaction markers, and trust metadata. It does not define a complete access-control, key-management, or encrypted-storage protocol.
+
+**Rules:**
+- The encryption fields in v1 section specs and postscript specs MUST be 0. Encrypted sections, encrypted columns, authenticated encryption modes, key identifiers, key rotation, and associated-data rules require a future required extension or profile.
+- Redaction is a logical/audit marker, not access control. If sensitive bytes are present unencrypted in a COVE file, COVE redaction metadata alone does not prevent disclosure.
+- Column-level or row-level access control is external to COVE v1. Engines enforcing access policy MUST apply that policy before exposing decoded values, indexes, synopses, dictionaries, or metadata that could reveal protected data.
+- Indexes, dictionaries, exact sets, blooms, histograms, Top-N summaries, and aggregate synopses may reveal value distributions. Writers handling sensitive datasets SHOULD omit or coarsen acceleration metadata according to policy.
+- Differentially private, sampled, masked, or otherwise privacy-preserving statistics MUST be marked as approximate or policy-protected. They MUST NOT be used as exact aggregate synopses, exact value sets, or predicate-proof metadata unless the proof remains valid under the declared privacy transformation.
+
 ---
 
 ## 65. Digest Manifest
@@ -3324,6 +3780,12 @@ enum CompressionCodec {
 **Indexes:**
   None or LZ4
 
+**Codec selection:**
+- Compression codecs wrap already encoded byte buffers or sections; they are distinct from CoveEncodingKind array encodings.
+- Writers SHOULD evaluate the codec choice after array encoding selection.
+- Writers SHOULD leave already compact bit-packed, RLE, run-end, local-codebook, or stats-only constant pages uncompressed when a block codec does not reduce size.
+- Writers MAY use Zstd for cold archive sections and LZ4 for hot scan sections, but MUST advertise any required codec feature bits.
+
 ---
 
 ## 67. I/O and Mechanical Sympathy
@@ -3353,6 +3815,17 @@ struct CoveIoHintV1 {
 ```
 
 Hints are advisory only.
+
+### 67.1 Small Page Packing
+
+COVE does not require fixed-size allocation blocks. Writers therefore SHOULD NOT import a database-style block allocation model that wastes space for narrow columns or tiny morsel pages.
+**Recommended writer policy:**
+- Pack small column pages contiguously inside TABLE_SEGMENT_DATA rather than aligning every page to a large block boundary.
+- Small pages from different columns and morsels MAY share a page cluster when each ColumnPageIndexEntry still identifies the exact page_offset, page_length, uncompressed_length, flags, and checksum.
+- Writers SHOULD use a tunable target cluster size for read coalescing and object-store range requests. The target is a writer/I/O policy, not a required allocation unit.
+- Large pages MAY be placed in dedicated aligned ranges when doing so improves direct reads or decompression.
+- Packing MUST NOT merge checksums across independently addressable pages unless an additional enclosing checksum is provided; each page checksum remains authoritative for that page's bytes.
+- Packing MUST preserve morsel and column page boundaries at the logical level even when physical bytes are adjacent.
 
 ---
 
@@ -3418,6 +3891,8 @@ struct CovxReferencedFileV1 {
 - COVX MUST be ignored if referenced file_id does not match.
 - COVX MUST NOT change query semantics.
 - COVX acceleration failures MUST fall back to COVE.
+- COVX vector, ANN, spatial, learned, or workload-specific indexes MUST have a registered descriptor that declares proof capability, false-negative policy, metric/query class where relevant, and fallback behaviour.
+- Approximate or candidate-generating COVX indexes MAY accelerate ranking or candidate selection, but MUST NOT advertise DefinitelyNo, DefinitelyYes, exact Top-N, or metadata-answerable semantics unless the index is exact for the declared query class.
 
 ---
 
@@ -3490,46 +3965,695 @@ struct CovmFileEntryV1 {
 - file-level exact sets,
 - dictionary fingerprints,
 - COVX references,
+- COVE-MAP artifact references, including projection catalogs where present,
 - object-store hints.
 **Rules:**
 - COVM MUST be ignored if stale.
 - COVM MUST NOT change COVE semantics.
 - Query planners MAY use COVM to prune files before opening COVE footers.
 
+### 69.3 COVM Publication and Atomic Update Discipline
+
+COVM describes a dataset state. Updating a dataset means publishing a new dataset state; it MUST NOT mutate the logical meaning of any referenced immutable COVE file.
+**Preferred publication model:**
+1. write a complete new COVM object or file;
+2. validate its header, section directory, footer/postscript, checksums, and referenced COVE digests when present;
+3. publish it by an atomic rename, catalog pointer update, compare-and-swap object metadata update, or other external atomic reference mechanism.
+**Rules:**
+- COVM readers MUST validate freshness using referenced file_id, file_len, footer_crc32c, and digest fields when digest_algorithm is not None before trusting manifest pruning.
+- A stale, corrupt, partially written, or unsupported COVM MUST be ignored; readers MUST fall back to opening COVE files directly.
+- The dual-root/header rotation pattern MAY be used only as an optional local-filesystem publication protocol for mutable COVM pointers. It MUST NOT be required for canonical .covm objects and MUST NOT be applied to immutable COVE data files.
+- If a local mutable COVM pointer file uses dual roots, each root slot MUST include a generation counter, COVM location or footer section spec, file length, digest or CRC, and checksum. Readers MUST choose the highest-generation root that fully validates; if neither validates, the COVM pointer is ignored.
+- Object-store deployments SHOULD prefer immutable COVM objects plus an atomic catalog/reference update over in-place 4 KiB header writes.
+
+
+### 69.4 COVM References to COVE-MAP
+
+COVM MAY reference COVE-MAP artifacts for lineage, planning, conversion replay, or explanation.
+
+**A COVM mapping reference SHOULD include:**
+- mapping artifact URI or logical reference,
+- mapping artifact digest and digest algorithm,
+- mapping_id and mapping_version,
+- source-set identity or source-load digest,
+- output COVE file IDs produced by the mapping run,
+- mapping execution ID,
+- conversion report reference.
+
+**Rules:**
+- COVM MUST NOT be the sole authority for semantic mapping rules unless a future required profile explicitly defines that behaviour.
+- COVM MUST NOT change the logical meaning of referenced COVE files.
+- If a COVM mapping reference is stale, corrupt, or unsupported, readers MUST still be able to read the referenced COVE files. Only mapping replay/explanation operations fail or degrade.
+- A COVE-MAP converter SHOULD emit a COVM dataset manifest when it materialises more than one output COVE file or when source lineage must be preserved across a dataset.
+
 ---
 
-## 70. Profile Capability Matrix
+
+## 70. COVE-MAP Deterministic Semantic Mapping Profile
+
+COVE-MAP is an optional profile and companion artifact for deterministic semantic mapping from one or more external source datasets into object-and-association-based COVE. In COVE-MAP, objects and associations are a paired semantic model: objects carry identity and properties; associations carry durable meaning between objects. Projected tables are read surfaces over that pair, not a replacement for it.
+
+COVE-MAP is not part of baseline COVE-Core, COVE-T, COVE-A, COVE-E, COVE-H, or COVE-O conformance. A general COVE reader MUST NOT require COVE-MAP support to read ordinary materialised COVE-T or COVE-O files.
+
+COVE-MAP is used when a tool needs to validate, replay, explain, perform source-to-object/association conversion, or expose COVE-O through deterministic table projections.
+
+**Typical flow:**
+
+```text
+source tables/files/streams
+  + COVE-MAP source catalog
+  + source-local row semantics
+  + deterministic semantic join keys
+  + identity/conflict/provenance rules
+  -> paired object-association semantic assertions
+  -> COVE-O object-temporal output with materialised association/link records
+  -> optional COVE-T/Arrow/SQL projections as read surfaces
+  -> optional COVM manifest and evidence indexes
+```
+
+**Destination and read-surface rule:**
+When the destination is object-based COVE, the materialised output SHOULD be valid COVE-O and SHOULD preserve both objects and associations as the semantic truth surface. Optional table projections MAY be emitted as COVE-T, Arrow record batches, SQL-accessible views, or other table-shaped read surfaces for engines that want relational scans over the object-association output. These projections MUST NOT redefine object identity, association identity, temporal history, or canonical property truth.
+
+### 70.1 Artifact Boundary
+
+COVE-MAP is an optional v1 profile with a stable conceptual and conformance boundary. Artifact identifiers, artifact framing, validation boundary, identity rules, projection/evidence rules, and operation-level fallback/rejection behaviour in this section are normative for v1. Exact reusable mapping-definition payload schemas and binary schemas for `MAP_*` payload bodies SHOULD be defined by a companion COVE-MAP schema specification or by a registered required extension.
+
+A reusable mapping definition SHOULD be stored in a separate `.covemap` artifact. Embedded `MAP_*` sections inside a `.cove` file are typically file-local evidence, projection catalogs, conversion reports, identity-equivalence indexes, or embedded mapping snapshots tied to that file or dataset state. Unless a required profile or extension explicitly says otherwise, the `.covemap` artifact is the authoritative reusable mapping definition.
+
+**COVEMAP final bytes:**
+[postscript bytes]
+[postscript_version: u16]
+[postscript_len: u16]
+[magic: "CMP1"]
+
+`.covemap` uses the same tail-discovery pattern as COVE files. The postscript points to the CovemapHeaderV1 region rather than to a COVE footer.
+
+```rust
+struct CovemapPostscriptV1 {
+  required_features: u64,
+  optional_features: u64,
+  file_len: u64,
+  header_offset: u64,
+  header_length: u64,
+  checksum: u32,
+}
+```
+
+```rust
+struct CovemapHeaderV1 {
+  magic: [u8; 4],          // "CMP1"
+
+  header_len: u16,
+  version_major: u16,
+  version_minor: u16,
+
+  flags: u32,
+
+  mapping_id: [u8; 16],
+
+  required_features: u64,
+  optional_features: u64,
+
+  section_count: u32,
+
+  mapping_version_len: u16,
+  reserved0: u16,
+
+  created_at_us: i64,
+
+  reserved: [u8; 32],
+
+  checksum: u32,
+}
+// followed by:
+//   mapping_version[mapping_version_len]
+//   CovemapSectionEntryV1[section_count]
+```
+
+```rust
+struct CovemapSectionEntryV1 {
+  section_id: u32,         // MAP_* or VENDOR_EXTENSION
+  offset: u64,
+  length: u64,
+  uncompressed_length: u64,
+  compression: u8,
+  required: u8,
+  reserved: u16,
+  checksum: u32,
+}
+```
+
+**Suggested mapping artifact identifiers:**
+
+| Field | Value |
+| --- | --- |
+| Artifact magic | `CMP1` |
+| Extension | `.covemap` |
+| Primary role | Deterministic source-row to semantic-assertion mapping |
+| Output role | Produce COVE-O object/association output and optional COVE-T/COVM/COVX/projection artifacts |
+
+A `.covemap` artifact may be referenced by COVM or by output COVE metadata using digest-verified references. COVM may reference mappings for lineage and replay, but COVM MUST NOT be the sole authority for semantic interpretation unless a future required profile defines that behaviour.
+
+COVE-MAP artifacts MUST be immutable for a declared mapping version. A new mapping version may produce different output, but the mapping version, source snapshot/load identity, deterministic functions, and conflict rules must make the difference explainable.
+
+**Rules:**
+- `magic` MUST be `CMP1`.
+- `mapping_version` identifies the reusable mapping-definition version; a new version MUST produce a new immutable artifact.
+- `.covemap` postscript discovery MUST use absolute byte offsets from the start of the artifact. `header_offset` and `header_length` in CovemapPostscriptV1 MUST be within `file_len` and MUST locate the CovemapHeaderV1 region for the artifact version being read.
+- `section_id` SHOULD reference `MAP_*` section kinds or `VENDOR_EXTENSION`.
+- `offset` and `length` in CovemapSectionEntryV1 are absolute byte offsets from the start of the `.covemap` artifact unless a future required extension defines otherwise.
+- `compression` in CovemapSectionEntryV1 uses the Section 66 `CompressionCodec` registry.
+- If `compression` is `None`, `length` MUST equal `uncompressed_length`.
+- If `compression` is not `None`, `uncompressed_length` MUST be the exact decoded byte length.
+- If `length == 0`, `uncompressed_length` MUST also be zero.
+- A `.covemap` artifact MUST be discoverable and integrity-checkable without consulting a COVE data file.
+- The artifact framing defined here is stable for v1. Payload bodies MAY use JSON, YAML, canonical CBOR, or another registered encoding, but the payload schema MUST be versioned, checksum-validated, and attributable to the mapping/profile version or required extension that defines it.
+- An implementation MAY claim COVE-MAP profile support without claiming every companion reusable-mapping payload schema. It SHOULD state which companion schema versions or required extensions it supports.
+
+### 70.2 Source Catalog
+
+A COVE-MAP source catalog describes the inputs that a mapping can consume.
+
+**Supported source kinds may include:**
+- COVE-T files,
+- SQL tables or query snapshots,
+- Parquet files,
+- ORC files,
+- CSV files,
+- JSON/NDJSON exports,
+- Arrow IPC/Feather data,
+- application logs,
+- event streams,
+- API payload snapshots,
+- other structured or semi-structured sources described by extension.
+
+**A source entry SHOULD declare:**
+- source_id,
+- source_kind,
+- source_uri or logical source reference,
+- source_owner or producer,
+- source_schema or schema fingerprint,
+- source_load_id or snapshot identity,
+- source_row_identity rule,
+- source ordering rule when order-sensitive,
+- source timestamp roles,
+- source payload digest policy,
+- source trust/sensitivity labels where applicable.
+
+**Rules:**
+- A mapping that claims replayability MUST identify source inputs by stable snapshot/load identity and digest or equivalent immutable source fingerprint.
+- A source row number alone SHOULD NOT be the only source row identity unless it is paired with a source file digest and schema fingerprint.
+- SQL/live source mappings MUST specify the snapshot, extraction query, transaction watermark, or export digest needed to reproduce the same rows.
+
+### 70.3 Source-Local Row Semantics
+
+Row semantics define what a source row means before identity resolution.
+
+COVE-MAP row semantics are an engine-neutral inversion of operational row-semantics systems: source rows are interpreted into semantic assertions rather than live engine mutations.
+
+**Row semantics kinds:**
+
+| Kind | Meaning |
+| --- | --- |
+| Object | Row contributes to one independent destination object. |
+| EventObject | Row creates a point-in-time event or transaction object. |
+| LinkObject | Row creates a first-class connector object between other objects. |
+| AssociationOnly | Row creates an association assertion without a separate object, unless materialised as a link object for COVE-O v1. |
+| Composite | Row contributes to multiple objects and associations. |
+| Dispatched | A discriminator value selects one of several row semantics rules. |
+| KeyValueFragment | Row is an entity-attribute-value or sparse-property fragment. |
+| ProjectionOnly | Row is a read-only projection and does not create new semantic truth unless declared. |
+| EvidenceOnly | Row provides source evidence for existing objects/properties/associations. |
+| Tombstone | Row represents deletion, closure, revocation, or absence according to a declared policy. |
+
+**Rules:**
+- A row semantics rule MUST declare the assertion kinds it may produce.
+- Object and association assertions are designed to be consumed together. A mapping that declares association output MUST NOT treat those associations merely as optional foreign-key hints; they are durable semantic facts subject to identity, temporal, evidence, governance, and projection rules.
+- Composite and dispatched semantics MUST be deterministic for each input row.
+- ProjectionOnly rows MUST NOT create canonical object identity unless an explicit identity rule says they do.
+- Tombstone semantics MUST declare whether the tombstone applies to an object, property, association, source-local record, or evidence assertion.
+
+### 70.4 Semantic Assertions
+
+COVE-MAP applies row semantics and identity rules to produce semantic assertions.
+
+**Assertion kinds:**
+- object assertion,
+- property assertion,
+- association assertion,
+- temporal assertion,
+- identity-key assertion,
+- identity-equivalence assertion,
+- candidate-match assertion,
+- tombstone assertion,
+- evidence assertion,
+- conflict assertion.
+
+A semantic assertion is not necessarily the final COVE-O row. It is the deterministic intermediate meaning produced from source data. A COVE-MAP converter may materialise assertions as COVE-O object records, COVE-O link/association object records, COVE-T projections, evidence indexes, conversion reports, or future association sections.
+
+**Rules:**
+- Assertion identity MUST be deterministic for a given source row identity, mapping rule ID, mapping version, and assertion payload.
+- Assertion canonical bytes MUST use COVE canonical value encoding for logical values where applicable.
+- A materialiser MUST NOT discard conflicts, candidate matches, or rejected rows silently when the mapping claims auditability.
+
+### 70.5 Identity Rules and Multi-Column Semantic Join Keys
+
+Identity rules determine which source rows contribute to the same destination object.
+
+An identity rule may define one or more semantic join keys. A join key is a deterministic ordered tuple of canonicalised components.
+A join key tuple is computed per source row or source record. Cross-source matching occurs because different source-specific column bindings map into the same ordered semantic roles, not because values from multiple sources are combined before identity resolution.
+
+**Identity rule classes:**
+
+| Class | May auto-merge? | Typical use |
+| --- | --- | --- |
+| authoritative | Yes | Source primary key or governed master key. |
+| strong_deterministic | Yes, if declared | Exact canonical match on a high-confidence tuple such as email + name, national ID + date of birth, or external ID + issuer. |
+| weak_deterministic | Not by default | Name + postcode, phone-only, or other collision-prone deterministic tuples. |
+| source_scoped | Only within source scope | Source-local ID with no cross-source merge authority. |
+| candidate | No | Suggested possible match retained as evidence. |
+| do_not_merge | Prevents merge | Explicit negative match, conflict rule, privacy boundary, or known collision. |
+
+**Multi-column join-key requirements:**
+- object_type,
+- identity_rule_id,
+- key_family or semantic key name,
+- confidence_class,
+- auto_merge flag,
+- component_count,
+- declared component order,
+- logical type for each component,
+- semantic role for each component,
+- source column bindings for each source,
+- normalisation/canonicalisation function for each component,
+- null/missing policy,
+- duplicate/collision policy,
+- do-not-merge behaviour,
+- tie-breaker policy.
+
+**Canonical tuple construction:**
+
+```text
+join_key_tuple_bytes =
+  version_marker
+  || object_type_id
+  || identity_rule_id
+  || component_count
+  || for each component in declared order:
+       component_role_id
+       logical_type_id
+       null_marker or length-prefixed canonical_value_bytes
+```
+
+If hashed, the hash input MUST be the canonical tuple bytes. Implementations MUST NOT hash display strings, source bytes, FileCodes, or engine-local ExecutionCodes as a substitute.
+
+**Example: Customer high-confidence match**
+
+```yaml
+identity_rules:
+  - id: customer.name_email.v1
+    object_type: Customer
+    class: strong_deterministic
+    auto_merge: true
+    null_policy: all_components_required
+    components:
+      - role: Customer.Name
+        logical_type: Utf8
+        normalise: cove.fn.person_name.v1
+        bindings:
+          crm.customers: name
+          support.tickets: requester_name
+      - role: Customer.Email
+        logical_type: Utf8
+        normalise: cove.fn.email.v1
+        bindings:
+          crm.customers: email
+          orders.orders: customer_email
+          support.tickets: requester_email
+    do_not_merge:
+      - rule: customer.email_marked_shared_or_role_account
+      - rule: source_policy_boundary_conflict
+```
+
+A CRM row and a Support row whose canonical `Customer.Name` and canonical `Customer.Email` components match create the same strong deterministic join key and may contribute to one `Customer` object. A row with the same name but different email does not match this key. A row with the same email but a do-not-merge marker is kept separate or rejected according to policy.
+
+A single source row may emit more than one identity-key assertion for the same row-semantics object output, for example a governed source ID, an email key, and a name-plus-email key. Those keys are separate evidence items; they become co-referential only under the equivalence rules below.
+
+### 70.6 Identity Resolution Algorithm
+
+A COVE-MAP implementation that claims deterministic identity resolution MUST implement an equivalent deterministic algorithm.
+
+**Recommended abstract algorithm:**
+1. For each source row, compute source row identity and source evidence digest.
+2. Apply row semantics to produce identity-key, object, property, association, temporal, and evidence assertions.
+3. Compute every declared join key using declared canonicalisation functions and null policies.
+4. Partition keys by object type and identity rule scope.
+5. Add merge edges only for authoritative or strong deterministic keys whose `auto_merge` policy is true.
+6. Add candidate edges only as candidate-match assertions.
+7. Apply do-not-merge constraints before forming final equivalence sets.
+8. For each valid equivalence set, choose a canonical identity anchor using declared precedence: identity class, rule precedence, source priority, canonical key bytes, and source row identity tie-breakers.
+9. Generate the destination GOID from the canonical anchor or from a declared external authoritative key.
+10. Emit identity-equivalence and evidence records linking all contributing keys, source rows, and mapping rules.
+
+**Rules:**
+- The algorithm MUST produce the same equivalence sets and GOIDs for the same source data, source order declarations, mapping version, function versions, and conflict policy.
+- If input row order can affect output, the mapping MUST declare a deterministic row ordering or reject replayability claims.
+- Do-not-merge constraints take precedence over auto-merge edges.
+- Identity-key assertions emitted for the same source row and the same row-semantics object output MAY declare co-reference. Co-referenced keys participate in the same identity equivalence graph only when their rule classes permit merge and no do-not-merge constraint applies.
+- Candidate matches MUST NOT participate in GOID selection.
+- A mapping MAY declare that unresolved identity conflicts reject the conversion, keep source-scoped objects separate, or emit conflict evidence. The default safe behaviour is rejection for canonical object output.
+
+### 70.7 GOID Generation for Mapped Objects
+
+COVE-O GOIDs produced by COVE-MAP SHOULD be deterministic within a declared mapping namespace.
+
+**Recommended GOID input:**
+- mapping namespace UUID or dataset namespace,
+- mapping_id,
+- mapping_version or declared identity-stability version,
+- object_type_id,
+- canonical identity anchor kind,
+- canonical identity anchor bytes,
+- optional source scope when identity is source-scoped.
+
+**Rules:**
+- GOIDs MUST NOT be derived from FileCodes.
+- GOIDs SHOULD NOT be derived from non-canonical display strings.
+- GOIDs generated from personal data SHOULD use a keyed or governance-approved digest policy when raw key exposure is a concern.
+- If a mapping version changes identity precedence or canonicalisation functions, generated GOIDs may change unless an explicit identity-stability policy or alias index is used.
+- A converter SHOULD emit an identity-equivalence index when multiple source keys or join keys map to the same GOID.
+
+### 70.8 Property Mapping and Conflict Rules
+
+A row may contribute property assertions to destination objects.
+
+**Property mapping SHOULD declare:**
+- destination object type and property ID/name,
+- source column binding,
+- logical type and conversion policy,
+- normalisation or derivation function,
+- temporal role if the value is time-qualified,
+- source priority,
+- null/missing semantics,
+- conflict handling,
+- evidence retention.
+
+**Conflict behaviours:**
+- source priority wins,
+- latest observed value wins with deterministic tie-breaker,
+- valid-time precedence,
+- reject on conflict,
+- keep multi-valued property,
+- keep source-specific facets,
+- canonicalise equivalent values,
+- retain non-winning values as evidence.
+
+**Rules:**
+- Conflict rules MUST be declared when multiple sources may write the same canonical property.
+- Time-based conflict rules MUST declare the temporal axis used and tie-breakers for equal timestamps.
+- Null MUST NOT overwrite a non-null value unless the mapping explicitly defines null as clearing, tombstoning, or unknown.
+- Non-winning values SHOULD be retained as evidence when auditability is claimed.
+
+### 70.9 Association Mapping
+
+COVE-MAP associations describe durable relationships between destination objects. Associations are first-class semantic outputs paired with objects. They SHOULD be inspectable, explainable, and projectable in the same way as objects.
+
+**Association mapping SHOULD declare:**
+- association type,
+- endpoint object types,
+- endpoint identity rules or aliases,
+- direction and cardinality,
+- association properties,
+- temporal validity fields,
+- duplicate handling,
+- source evidence,
+- materialisation strategy.
+
+For COVE-O v1 destinations, association assertions SHOULD be materialised as link/association object types as described in Section 61.1 unless a future association-specific extension is required. A reader that exposes COVE-O as an object-association surface SHOULD present these materialised records as associations even though their v1 storage form is object records.
+
+**Rules:**
+- Association endpoints MUST resolve through deterministic identity resolution.
+- Association duplicate handling MUST be deterministic.
+- Association validity time MUST NOT be confused with COVE-O commit/file-ordering timestamp.
+- Association readback MUST preserve declared direction, endpoint roles, association type, materialised association/link GOID where present, temporal validity, and evidence linkage.
+
+### 70.10 Object-Association Read Surfaces and Projection Rules
+
+COVE-MAP supports two complementary directions:
+
+1. **Source-to-object/association mapping:** external rows become deterministic semantic assertions and are materialised as COVE-O objects, link/association records, temporal facts, and evidence.
+2. **Object/association-to-table projection:** existing COVE-O object-association data is exposed as deterministic table-shaped read views for SQL, BI, Arrow, dataframe, debugging, or export workflows.
+
+A projection rule defines a read-time or materialised view over the object-association semantic surface. It does not create a new source of truth unless the projected output is explicitly materialised as COVE-T with lineage back to the COVE-O source and projection definition.
+
+Projection expression syntax in the examples below is non-normative pseudocode. A formal projection expression grammar, if standardised, MUST be defined by a companion COVE-MAP schema specification or a required extension.
+
+**Reader surfaces:**
+
+| Surface | Exposes | Required for baseline COVE-O? |
+| --- | --- | --- |
+| Object surface | Objects, properties, temporal history, GOIDs, tombstones | Yes for COVE-O readers. |
+| Association surface | Associations/link records, endpoint roles, direction, cardinality, validity, evidence | Recommended for COVE-MAP-derived COVE-O; required when association readback is claimed. |
+| Projection surface | Deterministic rows derived from objects and associations | Optional; required only when mapping-defined projection support is claimed. |
+| Evidence surface | Source rows, mapping rules, assertion IDs, conflicts, and provenance | Optional; required only when explanation/audit support is claimed. |
+
+**A projection rule SHOULD declare:**
+- projection_id,
+- output table or view name,
+- output schema,
+- row grain,
+- anchor object type or association type,
+- selected properties,
+- association traversals,
+- temporal mode or point-in-time cut,
+- conflict/value selection policy,
+- null and missing-value policy,
+- cardinality explosion policy,
+- duplicate handling,
+- ordering policy,
+- evidence inclusion policy,
+- whether the projection is read-only, materialised, exportable as COVE-T, or exportable as Arrow/SQL rows.
+
+**Recommended row grains:**
+
+| Row grain | Meaning |
+| --- | --- |
+| `one_row_per_object` | One row per object of the anchor type. |
+| `one_row_per_association` | One row per association of the anchor type. |
+| `one_row_per_link_object` | One row per materialised link/association object. |
+| `one_row_per_property_version` | One row per historical property value/version. |
+| `one_row_per_event_object` | One row per event or transaction object. |
+| `one_row_per_object_as_of_time` | One row per object at a declared temporal cut. |
+| `one_row_per_evidence_assertion` | One row per source evidence or mapping assertion. |
+
+**Example: object summary projection**
+
+```yaml
+projections:
+  - id: customer_summary.v1
+    output_table: customer_summary
+    row_grain: one_row_per_object
+    anchor:
+      object_type: Customer
+    temporal_mode:
+      as_of: latest_committed
+    columns:
+      - name: customer_goid
+        value: Customer.goid
+      - name: display_name
+        value: Customer.display_name
+        conflict_policy: canonical_value
+      - name: email
+        value: Customer.email
+        conflict_policy: canonical_value
+      - name: order_count
+        value: count(association(CustomerPlacedOrder))
+      - name: latest_ticket_opened_at
+        value: max(association(CustomerOpenedSupportTicket).SupportTicket.opened_at)
+```
+
+**Example: association edge projection**
+
+```yaml
+projections:
+  - id: customer_order_edges.v1
+    output_table: customer_order_edges
+    row_grain: one_row_per_association
+    anchor:
+      association_type: CustomerPlacedOrder
+    columns:
+      - name: customer_goid
+        value: association.source_goid
+      - name: order_goid
+        value: association.target_goid
+      - name: association_goid
+        value: association.goid
+      - name: order_date
+        value: Order.order_date
+      - name: evidence_source
+        value: evidence.source_id
+```
+
+**Rules:**
+- Projection support is optional. A COVE-O reader MAY expose only the object surface unless it claims association, projection, or evidence readback support.
+- A projection rule MUST be deterministic for a given COVE-O dataset state, mapping/projection version, temporal cut, and function registry.
+- A projection rule MUST declare how multi-valued associations are handled: explode rows, aggregate, choose deterministic first/last, reject, or emit nested/list values where the target format supports them.
+- A projection rule MUST declare whether it uses latest values, full history, valid-time state, observed-time state, or COVE-O commit/file-ordering state.
+- A projected table view MUST NOT change object identity, association identity, canonical property truth, tombstone semantics, or evidence lineage.
+- If a projected view is materialised as COVE-T, the COVE-T output SHOULD include lineage to the source COVE-O files, COVM dataset state where applicable, projection_id, projection_version, mapping/projection artifact digest, and temporal cut.
+
+### 70.11 Temporal Roles
+
+Source time fields must declare their temporal role.
+
+**Temporal roles:**
+- source event time,
+- valid-from time,
+- valid-to time,
+- observed-at time,
+- ingested-at time,
+- source transaction time,
+- mapping execution time,
+- COVE-O commit/file-ordering timestamp.
+
+Only a field explicitly mapped to COVE-O commit/file-ordering timestamp may populate COVE-O `timestamp_us`. Other temporal roles must be represented as properties, association validity fields, evidence fields, or future temporal-axis extensions.
+
+### 70.12 Provenance and Evidence
+
+COVE-MAP SHOULD preserve evidence linking output objects, properties, associations, identity decisions, conflicts, and tombstones back to source data.
+
+**Minimum evidence for explainable output SHOULD include:**
+- source_id,
+- source_kind,
+- source schema fingerprint,
+- source load/snapshot identity,
+- source row identity,
+- source row digest or payload digest,
+- mapping_id,
+- mapping_version,
+- mapping rule ID,
+- mapping execution ID,
+- output assertion ID,
+- output object GOID or association/link GOID where materialised.
+
+**Rules:**
+- Evidence entries MUST be deterministic for a given mapping run.
+- Evidence visibility MUST respect source governance/redaction policy.
+- If evidence cannot be retained because of privacy/security policy, the mapping SHOULD retain a redacted evidence stub with digest and policy reference where allowed.
+
+### 70.13 Deterministic Function Registry
+
+COVE-MAP may reference deterministic functions for normalisation, canonicalisation, hashing, type coercion, and simple derivation.
+
+**Function declarations SHOULD include:**
+- function_id,
+- function_version,
+- input logical types,
+- output logical type,
+- null policy,
+- Unicode normalisation policy,
+- locale/collation policy,
+- timezone policy when applicable,
+- hash/digest algorithm when applicable,
+- deterministic failure behaviour.
+
+**Rules:**
+- Functions used for identity MUST be declared and versioned.
+- Functions used for identity MUST NOT depend on undeclared locale defaults, mutable external services, random values, network calls, wall-clock time, or implementation-defined ordering.
+- A mapper MUST reject conversion if it cannot execute a required identity or property function exactly as declared.
+
+### 70.14 Security, Governance, and Privacy
+
+Semantic mapping can combine sources and reveal relationships not obvious in any single source.
+
+**Rules:**
+- A mapper MUST NOT silently weaken source access boundaries.
+- If mapped output combines sources with different sensitivity labels, the output MUST preserve the most restrictive applicable policy metadata, emit declared governance reconciliation metadata, or reject conversion.
+- Evidence indexes, identity-equivalence indexes, dictionaries, join-key digests, and conversion reports may leak sensitive information and must be governed like data.
+- Join keys derived from personal or regulated data SHOULD use digest/redaction policies that avoid exposing raw identity components to unauthorised readers.
+- COVE-MAP is not an access-control system. Readers and platforms remain responsible for enforcing policy.
+
+### 70.15 Conversion Tool Contract
+
+A COVE-MAP converter that targets object-and-association-based COVE SHOULD implement the following pipeline:
+
+1. Validate mapping artifact and deterministic function registry.
+2. Validate source snapshots, schema fingerprints, and source digests.
+3. Read source rows using declared source row identity and ordering.
+4. Apply source-local row semantics.
+5. Compute semantic join keys and source evidence digests.
+6. Resolve deterministic identity and produce GOIDs/equivalence sets.
+7. Apply property and association conflict rules.
+8. Produce semantic assertions and conversion diagnostics.
+9. Materialise COVE-O object records and link/association object records.
+10. Validate object-association readback semantics for the materialised output when association readback is claimed.
+11. Optionally materialise or register COVE-MAP projection rules for COVE-T/Arrow/SQL relational query engines.
+12. Emit evidence indexes and conversion report when auditability is claimed.
+13. Emit COVM manifest references when a dataset has multiple output files or lineage artifacts.
+14. Validate the produced COVE outputs independently of the mapping artifact.
+
+**Recommended tools:**
+- `cove-map validate`,
+- `cove-map preview`,
+- `cove-map plan-keys`,
+- `cove-map convert`,
+- `cove-map explain`,
+- `cove-map diff`,
+- `cove-map project`,
+- `cove-map test`.
+
+### 70.16 Non-Goals
+
+COVE-MAP v1 deliberately does not define:
+- probabilistic entity resolution as canonical identity,
+- AI-based automatic mapping as canonical identity,
+- a general ETL orchestration system,
+- a master-data-management workflow,
+- a business glossary standard,
+- mutable catalog transactions,
+- live database writes,
+- a mandatory Harbor dependency,
+- treating projected tables as more authoritative than the underlying object-association model.
+
+Future extensions may support candidate suggestions, interactive approval workflows, or external resolver integrations, but such features MUST NOT silently change deterministic object identity in a COVE-MAP output.
+
+---
+
+## 71. Profile Capability Matrix
 
 A public COVE implementation SHOULD declare which profile tier it supports.
 
-| Feature | COVE-Core Reader | COVE-T Scan Reader | COVE-A Archive Reader | COVE-E Reader | COVE-H Harbor Reader |
-| --- | --- | --- | --- | --- | --- |
-| Validate header/footer/sections | Required | Required | Required | Required | Required |
-| Decode FileCode to values | Required | Required | Required | Required | Required |
-| Decode NumCode columns | Required | Required | Required | Required | Required |
-| Arrow-compatible output | Recommended | Recommended | Recommended | Optional | Optional |
-| FileCode -> ExecutionCode | Optional | Recommended | Recommended | Required | Required as Harbor EngineCode |
-| Engine profile registry | Optional | Optional | Optional | Required | Required |
-| Morsel-aligned scanning | Optional | Required | Required | Optional | Required |
-| Zone stats | Optional | Required | Required | Optional | Required |
-| Predicate proof outcomes | Optional | Required | Required | Optional | Required |
-| Exact sets | Optional | Recommended | Recommended | Optional | Recommended |
-| Bloom filters | Optional | Recommended | Recommended | Optional | Recommended |
-| Inverted morsel indexes | Optional | Optional | Recommended | Optional | Recommended |
-| Lookup indexes | Optional | Optional | Recommended | Optional | Recommended |
-| Aggregate synopses | Optional | Optional | Recommended | Optional | Recommended |
-| Composite zone indexes | Optional | Optional | Recommended | Optional | Recommended |
-| Top-N summaries | Optional | Optional | Recommended | Optional | Recommended |
-| COVX sidecars | Optional | Optional | Optional | Optional | Optional |
-| COVM manifests | Optional | Optional | Recommended | Optional | Recommended |
-| COVE-O object profile | Optional | Optional | Optional | Optional | Recommended for Harbor |
-| COVE-H Harbor mount profile | Not required | Not required | Not required | Not required | Required |
+| Feature | COVE-Core Reader | COVE-T Scan Reader | COVE-A Archive Reader | COVE-E Reader | COVE-H Harbor Reader | COVE-MAP Tool |
+| --- | --- | --- | --- | --- | --- | --- |
+| Validate header/footer/sections | Required | Required | Required | Required | Required | Required for COVE outputs |
+| Decode FileCode to values | Required | Required | Required | Required | Required | Required when reading COVE sources/outputs |
+| Decode NumCode columns | Required | Required | Required | Required | Required | Required when reading COVE sources/outputs |
+| Arrow-compatible output | Recommended | Recommended | Recommended | Optional | Optional | Recommended for previews/projections |
+| FileCode -> ExecutionCode | Optional | Recommended | Recommended | Required | Required as Harbor EngineCode | Optional; never identity truth |
+| Engine profile registry | Optional | Optional | Optional | Required | Required | Optional |
+| Morsel-aligned scanning | Optional | Required | Required | Optional | Required | Optional |
+| Zone stats | Optional | Required | Required | Optional | Required | Optional |
+| Predicate proof outcomes | Optional | Required | Required | Optional | Required | Optional |
+| Exact sets | Optional | Recommended | Recommended | Optional | Recommended | Optional |
+| Bloom filters | Optional | Recommended | Recommended | Optional | Recommended | Optional |
+| Inverted morsel indexes | Optional | Optional | Recommended | Optional | Recommended | Optional |
+| Lookup indexes | Optional | Optional | Recommended | Optional | Recommended | Optional |
+| Aggregate synopses | Optional | Optional | Recommended | Optional | Recommended | Optional |
+| Composite zone indexes | Optional | Optional | Recommended | Optional | Recommended | Optional |
+| Top-N summaries | Optional | Optional | Recommended | Optional | Recommended | Optional |
+| COVX sidecars | Optional | Optional | Optional | Optional | Optional | Optional |
+| COVM manifests | Optional | Optional | Recommended | Optional | Recommended | Recommended for multi-file outputs |
+| COVE-O object profile | Optional | Optional | Optional | Optional | Optional unless object-temporal semantics are requested | Required when destination is object-based COVE |
+| COVE-O association readback | Optional | Not required | Optional | Optional | Recommended for object-association semantics | Required when association readback is claimed |
+| COVE-MAP projection readback | Not required | Optional | Optional | Optional | Optional unless table projection is requested | Required when mapping-defined projection support is claimed |
+| COVE-MAP semantic mapping | Not required | Not required | Not required | Not required | Not required unless mapping explanation is requested | Required |
+| COVE-H Harbor mount profile | Not required | Not required | Not required | Not required | Required only for COVE-H | Not required |
 
 ---
 
-## 71. Writer Profiles
+## 72. Writer Profiles
 
-### 71.1 COVE-Core Minimal Profile
+### 72.1 COVE-Core Minimal Profile
 
 **MUST emit:**
 - valid header,
@@ -3539,9 +4663,9 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 - file dictionary if FileCode columns exist,
 - valid checksums,
 - valid logical/physical typing,
-- valid null bitmaps.
+- valid null bitmaps, unless nullness is fully determined by valid page flags in a COVE-T stats-only constant page.
 
-### 71.2 COVE-T Minimal Table Profile
+### 72.2 COVE-T Minimal Table Profile
 
 **MUST emit:**
 - all COVE-Core requirements,
@@ -3553,7 +4677,25 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 - null counts,
 - segment/morsel row counts.
 
-### 71.3 COVE-T Scan Profile
+This profile MUST NOT require COVE-A, COVE-E, COVE-H, COVE-O, COVX, COVM, or any required custom extension.
+
+#### 72.2.1 COVE-T Starter Interoperability Subset
+
+A first public reader/writer SHOULD target this subset before claiming broader COVE ecosystem readiness:
+- COVE-Core plus COVE-T Minimal Table Profile,
+- primitive Bool/Int/UInt/Float/Decimal/Date/Timestamp types,
+- Utf8/Binary/Uuid through FileCode or VarBytes,
+- ordinary List/Struct/Map only when Arrow-compatible mappings are implemented,
+- uncompressed and LZ4 payloads,
+- valid null bitmaps and all-null/all-non-null page flags,
+- morsel_row_count = 4096 unless explicitly declared otherwise,
+- morsel-level zone stats for numeric and comparable FileCode columns,
+- Arrow-compatible export,
+- no required COVE-A, COVE-E, COVE-H, COVE-O, COVX, or COVM dependencies.
+
+Writers producing starter-subset files SHOULD avoid required extensions and exotic encodings. Readers implementing the starter subset MUST still reject unknown required feature bits and MUST remain correct when optional acceleration metadata is absent.
+
+### 72.3 COVE-T Scan Profile
 
 **Recommended default:**
 - all COVE-T Minimal requirements,
@@ -3567,9 +4709,12 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 - bloom filters for high-cardinality equality columns,
 - local codebook encoding for FileCode pages,
 - frame-of-reference or delta encoding for NumCode pages,
+- adaptive per-page encoding selection,
+- stats-only constant pages for all-null and all-non-null constant pages where supported,
+- small page packing inside table segment data,
 - LZ4 for hot scan pages.
 
-### 71.4 COVE-A Archive Acceleration Profile
+### 72.4 COVE-A Archive Acceleration Profile
 
 **Recommended for fast offline archives:**
 - all COVE-T Scan Profile features,
@@ -3580,9 +4725,10 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 - composite zone indexes,
 - Top-N summaries for ordered hot columns,
 - optional COVX sidecar,
+- safe COVM publication using immutable manifests or an external atomic reference update,
 - Zstd for cold page payloads where scan latency permits.
 
-### 71.5 COVE-E Engine Execution Profile
+### 72.5 COVE-E Engine Execution Profile
 
 **Recommended for engines with dictionary/coded execution:**
 - engine profile registry,
@@ -3594,7 +4740,7 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 - optional execution-code cache metadata,
 - reverse lookup policy.
 
-### 71.6 COVE-H Harbor Profile
+### 72.6 COVE-H Harbor Profile
 
 **Recommended for Harbor:**
 - all COVE-T Scan Profile features,
@@ -3606,7 +4752,7 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 - direct Harbor vector materialisation,
 - optional COVE-O object-temporal support.
 
-### 71.7 COVE-O Object Checkpoint Profile
+### 72.7 COVE-O Object Checkpoint Profile
 
 **Recommended for object state:**
 - object type catalog,
@@ -3617,11 +4763,31 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 - trust chain if compliance requires,
 - redaction manifest if redactions are present.
 
+
+### 72.8 COVE-MAP Object Conversion Profile
+
+**Recommended for deterministic multi-source conversion into object-and-association-based COVE:**
+- COVE-MAP mapping artifact or embedded mapping sections,
+- source catalog with source identity, source kind, schema fingerprint, source load/snapshot identity, and source row identity rules,
+- deterministic function registry with function IDs and versions,
+- row semantics catalog defining whether rows produce objects, event objects, link objects, associations, composite records, dispatch records, key/value fragments, projections, tombstones, or evidence-only assertions,
+- identity rule catalog with authoritative, strong deterministic, weak deterministic, source-scoped, candidate, and do-not-merge rules,
+- multi-column semantic join keys for high-confidence cross-source object matching,
+- deterministic conflict rules for property values and identity collisions,
+- evidence index linking output objects/properties/associations to source rows and mapping rule IDs,
+- COVE-O materialisation when the destination is object-based COVE, including materialised link/association object records when associations are produced,
+- optional object-association readback metadata for readers that expose associations as a first-class surface,
+- optional projection catalog for deterministic object/association-to-table readback,
+- optional COVE-T projections for query compatibility,
+- optional COVM manifest referencing mapping artifact, source set, conversion report, and output files.
+
+A COVE-MAP writer that claims object-conversion conformance MUST produce COVE-O output that is valid without requiring the mapping artifact for ordinary object reconstruction. If the writer claims association readback, it MUST preserve sufficient metadata for associations/link records to be exposed as associations rather than only as generic objects. The mapping artifact may be required for replay, explanation, conflict audit, projection readback, or source-row traceability.
+
 ---
 
-## 72. Validation Model
+## 73. Validation Model
 
-### 72.1 Bootstrap Validation
+### 73.1 Bootstrap Validation
 
 1. Read trailing magic.
 2. Read postscript_len and postscript_version.
@@ -3632,7 +4798,7 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 7. Validate footer CRC via postscript section spec.
 8. Parse footer and section directory.
 
-### 72.2 Structural Validation
+### 73.2 Structural Validation
 
 **For every used section:**
 - validate offset,
@@ -3645,7 +4811,7 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 - validate enum ranges,
 - validate arithmetic overflow.
 
-### 72.3 COVE-T Semantic Validation
+### 73.3 COVE-T Semantic Validation
 
 - table IDs unique,
 - column IDs unique within table,
@@ -3659,7 +4825,7 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 - stats safe before pushdown,
 - optional indexes checksum-valid before use.
 
-### 72.4 COVE-E Semantic Validation
+### 73.4 COVE-E Semantic Validation
 
 - engine profile namespace valid,
 - execution descriptor valid,
@@ -3669,7 +4835,7 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 - execution mapping optional or required according to requested operation,
 - unknown required profiles rejected only when needed.
 
-### 72.5 COVE-O Semantic Validation
+### 73.5 COVE-O Semantic Validation
 
 - object_type_id exists,
 - property_id exists,
@@ -3680,9 +4846,30 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 - prev_ref target kind matches,
 - reconstruction self-containment holds.
 
+### 73.6 COVE-MAP Semantic Validation
+
+A COVE-MAP-aware validator MUST validate the mapping artifact and any embedded mapping sections before using them for conversion, replay, or explanation.
+
+**Validation requirements:**
+- source IDs unique within the mapping artifact,
+- source schema fingerprints present when source replay is claimed,
+- source row identity rules deterministic and non-empty,
+- mapping_id and mapping_version present,
+- mapping function IDs declared with explicit versions,
+- no undeclared random, wall-clock, locale-default, network, or mutable external dependency,
+- identity rules reference existing object types and semantic roles,
+- multi-column join-key components have declared logical types, canonicalisation, null policy, and ordering,
+- auto-merge rules use authoritative or deterministic confidence classes only,
+- candidate rules do not alter canonical object identity,
+- do-not-merge constraints are checked before equivalence classes are materialised,
+- property conflict rules are declared for multi-source canonical properties,
+- association endpoints resolve to deterministic object identities,
+- output COVE-O object records satisfy COVE-O validation,
+- evidence entries refer to valid source IDs, source row identities or digests, mapping rule IDs, and output assertion IDs.
+
 ---
 
-## 73. Recovery and Failure Behavior
+## 74. Recovery and Failure Behavior
 
 | Condition | Default Behavior |
 | --- | --- |
@@ -3707,6 +4894,8 @@ A public COVE implementation SHOULD declare which profile tier it supports.
 | COVE-E required profile corrupt | Reject if needed |
 | COVX stale/corrupt | Ignore COVX |
 | COVM stale/corrupt | Ignore COVM |
+| COVE-MAP artifact stale/corrupt | Ignore for ordinary reads; reject mapping replay/explanation/conversion if required |
+| COVE-MAP identity conflict | Apply declared conflict behaviour; reject if no safe declared behaviour exists |
 | Segment checksum mismatch | Reject segment; fail read unless explicit best-effort mode |
 | Page checksum mismatch | Reject page; fail read unless explicit best-effort mode |
 | Invalid FileCode | Treat as corruption |
@@ -3719,7 +4908,7 @@ Normal readers fail closed for structural corruption.
 
 ---
 
-## 74. Durable Replace Protocol
+## 75. Durable Replace Protocol
 
 Writers MUST publish COVE files by durable replace.
 **Required protocol:**
@@ -3737,7 +4926,7 @@ Writers MUST publish COVE files by durable replace.
 
 ---
 
-## 75. Error Codes
+## 76. Error Codes
 
 | Code | Meaning |
 | --- | --- |
@@ -3767,12 +4956,17 @@ Writers MUST publish COVE files by durable replace.
 | COVE_E_PAGE_CORRUPT | Page structure invalid. |
 | COVE_E_REDACTION_POLICY | Redacted value cannot be surfaced under current policy. |
 | COVE_E_SIDECAR_STALE | COVX/COVM sidecar does not match referenced COVE. |
+| COVE_E_MAP_INVALID | COVE-MAP mapping artifact or embedded mapping section is malformed. |
+| COVE_E_MAP_FUNCTION_UNDECLARED | Mapping references an undeclared or unsupported deterministic function. |
+| COVE_E_MAP_IDENTITY_CONFLICT | Declared identity rules produce an unresolved merge/do-not-merge conflict. |
+| COVE_E_MAP_SOURCE_STALE | Source snapshot, schema fingerprint, or source digest does not match the mapping run. |
+| COVE_E_MAP_EVIDENCE_INVALID | Mapping evidence references a missing source, rule, row, assertion, or output object. |
 
 ---
 
-## 76. Compatibility
+## 77. Compatibility
 
-### 76.1 Versioning
+### 77.1 Versioning
 
 **COVE v1 readers support:**
 version_major = 1
@@ -3780,7 +4974,7 @@ version_major = 1
 - Readers MUST reject unsupported major versions.
 - Readers MAY accept newer minor versions if no unknown required features are set.
 
-### 76.2 Required vs Optional Features
+### 77.2 Required vs Optional Features
 
 Required features are needed for correctness.
 Optional features are accelerators or metadata.
@@ -3789,7 +4983,8 @@ Optional features are accelerators or metadata.
   - codec needed to decode projected data,
   - nested column support when projected,
   - trust-chain support when verification is requested,
-  - engine profile required by requested output mode.
+  - engine profile required by requested output mode,
+  - COVE-MAP artifact required by requested mapping replay, source-to-object conversion, or mapping explanation operation.
 
 **Optional:**
   - bloom filters,
@@ -3799,11 +4994,12 @@ Optional features are accelerators or metadata.
   - Top-N summaries,
   - COVX sidecars,
   - COVM manifests,
-  - optional engine profile mappings.
+  - optional engine profile mappings,
+  - COVE-MAP mapping artifacts and evidence when ordinary table/object reading does not request mapping replay or explanation.
 
 ---
 
-## 77. Conformance Requirements
+## 78. Conformance Requirements
 
 **A conforming COVE-Core reader MUST:**
 - validate header checksum,
@@ -3851,6 +5047,17 @@ Optional features are accelerators or metadata.
 - validate prev_ref targets,
 - enforce reconstruction self-containment,
 - verify trust chains when requested and present.
+**A COVE-MAP-aware tool MUST additionally:**
+- validate mapping artifacts and embedded mapping sections before use,
+- compute identity join keys from canonical logical values,
+- apply declared normalisation and canonicalisation function versions,
+- preserve declared component order for multi-column join keys,
+- keep candidate matches separate from canonical object identity unless explicitly promoted by deterministic mapping rules,
+- enforce do-not-merge constraints before automatic object merge,
+- materialise object-based destinations as valid COVE-O files when COVE-O output is requested,
+- preserve evidence sufficient to explain source row -> object/property/association output when explanation is claimed,
+- reject or report unresolved identity/property conflicts according to declared policy,
+- never require Harbor for COVE-MAP conversion or COVE-O output.
 **A conforming writer MUST:**
 - never emit engine execution codes as authoritative logical data,
 - write FileCodes densely into the file dictionary,
@@ -3864,7 +5071,9 @@ Optional features are accelerators or metadata.
 
 ---
 
-## 78. Open Conformance Suite
+## 79. Open Conformance Suite
+
+A public interoperability release of COVE SHOULD NOT claim broad v1 readiness without a working reference reader, reference writer, and binary conformance suite. The wire format is defined by this specification, but adoption depends on reproducible test artifacts. An implementation SHOULD NOT claim COVE-Core or COVE-T conformance until it passes the applicable public vectors for that level.
 
 **An open COVE release SHOULD include:**
 1. Reference reader.
@@ -3877,7 +5086,8 @@ Optional features are accelerators or metadata.
 8. Corruption/negative test corpus.
 9. Canonicalisation/collation test corpus.
 10. Parquet conversion corpus.
-11. Benchmark suite.
+11. COVE-MAP multi-source conversion corpus when COVE-MAP tooling is claimed.
+12. Benchmark suite.
 **Benchmark categories SHOULD include:**
 - full numeric scan,
 - string/category scan,
@@ -3894,11 +5104,25 @@ Optional features are accelerators or metadata.
 - COVE file-size overhead,
 - COVX/COVM acceleration impact,
 - ExecutionCode remap overhead,
-- Harbor EngineCode remap overhead.
+- Harbor EngineCode remap overhead,
+- COVE-MAP source-to-object conversion cost and identity-resolution cost when COVE-MAP tooling is claimed.
+
+### 79.1 Minimum Binary Test Vector Contract
+
+**Each public conformance vector SHOULD include:**
+- one or more binary .cove/.covx/.covm files,
+- a machine-readable expected logical result set or expected validation error,
+- expected cove-inspect/cove-dump metadata summaries,
+- declared conformance level and required feature bits,
+- producer version and vector version,
+- checksum and digest expectations where applicable.
+
+Negative vectors SHOULD name the expected error class rather than depending on exact implementation wording. Optional-profile vectors MUST state which profile is being tested; COVE-H and COVE-O vectors are optional unless an implementation claims those profiles.
+
 **Conformance vectors SHOULD cover:**
 - header/footer/postscript validation,
 - dictionary FileCode resolution,
-- null bitmap semantics,
+- null bitmap semantics, including bit order, final-byte padding, all-null/all-non-null flags, and Arrow validity inversion,
 - NumCode interpretation,
 - ColumnDomain ordering,
 - predicate proof outcomes,
@@ -3914,25 +5138,37 @@ Optional features are accelerators or metadata.
 - trust hash canonicalisation,
 - redaction handling,
 - digest verification,
-- Arrow interop mapping.
+- Arrow interop mapping,
+- Arrow IPC conversion boundaries,
+- lakehouse/COVM manifest freshness and visibility rules,
+- external delete/visibility overlay safety for pruning, lookup, and aggregate synopses,
+- row-reference file fingerprint validation,
+- conversion fidelity reports and lossy conversion rejection,
+- FixedSizeList/vector/tensor extension fallback behaviour,
+- approximate COVX index proof-capability restrictions,
+- Json opaque semantics and semantic-JSON extension behaviour,
+- security/privacy boundary cases including redaction, omitted sensitive indexes, and approximate/private statistics,
+- streaming-writer finalisation and partially written file rejection,
+- COVE-MAP source catalog validation, deterministic function registry validation, multi-column join-key canonicalisation, candidate-vs-canonical identity separation, do-not-merge enforcement, source evidence traceability, object-and-association-based COVE-O output validation, association readback validation, and projection-rule validation.
 
 ---
 
-## 79. Utilities and Supporting Artifacts
+## 80. Utilities and Supporting Artifacts
 
 The public COVE project SHOULD ship the following utilities and artifacts.
 
-### 79.1 Reference Libraries
+### 80.1 Reference Libraries
 
 - **cove-core:** Format primitives, checksums, section directory, dictionary, encoded arrays, validation, collation, extension registry.
 - **cove-reader:** Read COVE-Core and COVE-T files.
 - **cove-writer:** Write COVE-Core and COVE-T files.
 - **cove-arrow:** Export COVE data as Arrow arrays / record batches.
 - **cove-engine:** COVE-E engine execution profile helpers.
-- **cove-harbor:** COVE-H Harbor mount profile implementation.
+- **cove-harbor:** Optional COVE-H Harbor mount profile implementation.
 - **cove-convert:** Conversion library for Parquet/CSV/Arrow/ORC -> COVE-T.
+- **cove-map:** Optional COVE-MAP library for deterministic source-row semantics, multi-source identity joins, evidence tracking, materialisation into COVE-O object/association outputs, and deterministic object/association-to-table projections.
 
-### 79.2 CLI Tools
+### 80.2 CLI Tools
 
 - **cove-validate:** Validate structure, CRCs, digests, schema, dictionaries, sections, indexes, profiles, extensions, and conformance.
 - **cove-inspect:** Print human-readable file layout, sections, catalog, stats, dictionary summaries, execution profiles, and index summaries.
@@ -3946,11 +5182,22 @@ The public COVE project SHOULD ship the following utilities and artifacts.
 - **cove-verify-digest:** Verify cryptographic digests and Merkle roots.
 - **cove-fuzz:** Run corpus and property-based fuzz tests.
 - **cove-canonicalise:** Verify canonical value encodings, collation ordering, domain-rank construction, and trust input canonicalisation.
-
 - **cove-profile:** Inspect or generate COVE-E engine profile metadata.
 - **cove-arrow-export:** Export COVE-T tables to Arrow-compatible batches.
+- **cove-conversion-report:** Emit machine-readable conversion fidelity reports for source-to-COVE and COVE-to-source conversions.
+- **cove-map-validate:** Validate COVE-MAP artifacts, source declarations, deterministic function registries, identity rules, row semantics, and output profiles.
+- **cove-map-preview:** Show source-row to semantic-assertion output before materialisation.
+- **cove-map-convert:** Convert multiple declared sources into object-and-association-based COVE-O output and optional COVE-T projections.
+- **cove-map-explain:** Explain how source rows, join keys, rules, conflicts, and evidence produced an object/property/association output or projected table row.
+- **cove-map-diff:** Compare outputs from two mapping versions or two source snapshots.
+- **cove-map-test:** Run mapping fixtures with known input rows, expected join-key values, expected GOIDs, expected conflicts, and expected COVE-O output.
+- **cove-map-plan-keys:** Inspect multi-column join keys, component null rates, duplicate rates, candidate conflicts, and do-not-merge collisions before conversion.
+- **cove-map-project:** Expose COVE-O object/association data as deterministic projected tables, Arrow record batches, or materialised COVE-T outputs using declared projection rules.
 
-### 79.3 Engine Integrations
+- **cove-explain-pruning:** Explain file, segment, morsel, and page pruning decisions, including which statistic, domain, exact set, bloom, lookup index, synopsis, COVM entry, or COVX artifact produced DefinitelyNo, DefinitelyYes, or Unknown.
+- **cove-plan-cost:** Estimate projected I/O, morsel pruning, index utility, and expected scan work for representative predicates.
+
+### 80.3 Engine Integrations
 
 **Recommended initial integrations:**
 
@@ -3958,11 +5205,20 @@ The public COVE project SHOULD ship the following utilities and artifacts.
 - **DataFusion:** COVE TableProvider.
 - **DuckDB:** COVE scan extension / table function.
 - **Polars:** COVE scan/read support.
+- **Spark / Trino / Presto / ClickHouse:** Optional read-only adapters or table-format data-file adapters once COVE-T conformance vectors are stable.
 - **Python:** cove.read_table(), cove.scan(), cove.to_arrow(), cove.to_polars().
+- **Java / Scala:** Table-format and engine adapters where JVM ecosystem integration is required.
+- **Go:** Lightweight validation, inspection, and service-side read bindings.
 - **Rust:** cove-core, cove-io, cove-arrow, cove-datafusion, cove-engine.
-- **Harbor:** COVE-H direct leased-code mount support.
+- **WASM / embedded:** Optional lightweight COVE-Core/COVE-T validation and projection readers with optional profiles disabled by default.
+- **Harbor:** Optional COVE-H direct leased-code mount support.
 
-### 79.4 Dataset and Benchmark Corpus
+**Integration guidance:**
+- Engine integrations SHOULD start read-only until COVE-Core/COVE-T conformance vectors pass.
+- An engine integration MUST NOT reinterpret optional acceleration metadata as required table semantics.
+- Table-format adapters MUST apply external catalog visibility and delete rules before returning rows.
+
+### 80.4 Dataset and Benchmark Corpus
 
 **Recommended corpora:**
 
@@ -3977,9 +5233,15 @@ The public COVE project SHOULD ship the following utilities and artifacts.
 - **parquet-medical-operational:** categorical, temporal, event, and object-history style data.
 - **negative-corrupt:** malformed sections, invalid CRCs, bad offsets, invalid FileCodes.
 - **canonicalisation:** UTF-8, decimal, timestamp, UUID, NaN, null, map/list/struct cases.
-- **engine-profile:** FileCode -> ExecutionCode mapping tests for generic, Arrow, and Harbor profiles.
+- **semantic-mapping:** CRM/orders/support style multi-source datasets where `Customer.Name` + `Customer.Email` produces a strong deterministic object match, with candidate-name-only and do-not-merge negative cases.
+- **engine-profile:** FileCode -> ExecutionCode mapping tests for generic and Arrow profiles; Harbor vectors are required only for COVE-H claims.
 
-### 79.5 Governance Artifacts
+**Benchmark reporting:**
+- Public performance claims SHOULD publish dataset versions, query definitions, selected columns/predicates, hardware, storage medium, cold/warm cache state, thread count, engine version, COVE writer settings, comparator format settings, and reproducible scripts.
+- Benchmarks SHOULD separate file-size, conversion cost, cold planning latency, warm planning latency, scan CPU, decompression CPU, index build cost, and end-to-end query latency.
+- A benchmark MUST NOT claim format-level superiority when the result depends on a non-portable engine shortcut that is unavailable to the compared format, unless the shortcut is explicitly disclosed.
+
+### 80.5 Governance Artifacts
 
 **For open adoption, the project SHOULD publish:**
 - formal binary specification,
@@ -3990,6 +5252,8 @@ The public COVE project SHOULD ship the following utilities and artifacts.
 - extension registry,
 - engine profile registry,
 - collation registry,
+- COVE-MAP deterministic function registry,
+- COVE-MAP identity confidence-class and row-semantics registry,
 - test vector registry,
 - implementation conformance levels,
 - performance benchmark methodology,
@@ -3997,17 +5261,27 @@ The public COVE project SHOULD ship the following utilities and artifacts.
 - trademark/name guidance,
 - extension proposal process.
 
+Governance rules SHOULD ensure that required feature bits, section kinds, encoding IDs, and profile registrations are not controlled by a single proprietary engine or vendor-specific implementation. Named engine registrations are allowed, but they MUST remain optional unless a reader explicitly claims that named profile.
+**Governance for new stable features SHOULD require:**
+- an extension proposal or specification patch,
+- assigned feature bits and registry entries where applicable,
+- fallback and unknown-reader behaviour,
+- security/privacy review for features that expose, hide, encrypt, redact, or approximate data,
+- positive and negative conformance vectors,
+- reference implementation support,
+- interoperability evidence from at least one independent implementation before broad ecosystem conformance claims are made.
+
 ---
 
-## 80. Summary of v1 Design Decisions
+## 81. Summary of v1 Design Decisions
 
 **COVE v1 chooses:**
 
-- **Neutral public name:** Cove Format, with Harbor represented as COVE-H profile and origin influence.
+- **Neutral public name:** Cove Format, with Harbor represented only as an optional named COVE-H profile.
 - **File-local FileCodes:** over persisted engine-owned codes.
 - **ExecutionCode abstraction:** so non-Harbor engines can map FileCodes into their own runtime representations.
-- **COVE-E universal engine execution profile:** over making Harbor-specific mount behaviour the generic extension mechanism.
-- **COVE-H Harbor profile:** Harbor leased-code execution as one registered COVE-E implementation.
+- **COVE-E universal engine execution profile:** over making any one engine's mount behaviour the generic extension mechanism.
+- **COVE-H Harbor profile:** optional Harbor leased-code execution as one registered COVE-E implementation.
 - **Scope descriptors:** over hard-coded tenant fields in the universal core.
 - **Morsel-aligned pages:** over generic row-group-only scans.
 - **Encoded arrays:** over flat codec-only compression.
@@ -4020,10 +5294,15 @@ The public COVE project SHOULD ship the following utilities and artifacts.
 - **Extension registry:** so custom logical types, indexes, synopses, encodings, and engine profiles are safe, discoverable, and either ignorable or required.
 - **Arrow interop:** so COVE-T is useful without Harbor.
 - **Lakehouse compatibility:** so COVE files can live inside existing catalog/table ecosystems.
+- **No COVE table protocol in v1:** over duplicating Iceberg/Delta/Hudi-style ACID catalog responsibilities inside the file spec.
+- **External visibility overlays:** so delete vectors and table snapshots can be applied safely without changing immutable COVE file semantics.
 - **Binary section directories:** over JSON-authoritative metadata.
 - **Digest manifests:** over CRC-only archive integrity.
 - **Self-contained object reconstruction:** over mandatory cross-file prev_ref.
 - **WORM durable replace:** over in-place mutation.
+- **Extension-gated vectors, tensors, semantic JSON, encryption, and advanced indexes:** over adding immature workload-specific semantics to COVE-Core v1.
+- **COVE-MAP as an optional conversion/projection profile:** over embedding multi-source identity resolution, business-object mapping, source reconciliation, association readback, or object-to-table projection semantics into COVE-Core or COVE-T.
+- **Deterministic multi-column semantic join keys:** over probabilistic or hidden matching for canonical object identity.
 
 **The final shape is:**
 
@@ -4031,8 +5310,9 @@ The public COVE project SHOULD ship the following utilities and artifacts.
 - **COVE-T:** engine-neutral table scan format.
 - **COVE-A:** queryable archive acceleration profile.
 - **COVE-E:** universal engine execution/mount profile.
-- **COVE-H:** Harbor leased-code implementation of COVE-E.
-- **COVE-O:** object-temporal profile.
+- **COVE-H:** optional Harbor leased-code implementation of COVE-E.
+- **COVE-O:** optional object-temporal extension profile.
+- **COVE-MAP:** optional deterministic semantic mapping and multi-source object-conversion profile.
 - **COVX:** optional rebuildable accelerator sidecar.
 - **COVM:** optional multi-file dataset manifest.
-This gives Cove Format a neutral public identity, a strict portable decode path, rich queryable archive acceleration, and a universal execution-profile mechanism while preserving the Harbor-native fast path that inspired the design.
+This gives Cove Format a neutral public identity, a strict portable decode path, rich queryable archive acceleration, a universal execution-profile mechanism, and an optional path from fragmented source data into object-based COVE while allowing named engine fast paths such as COVE-H without making them dependencies of the core format.
