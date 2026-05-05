@@ -56,10 +56,7 @@ pub fn durable_replace(final_path: &Path, bytes: &[u8]) -> Result<PathBuf, QfErr
         drop(f);
 
         fs::rename(&tmp, final_path)?;
-        if let Some(parent) = final_path.parent() {
-            let dir = File::open(parent)?;
-            dir.sync_all()?;
-        }
+        sync_parent_dir_best_effort(final_path);
         Ok(())
     })();
 
@@ -68,6 +65,14 @@ pub fn durable_replace(final_path: &Path, bytes: &[u8]) -> Result<PathBuf, QfErr
     }
     result?;
     Ok(tmp)
+}
+
+fn sync_parent_dir_best_effort(final_path: &Path) {
+    if let Some(parent) = final_path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -99,5 +104,11 @@ mod tests {
         let read_back = std::fs::read(&target).unwrap();
         assert_eq!(read_back, payload);
         let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn parent_sync_open_failures_are_ignored() {
+        let path = Path::new("/definitely-missing-parent-for-qf-tests/output.quay");
+        sync_parent_dir_best_effort(path);
     }
 }

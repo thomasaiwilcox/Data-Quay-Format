@@ -16,17 +16,19 @@ use sha2::Digest as _;
 /// `payload` typically concatenates canonically-encoded scalars in column
 /// order (Spec §17, §63.3).
 #[cfg(feature = "digest-sha2")]
-pub fn chain(prev_hash: &[u8; 32], payload: &[u8]) -> [u8; 32] {
+pub fn chain(prev_hash: &[u8; 32], payload: &[u8]) -> Result<[u8; 32], QfError> {
     let mut h = sha2::Sha256::new();
     h.update(prev_hash);
     h.update(payload);
-    h.finalize().into()
+    Ok(h.finalize().into())
 }
 
 /// Stub used when the SHA-256 backend is not compiled in.
 #[cfg(not(feature = "digest-sha2"))]
-pub fn chain(_prev_hash: &[u8; 32], _payload: &[u8]) -> [u8; 32] {
-    [0u8; 32]
+pub fn chain(_prev_hash: &[u8; 32], _payload: &[u8]) -> Result<[u8; 32], QfError> {
+    Err(QfError::UnsupportedEncoding(
+        "trust-chain hashing requires feature `digest-sha2`".into(),
+    ))
 }
 
 /// Verify a trust chain over a sequence of (payload, expected_hash) pairs.
@@ -34,7 +36,7 @@ pub fn chain(_prev_hash: &[u8; 32], _payload: &[u8]) -> [u8; 32] {
 pub fn verify_chain(genesis_hash: [u8; 32], records: &[(&[u8], [u8; 32])]) -> Result<(), QfError> {
     let mut prev = genesis_hash;
     for (payload, expected) in records {
-        let computed = chain(&prev, payload);
+        let computed = chain(&prev, payload)?;
         if &computed != expected {
             return Err(QfError::DigestMismatch);
         }
@@ -51,8 +53,8 @@ mod tests {
     #[test]
     fn chain_round_trip() {
         let genesis = [0u8; 32];
-        let h1 = chain(&genesis, b"first");
-        let h2 = chain(&h1, b"second");
+        let h1 = chain(&genesis, b"first").unwrap();
+        let h2 = chain(&h1, b"second").unwrap();
         assert!(verify_chain(genesis, &[(b"first", h1), (b"second", h2)]).is_ok());
     }
 
@@ -60,11 +62,24 @@ mod tests {
     #[test]
     fn chain_break_rejected() {
         let genesis = [0u8; 32];
-        let h1 = chain(&genesis, b"first");
+        let h1 = chain(&genesis, b"first").unwrap();
         // wrong second hash
         assert_eq!(
             verify_chain(genesis, &[(b"first", h1), (b"second", [0u8; 32])]),
             Err(QfError::DigestMismatch)
         );
+    }
+
+    #[cfg(not(feature = "digest-sha2"))]
+    #[test]
+    fn chain_requires_sha256_backend() {
+        assert!(matches!(
+            chain(&[0u8; 32], b"first"),
+            Err(QfError::UnsupportedEncoding(_))
+        ));
+        assert!(matches!(
+            verify_chain([0u8; 32], &[(b"first", [0u8; 32])]),
+            Err(QfError::UnsupportedEncoding(_))
+        ));
     }
 }

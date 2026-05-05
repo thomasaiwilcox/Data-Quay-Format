@@ -55,8 +55,14 @@ impl KernelCapabilities {
             return Err(QfError::BufferTooShort);
         }
         let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let entry_size = 2 + 4;
-        if 4 + count * entry_size > bytes.len() {
+        let entry_size = 2usize + 4;
+        let entries_bytes = count
+            .checked_mul(entry_size)
+            .ok_or(QfError::ArithOverflow)?;
+        let required_len = 4usize
+            .checked_add(entries_bytes)
+            .ok_or(QfError::ArithOverflow)?;
+        if required_len > bytes.len() {
             return Err(QfError::BufferTooShort);
         }
         let mut entries = Vec::with_capacity(count);
@@ -112,5 +118,11 @@ mod tests {
             KernelCapabilities::parse(&bytes),
             Err(QfError::BadSection(_))
         ));
+    }
+
+    #[test]
+    fn rejects_oversized_entry_count_before_allocating() {
+        let bytes = u32::MAX.to_le_bytes().to_vec();
+        assert_eq!(KernelCapabilities::parse(&bytes), Err(QfError::BufferTooShort));
     }
 }

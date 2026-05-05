@@ -18,6 +18,10 @@ pub struct LakehouseHints {
 }
 
 impl LakehouseHints {
+    const PARTITION_HEADER_LEN: usize = 36;
+    const MIN_PARTITION_ENTRY_LEN: usize = 4;
+    const MIN_TRAILER_LEN: usize = 1 + 2 + 2 + 32;
+
     /// Wire format (LE):
     ///   `32` schema_fingerprint
     ///   `u32` partition_count
@@ -29,13 +33,22 @@ impl LakehouseHints {
     ///   `u16` provenance_len, provenance bytes.
     ///   `32` conversion_digest.
     pub fn parse(bytes: &[u8]) -> Result<Self, QfError> {
-        if bytes.len() < 36 {
+        if bytes.len() < Self::PARTITION_HEADER_LEN {
             return Err(QfError::BufferTooShort);
         }
         let mut sf = [0u8; 32];
         sf.copy_from_slice(&bytes[0..32]);
         let pc = u32::from_le_bytes(bytes[32..36].try_into().unwrap()) as usize;
-        let mut pos = 36usize;
+        let remaining = bytes
+            .len()
+            .checked_sub(Self::PARTITION_HEADER_LEN)
+            .ok_or(QfError::BufferTooShort)?;
+        let max_partitions = remaining.saturating_sub(Self::MIN_TRAILER_LEN)
+            / Self::MIN_PARTITION_ENTRY_LEN;
+        if pc > max_partitions {
+            return Err(QfError::BufferTooShort);
+        }
+        let mut pos = Self::PARTITION_HEADER_LEN;
         let mut partitions = Vec::with_capacity(pc);
         for _ in 0..pc {
             let k = read_str(bytes, &mut pos)?;
@@ -118,5 +131,16 @@ mod tests {
         let h = LakehouseHints::parse(&bytes).unwrap();
         assert!(h.partition_values.is_empty());
         assert!(h.source_snapshot.is_none());
+    }
+
+    #[test]
+    fn rejects_oversized_partition_count_before_allocating() {
+        let mut bytes = vec![0u8; 32];
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 32]);
+        assert_eq!(LakehouseHints::parse(&bytes), Err(QfError::BufferTooShort));
     }
 }
