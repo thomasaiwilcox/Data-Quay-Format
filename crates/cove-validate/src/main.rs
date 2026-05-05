@@ -114,7 +114,13 @@ fn validate_file_json(path: &Path, opts: ValidationOptions, explain: bool) -> bo
     };
 
     if data.len() >= 4 && data[data.len() - 4..] == MAGIC_COVEMAP {
-        return validate_covemap_json(&path_str, &data, opts.semantic, explain);
+        return validate_covemap_json(
+            &path_str,
+            &data,
+            opts.semantic,
+            opts.verify_digests,
+            explain,
+        );
     }
 
     match reader::validate_bytes_with_options(&data, opts) {
@@ -156,7 +162,13 @@ fn validate_file_json(path: &Path, opts: ValidationOptions, explain: bool) -> bo
     }
 }
 
-fn validate_covemap_json(path_str: &str, data: &[u8], semantic: bool, explain: bool) -> bool {
+fn validate_covemap_json(
+    path_str: &str,
+    data: &[u8],
+    semantic: bool,
+    verify_digests: bool,
+    explain: bool,
+) -> bool {
     match validate_covemap_bytes(data, semantic) {
         Ok(file) => {
             print!(
@@ -168,6 +180,9 @@ fn validate_covemap_json(path_str: &str, data: &[u8], semantic: bool, explain: b
                 json_str(&file.mapping_version),
                 file.sections.len()
             );
+            if verify_digests {
+                print!(",\"verify_digests_skipped\":true");
+            }
             if explain {
                 print!(",\"sections\":[");
                 for (index, section) in file.sections.iter().enumerate() {
@@ -175,9 +190,10 @@ fn validate_covemap_json(path_str: &str, data: &[u8], semantic: bool, explain: b
                         print!(",");
                     }
                     print!(
-                        "{{\"kind\":{},\"offset\":{},\"length\":{},\"required\":{}}}",
+                        "{{\"kind\":{},\"offset\":{},\"length\":{},\"uncompressed_length\":{},\"required\":{}}}",
                         section.entry.section_id,
                         section.entry.offset,
+                        section.entry.length,
                         section.entry.uncompressed_length,
                         section.entry.required
                     );
@@ -231,7 +247,7 @@ fn validate_file(path: &Path, opts: ValidationOptions) -> bool {
     };
 
     if data.len() >= 4 && data[data.len() - 4..] == MAGIC_COVEMAP {
-        return validate_covemap_file(&data, opts.semantic);
+        return validate_covemap_file(&data, opts.semantic, opts.verify_digests);
     }
 
     if data.len() < 4 || data[data.len() - 4..] != MAGIC_COVE {
@@ -291,7 +307,7 @@ fn validate_covemap_bytes(
     Ok(file)
 }
 
-fn validate_covemap_file(data: &[u8], semantic: bool) -> bool {
+fn validate_covemap_file(data: &[u8], semantic: bool, verify_digests: bool) -> bool {
     match validate_covemap_bytes(data, semantic) {
         Ok(file) => {
             let mode = if semantic { "semantic" } else { "structural" };
@@ -303,6 +319,11 @@ fn validate_covemap_file(data: &[u8], semantic: bool) -> bool {
             println!("  file_len        : {} bytes", data.len());
             println!("  mapping_version : {}", file.mapping_version);
             println!("  section_count   : {}", file.sections.len());
+            if verify_digests {
+                eprintln!(
+                    "  [NOTE] --verify-digests is not applicable to COVEMAP artifacts (skipped)"
+                );
+            }
             true
         }
         Err(error) => {

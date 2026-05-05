@@ -237,7 +237,11 @@ mod tests {
         let value = b"carol";
         let (h1, h2) = base_hashes(value);
         for i in 0..7 {
-            assert_eq!(double_hash(h1, h2, i), fnv1a64(value, 0).wrapping_add((i as u64).wrapping_mul(fnv1a64(value, 0xdead_beef))));
+            assert_eq!(
+                double_hash(h1, h2, i),
+                fnv1a64(value, 0)
+                    .wrapping_add((i as u64).wrapping_mul(fnv1a64(value, 0xdead_beef)))
+            );
         }
     }
 

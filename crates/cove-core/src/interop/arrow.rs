@@ -69,31 +69,53 @@ pub fn encoded_array_to_arrow(array: &EncodedArray<'_>) -> Result<ArrayRef, Cove
     let values = array.decode_all_rows()?;
     match arrow_data_type(array.logical)? {
         DataType::Boolean => Ok(Arc::new(BooleanArray::from(collect_bool(&values)?))),
-        DataType::Int8 => Ok(Arc::new(Int8Array::from(collect_i64(array.logical, &values, |v| {
-            i8::try_from(v).map_err(|_| CoveError::PageCorrupt)
-        })?))),
-        DataType::Int16 => Ok(Arc::new(Int16Array::from(collect_i64(array.logical, &values, |v| {
-            i16::try_from(v).map_err(|_| CoveError::PageCorrupt)
-        })?))),
-        DataType::Int32 => Ok(Arc::new(Int32Array::from(collect_i64(array.logical, &values, |v| {
-            i32::try_from(v).map_err(|_| CoveError::PageCorrupt)
-        })?))),
-        DataType::Int64 => Ok(Arc::new(Int64Array::from(collect_i64(array.logical, &values, Ok)?))),
-        DataType::UInt8 => Ok(Arc::new(UInt8Array::from(collect_u64(array.logical, &values, |v| {
-            u8::try_from(v).map_err(|_| CoveError::PageCorrupt)
-        })?))),
-        DataType::UInt16 => Ok(Arc::new(UInt16Array::from(collect_u64(array.logical, &values, |v| {
-            u16::try_from(v).map_err(|_| CoveError::PageCorrupt)
-        })?))),
-        DataType::UInt32 => Ok(Arc::new(UInt32Array::from(collect_u64(array.logical, &values, |v| {
-            u32::try_from(v).map_err(|_| CoveError::PageCorrupt)
-        })?))),
-        DataType::UInt64 => Ok(Arc::new(UInt64Array::from(collect_u64(array.logical, &values, Ok)?))),
+        DataType::Int8 => Ok(Arc::new(Int8Array::from(collect_i64(
+            array.logical,
+            &values,
+            |v| i8::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::Int16 => Ok(Arc::new(Int16Array::from(collect_i64(
+            array.logical,
+            &values,
+            |v| i16::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::Int32 => Ok(Arc::new(Int32Array::from(collect_i64(
+            array.logical,
+            &values,
+            |v| i32::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::Int64 => Ok(Arc::new(Int64Array::from(collect_i64(
+            array.logical,
+            &values,
+            Ok,
+        )?))),
+        DataType::UInt8 => Ok(Arc::new(UInt8Array::from(collect_u64(
+            array.logical,
+            &values,
+            |v| u8::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::UInt16 => Ok(Arc::new(UInt16Array::from(collect_u64(
+            array.logical,
+            &values,
+            |v| u16::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::UInt32 => Ok(Arc::new(UInt32Array::from(collect_u64(
+            array.logical,
+            &values,
+            |v| u32::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::UInt64 => Ok(Arc::new(UInt64Array::from(collect_u64(
+            array.logical,
+            &values,
+            Ok,
+        )?))),
         DataType::Float32 => Ok(Arc::new(Float32Array::from(collect_f32(&values)?))),
         DataType::Float64 => Ok(Arc::new(Float64Array::from(collect_f64(&values)?))),
-        DataType::Date32 => Ok(Arc::new(Date32Array::from(collect_i64(array.logical, &values, |v| {
-            i32::try_from(v).map_err(|_| CoveError::PageCorrupt)
-        })?))),
+        DataType::Date32 => Ok(Arc::new(Date32Array::from(collect_i64(
+            array.logical,
+            &values,
+            |v| i32::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
         DataType::Timestamp(TimeUnit::Microsecond, None) => Ok(Arc::new(
             TimestampMicrosecondArray::from(collect_i64(array.logical, &values, Ok)?),
         )),

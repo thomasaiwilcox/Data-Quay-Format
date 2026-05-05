@@ -395,9 +395,10 @@ impl<'a> EncodedArray<'a> {
 
     fn decode_all_canonical_rows(&self) -> Result<Vec<CoveArrayValue<'_>>, CoveError> {
         match self.logical {
-            CoveLogicalType::Null => {
-                Ok(vec![CoveArrayValue::Null; expected_row_count(self.row_count)?])
-            }
+            CoveLogicalType::Null => Ok(vec![
+                CoveArrayValue::Null;
+                expected_row_count(self.row_count)?
+            ]),
             CoveLogicalType::Bool => self.collect_rows(|row| self.decode_present_row(row)),
             CoveLogicalType::Utf8 | CoveLogicalType::Binary | CoveLogicalType::Json => {
                 self.decode_all_canonical_length_prefixed_rows()
@@ -426,7 +427,9 @@ impl<'a> EncodedArray<'a> {
         }
     }
 
-    fn decode_all_canonical_length_prefixed_rows(&self) -> Result<Vec<CoveArrayValue<'_>>, CoveError> {
+    fn decode_all_canonical_length_prefixed_rows(
+        &self,
+    ) -> Result<Vec<CoveArrayValue<'_>>, CoveError> {
         let mut out = Vec::with_capacity(expected_row_count(self.row_count)?);
         let mut pos = 0usize;
         for row in 0..self.row_count {
