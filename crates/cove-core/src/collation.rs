@@ -210,17 +210,23 @@ impl CollationRegistry {
     }
 
     /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
-    pub fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
         let mut out = Vec::with_capacity(4 + self.entries.len() * 8);
         out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for entry in &self.entries {
             let name_bytes = entry.name.as_bytes();
-            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            let name_len = u16::try_from(name_bytes.len()).map_err(|_| {
+                CoveError::BadSection("collation name exceeds u16 length limit".into())
+            })?;
+            let meta_len = u16::try_from(entry.metadata.len()).map_err(|_| {
+                CoveError::BadSection("collation metadata exceeds u16 length limit".into())
+            })?;
+            out.extend_from_slice(&name_len.to_le_bytes());
             out.extend_from_slice(name_bytes);
-            out.extend_from_slice(&(entry.metadata.len() as u16).to_le_bytes());
+            out.extend_from_slice(&meta_len.to_le_bytes());
             out.extend_from_slice(&entry.metadata);
         }
-        out
+        Ok(out)
     }
 
     /// Returns true if every named collation is one of the six v1 collations.
@@ -254,7 +260,7 @@ mod serialize_tests {
                 },
             ],
         };
-        let bytes = reg.serialize();
+        let bytes = reg.serialize().unwrap();
         let back = CollationRegistry::parse(&bytes).unwrap();
         assert_eq!(back.entries.len(), 2);
         assert_eq!(back.entries[0].name, "utf8-bytewise");
@@ -264,9 +270,22 @@ mod serialize_tests {
     #[test]
     fn serialize_empty() {
         let reg = CollationRegistry::default();
-        let bytes = reg.serialize();
+        let bytes = reg.serialize().unwrap();
         assert_eq!(bytes, vec![0u8; 4]);
         assert!(CollationRegistry::parse(&bytes).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn serialize_rejects_name_longer_than_u16() {
+        let reg = CollationRegistry {
+            entries: vec![CollationEntry {
+                name: "a".repeat(usize::from(u16::MAX) + 1),
+                metadata: vec![],
+                kind: None,
+            }],
+        };
+
+        assert!(matches!(reg.serialize(), Err(CoveError::BadSection(_))));
     }
 }
 

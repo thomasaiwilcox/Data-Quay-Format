@@ -154,10 +154,7 @@ fn validate_tagged_value(bytes: &[u8]) -> Result<(ValueTag, usize), CoveError> {
     let value_tag = ValueTag::from_u16(raw_tag_u16)
         .ok_or_else(|| CoveError::BadSection(format!("unknown canonical value tag {raw_tag}")))?;
     let payload_len = validate_payload_inner(value_tag, &bytes[tag_len..])?;
-    let consumed = tag_len
-        .checked_add(payload_len)
-        .ok_or(CoveError::ArithOverflow)
-        .map_err(|_| CoveError::BadSection("canonical tagged value length overflow".into()))?;
+    let consumed = tag_len.checked_add(payload_len).ok_or(CoveError::ArithOverflow)?;
     Ok((value_tag, consumed))
 }
 
@@ -199,10 +196,7 @@ fn validate_payload_inner(value_tag: ValueTag, bytes: &[u8]) -> Result<usize, Co
                 decode_canonical_varint(bytes, "canonical list element count")?;
             for _ in 0..element_count {
                 let (_, consumed) = validate_tagged_value(&bytes[pos..])?;
-                pos = pos
-                    .checked_add(consumed)
-                    .ok_or(CoveError::ArithOverflow)
-                    .map_err(|_| CoveError::BadSection("canonical list length overflow".into()))?;
+                pos = pos.checked_add(consumed).ok_or(CoveError::ArithOverflow)?;
             }
             Ok(pos)
         }
@@ -213,12 +207,7 @@ fn validate_payload_inner(value_tag: ValueTag, bytes: &[u8]) -> Result<usize, Co
             for _ in 0..field_count {
                 let (field_id, consumed) =
                     decode_canonical_varint(&bytes[pos..], "canonical struct field_id")?;
-                pos = pos
-                    .checked_add(consumed)
-                    .ok_or(CoveError::ArithOverflow)
-                    .map_err(|_| {
-                        CoveError::BadSection("canonical struct length overflow".into())
-                    })?;
+                pos = pos.checked_add(consumed).ok_or(CoveError::ArithOverflow)?;
                 if let Some(prev) = prev_field_id {
                     if field_id <= prev {
                         return Err(CoveError::BadSection(
@@ -228,12 +217,7 @@ fn validate_payload_inner(value_tag: ValueTag, bytes: &[u8]) -> Result<usize, Co
                 }
                 prev_field_id = Some(field_id);
                 let (_, consumed) = validate_tagged_value(&bytes[pos..])?;
-                pos = pos
-                    .checked_add(consumed)
-                    .ok_or(CoveError::ArithOverflow)
-                    .map_err(|_| {
-                        CoveError::BadSection("canonical struct length overflow".into())
-                    })?;
+                pos = pos.checked_add(consumed).ok_or(CoveError::ArithOverflow)?;
             }
             Ok(pos)
         }
@@ -248,10 +232,7 @@ fn validate_payload_inner(value_tag: ValueTag, bytes: &[u8]) -> Result<usize, Co
                         "canonical map key must be scalar".into(),
                     ));
                 }
-                pos = pos
-                    .checked_add(key_consumed)
-                    .ok_or(CoveError::ArithOverflow)
-                    .map_err(|_| CoveError::BadSection("canonical map length overflow".into()))?;
+                pos = pos.checked_add(key_consumed).ok_or(CoveError::ArithOverflow)?;
                 let key_bytes = bytes[key_start..pos].to_vec();
                 if let Some(prev) = &prev_key {
                     use std::cmp::Ordering;
@@ -271,10 +252,7 @@ fn validate_payload_inner(value_tag: ValueTag, bytes: &[u8]) -> Result<usize, Co
                 }
                 prev_key = Some(key_bytes);
                 let (_, value_consumed) = validate_tagged_value(&bytes[pos..])?;
-                pos = pos
-                    .checked_add(value_consumed)
-                    .ok_or(CoveError::ArithOverflow)
-                    .map_err(|_| CoveError::BadSection("canonical map length overflow".into()))?;
+                pos = pos.checked_add(value_consumed).ok_or(CoveError::ArithOverflow)?;
             }
             Ok(pos)
         }
@@ -298,10 +276,7 @@ fn decode_length_prefixed<'a>(bytes: &'a [u8], what: &str) -> Result<(&'a [u8], 
     let (payload_len, prefix_len) = decode_canonical_varint(bytes, what)?;
     let payload_len = usize::try_from(payload_len)
         .map_err(|_| CoveError::BadSection(format!("{what} length exceeds usize")))?;
-    let total = prefix_len
-        .checked_add(payload_len)
-        .ok_or(CoveError::ArithOverflow)
-        .map_err(|_| CoveError::BadSection(format!("{what} length overflow")))?;
+    let total = prefix_len.checked_add(payload_len).ok_or(CoveError::ArithOverflow)?;
     if total > bytes.len() {
         return Err(CoveError::BadSection(format!(
             "{what} length prefix exceeds available bytes"
@@ -573,6 +548,15 @@ mod tests {
         .encode()
         .unwrap();
         validate_canonical_payload(ValueTag::List, &list).unwrap();
+    }
+
+    #[test]
+    fn validate_canonical_payload_preserves_length_overflow_errors() {
+        let bytes = wire::encode_u64_leb128(u64::MAX);
+        assert_eq!(
+            validate_canonical_payload(ValueTag::Binary, &bytes),
+            Err(CoveError::ArithOverflow)
+        );
     }
 
     #[test]

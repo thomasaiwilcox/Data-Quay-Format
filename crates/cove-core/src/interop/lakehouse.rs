@@ -99,16 +99,20 @@ impl LakehouseHints {
     }
 
     /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
-    pub fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(&self.schema_fingerprint);
         out.extend_from_slice(&(self.partition_values.len() as u32).to_le_bytes());
         for (k, v) in &self.partition_values {
             let kb = k.as_bytes();
-            out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+            let key_len = u16::try_from(kb.len())
+                .map_err(|_| CoveError::BadSection("lakehouse partition key exceeds u16 length limit".into()))?;
+            out.extend_from_slice(&key_len.to_le_bytes());
             out.extend_from_slice(kb);
             let vb = v.as_bytes();
-            out.extend_from_slice(&(vb.len() as u16).to_le_bytes());
+            let value_len = u16::try_from(vb.len())
+                .map_err(|_| CoveError::BadSection("lakehouse partition value exceeds u16 length limit".into()))?;
+            out.extend_from_slice(&value_len.to_le_bytes());
             out.extend_from_slice(vb);
         }
         let mut flags = 0u8;
@@ -126,13 +130,19 @@ impl LakehouseHints {
             out.extend_from_slice(&v.to_le_bytes());
         }
         let cb = self.catalog_identifier.as_bytes();
-        out.extend_from_slice(&(cb.len() as u16).to_le_bytes());
+        let catalog_len = u16::try_from(cb.len()).map_err(|_| {
+            CoveError::BadSection("lakehouse catalog_identifier exceeds u16 length limit".into())
+        })?;
+        out.extend_from_slice(&catalog_len.to_le_bytes());
         out.extend_from_slice(cb);
         let pb = self.provenance.as_bytes();
-        out.extend_from_slice(&(pb.len() as u16).to_le_bytes());
+        let provenance_len = u16::try_from(pb.len()).map_err(|_| {
+            CoveError::BadSection("lakehouse provenance exceeds u16 length limit".into())
+        })?;
+        out.extend_from_slice(&provenance_len.to_le_bytes());
         out.extend_from_slice(pb);
         out.extend_from_slice(&self.conversion_digest);
-        out
+        Ok(out)
     }
 }
 
@@ -203,14 +213,24 @@ mod serialize_tests {
             provenance: "writer-v1".into(),
             conversion_digest: [0x22; 32],
         };
-        let bytes = h.serialize();
+        let bytes = h.serialize().unwrap();
         assert_eq!(LakehouseHints::parse(&bytes).unwrap(), h);
     }
 
     #[test]
     fn serialize_round_trip_minimal() {
         let h = LakehouseHints::default();
-        let bytes = h.serialize();
+        let bytes = h.serialize().unwrap();
         assert_eq!(LakehouseHints::parse(&bytes).unwrap(), h);
+    }
+
+    #[test]
+    fn serialize_rejects_catalog_identifier_longer_than_u16() {
+        let h = LakehouseHints {
+            catalog_identifier: "a".repeat(usize::from(u16::MAX) + 1),
+            ..LakehouseHints::default()
+        };
+
+        assert!(matches!(h.serialize(), Err(CoveError::BadSection(_))));
     }
 }

@@ -193,29 +193,39 @@ impl LookupIndex {
     }
 
     /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut entry_bytes = Vec::with_capacity(self.entries.len() * LOOKUP_INDEX_ENTRY_LEN);
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
+        let mut entry_bytes = Vec::with_capacity(
+            self.entries
+                .len()
+                .checked_mul(LOOKUP_INDEX_ENTRY_LEN)
+                .ok_or(CoveError::ArithOverflow)?,
+        );
         let mut rowref_bytes = Vec::new();
         let mut rowref_start = 0u32;
         for entry in &self.entries {
+            let row_count = u32::try_from(entry.rows.len()).map_err(|_| CoveError::ArithOverflow)?;
             entry_bytes.extend_from_slice(&entry.key.to_le_bytes());
             entry_bytes.extend_from_slice(&rowref_start.to_le_bytes());
-            entry_bytes.extend_from_slice(&(entry.rows.len() as u32).to_le_bytes());
+            entry_bytes.extend_from_slice(&row_count.to_le_bytes());
             for r in &entry.rows {
                 rowref_bytes.extend_from_slice(&r.encode());
             }
-            rowref_start = rowref_start.saturating_add(entry.rows.len() as u32);
+            rowref_start = rowref_start
+                .checked_add(row_count)
+                .ok_or(CoveError::ArithOverflow)?;
         }
         let mut header = self.header.clone();
         header.entry_count = self.entries.len() as u64;
         header.entries_offset = LOOKUP_INDEX_HEADER_LEN as u64;
-        header.entries_length = entry_bytes.len() as u64;
-        header.rowref_offset = (LOOKUP_INDEX_HEADER_LEN + entry_bytes.len()) as u64;
-        header.rowref_length = rowref_bytes.len() as u64;
+        header.entries_length = u64::try_from(entry_bytes.len()).map_err(|_| CoveError::ArithOverflow)?;
+        header.rowref_offset = (LOOKUP_INDEX_HEADER_LEN as u64)
+            .checked_add(header.entries_length)
+            .ok_or(CoveError::ArithOverflow)?;
+        header.rowref_length = u64::try_from(rowref_bytes.len()).map_err(|_| CoveError::ArithOverflow)?;
         let mut out = header.serialize().to_vec();
         out.extend_from_slice(&entry_bytes);
         out.extend_from_slice(&rowref_bytes);
-        out
+        Ok(out)
     }
 }
 
@@ -312,7 +322,7 @@ mod tests {
         };
         let bytes = build(3, &[(2, &[r1]), (5, &[r1, r2])]);
         let parsed = LookupIndex::parse(&bytes).unwrap();
-        let bytes2 = parsed.serialize();
+        let bytes2 = parsed.serialize().unwrap();
         let parsed2 = LookupIndex::parse(&bytes2).unwrap();
         assert_eq!(parsed, parsed2);
         assert_eq!(parsed2.rows_for(5).unwrap(), &[r1, r2]);

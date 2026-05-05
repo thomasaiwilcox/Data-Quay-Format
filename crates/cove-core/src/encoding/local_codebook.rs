@@ -161,7 +161,7 @@ impl LocalCodebookValues {
                     .checked_mul(4)
                     .ok_or(CoveError::ArithOverflow)?;
                 if bytes.len() != expected {
-                    return Err(CoveError::BufferTooShort);
+                    return Err(CoveError::PageCorrupt);
                 }
                 let values = bytes
                     .chunks_exact(4)
@@ -174,7 +174,7 @@ impl LocalCodebookValues {
                     .checked_mul(8)
                     .ok_or(CoveError::ArithOverflow)?;
                 if bytes.len() != expected {
-                    return Err(CoveError::BufferTooShort);
+                    return Err(CoveError::PageCorrupt);
                 }
                 let values = bytes
                     .chunks_exact(8)
@@ -184,7 +184,7 @@ impl LocalCodebookValues {
             }
             LocalCodebookValueKind::Boolean => {
                 if bytes.len() != codebook_len {
-                    return Err(CoveError::BufferTooShort);
+                    return Err(CoveError::PageCorrupt);
                 }
                 let mut values = Vec::with_capacity(codebook_len);
                 for value in bytes {
@@ -575,6 +575,21 @@ mod tests {
         }
         .encode();
         bytes[12] = 2;
+        assert_eq!(
+            LocalCodebookPayload::parse(&bytes),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_fixed_width_codebook_length_as_page_corrupt() {
+        let mut bytes = LocalCodebookPayload {
+            values: LocalCodebookValues::FileCode(vec![42]),
+            indexes: LocalIndexPayload::Rle(RlePayload { runs: vec![(0, 1)] }),
+        }
+        .encode();
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+
         assert_eq!(
             LocalCodebookPayload::parse(&bytes),
             Err(CoveError::PageCorrupt)

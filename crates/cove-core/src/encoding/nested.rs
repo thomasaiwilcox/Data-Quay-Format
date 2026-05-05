@@ -73,8 +73,11 @@ impl ListLayoutPayload {
         let offsets_end = offsets_start
             .checked_add(offsets_bytes_len)
             .ok_or(CoveError::ArithOverflow)?;
-        if offsets_end != bytes.len() {
+        if offsets_end > bytes.len() {
             return Err(CoveError::BufferTooShort);
+        }
+        if offsets_end < bytes.len() {
+            return Err(CoveError::PageCorrupt);
         }
         let mut offsets = Vec::with_capacity(offset_count);
         for index in 0..offset_count {
@@ -171,8 +174,11 @@ impl StructLayoutPayload {
         let counts_end = counts_start
             .checked_add(counts_bytes_len)
             .ok_or(CoveError::ArithOverflow)?;
-        if counts_end != bytes.len() {
+        if counts_end > bytes.len() {
             return Err(CoveError::BufferTooShort);
+        }
+        if counts_end < bytes.len() {
+            return Err(CoveError::PageCorrupt);
         }
         let mut field_row_counts = Vec::with_capacity(field_count);
         for index in 0..field_count {
@@ -510,6 +516,20 @@ mod tests {
     }
 
     #[test]
+    fn list_payload_trailing_bytes_are_page_corrupt() {
+        let mut bytes = ListLayoutPayload {
+            layout: ListLayout {
+                offsets: vec![0, 2, 2, 5],
+            },
+            child_row_count: 5,
+        }
+        .encode();
+        bytes.push(0);
+
+        assert_eq!(ListLayoutPayload::parse(&bytes), Err(CoveError::PageCorrupt));
+    }
+
+    #[test]
     fn struct_payload_round_trips() {
         let payload = StructLayoutPayload {
             layout: StructLayout {
@@ -521,6 +541,23 @@ mod tests {
         let parsed = StructLayoutPayload::parse(&bytes).unwrap();
         assert_eq!(parsed, payload);
         parsed.validate(3).unwrap();
+    }
+
+    #[test]
+    fn struct_payload_trailing_bytes_are_page_corrupt() {
+        let mut bytes = StructLayoutPayload {
+            layout: StructLayout {
+                field_row_counts: vec![3, 3],
+            },
+            parent_null_handling_declared: true,
+        }
+        .encode();
+        bytes.push(0);
+
+        assert_eq!(
+            StructLayoutPayload::parse(&bytes),
+            Err(CoveError::PageCorrupt)
+        );
     }
 
     #[test]
