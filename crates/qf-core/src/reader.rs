@@ -3,7 +3,9 @@
 use std::{fs, path::Path};
 
 use crate::{
-    checksum, compression,
+    checksum,
+    collation::CollationRegistry,
+    compression,
     constants::{
         PrimaryProfile, SectionKind, FEATURE_ARCHIVE_PROFILE, FEATURE_CODEC_LZ4,
         FEATURE_CODEC_ZSTD, FEATURE_ENGINE_PROFILE, FEATURE_EXTENSION_REGISTRY,
@@ -12,12 +14,34 @@ use crate::{
     },
     dictionary::FileDictionary,
     digest::DigestManifest,
+    domain::ColumnDomain,
     extensions::ExtensionRegistry,
     footer::QfFooter,
     header::{QfHeaderV1, HEADER_SIZE},
+    index::{
+        aggregate::AggregateSynopsis, bloom::BloomFilterIndex, composite::CompositeIndex,
+        exact_set::ExactSetIndex, inverted::InvertedMorselIndex, lookup::LookupIndex,
+        topn::TopNSummary,
+    },
+    interop::lakehouse::LakehouseHints,
+    kernel::KernelCapabilities,
     postscript::{QfPostscriptV1, POSTSCRIPT_TOTAL_SIZE},
+    profile::{
+        qfe::{
+            CodeSpaceDescriptorV1, EngineMountPolicyV1, EngineProfileRegistry,
+            ExecutionCodeDescriptorV1, ExecutionScopeDescriptorV1,
+        },
+        qfh::HarborMountHintsV1,
+        qfo::{ObjectTypeCatalog, TemporalSegmentIndex},
+    },
+    redaction::RedactionManifest,
+    registry,
+    segment::TableSegmentIndex,
+    table::TableCatalog,
     QfError,
 };
+
+use crate::footer::QfSectionEntryV1;
 
 /// Parsed and structurally validated QF file.
 #[derive(Debug, Clone)]
@@ -33,7 +57,6 @@ pub fn read_file(path: &Path) -> Result<ValidatedQfFile, QfError> {
     validate_bytes(&data)
 }
 
-/// Validate a complete in-memory QF file.
 pub fn validate_bytes(data: &[u8]) -> Result<ValidatedQfFile, QfError> {
     if data.len() < HEADER_SIZE + POSTSCRIPT_TOTAL_SIZE {
         return Err(QfError::BufferTooShort);
@@ -65,16 +88,12 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedQfFile, QfError> {
     if checksum::crc32c(footer_bytes) != postscript.footer.crc32c {
         return Err(QfError::ChecksumMismatch);
     }
-    if postscript.footer.compression != 0 {
-        return Err(QfError::UnsupportedEncoding(
-            "compressed footer is not supported in this build".to_string(),
-        ));
-    }
-
-    let footer = QfFooter::parse(footer_bytes)?;
-    if footer.header.total_len()? != postscript.footer.length {
+    validate_footer_codec_feature_advertisement(&postscript)?;
+    let footer_payload = compression::section_spec_payload(data, &postscript.footer)?;
+    let footer = QfFooter::parse(&footer_payload)?;
+    if footer.header.total_len()? != postscript.footer.uncompressed_length {
         return Err(QfError::BadSection(
-            "footer header length does not match postscript footer length".to_string(),
+            "footer header length does not match postscript footer uncompressed_length".to_string(),
         ));
     }
 
@@ -98,11 +117,16 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedQfFile, QfError> {
 }
 
 fn validate_required_feature_implementation(header: &QfHeaderV1) -> Result<(), QfError> {
-    let unsupported_required = header.required_features
-        & (FEATURE_CODEC_LZ4 | FEATURE_CODEC_ZSTD | crate::constants::FEATURE_DIGEST_MANIFEST);
+    let mut unsupported_required = 0u64;
+    if header.required_features & FEATURE_CODEC_LZ4 != 0 && !cfg!(feature = "compression-lz4") {
+        unsupported_required |= FEATURE_CODEC_LZ4;
+    }
+    if header.required_features & FEATURE_CODEC_ZSTD != 0 && !cfg!(feature = "compression-zstd") {
+        unsupported_required |= FEATURE_CODEC_ZSTD;
+    }
     if unsupported_required != 0 {
         return Err(QfError::UnsupportedEncoding(format!(
-            "required feature bits are known but unsupported by this build: 0x{unsupported_required:016x}"
+            "required codec feature bits are unsupported by this build: 0x{unsupported_required:016x}"
         )));
     }
     Ok(())
@@ -113,10 +137,36 @@ fn validate_required_feature_implementation(header: &QfHeaderV1) -> Result<(), Q
 pub struct ValidationOptions {
     /// When true, validates dictionary semantics (entry bounds, redaction).
     pub semantic: bool,
-    /// When true, verifies section digests if a DigestManifest is present (not yet implemented).
+    /// When true, verifies section digests if a DigestManifest is present.
     pub verify_digests: bool,
     /// When true, unknown optional extension registry entries are allowed.
     pub allow_unknown_optional_extensions: bool,
+}
+
+/// Coarse validation stages surfaced by [`ValidationReport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationStage {
+    Bootstrap,
+    Structural,
+    SharedSemantic,
+    DigestVerification,
+    QfTable,
+    QfObject,
+    QfEngine,
+    QfHarbor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationStageStatus {
+    Checked,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidationStageReport {
+    pub stage: ValidationStage,
+    pub status: ValidationStageStatus,
+    pub sections_checked: u32,
 }
 
 impl Default for ValidationOptions {
@@ -138,6 +188,8 @@ pub struct ValidationReport {
     pub semantic_checked: bool,
     /// Number of dictionary entries, if the dictionary was parsed.
     pub dict_entry_count: Option<u32>,
+    /// Per-stage validation outcomes.
+    pub stages: Vec<ValidationStageReport>,
 }
 
 /// Validate a QF file with configurable options.
@@ -150,91 +202,108 @@ pub fn validate_bytes_with_options(
     opts: ValidationOptions,
 ) -> Result<ValidationReport, QfError> {
     let validated = validate_bytes(data)?;
+    let mut stages = vec![
+        ValidationStageReport {
+            stage: ValidationStage::Bootstrap,
+            status: ValidationStageStatus::Checked,
+            sections_checked: 0,
+        },
+        ValidationStageReport {
+            stage: ValidationStage::Structural,
+            status: ValidationStageStatus::Checked,
+            sections_checked: validated.footer.sections.len() as u32,
+        },
+    ];
+
+    if !opts.semantic {
+        push_skipped_semantic_stages(&mut stages, opts.verify_digests);
+        return Ok(ValidationReport {
+            validated,
+            semantic_checked: false,
+            dict_entry_count: None,
+            stages,
+        });
+    }
 
     let mut dict_entry_count: Option<u32> = None;
-
-    if opts.semantic {
-        let has_dict_feature = validated.header.required_features & FEATURE_FILE_DICTIONARY != 0;
-
-        if has_dict_feature {
-            // Find index and payload sections
-            let index_entry = validated
-                .footer
-                .sections
-                .iter()
-                .find(|s| s.section_kind == SectionKind::FileDictionaryIndex as u16);
-            let payload_entry = validated
-                .footer
-                .sections
-                .iter()
-                .find(|s| s.section_kind == SectionKind::FileDictionaryPayload as u16);
-
-            match index_entry {
-                None => {
-                    return Err(QfError::BadSection(
-                        "FEATURE_FILE_DICTIONARY set but FILE_DICTIONARY_INDEX section missing"
-                            .into(),
-                    ));
-                }
-                Some(idx_entry) => {
-                    let index_bytes = compression::section_payload(data, idx_entry)?;
-                    let payload_bytes = match payload_entry {
-                        Some(pay_entry) => compression::section_payload(data, pay_entry)?,
-                        None => std::borrow::Cow::Borrowed(&[][..]),
-                    };
-                    let dict = FileDictionary::parse(&index_bytes, &payload_bytes)?;
-                    dict_entry_count = Some(dict.len());
-                }
-            }
-        }
-
-        let ext_registry_is_required =
-            validated.header.required_features & FEATURE_EXTENSION_REGISTRY != 0;
-        let ext_registry_is_optional =
-            validated.header.optional_features & FEATURE_EXTENSION_REGISTRY != 0;
-        if ext_registry_is_required || ext_registry_is_optional {
-            let ext_entry = validated
-                .footer
-                .sections
-                .iter()
-                .find(|s| s.section_kind == SectionKind::ExtensionRegistry as u16);
-            match (ext_registry_is_required, ext_entry) {
-                (true, None) => {
-                    return Err(QfError::BadSection(
-                        "FEATURE_EXTENSION_REGISTRY set in required_features but \
-                         EXTENSION_REGISTRY section missing"
-                            .into(),
-                    ));
-                }
-                (_, Some(entry)) => {
-                    let ext_bytes = compression::section_payload(data, entry)?;
-                    let registry = ExtensionRegistry::parse(&ext_bytes)?;
-                    registry.validate_known(opts.allow_unknown_optional_extensions)?;
-                }
-                (false, None) => {
-                    // Feature advertised in optional_features only and no section present — OK.
-                }
-            }
-        }
-
-        if opts.verify_digests {
-            verify_digest_manifests(data, &validated.footer)?;
-        }
+    validate_shared_semantics(data, &validated, &opts, &mut dict_entry_count, &mut stages)?;
+    if opts.verify_digests {
+        let checked = verify_digest_manifests(data, &validated.footer)?;
+        push_stage(
+            &mut stages,
+            ValidationStage::DigestVerification,
+            ValidationStageStatus::Checked,
+            checked,
+        );
+    } else {
+        push_stage(
+            &mut stages,
+            ValidationStage::DigestVerification,
+            ValidationStageStatus::Skipped,
+            0,
+        );
     }
+    validate_qft_semantics(data, &validated.footer, &mut stages)?;
+    validate_qfo_semantics(data, &validated, &mut stages)?;
+    validate_qfe_semantics(data, &validated, &mut stages)?;
+    validate_qfh_semantics(data, &validated, &mut stages)?;
 
     Ok(ValidationReport {
         validated,
         semantic_checked: opts.semantic,
         dict_entry_count,
+        stages,
     })
 }
 
-fn verify_digest_manifests(data: &[u8], footer: &QfFooter) -> Result<(), QfError> {
+fn push_stage(
+    stages: &mut Vec<ValidationStageReport>,
+    stage: ValidationStage,
+    status: ValidationStageStatus,
+    sections_checked: u32,
+) {
+    stages.push(ValidationStageReport {
+        stage,
+        status,
+        sections_checked,
+    });
+}
+
+fn push_skipped_semantic_stages(stages: &mut Vec<ValidationStageReport>, verify_digests: bool) {
+    push_stage(
+        stages,
+        ValidationStage::SharedSemantic,
+        ValidationStageStatus::Skipped,
+        0,
+    );
+    push_stage(
+        stages,
+        ValidationStage::DigestVerification,
+        if verify_digests {
+            ValidationStageStatus::Checked
+        } else {
+            ValidationStageStatus::Skipped
+        },
+        0,
+    );
+    for stage in [
+        ValidationStage::QfTable,
+        ValidationStage::QfObject,
+        ValidationStage::QfEngine,
+        ValidationStage::QfHarbor,
+    ] {
+        push_stage(stages, stage, ValidationStageStatus::Skipped, 0);
+    }
+}
+
+fn verify_digest_manifests(data: &[u8], footer: &QfFooter) -> Result<u32, QfError> {
+    let mut checked = 0u32;
     for digest_section in footer
         .sections
         .iter()
         .filter(|s| s.section_kind == SectionKind::DigestManifest as u16)
     {
+        checked += 1;
         let digest_bytes = compression::section_payload(data, digest_section)?;
         let manifest = DigestManifest::parse(&digest_bytes)?;
         for entry in &manifest.entries {
@@ -256,7 +325,352 @@ fn verify_digest_manifests(data: &[u8], footer: &QfFooter) -> Result<(), QfError
             manifest.verify_section(entry.section_id, section_bytes)?;
         }
     }
+    Ok(checked)
+}
+
+fn validate_shared_semantics(
+    data: &[u8],
+    validated: &ValidatedQfFile,
+    opts: &ValidationOptions,
+    dict_entry_count: &mut Option<u32>,
+    stages: &mut Vec<ValidationStageReport>,
+) -> Result<(), QfError> {
+    let footer = &validated.footer;
+    let mut checked = 0u32;
+
+    let has_dict_feature = validated.header.required_features & FEATURE_FILE_DICTIONARY != 0;
+    if has_dict_feature {
+        let index_entry = footer
+            .sections
+            .iter()
+            .find(|s| s.section_kind == SectionKind::FileDictionaryIndex as u16);
+        let payload_entry = footer
+            .sections
+            .iter()
+            .find(|s| s.section_kind == SectionKind::FileDictionaryPayload as u16);
+
+        match index_entry {
+            None => {
+                return Err(QfError::BadSection(
+                    "FEATURE_FILE_DICTIONARY set but FILE_DICTIONARY_INDEX section missing".into(),
+                ));
+            }
+            Some(idx_entry) => {
+                let index_bytes = compression::section_payload(data, idx_entry)?;
+                let payload_bytes = match payload_entry {
+                    Some(pay_entry) => compression::section_payload(data, pay_entry)?,
+                    None => std::borrow::Cow::Borrowed(&[][..]),
+                };
+                let dict = FileDictionary::parse(&index_bytes, &payload_bytes)?;
+                *dict_entry_count = Some(dict.len());
+                checked += 1 + u32::from(payload_entry.is_some());
+            }
+        }
+    }
+
+    let ext_registry_is_required =
+        validated.header.required_features & FEATURE_EXTENSION_REGISTRY != 0;
+    let ext_registry_is_optional =
+        validated.header.optional_features & FEATURE_EXTENSION_REGISTRY != 0;
+    if ext_registry_is_required || ext_registry_is_optional {
+        let ext_entry = footer
+            .sections
+            .iter()
+            .find(|s| s.section_kind == SectionKind::ExtensionRegistry as u16);
+        match (ext_registry_is_required, ext_entry) {
+            (true, None) => {
+                return Err(QfError::BadSection(
+                    "FEATURE_EXTENSION_REGISTRY set in required_features but \
+                     EXTENSION_REGISTRY section missing"
+                        .into(),
+                ));
+            }
+            (_, Some(entry)) => {
+                let ext_bytes = compression::section_payload(data, entry)?;
+                let registry = ExtensionRegistry::parse(&ext_bytes)?;
+                registry.validate_known(opts.allow_unknown_optional_extensions)?;
+                checked += 1;
+            }
+            (false, None) => {}
+        }
+    }
+
+    for entry in &footer.sections {
+        let payload = compression::section_payload(data, entry)?;
+        match SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
+            QfError::BadSection(format!("unknown section_kind {}", entry.section_kind))
+        })? {
+            SectionKind::CollationRegistry => {
+                CollationRegistry::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::DigestManifest => {
+                DigestManifest::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::RedactionManifest => {
+                RedactionManifest::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::LakehouseHints => {
+                LakehouseHints::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::KernelCapabilities => {
+                KernelCapabilities::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::FileDictionaryIndex
+            | SectionKind::FileDictionaryPayload
+            | SectionKind::ArrowInteropHints
+            | SectionKind::ExtensionRegistry
+            | SectionKind::ProfileCapabilityMatrix
+            | SectionKind::VendorExtension
+            | SectionKind::TableCatalog
+            | SectionKind::TableSegmentIndex
+            | SectionKind::TableSegmentData
+            | SectionKind::ColumnDomain
+            | SectionKind::ZoneStats
+            | SectionKind::ExactSetIndex
+            | SectionKind::BloomIndex
+            | SectionKind::InvertedMorselIndex
+            | SectionKind::LookupIndex
+            | SectionKind::AggregateSynopsis
+            | SectionKind::CompositeZoneIndex
+            | SectionKind::TopNZoneSummary
+            | SectionKind::EngineProfileRegistry
+            | SectionKind::ExecutionCodeDescriptor
+            | SectionKind::ExecutionScopeDescriptor
+            | SectionKind::CodeSpaceDescriptor
+            | SectionKind::EngineMountPolicy
+            | SectionKind::ObjectTypeCatalog
+            | SectionKind::TemporalSegmentIndex
+            | SectionKind::TemporalSegmentData
+            | SectionKind::TemporalBloomIndex
+            | SectionKind::TrustManifest
+            | SectionKind::HarborMountHints => {}
+        }
+    }
+
+    push_stage(
+        stages,
+        ValidationStage::SharedSemantic,
+        ValidationStageStatus::Checked,
+        checked,
+    );
     Ok(())
+}
+
+fn validate_qft_semantics(
+    data: &[u8],
+    footer: &QfFooter,
+    stages: &mut Vec<ValidationStageReport>,
+) -> Result<(), QfError> {
+    let mut checked = 0u32;
+    for entry in &footer.sections {
+        let payload = compression::section_payload(data, entry)?;
+        match SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
+            QfError::BadSection(format!("unknown section_kind {}", entry.section_kind))
+        })? {
+            SectionKind::TableCatalog => {
+                TableCatalog::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::TableSegmentIndex => {
+                TableSegmentIndex::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::ColumnDomain => {
+                ColumnDomain::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::ExactSetIndex => {
+                ExactSetIndex::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::BloomIndex => {
+                BloomFilterIndex::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::InvertedMorselIndex => {
+                InvertedMorselIndex::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::LookupIndex => {
+                LookupIndex::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::AggregateSynopsis => {
+                AggregateSynopsis::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::CompositeZoneIndex => {
+                CompositeIndex::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::TopNZoneSummary => {
+                TopNSummary::parse(&payload)?;
+                checked += 1;
+            }
+            SectionKind::FileDictionaryIndex
+            | SectionKind::FileDictionaryPayload
+            | SectionKind::CollationRegistry
+            | SectionKind::DigestManifest
+            | SectionKind::RedactionManifest
+            | SectionKind::ArrowInteropHints
+            | SectionKind::LakehouseHints
+            | SectionKind::ExtensionRegistry
+            | SectionKind::ProfileCapabilityMatrix
+            | SectionKind::TableSegmentData
+            | SectionKind::ZoneStats
+            | SectionKind::KernelCapabilities
+            | SectionKind::EngineProfileRegistry
+            | SectionKind::ExecutionCodeDescriptor
+            | SectionKind::ExecutionScopeDescriptor
+            | SectionKind::CodeSpaceDescriptor
+            | SectionKind::EngineMountPolicy
+            | SectionKind::ObjectTypeCatalog
+            | SectionKind::TemporalSegmentIndex
+            | SectionKind::TemporalSegmentData
+            | SectionKind::TemporalBloomIndex
+            | SectionKind::TrustManifest
+            | SectionKind::HarborMountHints
+            | SectionKind::VendorExtension => {}
+        }
+    }
+    push_stage(
+        stages,
+        ValidationStage::QfTable,
+        ValidationStageStatus::Checked,
+        checked,
+    );
+    Ok(())
+}
+
+fn validate_qfo_semantics(
+    data: &[u8],
+    validated: &ValidatedQfFile,
+    stages: &mut Vec<ValidationStageReport>,
+) -> Result<(), QfError> {
+    let mut checked = 0u32;
+    for entry in &validated.footer.sections {
+        let kind = SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
+            QfError::BadSection(format!("unknown section_kind {}", entry.section_kind))
+        })?;
+        let result = match kind {
+            SectionKind::ObjectTypeCatalog => {
+                let payload = compression::section_payload(data, entry)?;
+                ObjectTypeCatalog::parse(&payload).map(|_| ())
+            }
+            SectionKind::TemporalSegmentIndex => {
+                let payload = compression::section_payload(data, entry)?;
+                TemporalSegmentIndex::parse(&payload).map(|_| ())
+            }
+            SectionKind::TemporalSegmentData
+            | SectionKind::TemporalBloomIndex
+            | SectionKind::TrustManifest => Ok(()),
+            _ => continue,
+        };
+        checked += 1;
+        if let Err(err) = result {
+            if profile_error_is_fatal(&validated.header, entry, FEATURE_OBJECT_PROFILE) {
+                return Err(err);
+            }
+        }
+    }
+    push_stage(
+        stages,
+        ValidationStage::QfObject,
+        ValidationStageStatus::Checked,
+        checked,
+    );
+    Ok(())
+}
+
+fn validate_qfe_semantics(
+    data: &[u8],
+    validated: &ValidatedQfFile,
+    stages: &mut Vec<ValidationStageReport>,
+) -> Result<(), QfError> {
+    let mut checked = 0u32;
+    for entry in &validated.footer.sections {
+        let kind = SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
+            QfError::BadSection(format!("unknown section_kind {}", entry.section_kind))
+        })?;
+        let result = match kind {
+            SectionKind::EngineProfileRegistry => {
+                let payload = compression::section_payload(data, entry)?;
+                EngineProfileRegistry::parse(&payload).map(|_| ())
+            }
+            SectionKind::ExecutionCodeDescriptor => {
+                let payload = compression::section_payload(data, entry)?;
+                ExecutionCodeDescriptorV1::parse(&payload).map(|_| ())
+            }
+            SectionKind::ExecutionScopeDescriptor => {
+                let payload = compression::section_payload(data, entry)?;
+                ExecutionScopeDescriptorV1::parse(&payload).map(|_| ())
+            }
+            SectionKind::CodeSpaceDescriptor => {
+                let payload = compression::section_payload(data, entry)?;
+                CodeSpaceDescriptorV1::parse(&payload).map(|_| ())
+            }
+            SectionKind::EngineMountPolicy => {
+                let payload = compression::section_payload(data, entry)?;
+                EngineMountPolicyV1::parse(&payload).map(|_| ())
+            }
+            _ => continue,
+        };
+        checked += 1;
+        if let Err(err) = result {
+            if profile_error_is_fatal(&validated.header, entry, FEATURE_ENGINE_PROFILE) {
+                return Err(err);
+            }
+        }
+    }
+    push_stage(
+        stages,
+        ValidationStage::QfEngine,
+        ValidationStageStatus::Checked,
+        checked,
+    );
+    Ok(())
+}
+
+fn validate_qfh_semantics(
+    data: &[u8],
+    validated: &ValidatedQfFile,
+    stages: &mut Vec<ValidationStageReport>,
+) -> Result<(), QfError> {
+    let mut checked = 0u32;
+    for entry in &validated.footer.sections {
+        let kind = SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
+            QfError::BadSection(format!("unknown section_kind {}", entry.section_kind))
+        })?;
+        let result = match kind {
+            SectionKind::HarborMountHints => {
+                let payload = compression::section_payload(data, entry)?;
+                HarborMountHintsV1::parse(&payload).map(|_| ())
+            }
+            _ => continue,
+        };
+        checked += 1;
+        if let Err(err) = result {
+            if profile_error_is_fatal(&validated.header, entry, FEATURE_HARBOR_PROFILE) {
+                return Err(err);
+            }
+        }
+    }
+    push_stage(
+        stages,
+        ValidationStage::QfHarbor,
+        ValidationStageStatus::Checked,
+        checked,
+    );
+    Ok(())
+}
+
+fn profile_error_is_fatal(header: &QfHeaderV1, entry: &QfSectionEntryV1, feature: u64) -> bool {
+    header.required_features & feature != 0 || entry.required_features & feature != 0
 }
 
 fn validate_sections(
@@ -280,7 +694,11 @@ fn validate_sections(
         last_section_id = Some(entry.section_id);
 
         validate_section_profile(entry.section_kind, entry.profile)?;
-        validate_section_profile_feature_bit(entry.profile, header.required_features)?;
+        validate_section_profile_feature_bit(
+            entry.profile,
+            header.required_features | header.optional_features,
+        )?;
+        validate_section_required_feature_advertisement(header, entry)?;
         validate_codec_feature_advertisement(entry.compression, header, entry)?;
 
         let section_end = entry.end_offset()?;
@@ -307,10 +725,44 @@ fn validate_sections(
     Ok(())
 }
 
-fn validate_section_profile_feature_bit(
-    profile: u8,
-    file_required_features: u64,
+fn validate_footer_codec_feature_advertisement(postscript: &QfPostscriptV1) -> Result<(), QfError> {
+    let advertised = postscript.required_features | postscript.optional_features;
+    match postscript.footer.compression {
+        1 if advertised & FEATURE_CODEC_LZ4 == 0 => Err(QfError::BadSection(
+            "footer uses LZ4 compression but codec feature bit is not advertised".into(),
+        )),
+        2 if advertised & FEATURE_CODEC_ZSTD == 0 => Err(QfError::BadSection(
+            "footer uses ZSTD compression but codec feature bit is not advertised".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_section_required_feature_advertisement(
+    header: &QfHeaderV1,
+    entry: &crate::footer::QfSectionEntryV1,
 ) -> Result<(), QfError> {
+    let Some(info) =
+        registry::section_info(SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
+            QfError::BadSection(format!("unknown section_kind {}", entry.section_kind))
+        })?)
+    else {
+        return Ok(());
+    };
+    let Some(required_feature) = info.required_feature else {
+        return Ok(());
+    };
+    let file_advertised = header.required_features | header.optional_features;
+    if file_advertised & required_feature == 0 {
+        return Err(QfError::BadSection(format!(
+            "section {} of kind {} requires missing feature bit 0x{required_feature:016x}",
+            entry.section_id, info.wire_name
+        )));
+    }
+    Ok(())
+}
+
+fn validate_section_profile_feature_bit(profile: u8, file_features: u64) -> Result<(), QfError> {
     let required_profile_bit = match profile {
         0 => return Ok(()),
         1 => FEATURE_OBJECT_PROFILE,
@@ -324,7 +776,7 @@ fn validate_section_profile_feature_bit(
             )))
         }
     };
-    if file_required_features & required_profile_bit == 0 {
+    if file_features & required_profile_bit == 0 {
         return Err(QfError::BadSection(format!(
             "section profile {profile} requires missing file feature bit 0x{required_profile_bit:016x}"
         )));
@@ -443,9 +895,11 @@ mod tests {
     use super::*;
     use crate::{
         constants::{
-            CompressionCodec, SectionKind, FEATURE_CODEC_LZ4, FEATURE_EXTENSION_REGISTRY,
-            FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_TABLE_PROFILE,
+            CompressionCodec, SectionKind, FEATURE_CODEC_LZ4, FEATURE_ENGINE_PROFILE,
+            FEATURE_EXTENSION_REGISTRY, FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE,
+            FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE,
         },
+        footer::QfFooter,
         postscript::POSTSCRIPT_TOTAL_SIZE,
         writer::{MinimalQfWriter, SectionPayload},
     };
@@ -647,7 +1101,7 @@ mod tests {
         ));
 
         let mut good_writer = MinimalQfWriter::new();
-        good_writer.optional_features = FEATURE_CODEC_LZ4;
+        good_writer.optional_features = FEATURE_CODEC_LZ4 | FEATURE_FILE_DICTIONARY;
         good_writer.sections.push(SectionPayload {
             section_kind: SectionKind::FileDictionaryIndex as u16,
             profile: 0,
@@ -657,7 +1111,7 @@ mod tests {
             compression: CompressionCodec::Lz4 as u8,
             alignment_log2: 0,
             required_features: 0,
-            optional_features: FEATURE_CODEC_LZ4,
+            optional_features: FEATURE_CODEC_LZ4 | FEATURE_FILE_DICTIONARY,
             data: b"lz4-ish".to_vec(),
         });
         let good_bytes = good_writer.write();
@@ -775,6 +1229,183 @@ mod tests {
             validate_bytes(&bytes),
             Err(QfError::ChecksumMismatch)
         ));
+    }
+
+    #[cfg(feature = "compression-lz4")]
+    #[test]
+    fn accepts_lz4_compressed_footer() {
+        let mut writer = MinimalQfWriter::new();
+        writer.optional_features = FEATURE_CODEC_LZ4;
+        let mut bytes = writer.write();
+        let header = QfHeaderV1::parse(&bytes, false).unwrap();
+        let original_ps = QfPostscriptV1::parse_from_tail(&bytes).unwrap();
+        let original_footer = QfFooter::parse(
+            &bytes[original_ps.footer.offset as usize
+                ..original_ps.footer.end_offset().unwrap() as usize],
+        )
+        .unwrap();
+
+        let footer_plain = original_footer.serialize();
+        let footer_compressed = lz4_flex::block::compress(&footer_plain);
+        let compressed_offset = bytes.len() - POSTSCRIPT_TOTAL_SIZE - footer_compressed.len();
+        bytes.truncate(compressed_offset);
+        bytes.extend_from_slice(&footer_compressed);
+
+        let mut new_ps = original_ps;
+        new_ps.file_len = (bytes.len() + POSTSCRIPT_TOTAL_SIZE) as u64;
+        new_ps.footer.offset = compressed_offset as u64;
+        new_ps.footer.length = footer_compressed.len() as u64;
+        new_ps.footer.uncompressed_length = footer_plain.len() as u64;
+        new_ps.footer.compression = CompressionCodec::Lz4 as u8;
+        new_ps.footer.crc32c = checksum::crc32c(&footer_compressed);
+        bytes.extend_from_slice(&new_ps.serialize_tail());
+
+        let validated = validate_bytes(&bytes).unwrap();
+        assert_eq!(validated.header.required_features, header.required_features);
+        assert_eq!(validated.footer.header, original_footer.header);
+    }
+
+    #[test]
+    fn accepts_required_digest_manifest_feature() {
+        let mut writer = MinimalQfWriter::new();
+        writer.required_features =
+            FEATURE_TABLE_PROFILE | crate::constants::FEATURE_DIGEST_MANIFEST;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::DigestManifest as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: crate::constants::FEATURE_DIGEST_MANIFEST,
+            optional_features: 0,
+            data: 0u32.to_le_bytes().to_vec(),
+        });
+        assert!(validate_bytes(&writer.write()).is_ok());
+    }
+
+    #[test]
+    fn rejects_section_kind_missing_required_feature_bit() {
+        let mut writer = MinimalQfWriter::new();
+        writer.required_features = FEATURE_TABLE_PROFILE;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::ColumnDomain as u16,
+            profile: 2,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: vec![0, 0, 0, 0, 0, 0],
+        });
+        assert!(matches!(
+            validate_bytes(&writer.write()),
+            Err(QfError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn semantic_validation_parses_table_catalog_section() {
+        let mut writer = MinimalQfWriter::new();
+        writer.required_features = FEATURE_TABLE_PROFILE;
+        let cat = crate::table::TableCatalog {
+            flags: 0,
+            tables: vec![crate::table::TableEntry {
+                table_id: 1,
+                namespace: String::new(),
+                name: "t".into(),
+                row_count: 0,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![crate::table::ColumnEntry {
+                    column_id: 7,
+                    name: "c".into(),
+                    logical: crate::constants::QfLogicalType::Bool,
+                    physical: crate::constants::QfPhysicalKind::Boolean,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let data = cat.serialize().unwrap();
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::TableCatalog as u16,
+            profile: 2,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data,
+        });
+        assert!(validate_bytes_with_options(
+            &writer.write(),
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+            },
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn semantic_validation_rejects_invalid_column_domain() {
+        // Build a spec-§23 ColumnDomain payload whose `sorted_file_codes`
+        // are not strictly ascending (duplicates), which the parser must
+        // reject with QF_E_BAD_DOMAIN.
+        let mut writer = MinimalQfWriter::new();
+        writer.required_features = FEATURE_TABLE_PROFILE | crate::constants::FEATURE_COLUMN_DOMAINS;
+        let header = crate::domain::ColumnDomainHeaderV1 {
+            table_or_object_id: 1,
+            column_or_property_id: 2,
+            logical_type: 0,
+            collation_id: 0,
+            domain_count: 2,
+            sorted_file_codes_offset: crate::domain::COLUMN_DOMAIN_HEADER_LEN as u64,
+            file_code_to_rank_offset: (crate::domain::COLUMN_DOMAIN_HEADER_LEN + 2 * 4) as u64,
+            flags: 0,
+            checksum: 0,
+        };
+        let mut data = header.serialize().to_vec();
+        // Two duplicate FileCodes — violates strict-ascending requirement.
+        data.extend_from_slice(&5u32.to_le_bytes());
+        data.extend_from_slice(&5u32.to_le_bytes());
+        // Empty rank map region is permissible (zero dictionary entries).
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::ColumnDomain as u16,
+            profile: 2,
+            flags: 0,
+            item_count: 2,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: crate::constants::FEATURE_COLUMN_DOMAINS,
+            optional_features: 0,
+            data,
+        });
+        assert_eq!(
+            validate_bytes_with_options(
+                &writer.write(),
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                },
+            )
+            .unwrap_err(),
+            QfError::BadDomain
+        );
     }
 
     #[test]
@@ -904,7 +1535,8 @@ mod tests {
             (
                 3,
                 SectionKind::LookupIndex as u16,
-                crate::constants::FEATURE_ARCHIVE_PROFILE,
+                crate::constants::FEATURE_ARCHIVE_PROFILE
+                    | crate::constants::FEATURE_LOOKUP_INDEXES,
             ),
             (
                 4,
@@ -1006,6 +1638,201 @@ mod tests {
         let report = validate_bytes_with_options(&bytes, opts).expect("should validate");
         assert!(report.semantic_checked);
         assert!(report.dict_entry_count.is_none());
+        assert_eq!(
+            report
+                .stages
+                .iter()
+                .find(|s| s.stage == ValidationStage::QfTable)
+                .unwrap()
+                .status,
+            ValidationStageStatus::Checked
+        );
+    }
+
+    fn invalid_execution_descriptor_payload() -> Vec<u8> {
+        let mut bytes = crate::profile::qfe::ExecutionCodeDescriptorV1 {
+            descriptor_id: 1,
+            code_kind: crate::profile::qfe::ExecutionCodeKind::DictionaryKey,
+            code_width_bits: 32,
+            byte_order: 0,
+            lifetime: crate::profile::qfe::ExecutionCodeLifetime::Scan,
+            comparison_scope: crate::profile::qfe::ExecutionCodeComparisonScope::File,
+            canonicality: crate::profile::qfe::ExecutionCodeCanonicality::Transient,
+            null_code_policy: crate::profile::qfe::NullCodePolicy::NullBitmapOnly,
+            flags: 0,
+            scope_ref: 0,
+            code_space_ref: 0,
+            checksum: 0,
+        }
+        .serialize()
+        .to_vec();
+        bytes[4] = 42;
+        bytes[24..28].fill(0);
+        let crc = checksum::crc32c(&bytes);
+        bytes[24..28].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn semantic_validation_rejects_required_qfe_profile_error() {
+        let mut writer = MinimalQfWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.required_features = FEATURE_ENGINE_PROFILE;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::ExecutionCodeDescriptor as u16,
+            profile: 4,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_ENGINE_PROFILE,
+            optional_features: 0,
+            data: invalid_execution_descriptor_payload(),
+        });
+        assert_eq!(
+            validate_bytes_with_options(
+                &writer.write(),
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                },
+            )
+            .unwrap_err(),
+            QfError::BadEngineProfile
+        );
+    }
+
+    #[test]
+    fn semantic_validation_ignores_optional_qfe_profile_error() {
+        let mut writer = MinimalQfWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.required_features = 0;
+        writer.optional_features = FEATURE_ENGINE_PROFILE;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::ExecutionCodeDescriptor as u16,
+            profile: 4,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: FEATURE_ENGINE_PROFILE,
+            data: invalid_execution_descriptor_payload(),
+        });
+        let report = validate_bytes_with_options(
+            &writer.write(),
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            report
+                .stages
+                .iter()
+                .find(|s| s.stage == ValidationStage::QfEngine)
+                .unwrap()
+                .sections_checked,
+            1
+        );
+    }
+
+    #[test]
+    fn semantic_validation_rejects_required_qfo_object_catalog_error() {
+        let mut writer = MinimalQfWriter::new();
+        writer.primary_profile = PrimaryProfile::ObjectTemporal as u8;
+        writer.required_features = FEATURE_OBJECT_PROFILE;
+        let mut catalog = crate::profile::qfo::ObjectTypeCatalog {
+            flags: 0,
+            types: vec![crate::profile::qfo::ObjectTypeEntryV1 {
+                object_type_id: 1,
+                type_name: "Thing".into(),
+                properties: vec![crate::profile::qfo::PropertyEntryV1 {
+                    property_id: 1,
+                    property_name: "bad".into(),
+                    logical_type: crate::constants::QfLogicalType::Bool,
+                    physical_kind: crate::constants::QfPhysicalKind::Boolean,
+                    nullable: false,
+                    collation_id: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        catalog.types[0].properties[0].logical_type = crate::constants::QfLogicalType::Null;
+        catalog.types[0].properties[0].physical_kind = crate::constants::QfPhysicalKind::FileCode;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::ObjectTypeCatalog as u16,
+            profile: 1,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_OBJECT_PROFILE,
+            optional_features: 0,
+            data: catalog.serialize().unwrap(),
+        });
+        assert!(matches!(
+            validate_bytes_with_options(
+                &writer.write(),
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                },
+            ),
+            Err(QfError::BadSchema(_))
+        ));
+    }
+
+    #[test]
+    fn semantic_validation_ignores_optional_harbor_hint_error() {
+        let mut writer = MinimalQfWriter::new();
+        writer.primary_profile = PrimaryProfile::Mixed as u8;
+        writer.required_features = 0;
+        writer.optional_features = FEATURE_HARBOR_PROFILE;
+        let mut data = crate::profile::qfh::HarborMountHintsV1 {
+            harbor_profile_version_major: 1,
+            harbor_profile_version_minor: 0,
+            tenant_scope_ref: 1,
+            code_space_ref: 2,
+            lease_epoch: 3,
+            dictionary_digest_ref: 0,
+            catalog_digest_ref: 0,
+            mount_cache_policy: 0,
+            reserved: [0; 7],
+            private_payload_ref: 0,
+            checksum: 0,
+        }
+        .serialize()
+        .to_vec();
+        data[29] = 1;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::HarborMountHints as u16,
+            profile: 5,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: FEATURE_HARBOR_PROFILE,
+            data,
+        });
+        assert!(validate_bytes_with_options(
+            &writer.write(),
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+            },
+        )
+        .is_ok());
     }
 
     #[test]

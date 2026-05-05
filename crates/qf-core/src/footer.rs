@@ -18,6 +18,7 @@ use crate::{
         KNOWN_FEATURE_BITS_MASK, MAGIC_FOOTER, METADATA_LEN_MAX, SECTION_ENTRY_LEN,
     },
     error::QfError,
+    metadata::MetadataJson,
 };
 
 // ── QfFooterHeaderV1 ──────────────────────────────────────────────────────────
@@ -337,18 +338,7 @@ impl QfFooter {
 
         let meta_start = entries_start + header.section_count as usize * entry_size;
         let metadata_json = buf[meta_start..meta_start + header.metadata_len as usize].to_vec();
-        if std::str::from_utf8(&metadata_json).is_err() {
-            return Err(QfError::BadSection(
-                "metadata_json must be valid UTF-8".to_string(),
-            ));
-        }
-        if !metadata_json.is_empty()
-            && serde_json::from_slice::<serde_json::Value>(&metadata_json).is_err()
-        {
-            return Err(QfError::BadSection(
-                "metadata_json must be syntactically valid JSON".to_string(),
-            ));
-        }
+        MetadataJson::parse(&metadata_json)?;
 
         Ok(Self {
             header,
@@ -363,6 +353,11 @@ impl QfFooter {
     pub fn compute_crc(&self) -> u32 {
         let bytes = self.serialize();
         checksum::crc32c(&bytes)
+    }
+
+    /// Parse the optional descriptive metadata JSON stored in this footer.
+    pub fn metadata(&self) -> Result<MetadataJson, QfError> {
+        MetadataJson::parse(&self.metadata_json)
     }
 }
 

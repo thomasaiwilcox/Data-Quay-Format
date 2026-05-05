@@ -13,15 +13,17 @@
 //! | [`header`] | [`QfHeaderV1`] — the 128-byte file header (Section 10). |
 //! | [`postscript`] | [`QfPostscriptV1`] and [`QfSectionSpecV1`] (Section 12). |
 //! | [`footer`] | [`QfFooter`], [`QfFooterHeaderV1`], [`QfSectionEntryV1`] (Section 13). |
+//! | [`metadata`] | Descriptive footer metadata JSON (Section 15). |
 //! | [`dictionary`] | File dictionary types (Section 16). |
 //! | [`types`] | Logical/physical type compatibility and NumCode interpretation helpers. |
 //! | [`validity`] | [`validity::ValidityBitmap`] — null bitmap helpers (bit 1 = null). |
 //! | [`writer`] | [`MinimalQfWriter`] — writes minimal valid QF files. |
 //! | [`array`]      | [`array::EncodedArray`] — single-row decoder for encoded column arrays. |
 //! | [`compression`] | Section decompression layer (None/LZ4/Zstd). |
-//! | [`extensions`] | [`extensions::ExtensionRegistry`] — extension registry skeleton. |
-//! | [`collation`]  | [`collation::CollationRegistry`] — collation registry skeleton. |
-//! | [`digest`]     | [`digest::DigestManifest`] — digest manifest skeleton. |
+//! | [`extensions`] | [`extensions::ExtensionRegistry`] — extension registry parsing and validation. |
+//! | [`collation`]  | [`collation::CollationRegistry`] — v1 collation registry and comparison rules. |
+//! | [`digest`]     | [`digest::DigestManifest`] — digest manifest parsing and verification helpers. |
+//! | [`registry`]   | Structured spec registries for features, sections, and error codes. |
 //!
 //! ## Quick start
 //!
@@ -67,21 +69,43 @@
 //! ```
 
 pub mod array;
+pub mod artifact;
+pub mod canonical;
 pub mod checksum;
 pub mod collation;
 pub mod compression;
 pub mod constants;
 pub mod dictionary;
 pub mod digest;
+pub mod domain;
+pub mod durable;
+pub mod encoding;
 pub mod error;
 pub mod extensions;
 pub mod footer;
 pub mod header;
+pub mod index;
+pub mod interop;
+pub mod io_hints;
+pub mod kernel;
+pub mod metadata;
+pub mod page;
 pub mod postscript;
+pub mod predicate;
+pub mod profile;
+pub mod pruning;
 pub mod reader;
+pub mod redaction;
+pub mod registry;
+pub mod row_ref;
+pub mod segment;
+pub mod sort;
+pub mod table;
+pub mod trust_chain;
 pub mod types;
 pub mod validity;
 pub mod wire;
 pub mod writer;
+pub mod zone_stats;
 
 pub use error::QfError;

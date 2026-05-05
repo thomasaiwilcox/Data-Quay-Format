@@ -21,7 +21,15 @@ use crate::{
     },
     footer::{QfFooterHeaderV1, QfSectionEntryV1, FOOTER_HEADER_SIZE},
     header::{QfHeaderV1, HEADER_SIZE},
+    metadata,
     postscript::{QfPostscriptV1, QfSectionSpecV1, POSTSCRIPT_SIZE},
+    segment::{
+        RowMorselDirectory, RowMorselEntryV1, TableSegmentHeaderV1, TableSegmentIndex,
+        TableSegmentIndexEntryV1, ROW_MORSEL_ENTRY_LEN, TABLE_SEGMENT_HEADER_LEN,
+        TABLE_SEGMENT_INDEX_ENTRY_LEN,
+    },
+    table::TableCatalog,
+    QfError,
 };
 
 /// A simple builder for minimal valid QF files.
@@ -79,6 +87,10 @@ impl MinimalQfWriter {
         assert!(
             std::str::from_utf8(&self.metadata_json).is_ok(),
             "metadata_json must be valid UTF-8"
+        );
+        assert!(
+            metadata::validate(&self.metadata_json).is_ok(),
+            "metadata_json must be syntactically valid JSON"
         );
         assert!(
             self.sections.len() <= u32::MAX as usize,
@@ -276,10 +288,283 @@ impl Default for MinimalQfWriter {
     }
 }
 
+/// QF-T scan-profile writer surface (Spec §71.2/§71.3).
+///
+/// This builder emits a structurally valid table scan file with:
+/// table catalog, table segment index, and table segment data sections.
+/// It computes segment payload offsets before delegating to
+/// [`MinimalQfWriter`] so the segment index points at the actual bytes in
+/// the produced file.
+pub struct ScanProfileQfWriter {
+    pub created_at_us: i64,
+    pub file_id: [u8; 16],
+    pub producer_scope_id: [u8; 16],
+    pub producer_scope_kind: u16,
+    pub metadata_json: Vec<u8>,
+    pub table_catalog: TableCatalog,
+    pub segments: Vec<ScanSegment>,
+}
+
+/// Segment declaration accepted by [`ScanProfileQfWriter`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanSegment {
+    pub table_id: u32,
+    pub segment_id: u32,
+    pub row_start: u64,
+    pub row_count: u32,
+    pub morsel_row_count: u32,
+    pub column_count: u32,
+    pub stats_ref: u32,
+    pub flags: u32,
+}
+
+impl ScanSegment {
+    pub fn new(
+        table_id: u32,
+        segment_id: u32,
+        row_start: u64,
+        row_count: u32,
+        column_count: u32,
+    ) -> Self {
+        Self {
+            table_id,
+            segment_id,
+            row_start,
+            row_count,
+            morsel_row_count: 4096,
+            column_count,
+            stats_ref: 0,
+            flags: 0,
+        }
+    }
+
+    fn morsel_count(&self) -> Result<u32, QfError> {
+        if self.row_count == 0 {
+            return Ok(0);
+        }
+        if self.morsel_row_count == 0 {
+            return Err(QfError::SegmentCorrupt);
+        }
+        let count = self
+            .row_count
+            .checked_add(self.morsel_row_count - 1)
+            .ok_or(QfError::ArithOverflow)?
+            / self.morsel_row_count;
+        Ok(count)
+    }
+
+    fn payload(&self) -> Result<Vec<u8>, QfError> {
+        let morsel_count = self.morsel_count()?;
+        let morsel_dir_len = (morsel_count as usize)
+            .checked_mul(ROW_MORSEL_ENTRY_LEN)
+            .ok_or(QfError::ArithOverflow)?;
+        let column_directory_offset = TABLE_SEGMENT_HEADER_LEN
+            .checked_add(morsel_dir_len)
+            .ok_or(QfError::ArithOverflow)? as u64;
+        let header = TableSegmentHeaderV1 {
+            table_id: self.table_id,
+            segment_id: self.segment_id,
+            row_start: self.row_start,
+            row_count: self.row_count,
+            morsel_count,
+            morsel_row_count: self.morsel_row_count,
+            column_count: self.column_count,
+            morsel_directory_offset: TABLE_SEGMENT_HEADER_LEN as u64,
+            column_directory_offset,
+            page_index_offset: column_directory_offset,
+            data_offset: column_directory_offset,
+            flags: self.flags,
+            checksum: 0,
+        };
+        let mut morsels = Vec::with_capacity(morsel_count as usize);
+        let mut first_row = 0u32;
+        for morsel_id in 0..morsel_count {
+            let remaining = self.row_count - first_row;
+            let row_count = remaining.min(self.morsel_row_count);
+            morsels.push(RowMorselEntryV1 {
+                morsel_id,
+                first_row_in_segment: first_row,
+                row_count,
+                flags: 0,
+                stats_ref: 0,
+                checksum: 0,
+            });
+            first_row = first_row
+                .checked_add(row_count)
+                .ok_or(QfError::ArithOverflow)?;
+        }
+        let morsel_dir = RowMorselDirectory { entries: morsels };
+        let mut out = Vec::with_capacity(TABLE_SEGMENT_HEADER_LEN + morsel_dir_len);
+        out.extend_from_slice(&header.serialize());
+        out.extend_from_slice(&morsel_dir.serialize());
+        Ok(out)
+    }
+
+    fn index_entry(&self, offset: u64, length: u64) -> Result<TableSegmentIndexEntryV1, QfError> {
+        Ok(TableSegmentIndexEntryV1 {
+            table_id: self.table_id,
+            segment_id: self.segment_id,
+            row_start: self.row_start,
+            row_count: self.row_count,
+            morsel_count: self.morsel_count()?,
+            morsel_row_count: self.morsel_row_count,
+            column_count: self.column_count,
+            offset,
+            length,
+            stats_ref: self.stats_ref,
+            flags: self.flags,
+            checksum: 0,
+        })
+    }
+}
+
+impl ScanProfileQfWriter {
+    pub fn new(table_catalog: TableCatalog) -> Self {
+        Self {
+            created_at_us: 0,
+            file_id: [0; 16],
+            producer_scope_id: [0; 16],
+            producer_scope_kind: 0,
+            metadata_json: Vec::new(),
+            table_catalog,
+            segments: Vec::new(),
+        }
+    }
+
+    pub fn push_segment(&mut self, segment: ScanSegment) {
+        self.segments.push(segment);
+    }
+
+    pub fn write(&self) -> Result<Vec<u8>, QfError> {
+        self.table_catalog.validate()?;
+        self.validate_segments_against_catalog()?;
+
+        let table_catalog_payload = self.table_catalog.serialize()?;
+        let segment_index_len = 8usize
+            .checked_add(
+                self.segments
+                    .len()
+                    .checked_mul(TABLE_SEGMENT_INDEX_ENTRY_LEN)
+                    .ok_or(QfError::ArithOverflow)?,
+            )
+            .ok_or(QfError::ArithOverflow)?;
+        let segment_payloads = self
+            .segments
+            .iter()
+            .map(ScanSegment::payload)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut offset = (HEADER_SIZE + table_catalog_payload.len() + segment_index_len) as u64;
+        let mut index_entries = Vec::with_capacity(self.segments.len());
+        for (segment, payload) in self.segments.iter().zip(segment_payloads.iter()) {
+            let length = payload.len() as u64;
+            index_entries.push(segment.index_entry(offset, length)?);
+            offset = offset.checked_add(length).ok_or(QfError::ArithOverflow)?;
+        }
+        let segment_index = TableSegmentIndex {
+            flags: 0,
+            entries: index_entries,
+        };
+        segment_index.validate()?;
+        let segment_index_payload = segment_index.serialize()?;
+
+        let mut inner = MinimalQfWriter::new();
+        inner.created_at_us = self.created_at_us;
+        inner.file_id = self.file_id;
+        inner.producer_scope_id = self.producer_scope_id;
+        inner.producer_scope_kind = self.producer_scope_kind;
+        inner.metadata_json = self.metadata_json.clone();
+        inner.required_features = FEATURE_TABLE_PROFILE;
+        inner.sections.push(SectionPayload {
+            section_kind: SectionKind::TableCatalog as u16,
+            profile: PrimaryProfile::TableScan as u8,
+            flags: 0,
+            item_count: self.table_catalog.tables.len() as u64,
+            row_count: self.table_catalog.tables.iter().map(|t| t.row_count).sum(),
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: table_catalog_payload,
+        });
+        inner.sections.push(SectionPayload {
+            section_kind: SectionKind::TableSegmentIndex as u16,
+            profile: PrimaryProfile::TableScan as u8,
+            flags: 0,
+            item_count: self.segments.len() as u64,
+            row_count: self.segments.iter().map(|s| s.row_count as u64).sum(),
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: segment_index_payload,
+        });
+        for (segment, payload) in self.segments.iter().zip(segment_payloads) {
+            inner.sections.push(SectionPayload {
+                section_kind: SectionKind::TableSegmentData as u16,
+                profile: PrimaryProfile::TableScan as u8,
+                flags: 0,
+                item_count: 1,
+                row_count: segment.row_count as u64,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: 0,
+                data: payload,
+            });
+        }
+        Ok(inner.write())
+    }
+
+    fn validate_segments_against_catalog(&self) -> Result<(), QfError> {
+        use std::collections::BTreeMap;
+
+        let mut tables = BTreeMap::new();
+        for table in &self.table_catalog.tables {
+            tables.insert(
+                table.table_id,
+                (table.row_count, table.columns.len() as u32),
+            );
+        }
+        let mut rows_by_table: BTreeMap<u32, u64> = BTreeMap::new();
+        for segment in &self.segments {
+            let Some((_declared_rows, column_count)) = tables.get(&segment.table_id) else {
+                return Err(QfError::BadSchema(format!(
+                    "segment references unknown table_id {}",
+                    segment.table_id
+                )));
+            };
+            if segment.column_count != *column_count {
+                return Err(QfError::BadSchema(format!(
+                    "segment {} column_count {} does not match table {} column count {}",
+                    segment.segment_id, segment.column_count, segment.table_id, column_count
+                )));
+            }
+            *rows_by_table.entry(segment.table_id).or_default() += segment.row_count as u64;
+        }
+        for (table_id, (declared_rows, _column_count)) in tables {
+            let segment_rows = rows_by_table.get(&table_id).copied().unwrap_or(0);
+            if segment_rows != declared_rows {
+                return Err(QfError::BadSchema(format!(
+                    "table {} declares row_count {}, but segments cover {} rows",
+                    table_id, declared_rows, segment_rows
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{footer::QfFooter, header::QfHeaderV1, postscript::QfPostscriptV1};
+    use crate::{
+        constants::{QfLogicalType, QfPhysicalKind},
+        footer::QfFooter,
+        header::QfHeaderV1,
+        postscript::QfPostscriptV1,
+        reader::{validate_bytes_with_options, ValidationOptions},
+        table::{ColumnEntry, TableEntry},
+    };
 
     #[test]
     #[should_panic(expected = "metadata_json exceeds v1 limit")]
@@ -294,6 +579,14 @@ mod tests {
     fn write_rejects_invalid_metadata_utf8() {
         let mut w = MinimalQfWriter::new();
         w.metadata_json = vec![0xff];
+        let _ = w.write();
+    }
+
+    #[test]
+    #[should_panic(expected = "metadata_json must be syntactically valid JSON")]
+    fn write_rejects_invalid_metadata_json() {
+        let mut w = MinimalQfWriter::new();
+        w.metadata_json = b"{not-json".to_vec();
         let _ = w.write();
     }
 
@@ -362,5 +655,86 @@ mod tests {
         let section_data = &bytes[s.offset as usize..(s.offset + s.length) as usize];
         assert_eq!(checksum::crc32c(section_data), s.crc32c);
         assert_eq!(section_data, payload_data.as_slice());
+    }
+
+    #[test]
+    fn scan_profile_writer_emits_semantically_valid_table_file() {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 10,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "active".into(),
+                    logical: QfLogicalType::Bool,
+                    physical: QfPhysicalKind::Boolean,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut writer = ScanProfileQfWriter::new(catalog);
+        writer.push_segment(ScanSegment::new(1, 0, 0, 10, 1));
+        let bytes = writer.write().unwrap();
+        let report = validate_bytes_with_options(
+            &bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.validated.footer.sections.len(), 3);
+
+        let segment_index_entry = report
+            .validated
+            .footer
+            .sections
+            .iter()
+            .find(|s| s.section_kind == SectionKind::TableSegmentIndex as u16)
+            .unwrap();
+        let segment_index_payload = &bytes[segment_index_entry.offset as usize
+            ..segment_index_entry.end_offset().unwrap() as usize];
+        let segment_index = TableSegmentIndex::parse(segment_index_payload).unwrap();
+        let segment_data_entry = report
+            .validated
+            .footer
+            .sections
+            .iter()
+            .find(|s| s.section_kind == SectionKind::TableSegmentData as u16)
+            .unwrap();
+        assert_eq!(segment_index.entries[0].offset, segment_data_entry.offset);
+        assert_eq!(segment_index.entries[0].row_count, 10);
+    }
+
+    #[test]
+    fn scan_profile_writer_rejects_row_count_mismatch() {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: String::new(),
+                name: "events".into(),
+                row_count: 11,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![],
+            }],
+        };
+        let mut writer = ScanProfileQfWriter::new(catalog);
+        writer.push_segment(ScanSegment::new(1, 0, 0, 10, 0));
+        assert!(matches!(writer.write(), Err(QfError::BadSchema(_))));
     }
 }

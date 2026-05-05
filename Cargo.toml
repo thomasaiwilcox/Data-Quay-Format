@@ -4,5 +4,7 @@ members = [
     "crates/qf-validate",
     "crates/qf-inspect",
     "crates/qf-dump",
+    "crates/qf-conformance",
+    "crates/qf-bench",
 ]
 resolver = "2"
