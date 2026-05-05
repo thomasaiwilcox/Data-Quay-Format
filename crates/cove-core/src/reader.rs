@@ -10,7 +10,7 @@ use crate::{
         PrimaryProfile, SectionKind, StorageClass, FEATURE_ARCHIVE_PROFILE, FEATURE_CODEC_LZ4,
         FEATURE_CODEC_ZSTD, FEATURE_ENGINE_PROFILE, FEATURE_EXTENSION_REGISTRY,
         FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE,
-        FEATURE_TABLE_PROFILE, MAGIC_COVE,
+        FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE, MAGIC_COVE,
     },
     dictionary::FileDictionary,
     digest::DigestManifest,
@@ -32,6 +32,7 @@ use crate::{
             ExecutionCodeDescriptorV1, ExecutionScopeDescriptorV1,
         },
         cove_h::HarborMountHintsV1,
+        cove_map::{parse_embedded_section, validate_embedded_sections, EmbeddedMapSection},
         cove_o::{
             validate_self_contained, ObjectTypeCatalog, TemporalBloomIndex, TemporalSegmentData,
             TemporalSegmentIndex, TrustManifest,
@@ -158,6 +159,7 @@ pub enum ValidationStage {
     CoveObject,
     CoveEngine,
     CoveHarbor,
+    CoveMap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,10 +249,11 @@ pub fn validate_bytes_with_options(
             0,
         );
     }
-    validate_cove_t_semantics(data, &validated.footer, &mut stages)?;
+    validate_cove_t_semantics(data, &validated, &mut stages)?;
     validate_cove_o_semantics(data, &validated, &mut stages)?;
     validate_cove_e_semantics(data, &validated, &mut stages)?;
     validate_cove_h_semantics(data, &validated, &mut stages)?;
+    validate_cove_map_semantics(data, &validated, &mut stages)?;
 
     Ok(ValidationReport {
         validated,
@@ -295,6 +298,7 @@ fn push_skipped_semantic_stages(stages: &mut Vec<ValidationStageReport>, verify_
         ValidationStage::CoveObject,
         ValidationStage::CoveEngine,
         ValidationStage::CoveHarbor,
+        ValidationStage::CoveMap,
     ] {
         push_stage(stages, stage, ValidationStageStatus::Skipped, 0);
     }
@@ -463,7 +467,16 @@ fn validate_shared_semantics(
             | SectionKind::TemporalSegmentData
             | SectionKind::TemporalBloomIndex
             | SectionKind::TrustManifest
-            | SectionKind::HarborMountHints => {}
+            | SectionKind::HarborMountHints
+            | SectionKind::MapSourceCatalog
+            | SectionKind::MapFunctionRegistry
+            | SectionKind::MapIdentityRuleCatalog
+            | SectionKind::MapRowSemanticsCatalog
+            | SectionKind::MapAssertionLog
+            | SectionKind::MapIdentityEquivalenceIndex
+            | SectionKind::MapEvidenceIndex
+            | SectionKind::MapConversionReport
+            | SectionKind::MapProjectionCatalog => {}
         }
     }
 
@@ -537,11 +550,11 @@ fn validate_redaction_manifest_links(
 
 fn validate_cove_t_semantics(
     data: &[u8],
-    footer: &CoveFooter,
+    validated: &ValidatedCoveFile,
     stages: &mut Vec<ValidationStageReport>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
-    for entry in &footer.sections {
+    for entry in &validated.footer.sections {
         let payload = compression::section_payload(data, entry)?;
         match SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
             CoveError::BadSection(format!("unknown section_kind {}", entry.section_kind))
@@ -555,7 +568,10 @@ fn validate_cove_t_semantics(
                 checked += 1;
             }
             SectionKind::TableSegmentData => {
-                TableSegmentPayloadV1::parse(&payload)?;
+                TableSegmentPayloadV1::parse_with_required_features(
+                    &payload,
+                    validated.header.required_features,
+                )?;
                 checked += 1;
             }
             SectionKind::ColumnDomain => {
@@ -615,6 +631,15 @@ fn validate_cove_t_semantics(
             | SectionKind::TemporalBloomIndex
             | SectionKind::TrustManifest
             | SectionKind::HarborMountHints
+            | SectionKind::MapSourceCatalog
+            | SectionKind::MapFunctionRegistry
+            | SectionKind::MapIdentityRuleCatalog
+            | SectionKind::MapRowSemanticsCatalog
+            | SectionKind::MapAssertionLog
+            | SectionKind::MapIdentityEquivalenceIndex
+            | SectionKind::MapEvidenceIndex
+            | SectionKind::MapConversionReport
+            | SectionKind::MapProjectionCatalog
             | SectionKind::VendorExtension => {}
         }
     }
@@ -885,6 +910,61 @@ fn validate_cove_h_semantics(
     Ok(())
 }
 
+fn validate_cove_map_semantics(
+    data: &[u8],
+    validated: &ValidatedCoveFile,
+    stages: &mut Vec<ValidationStageReport>,
+) -> Result<(), CoveError> {
+    let mut checked = 0u32;
+    let mut map_sections = Vec::<EmbeddedMapSection>::new();
+    for entry in &validated.footer.sections {
+        let kind = SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
+            CoveError::BadSection(format!("unknown section_kind {}", entry.section_kind))
+        })?;
+        let result = match kind {
+            SectionKind::MapSourceCatalog
+            | SectionKind::MapFunctionRegistry
+            | SectionKind::MapIdentityRuleCatalog
+            | SectionKind::MapRowSemanticsCatalog
+            | SectionKind::MapAssertionLog
+            | SectionKind::MapIdentityEquivalenceIndex
+            | SectionKind::MapEvidenceIndex
+            | SectionKind::MapConversionReport
+            | SectionKind::MapProjectionCatalog => {
+                let payload = compression::section_payload(data, entry)?;
+                parse_embedded_section(kind, &payload).map(|section| {
+                    map_sections.push(section);
+                })
+            }
+            _ => continue,
+        };
+        checked += 1;
+        if let Err(err) = result {
+            if profile_error_is_fatal(&validated.header, entry, FEATURE_SEMANTIC_MAP) {
+                return Err(err);
+            }
+        }
+    }
+    if let Err(err) = validate_embedded_sections(&map_sections) {
+        let map_required = validated.header.required_features & FEATURE_SEMANTIC_MAP != 0
+            || validated
+                .footer
+                .sections
+                .iter()
+                .any(|entry| entry.required_features & FEATURE_SEMANTIC_MAP != 0);
+        if map_required {
+            return Err(err);
+        }
+    }
+    push_stage(
+        stages,
+        ValidationStage::CoveMap,
+        ValidationStageStatus::Checked,
+        checked,
+    );
+    Ok(())
+}
+
 fn profile_error_is_fatal(header: &CoveHeaderV1, entry: &CoveSectionEntryV1, feature: u64) -> bool {
     header.required_features & feature != 0 || entry.required_features & feature != 0
 }
@@ -988,6 +1068,7 @@ fn validate_section_profile_feature_bit(profile: u8, file_features: u64) -> Resu
         3 => FEATURE_ARCHIVE_PROFILE,
         4 => FEATURE_ENGINE_PROFILE,
         5 => FEATURE_HARBOR_PROFILE,
+        6 => FEATURE_SEMANTIC_MAP,
         _ => {
             return Err(CoveError::BadSection(format!(
                 "unknown profile {profile} in section directory"
@@ -1043,6 +1124,7 @@ fn validate_primary_profile_features(header: &CoveHeaderV1) -> Result<(), CoveEr
         PrimaryProfile::ArchiveAcceleration => FEATURE_ARCHIVE_PROFILE,
         PrimaryProfile::EngineExecution => FEATURE_ENGINE_PROFILE,
         PrimaryProfile::HarborExecution => FEATURE_HARBOR_PROFILE,
+        PrimaryProfile::SemanticMapping => FEATURE_SEMANTIC_MAP,
     };
 
     if header.required_features & required_bit == 0 {
@@ -1099,6 +1181,16 @@ fn validate_section_profile(section_kind: u16, profile: u8) -> Result<(), CoveEr
         | SectionKind::TrustManifest => &[1],
         // COVE-H (profile 5)
         SectionKind::HarborMountHints => &[5],
+        // COVE-MAP (profile 6)
+        SectionKind::MapSourceCatalog
+        | SectionKind::MapFunctionRegistry
+        | SectionKind::MapIdentityRuleCatalog
+        | SectionKind::MapRowSemanticsCatalog
+        | SectionKind::MapAssertionLog
+        | SectionKind::MapIdentityEquivalenceIndex
+        | SectionKind::MapEvidenceIndex
+        | SectionKind::MapConversionReport
+        | SectionKind::MapProjectionCatalog => &[6],
     };
     if !allowed.contains(&profile) {
         return Err(CoveError::BadSection(format!(

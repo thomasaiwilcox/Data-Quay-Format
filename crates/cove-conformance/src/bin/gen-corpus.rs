@@ -15,6 +15,10 @@ use parquet::arrow::ArrowWriter;
 
 use cove_core::{
     artifact::{
+        covemap::{
+            CovemapFile, CovemapHeaderV1, CovemapPostscriptV1, CovemapSection,
+            CovemapSectionEntryV1,
+        },
         covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
         covx::{CovxFile, CovxHeaderV1, CovxPostscriptV1, CovxReferencedFileV1},
     },
@@ -24,7 +28,8 @@ use cove_core::{
         CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind, DigestAlgorithm,
         PrimaryProfile, SectionKind, StorageClass, ValueTag, FEATURE_CODEC_LZ4, FEATURE_CODEC_ZSTD,
         FEATURE_COLUMN_DOMAINS, FEATURE_ENGINE_PROFILE, FEATURE_HARBOR_PROFILE,
-        FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE, FEATURE_TRUST_CHAIN,
+        FEATURE_OBJECT_PROFILE, FEATURE_PAGE_PAYLOAD_ELISION, FEATURE_SEMANTIC_MAP,
+        FEATURE_TABLE_PROFILE, FEATURE_TRUST_CHAIN,
     },
     dictionary::{FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
     digest::compute_digest,
@@ -42,7 +47,7 @@ use cove_core::{
         plain::{PlainFixedPayload, PlainVarintPayload},
         rle::RlePayload,
     },
-    header::HEADER_SIZE,
+    header::{CoveHeaderV1, HEADER_SIZE},
     index::{
         aggregate::{AggregateEntry, SynopsisAccuracy, SynopsisKind},
         bloom::{
@@ -67,6 +72,7 @@ use cove_core::{
         topn::{TopNDirection, TopNSummary, TOPN_ZONE_SUMMARY_LEN},
     },
     io_hints::defaults_object_store,
+    page::{PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT},
     postscript::{CovePostscriptV1, POSTSCRIPT_SIZE, POSTSCRIPT_TOTAL_SIZE},
     profile::{
         cove_e::{
@@ -134,6 +140,32 @@ fn main() {
             &["§24", "§25", "§26", "§27", "§71.2", "§71.3", "§72"],
         ),
         cove_t_scan_table_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/cove_t_payload_elision_stats_only_all_null_valid.cove",
+            "cove",
+            "accept",
+            None,
+            &["§27.2", "§71.2", "§72"],
+        ),
+        cove_t_payload_elision_stats_only_all_null_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_t_payload_elision_missing_feature.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_BAD_SECTION"),
+            &["§27.2", "§71.2"],
+        ),
+        cove_t_payload_elision_missing_feature_file(),
     );
 
     write_fixture(
@@ -418,6 +450,20 @@ fn main() {
         covm_bytes.clone(),
     );
 
+    let covemap_bytes = valid_covemap_file();
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/covemap_valid.covemap",
+            "covemap",
+            "accept",
+            None,
+            &["§70"],
+        ),
+        covemap_bytes.clone(),
+    );
+
     write_fixture(
         &root,
         &mut entries,
@@ -644,6 +690,73 @@ fn main() {
             }
             .encode(),
             "expect_values": [7, 7, 7, 9, 7, 7]
+        })),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/encoded_array_decode_rle_valid.json",
+            "encoded_array_decode_case",
+            "accept",
+            None,
+            &["§20", "§71.3"],
+        ),
+        encoding_fixture_bytes(json!({
+            "logical": "Int64",
+            "physical": "FixedBytes",
+            "encoding": "Rle",
+            "row_count": 4,
+            "payload": RlePayload { runs: vec![(-2, 2), (9, 2)] }.encode(),
+            "expect": [-2, -2, 9, 9]
+        })),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/encoded_array_decode_local_codebook_varbytes_valid.json",
+            "encoded_array_decode_case",
+            "accept",
+            None,
+            &["§20", "§71.3"],
+        ),
+        encoding_fixture_bytes(json!({
+            "logical": "Utf8",
+            "physical": "VarBytes",
+            "encoding": "LocalCodebook",
+            "row_count": 3,
+            "payload": LocalCodebookPayload {
+                values: LocalCodebookValues::VarBytes(vec![b"red".to_vec(), b"blue".to_vec()]),
+                indexes: LocalIndexPayload::Rle(RlePayload {
+                    runs: vec![(0, 1), (1, 2)],
+                }),
+            }
+            .encode(),
+            "expect": ["red", "blue", "blue"]
+        })),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/arrow_export_utf8_valid.json",
+            "arrow_export_case",
+            "accept",
+            None,
+            &["§49", "§20", "§71.3"],
+        ),
+        encoding_fixture_bytes(json!({
+            "logical": "Utf8",
+            "physical": "VarBytes",
+            "encoding": "VarBytes",
+            "row_count": 2,
+            "payload": varbytes_payload(&[b"hi".as_ref(), b"there".as_ref()]),
+            "expect_type": "Utf8",
+            "expect": ["hi", "there"]
         })),
     );
 
@@ -1638,7 +1751,55 @@ fn main() {
             "codec": "none",
             "payload": "abcdef",
             // Reserved bits above the codec byte must be zero in v1.0.
-            "flags_override": 0x0000_0100u64,
+            "flags_override": 0x0000_1000u64,
+            "expect": "parse_reject"
+        })),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/page_codec_stats_only_constant_all_null_round_trip.json",
+            "page_codec_case",
+            "accept",
+            None,
+            &["§27.2", "§66"],
+        ),
+        page_codec_fixture_bytes(json!({
+            "codec": "none",
+            "payload": "",
+            "flags_override": 0x0000_0300u64,
+            "row_count_override": 1u64,
+            "non_null_count_override": 0u64,
+            "null_count_override": 1u64,
+            "encoding_root_override": 0xFFFF_FFFFu64,
+            "page_offset_override": 0u64,
+            "page_length_override": 0u64,
+            "uncompressed_length_override": 0u64,
+            "expect": "round_trip"
+        })),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/page_codec_stats_only_constant_requires_empty_payload.json",
+            "page_codec_case",
+            "accept",
+            None,
+            &["§27.2", "§66"],
+        ),
+        page_codec_fixture_bytes(json!({
+            "codec": "none",
+            "payload": "abcdef",
+            "flags_override": 0x0000_0300u64,
+            "row_count_override": 1u64,
+            "non_null_count_override": 0u64,
+            "null_count_override": 1u64,
+            "encoding_root_override": 0xFFFF_FFFFu64,
+            "page_offset_override": 0u64,
             "expect": "parse_reject"
         })),
     );
@@ -2322,6 +2483,84 @@ fn main() {
         &root,
         &mut entries,
         fixture(
+            "accept/cove_map_valid.cove",
+            "cove",
+            "accept",
+            None,
+            &["§70", "§73.6"],
+        ),
+        cove_map_valid_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_map_invalid.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_MAP_INVALID"),
+            &["§70", "§73.6"],
+        ),
+        cove_map_invalid_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_map_function_undeclared.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_MAP_FUNCTION_UNDECLARED"),
+            &["§70", "§73.6"],
+        ),
+        cove_map_function_undeclared_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_map_identity_conflict.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_MAP_IDENTITY_CONFLICT"),
+            &["§70", "§73.6"],
+        ),
+        cove_map_identity_conflict_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_map_source_stale.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_MAP_SOURCE_STALE"),
+            &["§70", "§73.6"],
+        ),
+        cove_map_source_stale_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_map_evidence_invalid.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_MAP_EVIDENCE_INVALID"),
+            &["§70", "§73.6"],
+        ),
+        cove_map_evidence_invalid_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
             "accept/cove_o_optional_bad_catalog.cove",
             "cove",
             "accept",
@@ -2668,6 +2907,21 @@ fn main() {
             &["§69", "§75"],
         ),
         covm_bad,
+    );
+
+    let mut covemap_bad = covemap_bytes;
+    covemap_bad[94] ^= 0xFF;
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/covemap_header_crc_flipped.covemap",
+            "covemap",
+            "reject",
+            Some("COVE_E_CHECKSUM_MISMATCH"),
+            &["§70", "§75"],
+        ),
+        covemap_bad,
     );
 
     write_fixture(
@@ -3592,6 +3846,26 @@ fn main() {
             "reject/error_surface_sidecar_stale.json",
             "COVE_E_SIDECAR_STALE",
         ),
+        (
+            "reject/error_surface_map_invalid.json",
+            "COVE_E_MAP_INVALID",
+        ),
+        (
+            "reject/error_surface_map_function_undeclared.json",
+            "COVE_E_MAP_FUNCTION_UNDECLARED",
+        ),
+        (
+            "reject/error_surface_map_identity_conflict.json",
+            "COVE_E_MAP_IDENTITY_CONFLICT",
+        ),
+        (
+            "reject/error_surface_map_source_stale.json",
+            "COVE_E_MAP_SOURCE_STALE",
+        ),
+        (
+            "reject/error_surface_map_evidence_invalid.json",
+            "COVE_E_MAP_EVIDENCE_INVALID",
+        ),
     ] {
         write_fixture(
             &root,
@@ -3618,6 +3892,7 @@ fn main() {
                 "needles": [
                     "cargo fmt --check",
                     "cargo test --workspace",
+                    "cargo test -p cove-convert-parquet",
                     "cargo run -p cove-bench --bin cove-bench > /dev/null",
                     "cargo run -p cove-conformance --bin gen-corpus -- --check",
                     "cargo run -p cove-conformance --bin gen-capability-matrix -- --check",
@@ -3634,6 +3909,7 @@ fn main() {
                     "crates/cove-validate",
                     "crates/cove-inspect",
                     "crates/cove-dump",
+                    "crates/cove-convert-parquet",
                     "crates/cove-conformance",
                     "crates/cove-bench"
                 ],
@@ -3736,6 +4012,10 @@ fn pruning_fixture_bytes(value: Value) -> Vec<u8> {
 }
 
 fn page_codec_fixture_bytes(value: Value) -> Vec<u8> {
+    serde_json::to_vec_pretty(&value).unwrap()
+}
+
+fn map_payload_bytes(value: Value) -> Vec<u8> {
     serde_json::to_vec_pretty(&value).unwrap()
 }
 
@@ -3844,6 +4124,15 @@ fn patched_base_payload_bytes(base: &[i64], patches: &[(u32, i64)]) -> Vec<u8> {
     for (position, value) in patches {
         out.extend_from_slice(&position.to_le_bytes());
         out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+fn varbytes_payload(values: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for value in values {
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(value);
     }
     out
 }
@@ -4953,6 +5242,355 @@ fn cove_t_scan_table_file() -> Vec<u8> {
     writer.write().unwrap()
 }
 
+fn cove_t_payload_elision_stats_only_all_null_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 1,
+            namespace: "public".into(),
+            name: "events".into(),
+            row_count: 6,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![ColumnEntry {
+                column_id: 1,
+                name: "status_code".into(),
+                logical: CoveLogicalType::UInt32,
+                physical: CovePhysicalKind::NumCode,
+                nullable: true,
+                sort_order: 0,
+                collation_id: 0,
+                precision: 0,
+                scale: 0,
+                flags: 0,
+            }],
+        }],
+    };
+    let mut segment = ScanSegment::new(1, 0, 0, 6, 1);
+    segment.set_column_pages(
+        1,
+        vec![ScanPageSpec::new(6, Vec::new())
+            .with_counts(0, 6)
+            .with_encoding_root(u32::MAX)
+            .with_flags(PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL)],
+    );
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn cove_t_payload_elision_missing_feature_file() -> Vec<u8> {
+    clear_required_feature(
+        cove_t_payload_elision_stats_only_all_null_file(),
+        FEATURE_PAGE_PAYLOAD_ELISION,
+    )
+}
+
+fn cove_map_valid_file() -> Vec<u8> {
+    semantic_profile_cove_file(
+        PrimaryProfile::SemanticMapping,
+        FEATURE_SEMANTIC_MAP,
+        0,
+        valid_map_sections(),
+    )
+}
+
+fn cove_map_invalid_file() -> Vec<u8> {
+    semantic_profile_cove_file(
+        PrimaryProfile::SemanticMapping,
+        FEATURE_SEMANTIC_MAP,
+        0,
+        vec![map_section(
+            SectionKind::MapSourceCatalog,
+            1,
+            json!({
+                "mapping_version": "2026.05",
+                "sources": [{
+                    "source_id": "crm.customers",
+                    "schema_fingerprint": "schema-v1",
+                    "snapshot_digest": "digest-v1",
+                    "row_identity_rules": ["customer_id"],
+                    "replay_claimed": true
+                }]
+            }),
+        )],
+    )
+}
+
+fn cove_map_function_undeclared_file() -> Vec<u8> {
+    let mut sections = valid_map_sections();
+    sections[1] = map_section(
+        SectionKind::MapFunctionRegistry,
+        0,
+        json!({
+            "mapping_id": "customer-map",
+            "mapping_version": "2026.05",
+            "functions": []
+        }),
+    );
+    semantic_profile_cove_file(
+        PrimaryProfile::SemanticMapping,
+        FEATURE_SEMANTIC_MAP,
+        0,
+        sections,
+    )
+}
+
+fn cove_map_identity_conflict_file() -> Vec<u8> {
+    let mut sections = valid_map_sections();
+    sections[2] = map_section(
+        SectionKind::MapIdentityRuleCatalog,
+        1,
+        json!({
+            "mapping_id": "customer-map",
+            "mapping_version": "2026.05",
+            "identity_rules": [{
+                "rule_id": "customer_identity",
+                "object_type": "Customer",
+                "semantic_role": "subject",
+                "confidence_class": "authoritative",
+                "candidate_only": false,
+                "property_conflicts_declared": true,
+                "function_ids": ["trim_lower"],
+                "join_keys": [{
+                    "logical_type": "utf8",
+                    "canonicalization": "trim_lower",
+                    "null_policy": "reject",
+                    "ordering": "asc"
+                }]
+            }],
+            "do_not_merge": [{
+                "left_identity": "customer:1",
+                "right_identity": "customer:2"
+            }]
+        }),
+    );
+    sections.push(map_section(
+        SectionKind::MapIdentityEquivalenceIndex,
+        1,
+        json!({
+            "mapping_id": "customer-map",
+            "mapping_version": "2026.05",
+            "equivalences": [{
+                "left_identity": "customer:1",
+                "right_identity": "customer:2"
+            }]
+        }),
+    ));
+    semantic_profile_cove_file(
+        PrimaryProfile::SemanticMapping,
+        FEATURE_SEMANTIC_MAP,
+        0,
+        sections,
+    )
+}
+
+fn cove_map_source_stale_file() -> Vec<u8> {
+    let mut sections = valid_map_sections();
+    sections[6] = map_section(
+        SectionKind::MapConversionReport,
+        1,
+        json!({
+            "mapping_id": "customer-map",
+            "mapping_version": "2026.05",
+            "sources": [{
+                "source_id": "crm.customers",
+                "schema_fingerprint": "schema-v2",
+                "snapshot_digest": "digest-v1"
+            }]
+        }),
+    );
+    semantic_profile_cove_file(
+        PrimaryProfile::SemanticMapping,
+        FEATURE_SEMANTIC_MAP,
+        0,
+        sections,
+    )
+}
+
+fn cove_map_evidence_invalid_file() -> Vec<u8> {
+    let mut sections = valid_map_sections();
+    sections[5] = map_section(
+        SectionKind::MapEvidenceIndex,
+        1,
+        json!({
+            "mapping_id": "customer-map",
+            "mapping_version": "2026.05",
+            "entries": [{
+                "source_id": "crm.customers",
+                "source_row_identity": "customer_id=1",
+                "rule_id": "upsert_customer",
+                "assertion_id": "assert_missing",
+                "output_object_id": "goid:customer:1",
+                "observed_schema_fingerprint": "schema-v1",
+                "observed_snapshot_digest": "digest-v1"
+            }]
+        }),
+    );
+    semantic_profile_cove_file(
+        PrimaryProfile::SemanticMapping,
+        FEATURE_SEMANTIC_MAP,
+        0,
+        sections,
+    )
+}
+
+fn valid_map_sections() -> Vec<SectionPayload> {
+    vec![
+        map_section(
+            SectionKind::MapSourceCatalog,
+            1,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "sources": [{
+                    "source_id": "crm.customers",
+                    "schema_fingerprint": "schema-v1",
+                    "snapshot_digest": "digest-v1",
+                    "row_identity_rules": ["customer_id"],
+                    "replay_claimed": true
+                }]
+            }),
+        ),
+        map_section(
+            SectionKind::MapFunctionRegistry,
+            1,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "functions": [{
+                    "function_id": "trim_lower",
+                    "version": "1.0.0",
+                    "deterministic": true,
+                    "dependency": "pure"
+                }]
+            }),
+        ),
+        map_section(
+            SectionKind::MapIdentityRuleCatalog,
+            1,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "identity_rules": [{
+                    "rule_id": "customer_identity",
+                    "object_type": "Customer",
+                    "semantic_role": "subject",
+                    "confidence_class": "authoritative",
+                    "candidate_only": false,
+                    "property_conflicts_declared": true,
+                    "function_ids": ["trim_lower"],
+                    "join_keys": [{
+                        "logical_type": "utf8",
+                        "canonicalization": "trim_lower",
+                        "null_policy": "reject",
+                        "ordering": "asc"
+                    }]
+                }],
+                "do_not_merge": []
+            }),
+        ),
+        map_section(
+            SectionKind::MapRowSemanticsCatalog,
+            1,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "rules": [{
+                    "rule_id": "upsert_customer",
+                    "source_id": "crm.customers",
+                    "identity_rule_id": "customer_identity",
+                    "function_ids": ["trim_lower"],
+                    "output_assertion_ids": ["assert_customer_name"],
+                    "association_endpoints": []
+                }]
+            }),
+        ),
+        map_section(
+            SectionKind::MapAssertionLog,
+            1,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "assertions": [{
+                    "assertion_id": "assert_customer_name",
+                    "output_object_id": "goid:customer:1"
+                }]
+            }),
+        ),
+        map_section(
+            SectionKind::MapEvidenceIndex,
+            1,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "entries": [{
+                    "source_id": "crm.customers",
+                    "source_row_identity": "customer_id=1",
+                    "rule_id": "upsert_customer",
+                    "assertion_id": "assert_customer_name",
+                    "output_object_id": "goid:customer:1",
+                    "observed_schema_fingerprint": "schema-v1",
+                    "observed_snapshot_digest": "digest-v1"
+                }]
+            }),
+        ),
+        map_section(
+            SectionKind::MapConversionReport,
+            1,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "sources": [{
+                    "source_id": "crm.customers",
+                    "schema_fingerprint": "schema-v1",
+                    "snapshot_digest": "digest-v1"
+                }]
+            }),
+        ),
+        map_section(
+            SectionKind::MapProjectionCatalog,
+            1,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "projections": [{
+                    "projection_id": "customer_projection",
+                    "assertion_ids": ["assert_customer_name"]
+                }]
+            }),
+        ),
+    ]
+}
+
+fn map_section(section_kind: SectionKind, item_count: u64, value: Value) -> SectionPayload {
+    SectionPayload {
+        section_kind: section_kind as u16,
+        profile: PrimaryProfile::SemanticMapping as u8,
+        flags: 0,
+        item_count,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: FEATURE_SEMANTIC_MAP,
+        optional_features: 0,
+        data: map_payload_bytes(value),
+    }
+}
+
+fn clear_required_feature(mut bytes: Vec<u8>, feature: u64) -> Vec<u8> {
+    let mut header = CoveHeaderV1::parse(&bytes).unwrap();
+    header.required_features &= !feature;
+    bytes[..HEADER_SIZE].copy_from_slice(&header.serialize());
+
+    let mut postscript = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
+    postscript.required_features &= !feature;
+    let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
+    bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+    bytes
+}
+
 fn cove_t_local_codebook_lz4_file() -> Vec<u8> {
     let catalog = TableCatalog {
         flags: 0,
@@ -5351,6 +5989,70 @@ fn valid_covm_file() -> Vec<u8> {
             entries_len: 0,
             file_len: 0,
             flags: 0,
+            checksum: 0,
+        },
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn valid_covemap_file() -> Vec<u8> {
+    CovemapFile {
+        header: CovemapHeaderV1::new([0x33; 16], 1_700_000_000_000_000),
+        mapping_version: "example/v1".into(),
+        sections: vec![
+            CovemapSection {
+                entry: CovemapSectionEntryV1 {
+                    section_id: SectionKind::MapSourceCatalog as u32,
+                    offset: 0,
+                    length: 0,
+                    uncompressed_length: 0,
+                    compression: CompressionCodec::None as u8,
+                    required: true,
+                    reserved: 0,
+                    checksum: 0,
+                },
+                payload: map_payload_bytes(json!({
+                    "mapping_id": "m1",
+                    "mapping_version": "example/v1",
+                    "sources": [{
+                        "source_id": "crm",
+                        "schema_fingerprint": "schema:v1",
+                        "snapshot_digest": "digest:v1",
+                        "row_identity_rules": ["crm.pk"],
+                        "replay_claimed": true
+                    }]
+                })),
+            },
+            CovemapSection {
+                entry: CovemapSectionEntryV1 {
+                    section_id: SectionKind::MapFunctionRegistry as u32,
+                    offset: 0,
+                    length: 0,
+                    uncompressed_length: 0,
+                    compression: CompressionCodec::None as u8,
+                    required: false,
+                    reserved: 0,
+                    checksum: 0,
+                },
+                payload: map_payload_bytes(json!({
+                    "mapping_id": "m1",
+                    "mapping_version": "example/v1",
+                    "functions": [{
+                        "function_id": "trim_lower",
+                        "version": "v1",
+                        "deterministic": true,
+                        "dependency": "pure"
+                    }]
+                })),
+            },
+        ],
+        postscript: CovemapPostscriptV1 {
+            required_features: FEATURE_SEMANTIC_MAP,
+            optional_features: 0,
+            file_len: 0,
+            header_offset: 0,
+            header_length: 0,
             checksum: 0,
         },
     }

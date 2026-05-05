@@ -2,6 +2,7 @@
   "needles": [
     "cargo fmt --check",
     "cargo test --workspace",
+    "cargo test -p cove-convert-parquet",
     "cargo run -p cove-bench --bin cove-bench > /dev/null",
     "cargo run -p cove-conformance --bin gen-corpus -- --check",
     "cargo run -p cove-conformance --bin gen-capability-matrix -- --check",

@@ -19,14 +19,18 @@ use crate::{
     constants::{
         CompressionCodec, CovePhysicalKind, PrimaryProfile, ProducerScopeKind, SectionKind,
         ENDIANNESS_LITTLE, FEATURE_CODEC_LZ4, FEATURE_CODEC_ZSTD, FEATURE_NESTED_COLUMNS,
-        FEATURE_TABLE_PROFILE, FOOTER_VERSION_V1, HEADER_LEN_V1, KNOWN_FEATURE_BITS_MASK,
-        MAGIC_COVE, MAGIC_COVE_FOOTER, METADATA_LEN_MAX, SECTION_ENTRY_LEN, VERSION_MAJOR_V1,
+        FEATURE_PAGE_PAYLOAD_ELISION, FEATURE_TABLE_PROFILE, FOOTER_VERSION_V1, HEADER_LEN_V1,
+        KNOWN_FEATURE_BITS_MASK, MAGIC_COVE, MAGIC_COVE_FOOTER, METADATA_LEN_MAX,
+        SECTION_ENTRY_LEN, VERSION_MAJOR_V1,
     },
     durable,
     footer::{CoveFooterHeaderV1, CoveSectionEntryV1, FOOTER_HEADER_SIZE},
     header::{CoveHeaderV1, HEADER_SIZE},
     metadata,
-    page::ColumnPageIndexEntryV1,
+    page::{
+        page_uses_payload_elision, ColumnPageIndexEntryV1, PAGE_FLAG_CODEC_MASK,
+        PAGE_FLAG_STATS_ONLY_CONSTANT,
+    },
     postscript::{CovePostscriptV1, CoveSectionSpecV1, POSTSCRIPT_SIZE},
     segment::{
         RowMorselDirectory, RowMorselEntryV1, TableColumnDirectoryEntryV1, TableSegmentHeaderV1,
@@ -325,6 +329,7 @@ pub struct ScanPageSpec {
     pub null_count: u32,
     pub encoding_root: u32,
     pub compression: CompressionCodec,
+    pub flags: u32,
     pub stats_ref: u32,
     /// Uncompressed payload bytes; the writer applies `compression` on write.
     pub payload: Vec<u8>,
@@ -338,6 +343,7 @@ impl ScanPageSpec {
             null_count: 0,
             encoding_root: 0,
             compression: CompressionCodec::None,
+            flags: 0,
             stats_ref: 0,
             payload,
         }
@@ -356,6 +362,11 @@ impl ScanPageSpec {
 
     pub fn with_encoding_root(mut self, encoding_root: u32) -> Self {
         self.encoding_root = encoding_root;
+        self
+    }
+
+    pub fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
         self
     }
 }
@@ -523,6 +534,11 @@ impl ScanSegment {
                     if spec.row_count != morsel.row_count {
                         return Err(CoveError::PageCorrupt);
                     }
+                    if spec.flags & PAGE_FLAG_CODEC_MASK != 0 {
+                        return Err(CoveError::BadSection(
+                            "ScanPageSpec flags must not set codec bits directly".into(),
+                        ));
+                    }
                     if spec
                         .non_null_count
                         .checked_add(spec.null_count)
@@ -536,10 +552,32 @@ impl ScanSegment {
                             "compressed page payload must be non-empty".into(),
                         ));
                     }
+                    let stats_only_constant = spec.flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0;
+                    if stats_only_constant {
+                        if !spec.payload.is_empty() {
+                            return Err(CoveError::BadSection(
+                                "stats-only constant page specs must use an empty payload".into(),
+                            ));
+                        }
+                        if spec.encoding_root != u32::MAX {
+                            return Err(CoveError::BadSection(
+                                "stats-only constant page specs must use encoding_root=u32::MAX"
+                                    .into(),
+                            ));
+                        }
+                    } else if spec.payload.is_empty() {
+                        return Err(CoveError::BadSection(
+                            "empty page payload requires PAGE_FLAG_STATS_ONLY_CONSTANT".into(),
+                        ));
+                    }
                     let wire_payload =
                         compression::encode_page_payload(&spec.payload, spec.compression)?;
                     let page_length = wire_payload.len() as u64;
-                    let page_offset = next_data_offset;
+                    let page_offset = if stats_only_constant {
+                        0
+                    } else {
+                        next_data_offset
+                    };
                     let page_checksum = checksum::crc32c(&wire_payload);
                     let page = ColumnPageIndexEntryV1 {
                         column_id: column.column_id,
@@ -552,14 +590,16 @@ impl ScanSegment {
                         page_length,
                         uncompressed_length: spec.payload.len() as u64,
                         stats_ref: spec.stats_ref,
-                        flags: spec.compression as u32,
+                        flags: spec.flags | spec.compression as u32,
                         checksum: page_checksum,
                     };
                     page_index_bytes.extend_from_slice(&page.serialize());
-                    page_payload_bytes.extend_from_slice(&wire_payload);
-                    next_data_offset = next_data_offset
-                        .checked_add(page_length)
-                        .ok_or(CoveError::ArithOverflow)?;
+                    if page_length != 0 {
+                        page_payload_bytes.extend_from_slice(&wire_payload);
+                        next_data_offset = next_data_offset
+                            .checked_add(page_length)
+                            .ok_or(CoveError::ArithOverflow)?;
+                    }
                     column_page_count += 1;
                 }
             } else {
@@ -675,6 +715,19 @@ impl ScanSegment {
                 bits | codec_feature_bit(page.compression)
             })
     }
+
+    fn page_required_features(&self) -> u64 {
+        self.column_page_specs
+            .iter()
+            .flat_map(|spec| spec.pages.iter())
+            .fold(0u64, |bits, page| {
+                bits | if page_uses_payload_elision(page.flags) {
+                    FEATURE_PAGE_PAYLOAD_ELISION
+                } else {
+                    0
+                }
+            })
+    }
 }
 
 fn codec_feature_bit(codec: CompressionCodec) -> u64 {
@@ -775,6 +828,9 @@ impl ScanProfileCoveWriter {
             .segments
             .iter()
             .fold(0u64, |bits, segment| bits | segment.page_codec_features());
+        let page_required_features = self.segments.iter().fold(0u64, |bits, segment| {
+            bits | segment.page_required_features()
+        });
         let nested_column_features = self.table_catalog.tables.iter().fold(0u64, |bits, table| {
             bits | columns_feature_bits(&table.columns)
         });
@@ -791,7 +847,8 @@ impl ScanProfileCoveWriter {
         inner.producer_scope_id = self.producer_scope_id;
         inner.producer_scope_kind = self.producer_scope_kind;
         inner.metadata_json = self.metadata_json.clone();
-        inner.required_features = FEATURE_TABLE_PROFILE | nested_column_features;
+        inner.required_features =
+            FEATURE_TABLE_PROFILE | nested_column_features | page_required_features;
         inner.optional_features = page_codec_features;
         inner.sections.push(SectionPayload {
             section_kind: SectionKind::TableCatalog as u16,
@@ -829,7 +886,8 @@ impl ScanProfileCoveWriter {
                 required_features: table_nested_features
                     .get(&segment.table_id)
                     .copied()
-                    .unwrap_or(0),
+                    .unwrap_or(0)
+                    | segment.page_required_features(),
                 optional_features: segment.page_codec_features(),
                 data: payload,
             });
@@ -883,13 +941,16 @@ mod tests {
         compression::column_page_payload,
         constants::{
             CoveLogicalType, CovePhysicalKind, FEATURE_CODEC_LZ4, FEATURE_CODEC_ZSTD,
-            FEATURE_NESTED_COLUMNS,
+            FEATURE_NESTED_COLUMNS, FEATURE_PAGE_PAYLOAD_ELISION,
         },
         encoding::local_codebook::{LocalCodebookPayload, LocalCodebookValues, LocalIndexPayload},
         encoding::nested::{ListLayout, ListLayoutPayload},
         footer::CoveFooter,
         header::CoveHeaderV1,
-        page::{ColumnPageIndex, PAGE_FLAG_CODEC_MASK},
+        page::{
+            ColumnPageIndex, PAGE_FLAG_ALL_NULL, PAGE_FLAG_CODEC_MASK,
+            PAGE_FLAG_STATS_ONLY_CONSTANT,
+        },
         postscript::CovePostscriptV1,
         reader::{validate_bytes_with_options, ValidationOptions},
         segment::TableSegmentPayloadV1,
@@ -1262,6 +1323,91 @@ mod tests {
         let mut writer = ScanProfileCoveWriter::new(catalog);
         writer.push_segment(ScanSegment::new(1, 0, 0, 10, 0));
         assert!(matches!(writer.write(), Err(CoveError::BadSchema(_))));
+    }
+
+    #[test]
+    fn scan_profile_writer_emits_stats_only_all_null_page_and_required_feature() {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 6,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "status_code".into(),
+                    logical: CoveLogicalType::UInt32,
+                    physical: CovePhysicalKind::NumCode,
+                    nullable: true,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut segment = ScanSegment::new(1, 0, 0, 6, 1);
+        segment.set_column_pages(
+            1,
+            vec![ScanPageSpec::new(6, Vec::new())
+                .with_counts(0, 6)
+                .with_encoding_root(u32::MAX)
+                .with_flags(PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL)],
+        );
+
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_segment(segment);
+
+        let bytes = writer.write().unwrap();
+        let report = validate_bytes_with_options(
+            &bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            report.validated.header.required_features & FEATURE_PAGE_PAYLOAD_ELISION,
+            0
+        );
+
+        let segment_data_entry = report
+            .validated
+            .footer
+            .sections
+            .iter()
+            .find(|s| s.section_kind == SectionKind::TableSegmentData as u16)
+            .unwrap();
+        assert_ne!(
+            segment_data_entry.required_features & FEATURE_PAGE_PAYLOAD_ELISION,
+            0
+        );
+
+        let segment_bytes = &bytes
+            [segment_data_entry.offset as usize..segment_data_entry.end_offset().unwrap() as usize];
+        let payload = TableSegmentPayloadV1::parse_with_required_features(
+            segment_bytes,
+            report.validated.header.required_features,
+        )
+        .unwrap();
+        let column = &payload.columns[0];
+        let page_index_bytes = &segment_bytes[column.page_index_offset as usize
+            ..(column.page_index_offset + column.page_index_length) as usize];
+        let page_index = ColumnPageIndex::parse(page_index_bytes).unwrap();
+        let page = &page_index.entries[0];
+        assert_eq!(
+            page.flags & (PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL),
+            PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL
+        );
+        assert_eq!(page.page_length, 0);
+        assert_eq!(page.page_offset, 0);
     }
 
     #[test]

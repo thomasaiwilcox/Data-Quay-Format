@@ -15,10 +15,24 @@ use crate::{
 pub const COLUMN_PAGE_INDEX_ENTRY_LEN: usize = 60;
 
 /// Spec §27.2 / §66: the low byte of `ColumnPageIndexEntryV1.flags` carries
-/// the page-level [`CompressionCodec`] identifier. The remaining 24 bits are
-/// reserved for future use and MUST be zero in v1.0.
+/// the page-level [`CompressionCodec`] identifier. Bits `0x0100..0x0800`
+/// carry the v1 payload-elision flags; the remaining high bits are reserved
+/// and MUST be zero in v1.0.
 pub const PAGE_FLAG_CODEC_MASK: u32 = 0x0000_00FF;
-pub const PAGE_FLAG_RESERVED_MASK: u32 = !PAGE_FLAG_CODEC_MASK;
+pub const PAGE_FLAG_STATS_ONLY_CONSTANT: u32 = 0x0000_0100;
+pub const PAGE_FLAG_ALL_NULL: u32 = 0x0000_0200;
+pub const PAGE_FLAG_ALL_NON_NULL: u32 = 0x0000_0400;
+pub const PAGE_FLAG_VALUE_STREAM_ELIDED: u32 = 0x0000_0800;
+pub const PAGE_FLAG_KNOWN_MASK: u32 = PAGE_FLAG_CODEC_MASK
+    | PAGE_FLAG_STATS_ONLY_CONSTANT
+    | PAGE_FLAG_ALL_NULL
+    | PAGE_FLAG_ALL_NON_NULL
+    | PAGE_FLAG_VALUE_STREAM_ELIDED;
+pub const PAGE_FLAG_RESERVED_MASK: u32 = !PAGE_FLAG_KNOWN_MASK;
+
+fn empty_page_checksum() -> u32 {
+    crc32c(&[])
+}
 
 /// Returns the [`CompressionCodec`] encoded in `flags`, or an error if the
 /// codec value is unknown or any reserved bit is set.
@@ -31,6 +45,15 @@ pub fn page_flag_codec(flags: u32) -> Result<CompressionCodec, CoveError> {
     let raw = (flags & PAGE_FLAG_CODEC_MASK) as u8;
     CompressionCodec::from_u8(raw)
         .ok_or_else(|| CoveError::BadSection(format!("unknown page compression codec {raw}")))
+}
+
+pub fn page_uses_payload_elision(flags: u32) -> bool {
+    flags
+        & (PAGE_FLAG_STATS_ONLY_CONSTANT
+            | PAGE_FLAG_ALL_NULL
+            | PAGE_FLAG_ALL_NON_NULL
+            | PAGE_FLAG_VALUE_STREAM_ELIDED)
+        != 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,10 +111,65 @@ impl ColumnPageIndexEntryV1 {
         let uncompressed_length = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
         let flags = u32::from_le_bytes(bytes[52..56].try_into().unwrap());
         let codec = page_flag_codec(flags)?;
+        let stats_only_constant = flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0;
+        let all_null = flags & PAGE_FLAG_ALL_NULL != 0;
+        let all_non_null = flags & PAGE_FLAG_ALL_NON_NULL != 0;
+
+        if all_null && all_non_null {
+            return Err(CoveError::BadSection(
+                "PAGE_FLAG_ALL_NULL and PAGE_FLAG_ALL_NON_NULL are mutually exclusive".into(),
+            ));
+        }
+        if all_null && (null_count != row_count || non_null_count != 0) {
+            return Err(CoveError::PageCorrupt);
+        }
+        if all_non_null && (null_count != 0 || non_null_count != row_count) {
+            return Err(CoveError::PageCorrupt);
+        }
         // Spec §13.2 / §66: codec=None requires page_length == uncompressed_length.
         // Compressed codecs require uncompressed_length > 0 whenever page_length
         // > 0 (a compressed payload cannot decode to zero bytes), and an empty
         // page (page_length == 0) MUST also have uncompressed_length == 0.
+        if stats_only_constant {
+            if !all_null && !all_non_null {
+                return Err(CoveError::BadSection(
+                    "PAGE_FLAG_STATS_ONLY_CONSTANT requires PAGE_FLAG_ALL_NULL or PAGE_FLAG_ALL_NON_NULL"
+                        .into(),
+                ));
+            }
+            if codec != CompressionCodec::None {
+                return Err(CoveError::BadSection(
+                    "stats-only constant pages must use page codec=None".into(),
+                ));
+            }
+            if page_length != 0 || uncompressed_length != 0 {
+                return Err(CoveError::BadSection(
+                    "stats-only constant pages must have page_length=0 and uncompressed_length=0"
+                        .into(),
+                ));
+            }
+            if u64::from_le_bytes(bytes[24..32].try_into().unwrap()) != 0 {
+                return Err(CoveError::BadSection(
+                    "stats-only constant pages must set page_offset=0".into(),
+                ));
+            }
+            if u32::from_le_bytes(bytes[20..24].try_into().unwrap()) != u32::MAX {
+                return Err(CoveError::BadSection(
+                    "stats-only constant pages must set encoding_root=u32::MAX".into(),
+                ));
+            }
+            if checksum != empty_page_checksum() {
+                return Err(CoveError::BadSection(
+                    "stats-only constant pages must use the empty-page checksum".into(),
+                ));
+            }
+        } else {
+            if page_length == 0 {
+                return Err(CoveError::BadSection(
+                    "page_length=0 requires PAGE_FLAG_STATS_ONLY_CONSTANT".into(),
+                ));
+            }
+        }
         if codec == CompressionCodec::None && page_length != uncompressed_length {
             return Err(CoveError::BadSection(
                 "uncompressed_length must equal page_length when page codec=None".into(),
@@ -426,8 +504,180 @@ mod tests {
 
     #[test]
     fn page_reserved_flag_bits_must_be_zero() {
-        // Setting any bit above the codec byte is rejected (forward-compat lock).
-        let bytes = page_entry(10, 10, 0x0000_0100).serialize();
+        // Unknown high bits above the known codec/elision flags are rejected.
+        let bytes = page_entry(10, 10, 0x0000_1000).serialize();
+        assert!(matches!(
+            ColumnPageIndexEntryV1::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn page_payload_elision_flag_helper_detects_usage() {
+        assert!(!page_uses_payload_elision(CompressionCodec::None as u32));
+        assert!(page_uses_payload_elision(PAGE_FLAG_ALL_NULL));
+        assert!(page_uses_payload_elision(
+            PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL
+        ));
+    }
+
+    #[test]
+    fn page_flags_all_null_requires_all_rows_null() {
+        let bytes = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 2,
+            row_count: 4,
+            non_null_count: 1,
+            null_count: 3,
+            encoding_root: 0,
+            page_offset: 0,
+            page_length: 4,
+            uncompressed_length: 4,
+            stats_ref: 0,
+            flags: PAGE_FLAG_ALL_NULL,
+            checksum: 0,
+        }
+        .serialize();
+        assert_eq!(
+            ColumnPageIndexEntryV1::parse(&bytes),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
+    fn page_flags_all_non_null_requires_no_nulls() {
+        let bytes = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 2,
+            row_count: 4,
+            non_null_count: 3,
+            null_count: 1,
+            encoding_root: 0,
+            page_offset: 0,
+            page_length: 4,
+            uncompressed_length: 4,
+            stats_ref: 0,
+            flags: PAGE_FLAG_ALL_NON_NULL,
+            checksum: 0,
+        }
+        .serialize();
+        assert_eq!(
+            ColumnPageIndexEntryV1::parse(&bytes),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
+    fn page_flags_all_null_and_all_non_null_conflict() {
+        let bytes = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 2,
+            row_count: 4,
+            non_null_count: 0,
+            null_count: 4,
+            encoding_root: 0,
+            page_offset: 0,
+            page_length: 4,
+            uncompressed_length: 4,
+            stats_ref: 0,
+            flags: PAGE_FLAG_ALL_NULL | PAGE_FLAG_ALL_NON_NULL,
+            checksum: 0,
+        }
+        .serialize();
+        assert!(matches!(
+            ColumnPageIndexEntryV1::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn stats_only_constant_requires_all_null_or_all_non_null() {
+        let bytes = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 2,
+            row_count: 4,
+            non_null_count: 2,
+            null_count: 2,
+            encoding_root: u32::MAX,
+            page_offset: 0,
+            page_length: 0,
+            uncompressed_length: 0,
+            stats_ref: 0,
+            flags: PAGE_FLAG_STATS_ONLY_CONSTANT,
+            checksum: empty_page_checksum(),
+        }
+        .serialize();
+        assert!(matches!(
+            ColumnPageIndexEntryV1::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn stats_only_constant_requires_empty_none_payload() {
+        let bytes = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 2,
+            row_count: 4,
+            non_null_count: 0,
+            null_count: 4,
+            encoding_root: u32::MAX,
+            page_offset: 0,
+            page_length: 1,
+            uncompressed_length: 1,
+            stats_ref: 0,
+            flags: PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL,
+            checksum: empty_page_checksum(),
+        }
+        .serialize();
+        assert!(matches!(
+            ColumnPageIndexEntryV1::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[test]
+    fn stats_only_constant_all_null_page_is_accepted() {
+        let bytes = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 2,
+            row_count: 4,
+            non_null_count: 0,
+            null_count: 4,
+            encoding_root: u32::MAX,
+            page_offset: 0,
+            page_length: 0,
+            uncompressed_length: 0,
+            stats_ref: 0,
+            flags: PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL,
+            checksum: empty_page_checksum(),
+        }
+        .serialize();
+        let entry = ColumnPageIndexEntryV1::parse(&bytes).unwrap();
+        assert_eq!(
+            entry.flags,
+            PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL
+        );
+        assert_eq!(entry.page_length, 0);
+    }
+
+    #[test]
+    fn page_length_zero_without_stats_only_constant_is_rejected() {
+        let bytes = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 2,
+            row_count: 4,
+            non_null_count: 4,
+            null_count: 0,
+            encoding_root: 0,
+            page_offset: 0,
+            page_length: 0,
+            uncompressed_length: 0,
+            stats_ref: 0,
+            flags: PAGE_FLAG_ALL_NON_NULL,
+            checksum: empty_page_checksum(),
+        }
+        .serialize();
         assert!(matches!(
             ColumnPageIndexEntryV1::parse(&bytes),
             Err(CoveError::BadSection(_))

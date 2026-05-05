@@ -50,6 +50,7 @@ COVE is designed to help engines:
 - `crates/cove-validate`: validates COVE files (headers, footers, section CRCs, feature consistency, and optional semantic/profile checks)
 - `crates/cove-inspect`: prints a readable layout summary for COVE files
 - `crates/cove-dump`: dumps metadata or section bytes as hex for debugging
+- `crates/cove-convert-parquet`: converts supported Parquet files into COVE-T scan-profile files and can emit a conversion report
 - `conformance`: generated capability matrix plus whole-file, artifact, and parser-focused accept/reject fixtures
 
 ## Implementation status
@@ -64,10 +65,11 @@ the current status of each spec area across these columns:
 - written: a writer can emit the structure
 - corpus: conformance fixtures exercise the behavior through the runner
 
-Some areas are intentionally marked as partial or scaffold-only. In particular,
-Parquet conversion is currently a design surface, not a working converter, and
-higher writer profiles still need full writer-emitted page-payload coverage
-before they should be described as complete.
+Some areas are intentionally marked as partial or scaffold-only. Parquet
+conversion now has a supported reference path for non-null primitive, temporal,
+UTF-8, binary, and decimal128 columns, plus a standalone CLI; broader nested and
+dictionary-synthesis policies remain visible follow-on areas in the capability
+matrix.
 
 Before making or publishing compliance claims, run the release gate:
 

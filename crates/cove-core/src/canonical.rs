@@ -154,7 +154,9 @@ fn validate_tagged_value(bytes: &[u8]) -> Result<(ValueTag, usize), CoveError> {
     let value_tag = ValueTag::from_u16(raw_tag_u16)
         .ok_or_else(|| CoveError::BadSection(format!("unknown canonical value tag {raw_tag}")))?;
     let payload_len = validate_payload_inner(value_tag, &bytes[tag_len..])?;
-    let consumed = tag_len.checked_add(payload_len).ok_or(CoveError::ArithOverflow)?;
+    let consumed = tag_len
+        .checked_add(payload_len)
+        .ok_or(CoveError::ArithOverflow)?;
     Ok((value_tag, consumed))
 }
 
@@ -232,7 +234,9 @@ fn validate_payload_inner(value_tag: ValueTag, bytes: &[u8]) -> Result<usize, Co
                         "canonical map key must be scalar".into(),
                     ));
                 }
-                pos = pos.checked_add(key_consumed).ok_or(CoveError::ArithOverflow)?;
+                pos = pos
+                    .checked_add(key_consumed)
+                    .ok_or(CoveError::ArithOverflow)?;
                 let key_bytes = bytes[key_start..pos].to_vec();
                 if let Some(prev) = &prev_key {
                     use std::cmp::Ordering;
@@ -252,7 +256,9 @@ fn validate_payload_inner(value_tag: ValueTag, bytes: &[u8]) -> Result<usize, Co
                 }
                 prev_key = Some(key_bytes);
                 let (_, value_consumed) = validate_tagged_value(&bytes[pos..])?;
-                pos = pos.checked_add(value_consumed).ok_or(CoveError::ArithOverflow)?;
+                pos = pos
+                    .checked_add(value_consumed)
+                    .ok_or(CoveError::ArithOverflow)?;
             }
             Ok(pos)
         }
@@ -276,7 +282,9 @@ fn decode_length_prefixed<'a>(bytes: &'a [u8], what: &str) -> Result<(&'a [u8], 
     let (payload_len, prefix_len) = decode_canonical_varint(bytes, what)?;
     let payload_len = usize::try_from(payload_len)
         .map_err(|_| CoveError::BadSection(format!("{what} length exceeds usize")))?;
-    let total = prefix_len.checked_add(payload_len).ok_or(CoveError::ArithOverflow)?;
+    let total = prefix_len
+        .checked_add(payload_len)
+        .ok_or(CoveError::ArithOverflow)?;
     if total > bytes.len() {
         return Err(CoveError::BadSection(format!(
             "{what} length prefix exceeds available bytes"
@@ -310,13 +318,15 @@ fn encode_u64_width(width: u8, value: u128) -> Result<Vec<u8>, CoveError> {
 }
 
 fn length_prefixed(bytes: &[u8]) -> Vec<u8> {
-    let mut out = wire::encode_u64_leb128(bytes.len() as u64);
+    let mut out = Vec::new();
+    wire::append_u64_leb128(&mut out, bytes.len() as u64);
     out.extend_from_slice(bytes);
     out
 }
 
 fn encode_tagged(value: &CanonicalValue<'_>) -> Result<Vec<u8>, CoveError> {
-    let mut out = wire::encode_u64_leb128(value.value_tag() as u64);
+    let mut out = Vec::new();
+    wire::append_u64_leb128(&mut out, value.value_tag() as u64);
     out.extend_from_slice(&value.encode()?);
     Ok(out)
 }
@@ -353,7 +363,8 @@ pub fn canonicalize_map_entries(
 /// Canonical encoding of a list (Spec §17): varint element count followed by
 /// each element's value tag and payload.
 pub fn canonicalize_list(elements: &[CanonicalValue<'_>]) -> Result<Vec<u8>, CoveError> {
-    let mut out = wire::encode_u64_leb128(elements.len() as u64);
+    let mut out = Vec::new();
+    wire::append_u64_leb128(&mut out, elements.len() as u64);
     for e in elements {
         out.extend_from_slice(&encode_tagged(e)?);
     }
@@ -371,9 +382,10 @@ pub fn canonicalize_struct(fields: &[CanonicalField<'_>]) -> Result<Vec<u8>, Cov
         }
     }
 
-    let mut out = wire::encode_u64_leb128(sorted.len() as u64);
+    let mut out = Vec::new();
+    wire::append_u64_leb128(&mut out, sorted.len() as u64);
     for field in &sorted {
-        out.extend_from_slice(&wire::encode_u64_leb128(field.field_id));
+        wire::append_u64_leb128(&mut out, field.field_id);
         out.extend_from_slice(&encode_tagged(&field.value)?);
     }
     Ok(out)
@@ -383,7 +395,8 @@ pub fn canonicalize_map(
     entries: &[(CanonicalValue<'_>, CanonicalValue<'_>)],
 ) -> Result<Vec<u8>, CoveError> {
     let sorted = canonicalize_map_entries(entries)?;
-    let mut out = wire::encode_u64_leb128(sorted.len() as u64);
+    let mut out = Vec::new();
+    wire::append_u64_leb128(&mut out, sorted.len() as u64);
     for (key, value) in sorted {
         out.extend_from_slice(&key);
         out.extend_from_slice(&value);

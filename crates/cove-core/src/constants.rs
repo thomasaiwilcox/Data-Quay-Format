@@ -24,6 +24,9 @@ pub const MAGIC_COVX: [u8; 4] = *b"CVX1";
 /// Magic bytes at the end of a COVM dataset manifest (`b"CVM1"`).
 pub const MAGIC_COVM: [u8; 4] = *b"CVM1";
 
+/// Magic bytes at the end of a COVE-MAP reusable mapping artifact (`b"CMP1"`).
+pub const MAGIC_COVEMAP: [u8; 4] = *b"CMP1";
+
 // ── File-level constants ──────────────────────────────────────────────────────
 
 /// Required value of `header_len` for COVE v1.
@@ -94,6 +97,8 @@ pub const FEATURE_LAKEHOUSE_HINTS: u64 = 0x0000_0000_0010_0000;
 pub const FEATURE_EXTENSION_REGISTRY: u64 = 0x0000_0000_0020_0000;
 pub const FEATURE_CODEC_LZ4: u64 = 0x0000_0000_0040_0000;
 pub const FEATURE_CODEC_ZSTD: u64 = 0x0000_0000_0080_0000;
+pub const FEATURE_SEMANTIC_MAP: u64 = 0x0000_0000_0100_0000;
+pub const FEATURE_PAGE_PAYLOAD_ELISION: u64 = 0x0000_0000_0200_0000;
 
 /// Bitmask of all feature bits defined in COVE v1.0 (Section 11).
 ///
@@ -123,7 +128,9 @@ pub const KNOWN_FEATURE_BITS_MASK: u64 = FEATURE_OBJECT_PROFILE
     | FEATURE_LAKEHOUSE_HINTS
     | FEATURE_EXTENSION_REGISTRY
     | FEATURE_CODEC_LZ4
-    | FEATURE_CODEC_ZSTD;
+    | FEATURE_CODEC_ZSTD
+    | FEATURE_SEMANTIC_MAP
+    | FEATURE_PAGE_PAYLOAD_ELISION;
 
 // ── Primary profile (header field) ──────────────────────────────────────────
 
@@ -143,6 +150,8 @@ pub enum PrimaryProfile {
     EngineExecution = 4,
     /// COVE-H Harbor registered execution profile.
     HarborExecution = 5,
+    /// COVE-MAP semantic mapping profile.
+    SemanticMapping = 6,
 }
 
 impl PrimaryProfile {
@@ -155,6 +164,7 @@ impl PrimaryProfile {
             3 => Some(Self::ArchiveAcceleration),
             4 => Some(Self::EngineExecution),
             5 => Some(Self::HarborExecution),
+            6 => Some(Self::SemanticMapping),
             _ => None,
         }
     }
@@ -241,6 +251,17 @@ pub enum SectionKind {
     // COVE-H sections (profile = 5)
     HarborMountHints = 50,
 
+    // COVE-MAP sections (profile = 6)
+    MapSourceCatalog = 60,
+    MapFunctionRegistry = 61,
+    MapIdentityRuleCatalog = 62,
+    MapRowSemanticsCatalog = 63,
+    MapAssertionLog = 64,
+    MapIdentityEquivalenceIndex = 65,
+    MapEvidenceIndex = 66,
+    MapConversionReport = 67,
+    MapProjectionCatalog = 68,
+
     // Vendor extension (shared)
     VendorExtension = 255,
 }
@@ -281,6 +302,15 @@ impl SectionKind {
             43 => Some(Self::TemporalBloomIndex),
             44 => Some(Self::TrustManifest),
             50 => Some(Self::HarborMountHints),
+            60 => Some(Self::MapSourceCatalog),
+            61 => Some(Self::MapFunctionRegistry),
+            62 => Some(Self::MapIdentityRuleCatalog),
+            63 => Some(Self::MapRowSemanticsCatalog),
+            64 => Some(Self::MapAssertionLog),
+            65 => Some(Self::MapIdentityEquivalenceIndex),
+            66 => Some(Self::MapEvidenceIndex),
+            67 => Some(Self::MapConversionReport),
+            68 => Some(Self::MapProjectionCatalog),
             255 => Some(Self::VendorExtension),
             _ => None,
         }
@@ -615,11 +645,15 @@ mod tests {
             PrimaryProfile::from_u8(5),
             Some(PrimaryProfile::HarborExecution)
         );
+        assert_eq!(
+            PrimaryProfile::from_u8(6),
+            Some(PrimaryProfile::SemanticMapping)
+        );
     }
 
     #[test]
     fn primary_profile_from_u8_unknown() {
-        assert_eq!(PrimaryProfile::from_u8(6), None);
+        assert_eq!(PrimaryProfile::from_u8(7), None);
         assert_eq!(PrimaryProfile::from_u8(255), None);
     }
 
@@ -791,6 +825,42 @@ mod tests {
         assert_eq!(
             SectionKind::from_u16(50),
             Some(SectionKind::HarborMountHints)
+        );
+        assert_eq!(
+            SectionKind::from_u16(60),
+            Some(SectionKind::MapSourceCatalog)
+        );
+        assert_eq!(
+            SectionKind::from_u16(61),
+            Some(SectionKind::MapFunctionRegistry)
+        );
+        assert_eq!(
+            SectionKind::from_u16(62),
+            Some(SectionKind::MapIdentityRuleCatalog)
+        );
+        assert_eq!(
+            SectionKind::from_u16(63),
+            Some(SectionKind::MapRowSemanticsCatalog)
+        );
+        assert_eq!(
+            SectionKind::from_u16(64),
+            Some(SectionKind::MapAssertionLog)
+        );
+        assert_eq!(
+            SectionKind::from_u16(65),
+            Some(SectionKind::MapIdentityEquivalenceIndex)
+        );
+        assert_eq!(
+            SectionKind::from_u16(66),
+            Some(SectionKind::MapEvidenceIndex)
+        );
+        assert_eq!(
+            SectionKind::from_u16(67),
+            Some(SectionKind::MapConversionReport)
+        );
+        assert_eq!(
+            SectionKind::from_u16(68),
+            Some(SectionKind::MapProjectionCatalog)
         );
         assert_eq!(
             SectionKind::from_u16(255),
@@ -1086,6 +1156,8 @@ mod tests {
             FEATURE_EXTENSION_REGISTRY,
             FEATURE_CODEC_LZ4,
             FEATURE_CODEC_ZSTD,
+            FEATURE_SEMANTIC_MAP,
+            FEATURE_PAGE_PAYLOAD_ELISION,
         ];
         for bit in &defined {
             assert_eq!(
@@ -1099,7 +1171,7 @@ mod tests {
     #[test]
     fn known_feature_bits_mask_does_not_contain_future_bits() {
         // Bits beyond the defined range should not be in the mask.
-        let future_bit: u64 = 0x0000_0001_0000_0000;
+        let future_bit: u64 = 0x0000_0000_0400_0000;
         assert_eq!(KNOWN_FEATURE_BITS_MASK & future_bit, 0);
     }
 }
