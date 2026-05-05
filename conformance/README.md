@@ -1,26 +1,26 @@
-# QF Conformance Corpus
+# COVE Conformance Corpus
 
 This directory contains binary fixtures and a `manifest.jsonl` that maps each
 fixture to the Spec §1–§79 sections it exercises. The corpus includes complete
-`.quay` files plus parser-focused payload and artifact fixtures for structures
-that are not always meaningful as standalone QF files. Run the corpus with:
+`.cove` files plus parser-focused payload and artifact fixtures for structures
+that are not always meaningful as standalone COVE files. Run the corpus with:
 
 ```sh
-cargo run -p qf-conformance --bin qf-conformance -- conformance/
+cargo run -p cove-conformance --bin cove-conformance -- conformance/
 ```
 
 Each manifest line is one JSON object:
 - `path`     — relative path from this directory
-- `kind`     — parser to run; omitted means `qf`. Current generated kinds are:
-    `qf`, `qfx`, `qfm`, `metadata_json`, `collation_registry`,
+- `kind`     — parser to run; omitted means `cove`. Current generated kinds are:
+    `cove`, `covx`, `covm`, `metadata_json`, `collation_registry`,
     `digest_manifest`, `redaction_manifest`, `io_hints`, `lakehouse_hints`,
     `kernel_capabilities`, `page_index`, `column_domain`, `table_catalog`,
     `table_segment_index`, `table_segment_header`, `row_morsel_directory`,
     `exact_set_index`, `bloom_index`, `inverted_morsel_index`, `lookup_index`,
     `aggregate_synopsis`, `composite_zone_index`, `topn_summary`, `sort_key`,
-    `clustering_key`, `qfe_engine_registry`, `qfe_execution_code`,
-    `qfe_mount_policy`, `qfh_mount_hints`, `qfo_object_catalog`, and
-    `qfo_temporal_segment_index`
+    `clustering_key`, `cove_e_engine_registry`, `cove_e_execution_code`,
+    `cove_e_mount_policy`, `cove_h_mount_hints`, `cove_o_object_catalog`, and
+    `cove_o_temporal_segment_index`
 - `expect`   — `"accept"` or `"reject"`
 - `error_code` — (preferred when `expect=reject`) stable Spec §75 error code
 - `error`    — optional fallback substring match for ad hoc cases
@@ -43,8 +43,8 @@ separates five evidence levels:
 Generated artifacts can be checked without rewriting files:
 
 ```sh
-cargo run -p qf-conformance --bin gen-corpus -- --check
-cargo run -p qf-conformance --bin gen-capability-matrix -- --check
+cargo run -p cove-conformance --bin gen-corpus -- --check
+cargo run -p cove-conformance --bin gen-capability-matrix -- --check
 ```
 
 A capability should only be treated as release-grade when the relevant columns
