@@ -257,12 +257,11 @@ pub fn decode_materialized_page_values(
         payload,
         None,
     );
-    let mut out = Vec::with_capacity(row_count as usize);
-    for row in 0..row_count as u64 {
-        let value = array.decode_row(row)?;
-        out.push(decoded_value_to_scalar(column, value)?);
-    }
-    Ok(out)
+    array
+        .decode_all_rows()?
+        .into_iter()
+        .map(|value| decoded_value_to_scalar(column, value))
+        .collect()
 }
 
 /// Convert Parquet bytes into a semantically valid COVE-T scan-profile file.

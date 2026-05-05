@@ -4,6 +4,7 @@ members = [
     "crates/cove-validate",
     "crates/cove-inspect",
     "crates/cove-dump",
+    "crates/cove-convert-parquet",
     "crates/cove-conformance",
     "crates/cove-bench",
 ]

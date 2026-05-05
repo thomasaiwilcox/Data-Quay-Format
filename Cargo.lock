@@ -276,6 +276,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cove-convert-parquet"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "cove-core",
+ "parquet",
+ "serde_json",
+]
+
+[[package]]
 name = "cove-core"
 version = "0.1.0"
 dependencies = [

@@ -60,6 +60,16 @@ pub enum CoveError {
     RedactionPolicy,
     /// COVX/COVM sidecar does not match referenced COVE (COVE_E_SIDECAR_STALE).
     SidecarStale,
+    /// Semantic mapping payload invalid (COVE_E_MAP_INVALID).
+    MapInvalid,
+    /// Referenced map function was not declared (COVE_E_MAP_FUNCTION_UNDECLARED).
+    MapFunctionUndeclared,
+    /// Semantic mapping identity rules conflict (COVE_E_MAP_IDENTITY_CONFLICT).
+    MapIdentityConflict,
+    /// Semantic mapping source metadata is stale (COVE_E_MAP_SOURCE_STALE).
+    MapSourceStale,
+    /// Semantic mapping evidence payload invalid (COVE_E_MAP_EVIDENCE_INVALID).
+    MapEvidenceInvalid,
     /// Input buffer is too short to parse the requested structure.
     BufferTooShort,
     /// A field that MUST be zero contained a non-zero value.
@@ -154,6 +164,25 @@ impl fmt::Display for CoveError {
                 f,
                 "COVE_E_SIDECAR_STALE: COVX/COVM sidecar does not match COVE file"
             ),
+            CoveError::MapInvalid => {
+                write!(f, "COVE_E_MAP_INVALID: semantic mapping payload invalid")
+            }
+            CoveError::MapFunctionUndeclared => write!(
+                f,
+                "COVE_E_MAP_FUNCTION_UNDECLARED: semantic mapping function not declared"
+            ),
+            CoveError::MapIdentityConflict => write!(
+                f,
+                "COVE_E_MAP_IDENTITY_CONFLICT: semantic mapping identity rules conflict"
+            ),
+            CoveError::MapSourceStale => write!(
+                f,
+                "COVE_E_MAP_SOURCE_STALE: semantic mapping source metadata is stale"
+            ),
+            CoveError::MapEvidenceInvalid => write!(
+                f,
+                "COVE_E_MAP_EVIDENCE_INVALID: semantic mapping evidence invalid"
+            ),
             CoveError::BufferTooShort => {
                 write!(
                     f,
@@ -171,7 +200,7 @@ impl fmt::Display for CoveError {
 
 impl CoveError {
     /// Complete Spec §75 code inventory surfaced by [`Self::spec_code`].
-    pub const ALL_SPEC_CODES: [&'static str; 26] = [
+    pub const ALL_SPEC_CODES: [&'static str; 31] = [
         "COVE_E_BAD_MAGIC",
         "COVE_E_BAD_VERSION",
         "COVE_E_UNKNOWN_REQUIRED_FEATURE",
@@ -198,6 +227,11 @@ impl CoveError {
         "COVE_E_PAGE_CORRUPT",
         "COVE_E_REDACTION_POLICY",
         "COVE_E_SIDECAR_STALE",
+        "COVE_E_MAP_INVALID",
+        "COVE_E_MAP_FUNCTION_UNDECLARED",
+        "COVE_E_MAP_IDENTITY_CONFLICT",
+        "COVE_E_MAP_SOURCE_STALE",
+        "COVE_E_MAP_EVIDENCE_INVALID",
     ];
 
     /// Return the closest Spec §75 error code for this error.
@@ -233,6 +267,11 @@ impl CoveError {
             CoveError::PageCorrupt => Some("COVE_E_PAGE_CORRUPT"),
             CoveError::RedactionPolicy => Some("COVE_E_REDACTION_POLICY"),
             CoveError::SidecarStale => Some("COVE_E_SIDECAR_STALE"),
+            CoveError::MapInvalid => Some("COVE_E_MAP_INVALID"),
+            CoveError::MapFunctionUndeclared => Some("COVE_E_MAP_FUNCTION_UNDECLARED"),
+            CoveError::MapIdentityConflict => Some("COVE_E_MAP_IDENTITY_CONFLICT"),
+            CoveError::MapSourceStale => Some("COVE_E_MAP_SOURCE_STALE"),
+            CoveError::MapEvidenceInvalid => Some("COVE_E_MAP_EVIDENCE_INVALID"),
             CoveError::Io(_) | CoveError::UnsupportedEncoding(_) => None,
         }
     }
@@ -258,6 +297,10 @@ mod tests {
             CoveError::ReservedNotZero.spec_code(),
             Some("COVE_E_BAD_SECTION")
         );
+        assert_eq!(
+            CoveError::MapInvalid.spec_code(),
+            Some("COVE_E_MAP_INVALID")
+        );
         assert_eq!(CoveError::Io("disk".into()).spec_code(), None);
     }
 
@@ -281,6 +324,7 @@ mod tests {
         assert_eq!(unique.len(), CoveError::ALL_SPEC_CODES.len());
         assert!(unique.contains("COVE_E_BAD_MAGIC"));
         assert!(unique.contains("COVE_E_SIDECAR_STALE"));
+        assert!(unique.contains("COVE_E_MAP_EVIDENCE_INVALID"));
     }
 }
 

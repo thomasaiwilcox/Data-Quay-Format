@@ -526,7 +526,10 @@ mod tests {
         .encode();
         bytes.push(0);
 
-        assert_eq!(ListLayoutPayload::parse(&bytes), Err(CoveError::PageCorrupt));
+        assert_eq!(
+            ListLayoutPayload::parse(&bytes),
+            Err(CoveError::PageCorrupt)
+        );
     }
 
     #[test]

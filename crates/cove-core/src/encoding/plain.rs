@@ -76,7 +76,7 @@ impl PlainVarintPayload {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.values.len() as u32).to_le_bytes());
         for v in &self.values {
-            out.extend_from_slice(&wire::encode_u64_leb128(wire::zigzag_encode_i64(*v)));
+            wire::append_u64_leb128(&mut out, wire::zigzag_encode_i64(*v));
         }
         out
     }

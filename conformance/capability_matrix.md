@@ -35,9 +35,9 @@ Evidence key: `yes` = implemented and exercised, `partial` = incomplete, `helper
 | §42 | Code-space descriptors | yes | yes | yes | yes | yes | profile/cove_e.rs plus reader.rs; standalone and integrated full-file code-space corpus; `CodeSpaceDescriptorV1::serialize` round-trips with parser |
 | §43 | Engine mount policy | yes | yes | yes | yes | yes | profile/cove_e.rs plus reader.rs; mount-policy plus required/optional full-file bundle corpus; `EngineMountPolicyV1::serialize` round-trips with parser |
 | §44 | Harbor mount hints | yes | yes | yes | yes | yes | profile/cove_h.rs; mount-hints plus required/optional corpus; `HarborMountHintsV1::serialize` round-trips with parser |
-| §49 | Arrow null↔validity inversion | yes | n/a | yes | n/a | yes | interop/arrow.rs plus arrow_bitmap_case accept/reject corpus |
+| §49 | Arrow interop and export | yes | n/a | yes | yes | yes | interop/arrow.rs covers null↔validity inversion plus EncodedArray-to-Arrow scalar/export helpers; arrow_bitmap_case and arrow_export_case corpus cover both surfaces |
 | §50 | Lakehouse hints | yes | yes | yes | yes | yes | interop/lakehouse.rs; accept/reject corpus; `LakehouseHints::serialize` round-trips with parser |
-| §51 | Parquet conversion | yes | yes | yes | yes | yes | interop/parquet.rs now converts primitive/temporal/utf8/binary parquet batches into COVE-T scan-profile files with machine-readable reports; parquet_conversion_case corpus covers accept plus null/nested reject cases |
+| §51 | Parquet conversion | yes | yes | yes | yes | yes | interop/parquet.rs plus cove-convert-parquet CLI convert primitive/temporal/utf8/binary parquet batches into COVE-T scan-profile files with machine-readable reports; parquet_conversion_case corpus covers accept plus null/nested reject cases |
 | §52 | Nested layouts | yes | yes | yes | yes | yes | encoding/nested.rs payload parsers plus ScanProfileCoveWriter explicit nested page specs, semantic TableSegmentData validation, nested_case JSON fixtures, and accept/reject nested .cove files for list/struct/map invariants |
 | §53 | Sort + clustering keys | yes | yes | yes | yes | yes | sort.rs fixed-size §53 entries; accept/reject corpus; `SortKey::serialize` round-trips with parser |
 | §54 | RowRef | yes | yes | yes | yes | yes | row_ref.rs; standalone accept/reject corpus plus lookup-index integration |
@@ -52,10 +52,11 @@ Evidence key: `yes` = implemented and exercised, `partial` = incomplete, `helper
 | §67 | I/O hints | yes | yes | yes | yes | yes | io_hints.rs; accept/reject corpus; `IoHints::encode` round-trips with parser |
 | §68 | COVX sidecar | yes | yes | yes | yes | yes | artifact/covx.rs; accept/reject artifact corpus; `CovxFile::serialize` round-trips with parser |
 | §69 | COVM manifest | yes | yes | yes | yes | yes | artifact/covm.rs; accept/reject manifest corpus; `CovmFile::serialize` round-trips with parser |
+| §70 | COVEMAP artifact framing | yes | yes | yes | yes | yes | artifact/covemap.rs; accept/reject artifact corpus; `CovemapFile::serialize` round-trips with parser |
 | §71 | Writer profiles | yes | n/a | yes | yes | yes | Minimal writer plus ScanProfileCoveWriter; generated COVE-T scan fixture now includes column/page regions |
 | §72 | Validation model | yes | n/a | yes | n/a | yes | reader stages + cove-validate; required/optional profile corpus; shared, COVE-T, and COVE-O semantic invariants exercised end to end |
 | §74 | Durable replace | yes | n/a | yes | yes | yes | durable.rs plus writer.rs; tempdir failure-injection coverage and writer-facing publish API |
 | §75 | Error-code surface | yes | n/a | yes | n/a | yes | error.rs spec_code()/ALL_SPEC_CODES, cove-validate JSON output, and generated reject fixtures including error_surface_case coverage |
-| §78 | Conformance/benchmark suite | yes | n/a | yes | yes | yes | suite_contract_case corpus, CLI smoke tests, release-gate bench smoke, and deterministic robustness harness |
+| §78 | Conformance/benchmark suite | yes | n/a | yes | yes | yes | suite_contract_case corpus, CLI smoke tests including cove-convert-parquet, release-gate bench/conformance smoke, and deterministic robustness harness |
 
-**Fully gated capabilities:** 51 / 51
+**Fully gated capabilities:** 52 / 52

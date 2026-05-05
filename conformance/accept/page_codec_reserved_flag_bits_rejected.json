@@ -1,6 +1,6 @@
 {
   "codec": "none",
   "expect": "parse_reject",
-  "flags_override": 256,
+  "flags_override": 4096,
   "payload": "abcdef"
 }

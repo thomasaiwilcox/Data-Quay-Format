@@ -20,12 +20,36 @@ fn write_temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     path
 }
 
+fn accept_fixture(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../conformance/accept")
+        .join(name)
+}
+
+fn reject_fixture(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../conformance/reject")
+        .join(name)
+}
+
 fn run_validate(path: &std::path::Path, semantic: bool) -> std::process::Output {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cove-validate"));
     if semantic {
         cmd.arg("--semantic");
     }
     cmd.arg("--json").arg(path).output().unwrap()
+}
+
+fn run_validate_json_explain(path: &std::path::Path, semantic: bool) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cove-validate"));
+    if semantic {
+        cmd.arg("--semantic");
+    }
+    cmd.arg("--json")
+        .arg("--explain")
+        .arg(path)
+        .output()
+        .unwrap()
 }
 
 fn dictionary_index_bytes(redacted: bool) -> Vec<u8> {
@@ -246,6 +270,29 @@ fn validate_corrupted_file() {
     );
     // Cleanup is best-effort; if removal fails the test OS will clean up temp files.
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn validate_accepts_standalone_covemap_json() {
+    let path = accept_fixture("covemap_valid.covemap");
+    let output = run_validate_json_explain(&path, true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("\"artifact\":\"covemap\""), "{stdout}");
+    assert!(
+        stdout.contains("\"mapping_version\":\"example/v1\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"section_count\":2"), "{stdout}");
+}
+
+#[test]
+fn validate_rejects_corrupt_standalone_covemap_json() {
+    let path = reject_fixture("covemap_header_crc_flipped.covemap");
+    let output = run_validate(&path, false);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(stdout.contains("COVE_E_CHECKSUM_MISMATCH"), "{stdout}");
 }
 
 #[test]

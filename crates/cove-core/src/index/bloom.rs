@@ -150,8 +150,9 @@ impl BloomFilterIndex {
         if nbits == 0 {
             return;
         }
+        let (h1, h2) = base_hashes(value);
         for i in 0..self.hash_count {
-            let bit = double_hash(value, i) % nbits;
+            let bit = double_hash(h1, h2, i) % nbits;
             self.bits[(bit / 8) as usize] |= 1 << (bit % 8);
         }
     }
@@ -162,8 +163,9 @@ impl BloomFilterIndex {
         if nbits == 0 {
             return false;
         }
+        let (h1, h2) = base_hashes(value);
         for i in 0..self.hash_count {
-            let bit = double_hash(value, i) % nbits;
+            let bit = double_hash(h1, h2, i) % nbits;
             if self.bits[(bit / 8) as usize] & (1 << (bit % 8)) == 0 {
                 return false;
             }
@@ -191,9 +193,11 @@ fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
     h
 }
 
-fn double_hash(value: &[u8], i: u8) -> u64 {
-    let h1 = fnv1a64(value, 0);
-    let h2 = fnv1a64(value, 0xdead_beef);
+fn base_hashes(value: &[u8]) -> (u64, u64) {
+    (fnv1a64(value, 0), fnv1a64(value, 0xdead_beef))
+}
+
+fn double_hash(h1: u64, h2: u64, i: u8) -> u64 {
     h1.wrapping_add((i as u64).wrapping_mul(h2))
 }
 
@@ -226,6 +230,19 @@ mod tests {
         assert!(b.might_contain(b"alice"));
         assert!(b.might_contain(b"bob"));
         assert!(b.might_contain(b"carol"));
+    }
+
+    #[test]
+    fn combined_hash_matches_previous_formula() {
+        let value = b"carol";
+        let (h1, h2) = base_hashes(value);
+        for i in 0..7 {
+            assert_eq!(
+                double_hash(h1, h2, i),
+                fnv1a64(value, 0)
+                    .wrapping_add((i as u64).wrapping_mul(fnv1a64(value, 0xdead_beef)))
+            );
+        }
     }
 
     #[test]

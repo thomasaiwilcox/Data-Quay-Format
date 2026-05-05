@@ -6,6 +6,8 @@
 //!
 //! * [`covx`] — Spec §68: per-file index extension.
 //! * [`covm`] — Spec §69: cross-file manifest.
+//! * [`covemap`] — Spec §70: reusable COVE-MAP artifact.
 
+pub mod covemap;
 pub mod covm;
 pub mod covx;

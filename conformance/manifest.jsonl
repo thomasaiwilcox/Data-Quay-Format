@@ -1,5 +1,7 @@
 {"expect":"accept","kind":"cove","path":"accept/min_empty.cove","sections":["§9","§10","§13","§71.1"]}
 {"expect":"accept","kind":"cove","path":"accept/cove_t_scan_table.cove","sections":["§24","§25","§26","§27","§71.2","§71.3","§72"]}
+{"expect":"accept","kind":"cove","path":"accept/cove_t_payload_elision_stats_only_all_null_valid.cove","sections":["§27.2","§71.2","§72"]}
+{"error_code":"COVE_E_BAD_SECTION","expect":"reject","kind":"cove","path":"reject/cove_t_payload_elision_missing_feature.cove","sections":["§27.2","§71.2","§75"]}
 {"expect":"accept","kind":"cove","path":"accept/cove_t_local_codebook_lz4.cove","sections":["§20","§25","§27","§66","§71.3"]}
 {"expect":"accept","kind":"cove","path":"accept/cove_t_nested_list_valid.cove","sections":["§25","§27","§52","§71.3"]}
 {"expect":"accept","kind":"cove","path":"accept/cove_t_nested_struct_valid.cove","sections":["§25","§27","§52","§71.3"]}
@@ -18,6 +20,7 @@
 {"expect":"accept","kind":"row_ref","path":"accept/row_ref_valid.bin","sections":["§54"]}
 {"expect":"accept","kind":"covx","path":"accept/covx_valid.covx","sections":["§68"]}
 {"expect":"accept","kind":"covm","path":"accept/covm_valid.covm","sections":["§69"]}
+{"expect":"accept","kind":"covemap","path":"accept/covemap_valid.covemap","sections":["§70"]}
 {"expect":"accept","kind":"metadata_json","path":"accept/metadata_json_valid.json","sections":["§15"]}
 {"expect":"accept","kind":"encoding_case","path":"accept/encoding_constant_valid.json","sections":["§20"]}
 {"expect":"accept","kind":"encoding_case","path":"accept/encoding_rle_valid.json","sections":["§20"]}
@@ -31,6 +34,9 @@
 {"expect":"accept","kind":"encoding_case","path":"accept/encoding_sparse_valid.json","sections":["§20"]}
 {"expect":"accept","kind":"encoding_case","path":"accept/encoding_local_codebook_bit_packed_valid.json","sections":["§20"]}
 {"expect":"accept","kind":"encoding_case","path":"accept/encoding_local_codebook_rle_valid.json","sections":["§20"]}
+{"expect":"accept","kind":"encoded_array_decode_case","path":"accept/encoded_array_decode_rle_valid.json","sections":["§20","§71.3"]}
+{"expect":"accept","kind":"encoded_array_decode_case","path":"accept/encoded_array_decode_local_codebook_varbytes_valid.json","sections":["§20","§71.3"]}
+{"expect":"accept","kind":"arrow_export_case","path":"accept/arrow_export_utf8_valid.json","sections":["§49","§20","§71.3"]}
 {"expect":"accept","kind":"nested_case","path":"accept/nested_list_valid.json","sections":["§52"]}
 {"expect":"accept","kind":"nested_case","path":"accept/nested_struct_valid.json","sections":["§52"]}
 {"expect":"accept","kind":"nested_case","path":"accept/nested_map_valid.json","sections":["§52"]}
@@ -69,6 +75,8 @@
 {"expect":"accept","kind":"page_codec_case","path":"accept/page_codec_none_length_mismatch_rejected.json","sections":["§13.2","§27.2","§66"]}
 {"expect":"accept","kind":"page_codec_case","path":"accept/page_codec_unknown_codec_rejected.json","sections":["§27.2","§66"]}
 {"expect":"accept","kind":"page_codec_case","path":"accept/page_codec_reserved_flag_bits_rejected.json","sections":["§27.2","§66"]}
+{"expect":"accept","kind":"page_codec_case","path":"accept/page_codec_stats_only_constant_all_null_round_trip.json","sections":["§27.2","§66"]}
+{"expect":"accept","kind":"page_codec_case","path":"accept/page_codec_stats_only_constant_requires_empty_payload.json","sections":["§27.2","§66"]}
 {"expect":"accept","kind":"page_codec_case","path":"accept/page_codec_lz4_truncated_rejected.json","sections":["§27","§66"]}
 {"expect":"accept","kind":"wire_primitive_case","path":"accept/wire_varint_zero.json","sections":["§10"]}
 {"expect":"accept","kind":"wire_primitive_case","path":"accept/wire_varint_127.json","sections":["§10"]}
@@ -120,6 +128,12 @@
 {"expect":"accept","kind":"cove","path":"accept/cove_e_profile_bundle_valid.cove","sections":["§39","§40","§41","§42","§43","§72"]}
 {"expect":"accept","kind":"cove","path":"accept/cove_e_optional_bad_refs.cove","sections":["§39","§40","§41","§42","§43","§76"]}
 {"expect":"accept","kind":"cove","path":"accept/cove_h_optional_bad_hints.cove","sections":["§44","§76"]}
+{"expect":"accept","kind":"cove","path":"accept/cove_map_valid.cove","sections":["§70","§73.6"]}
+{"error_code":"COVE_E_MAP_INVALID","expect":"reject","kind":"cove","path":"reject/cove_map_invalid.cove","sections":["§70","§73.6","§75"]}
+{"error_code":"COVE_E_MAP_FUNCTION_UNDECLARED","expect":"reject","kind":"cove","path":"reject/cove_map_function_undeclared.cove","sections":["§70","§73.6","§75"]}
+{"error_code":"COVE_E_MAP_IDENTITY_CONFLICT","expect":"reject","kind":"cove","path":"reject/cove_map_identity_conflict.cove","sections":["§70","§73.6","§75"]}
+{"error_code":"COVE_E_MAP_SOURCE_STALE","expect":"reject","kind":"cove","path":"reject/cove_map_source_stale.cove","sections":["§70","§73.6","§75"]}
+{"error_code":"COVE_E_MAP_EVIDENCE_INVALID","expect":"reject","kind":"cove","path":"reject/cove_map_evidence_invalid.cove","sections":["§70","§73.6","§75"]}
 {"expect":"accept","kind":"cove","path":"accept/cove_o_optional_bad_catalog.cove","sections":["§56","§76"]}
 {"error_code":"COVE_E_BAD_MAGIC","expect":"reject","kind":"cove","path":"reject/truncated_magic.cove","sections":["§12","§75"]}
 {"error_code":"COVE_E_OFFSET_RANGE","expect":"reject","kind":"cove","path":"reject/short_file.cove","sections":["§12","§75"]}
@@ -142,6 +156,7 @@
 {"error_code":"COVE_E_OFFSET_RANGE","expect":"reject","kind":"row_ref","path":"reject/row_ref_truncated.bin","sections":["§54","§75"]}
 {"error_code":"COVE_E_CHECKSUM_MISMATCH","expect":"reject","kind":"covx","path":"reject/covx_header_crc_flipped.covx","sections":["§68","§75"]}
 {"error_code":"COVE_E_CHECKSUM_MISMATCH","expect":"reject","kind":"covm","path":"reject/covm_header_crc_flipped.covm","sections":["§69","§75"]}
+{"error_code":"COVE_E_CHECKSUM_MISMATCH","expect":"reject","kind":"covemap","path":"reject/covemap_header_crc_flipped.covemap","sections":["§70","§75"]}
 {"error_code":"COVE_E_BAD_SECTION","expect":"reject","kind":"metadata_json","path":"reject/metadata_json_invalid.json","sections":["§15","§75"]}
 {"error_code":"COVE_E_BAD_SECTION","expect":"reject","kind":"file_dictionary","path":"reject/file_dictionary_bad_utf8_len.bin","sections":["§16","§17","§75"]}
 {"error_code":"COVE_E_BAD_SECTION","expect":"reject","kind":"file_dictionary","path":"reject/file_dictionary_bad_map_duplicate.bin","sections":["§16","§17","§75"]}
@@ -204,6 +219,11 @@
 {"error_code":"COVE_E_NOT_SELF_CONTAINED","expect":"reject","kind":"error_surface_case","path":"reject/error_surface_not_self_contained.json","sections":["§75"]}
 {"error_code":"COVE_E_REDACTION_POLICY","expect":"reject","kind":"error_surface_case","path":"reject/error_surface_redaction_policy.json","sections":["§75"]}
 {"error_code":"COVE_E_SIDECAR_STALE","expect":"reject","kind":"error_surface_case","path":"reject/error_surface_sidecar_stale.json","sections":["§75"]}
+{"error_code":"COVE_E_MAP_INVALID","expect":"reject","kind":"error_surface_case","path":"reject/error_surface_map_invalid.json","sections":["§75"]}
+{"error_code":"COVE_E_MAP_FUNCTION_UNDECLARED","expect":"reject","kind":"error_surface_case","path":"reject/error_surface_map_function_undeclared.json","sections":["§75"]}
+{"error_code":"COVE_E_MAP_IDENTITY_CONFLICT","expect":"reject","kind":"error_surface_case","path":"reject/error_surface_map_identity_conflict.json","sections":["§75"]}
+{"error_code":"COVE_E_MAP_SOURCE_STALE","expect":"reject","kind":"error_surface_case","path":"reject/error_surface_map_source_stale.json","sections":["§75"]}
+{"error_code":"COVE_E_MAP_EVIDENCE_INVALID","expect":"reject","kind":"error_surface_case","path":"reject/error_surface_map_evidence_invalid.json","sections":["§75"]}
 {"expect":"accept","kind":"suite_contract_case","path":"accept/suite_manifest_contract.json","sections":["§78"]}
 {"expect":"accept","kind":"suite_contract_case","path":"accept/suite_release_gates_contract.json","sections":["§78"]}
 {"expect":"accept","kind":"suite_contract_case","path":"accept/suite_workspace_contract.json","sections":["§78"]}

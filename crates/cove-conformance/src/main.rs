@@ -21,14 +21,18 @@
 
 use std::{borrow::Cow, collections::BTreeSet, path::Path, process};
 
-use serde_json::Value;
+use arrow_array::{Array, BinaryArray, BooleanArray, Int32Array, StringArray, UInt64Array};
+use serde_json::{json, Value};
 
 use cove_core::{
-    artifact::{covm::CovmFile, covx::CovxFile},
+    array::{CoveArrayValue, EncodedArray},
+    artifact::{covemap::CovemapFile, covm::CovmFile, covx::CovxFile},
     checksum,
     collation::CollationRegistry,
     compression::{column_page_payload, encode_page_payload, section_payload},
-    constants::{CompressionCodec, SectionKind},
+    constants::{
+        CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind, SectionKind,
+    },
     dictionary::FileDictionary,
     digest::DigestManifest,
     domain::ColumnDomain,
@@ -60,7 +64,7 @@ use cove_core::{
         topn::TopNSummary,
     },
     interop::{
-        arrow::{arrow_validity_to_cove_null, cove_null_to_arrow_validity},
+        arrow::{arrow_validity_to_cove_null, cove_null_to_arrow_validity, encoded_array_to_arrow},
         lakehouse::LakehouseHints,
         parquet::{
             convert_parquet_bytes, decode_materialized_page_values, ParquetConversionOptions,
@@ -226,12 +230,15 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
             },
         )
         .map(|_| ()),
+        "covemap" => CovemapFile::parse(bytes).map(|_| ()),
         "covx" => CovxFile::parse(bytes).map(|_| ()),
         "covm" => CovmFile::parse(bytes).map(|_| ()),
         "metadata_json" => MetadataJson::parse(bytes).map(|_| ()),
         "encoding_case" => validate_encoding_fixture(bytes),
+        "encoded_array_decode_case" => validate_encoded_array_decode_fixture(bytes),
         "nested_case" => validate_nested_fixture(bytes),
         "arrow_bitmap_case" => validate_arrow_bitmap_fixture(bytes),
+        "arrow_export_case" => validate_arrow_export_fixture(bytes),
         "parquet_conversion_case" => validate_parquet_conversion_fixture(entry, bytes),
         "error_surface_case" => validate_error_surface_fixture(bytes),
         "suite_contract_case" => validate_suite_contract_fixture(corpus, bytes),
@@ -465,6 +472,11 @@ fn synthetic_error_surface_error(code: &str) -> Option<CoveError> {
         "COVE_E_NOT_SELF_CONTAINED" => Some(CoveError::NotSelfContained),
         "COVE_E_REDACTION_POLICY" => Some(CoveError::RedactionPolicy),
         "COVE_E_SIDECAR_STALE" => Some(CoveError::SidecarStale),
+        "COVE_E_MAP_INVALID" => Some(CoveError::MapInvalid),
+        "COVE_E_MAP_FUNCTION_UNDECLARED" => Some(CoveError::MapFunctionUndeclared),
+        "COVE_E_MAP_IDENTITY_CONFLICT" => Some(CoveError::MapIdentityConflict),
+        "COVE_E_MAP_SOURCE_STALE" => Some(CoveError::MapSourceStale),
+        "COVE_E_MAP_EVIDENCE_INVALID" => Some(CoveError::MapEvidenceInvalid),
         _ => None,
     }
 }
@@ -650,6 +662,286 @@ where
         )));
     }
     Ok(())
+}
+
+fn validate_encoded_array_decode_fixture(bytes: &[u8]) -> Result<(), CoveError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|err| {
+        CoveError::BadSection(format!("invalid encoded_array fixture json: {err}"))
+    })?;
+    let fixture = fixture_encoded_array(&value)?;
+    let array = fixture.as_array();
+    let expected = value
+        .get("expect")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CoveError::BadSection("encoded_array fixture missing expect".into()))?;
+    if expected.len() as u64 != array.row_count {
+        return Err(CoveError::BadSection(
+            "encoded_array fixture expect length must match row_count".into(),
+        ));
+    }
+
+    let actual = array
+        .decode_all_rows()?
+        .into_iter()
+        .map(|value| array_value_to_json(array.logical, value))
+        .collect::<Result<Vec<_>, _>>()?;
+    if actual != *expected {
+        return Err(CoveError::BadSection(format!(
+            "encoded_array fixture mismatch: expected {expected:?}, got {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_arrow_export_fixture(bytes: &[u8]) -> Result<(), CoveError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|err| {
+        CoveError::BadSection(format!("invalid arrow export fixture json: {err}"))
+    })?;
+    let fixture = fixture_encoded_array(&value)?;
+    let array = fixture.as_array();
+    let arrow = encoded_array_to_arrow(&array)?;
+    let expected_type = value
+        .get("expect_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoveError::BadSection("arrow export fixture missing expect_type".into()))?;
+    let actual_type = format!("{:?}", arrow.data_type());
+    if actual_type != expected_type {
+        return Err(CoveError::BadSection(format!(
+            "arrow export data type mismatch: expected {expected_type}, got {actual_type}"
+        )));
+    }
+    let expected = value
+        .get("expect")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CoveError::BadSection("arrow export fixture missing expect".into()))?;
+    let actual = arrow_array_to_json(expected_type, arrow.as_ref())?;
+    if actual != *expected {
+        return Err(CoveError::BadSection(format!(
+            "arrow export fixture mismatch: expected {expected:?}, got {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
+struct EncodedArrayFixture {
+    logical: CoveLogicalType,
+    physical: CovePhysicalKind,
+    encoding: CoveEncodingKind,
+    row_count: u64,
+    payload: Vec<u8>,
+}
+
+impl EncodedArrayFixture {
+    fn as_array(&self) -> EncodedArray<'_> {
+        EncodedArray::new(
+            self.logical,
+            self.physical,
+            self.row_count,
+            self.encoding,
+            None,
+            &self.payload,
+            None,
+        )
+    }
+}
+
+fn fixture_encoded_array(value: &Value) -> Result<EncodedArrayFixture, CoveError> {
+    let logical = parse_logical_type(
+        value
+            .get("logical")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoveError::BadSection("array fixture missing logical".into()))?,
+    )?;
+    let physical = parse_physical_kind(
+        value
+            .get("physical")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoveError::BadSection("array fixture missing physical".into()))?,
+    )?;
+    let encoding = parse_encoding_kind(
+        value
+            .get("encoding")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoveError::BadSection("array fixture missing encoding".into()))?,
+    )?;
+    let row_count = value
+        .get("row_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CoveError::BadSection("array fixture missing row_count".into()))?;
+    let payload = value
+        .get("payload")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CoveError::BadSection("array fixture missing payload".into()))?;
+    let payload = payload
+        .iter()
+        .map(|item| {
+            item.as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(|| CoveError::BadSection("array fixture payload must be bytes".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(EncodedArrayFixture {
+        logical,
+        physical,
+        encoding,
+        row_count,
+        payload,
+    })
+}
+
+fn array_value_to_json(
+    logical: CoveLogicalType,
+    value: CoveArrayValue<'_>,
+) -> Result<Value, CoveError> {
+    match value {
+        CoveArrayValue::Null => Ok(Value::Null),
+        CoveArrayValue::ValidityBit(value) | CoveArrayValue::Boolean(value) => Ok(json!(value)),
+        CoveArrayValue::Int64(value) => Ok(json!(value)),
+        CoveArrayValue::NumCode(value) | CoveArrayValue::Varint(value) => Ok(json!(value)),
+        CoveArrayValue::FileCode(value) => Ok(json!(value)),
+        CoveArrayValue::Bytes(bytes) => bytes_value_to_json(logical, bytes),
+        CoveArrayValue::OwnedBytes(bytes) => bytes_value_to_json(logical, &bytes),
+        CoveArrayValue::DictValue(_) => Err(CoveError::BadSection(
+            "array decode conformance fixtures do not use dictionaries".into(),
+        )),
+    }
+}
+
+fn bytes_value_to_json(logical: CoveLogicalType, bytes: &[u8]) -> Result<Value, CoveError> {
+    match logical {
+        CoveLogicalType::Utf8 | CoveLogicalType::Json => Ok(json!(std::str::from_utf8(bytes)
+            .map_err(|err| CoveError::BadSection(format!("invalid UTF-8 value: {err}")))?)),
+        CoveLogicalType::Binary | CoveLogicalType::Uuid => Ok(json!(hex_encode(bytes))),
+        _ => Ok(json!(hex_encode(bytes))),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn arrow_array_to_json(expected_type: &str, array: &dyn Array) -> Result<Vec<Value>, CoveError> {
+    match expected_type {
+        "Boolean" => {
+            let values = downcast_arrow_array::<BooleanArray>(array, expected_type)?;
+            Ok((0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        Value::Null
+                    } else {
+                        json!(values.value(row))
+                    }
+                })
+                .collect())
+        }
+        "Int32" => {
+            let values = downcast_arrow_array::<Int32Array>(array, expected_type)?;
+            Ok((0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        Value::Null
+                    } else {
+                        json!(values.value(row))
+                    }
+                })
+                .collect())
+        }
+        "UInt64" => {
+            let values = downcast_arrow_array::<UInt64Array>(array, expected_type)?;
+            Ok((0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        Value::Null
+                    } else {
+                        json!(values.value(row))
+                    }
+                })
+                .collect())
+        }
+        "Utf8" => {
+            let values = downcast_arrow_array::<StringArray>(array, expected_type)?;
+            Ok((0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        Value::Null
+                    } else {
+                        json!(values.value(row))
+                    }
+                })
+                .collect())
+        }
+        "Binary" => {
+            let values = downcast_arrow_array::<BinaryArray>(array, expected_type)?;
+            Ok((0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        Value::Null
+                    } else {
+                        json!(hex_encode(values.value(row)))
+                    }
+                })
+                .collect())
+        }
+        other => Err(CoveError::BadSection(format!(
+            "unsupported arrow export fixture type {other}"
+        ))),
+    }
+}
+
+fn downcast_arrow_array<'a, T: 'static>(
+    array: &'a dyn Array,
+    expected_type: &str,
+) -> Result<&'a T, CoveError> {
+    array.as_any().downcast_ref::<T>().ok_or_else(|| {
+        CoveError::BadSection(format!(
+            "arrow export fixture expected {expected_type} array"
+        ))
+    })
+}
+
+fn parse_logical_type(value: &str) -> Result<CoveLogicalType, CoveError> {
+    match value {
+        "Bool" => Ok(CoveLogicalType::Bool),
+        "Int32" => Ok(CoveLogicalType::Int32),
+        "Int64" => Ok(CoveLogicalType::Int64),
+        "UInt64" => Ok(CoveLogicalType::UInt64),
+        "Utf8" => Ok(CoveLogicalType::Utf8),
+        "Binary" => Ok(CoveLogicalType::Binary),
+        other => Err(CoveError::BadSection(format!(
+            "unsupported array fixture logical type {other}"
+        ))),
+    }
+}
+
+fn parse_physical_kind(value: &str) -> Result<CovePhysicalKind, CoveError> {
+    match value {
+        "Boolean" => Ok(CovePhysicalKind::Boolean),
+        "FixedBytes" => Ok(CovePhysicalKind::FixedBytes),
+        "NumCode" => Ok(CovePhysicalKind::NumCode),
+        "VarBytes" => Ok(CovePhysicalKind::VarBytes),
+        other => Err(CoveError::BadSection(format!(
+            "unsupported array fixture physical kind {other}"
+        ))),
+    }
+}
+
+fn parse_encoding_kind(value: &str) -> Result<CoveEncodingKind, CoveError> {
+    match value {
+        "PlainFixed" => Ok(CoveEncodingKind::PlainFixed),
+        "NumCode" => Ok(CoveEncodingKind::NumCode),
+        "VarBytes" => Ok(CoveEncodingKind::VarBytes),
+        "Rle" => Ok(CoveEncodingKind::Rle),
+        "LocalCodebook" => Ok(CoveEncodingKind::LocalCodebook),
+        other => Err(CoveError::BadSection(format!(
+            "unsupported array fixture encoding kind {other}"
+        ))),
+    }
 }
 
 fn validate_arrow_bitmap_fixture(bytes: &[u8]) -> Result<(), CoveError> {
@@ -1093,6 +1385,11 @@ fn validate_wire_primitive_fixture(bytes: &[u8]) -> Result<(), CoveError> {
 ///   "page_length_override":         <u64?>,
 ///   "uncompressed_length_override": <u64?>,
 ///   "flags_override":               <u32?>,
+///   "row_count_override":           <u32?>,
+///   "non_null_count_override":      <u32?>,
+///   "null_count_override":          <u32?>,
+///   "encoding_root_override":       <u32?>,
+///   "page_offset_override":         <u64?>,
 ///   // optional wire-byte mutation applied before column_page_payload:
 ///   "truncate_wire_bytes":          <usize?>
 /// }
@@ -1143,15 +1440,35 @@ fn validate_page_codec_fixture(bytes: &[u8]) -> Result<(), CoveError> {
         .and_then(Value::as_u64)
         .map(|raw| raw as u32)
         .unwrap_or(codec as u32);
+    let row_count = value
+        .get("row_count_override")
+        .and_then(Value::as_u64)
+        .unwrap_or(1) as u32;
+    let non_null_count = value
+        .get("non_null_count_override")
+        .and_then(Value::as_u64)
+        .unwrap_or(row_count as u64) as u32;
+    let null_count = value
+        .get("null_count_override")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    let encoding_root = value
+        .get("encoding_root_override")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    let page_offset = value
+        .get("page_offset_override")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
 
     let entry = ColumnPageIndexEntryV1 {
         column_id: 1,
         morsel_id: 0,
-        row_count: 1,
-        non_null_count: 1,
-        null_count: 0,
-        encoding_root: 0,
-        page_offset: 0,
+        row_count,
+        non_null_count,
+        null_count,
+        encoding_root,
+        page_offset,
         page_length,
         uncompressed_length,
         stats_ref: 0,

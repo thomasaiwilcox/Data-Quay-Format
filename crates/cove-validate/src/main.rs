@@ -12,7 +12,7 @@
 //! Usage:
 //! ```text
 //! cove-validate [--semantic] [--verify-digests] [--json] [--explain]
-//!             <file.cove> [<file2.cove> ...]
+//!             <file.cove|file.covemap> [<file2> ...]
 //! ```
 //!
 //! Exit codes:
@@ -22,7 +22,11 @@
 
 use std::{path::Path, process};
 
-use cove_core::reader::{self, ValidationOptions};
+use cove_core::{
+    artifact::covemap::CovemapFile,
+    constants::{PrimaryProfile, MAGIC_COVE, MAGIC_COVEMAP},
+    reader::{self, ValidationOptions},
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -55,7 +59,7 @@ fn main() {
 
     if file_paths.is_empty() {
         eprintln!(
-            "Usage: cove-validate [--semantic] [--verify-digests] [--json] [--explain] <file.cove> [<file2.cove> ...]"
+            "Usage: cove-validate [--semantic] [--verify-digests] [--json] [--explain] <file.cove|file.covemap> [<file2> ...]"
         );
         process::exit(2);
     }
@@ -108,6 +112,17 @@ fn validate_file_json(path: &Path, opts: ValidationOptions, explain: bool) -> bo
             return false;
         }
     };
+
+    if data.len() >= 4 && data[data.len() - 4..] == MAGIC_COVEMAP {
+        return validate_covemap_json(
+            &path_str,
+            &data,
+            opts.semantic,
+            opts.verify_digests,
+            explain,
+        );
+    }
+
     match reader::validate_bytes_with_options(&data, opts) {
         Ok(report) => {
             let info = &report.validated;
@@ -138,6 +153,58 @@ fn validate_file_json(path: &Path, opts: ValidationOptions, explain: bool) -> bo
         }
         Err(error) => {
             print!("{{\"path\":{},\"ok\":false", json_str(&path_str));
+            if let Some(code) = error.spec_code() {
+                print!(",\"error_code\":{}", json_str(code));
+            }
+            print!(",\"error\":{}}}", json_str(&error.to_string()));
+            false
+        }
+    }
+}
+
+fn validate_covemap_json(
+    path_str: &str,
+    data: &[u8],
+    semantic: bool,
+    verify_digests: bool,
+    explain: bool,
+) -> bool {
+    match validate_covemap_bytes(data, semantic) {
+        Ok(file) => {
+            print!(
+                "{{\"path\":{},\"ok\":true,\"artifact\":\"covemap\",\"semantic\":{},\"version_major\":{},\"version_minor\":{},\"mapping_version\":{},\"section_count\":{}",
+                json_str(path_str),
+                semantic,
+                file.header.version_major,
+                file.header.version_minor,
+                json_str(&file.mapping_version),
+                file.sections.len()
+            );
+            if verify_digests {
+                print!(",\"verify_digests_skipped\":true");
+            }
+            if explain {
+                print!(",\"sections\":[");
+                for (index, section) in file.sections.iter().enumerate() {
+                    if index > 0 {
+                        print!(",");
+                    }
+                    print!(
+                        "{{\"kind\":{},\"offset\":{},\"length\":{},\"uncompressed_length\":{},\"required\":{}}}",
+                        section.entry.section_id,
+                        section.entry.offset,
+                        section.entry.length,
+                        section.entry.uncompressed_length,
+                        section.entry.required
+                    );
+                }
+                print!("]");
+            }
+            print!("}}");
+            true
+        }
+        Err(error) => {
+            print!("{{\"path\":{},\"ok\":false", json_str(path_str));
             if let Some(code) = error.spec_code() {
                 print!(",\"error_code\":{}", json_str(code));
             }
@@ -179,6 +246,16 @@ fn validate_file(path: &Path, opts: ValidationOptions) -> bool {
         }
     };
 
+    if data.len() >= 4 && data[data.len() - 4..] == MAGIC_COVEMAP {
+        return validate_covemap_file(&data, opts.semantic, opts.verify_digests);
+    }
+
+    if data.len() < 4 || data[data.len() - 4..] != MAGIC_COVE {
+        println!("INVALID");
+        eprintln!("  [ERR] COVE_E_BAD_MAGIC: unrecognized trailing magic");
+        return false;
+    }
+
     match reader::validate_bytes_with_options(&data, opts) {
         Ok(report) => {
             let mode = if report.semantic_checked {
@@ -219,14 +296,53 @@ fn validate_file(path: &Path, opts: ValidationOptions) -> bool {
     }
 }
 
+fn validate_covemap_bytes(
+    data: &[u8],
+    semantic: bool,
+) -> Result<CovemapFile, cove_core::CoveError> {
+    let file = CovemapFile::parse(data)?;
+    if semantic {
+        file.validate_map_sections()?;
+    }
+    Ok(file)
+}
+
+fn validate_covemap_file(data: &[u8], semantic: bool, verify_digests: bool) -> bool {
+    match validate_covemap_bytes(data, semantic) {
+        Ok(file) => {
+            let mode = if semantic { "semantic" } else { "structural" };
+            println!("OK [{mode}]");
+            println!(
+                "  COVEMAP v{}.{}",
+                file.header.version_major, file.header.version_minor
+            );
+            println!("  file_len        : {} bytes", data.len());
+            println!("  mapping_version : {}", file.mapping_version);
+            println!("  section_count   : {}", file.sections.len());
+            if verify_digests {
+                eprintln!(
+                    "  [NOTE] --verify-digests is not applicable to COVEMAP artifacts (skipped)"
+                );
+            }
+            true
+        }
+        Err(error) => {
+            println!("INVALID");
+            eprintln!("  [ERR] {error}");
+            false
+        }
+    }
+}
+
 fn profile_name(code: u8) -> String {
-    match code {
-        0 => "Mixed/Unknown".into(),
-        1 => "COVE-O (Object Temporal)".into(),
-        2 => "COVE-T (Table Scan)".into(),
-        3 => "COVE-A (Archive Acceleration)".into(),
-        4 => "COVE-E (Engine Execution)".into(),
-        5 => "COVE-H (Harbor Execution)".into(),
-        _ => format!("Unknown({code})"),
+    match PrimaryProfile::from_u8(code) {
+        Some(PrimaryProfile::Mixed) => "Mixed/Unknown".into(),
+        Some(PrimaryProfile::ObjectTemporal) => "COVE-O (Object Temporal)".into(),
+        Some(PrimaryProfile::TableScan) => "COVE-T (Table Scan)".into(),
+        Some(PrimaryProfile::ArchiveAcceleration) => "COVE-A (Archive Acceleration)".into(),
+        Some(PrimaryProfile::EngineExecution) => "COVE-E (Engine Execution)".into(),
+        Some(PrimaryProfile::HarborExecution) => "COVE-H (Harbor Execution)".into(),
+        Some(PrimaryProfile::SemanticMapping) => "COVE-MAP (Semantic Mapping)".into(),
+        None => format!("Unknown({code})"),
     }
 }

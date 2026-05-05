@@ -209,6 +209,18 @@ pub const FEATURE_REGISTRY: &[FeatureInfo] = &[
         spec_section: "Spec §11",
         description: "File uses Zstd-compressed payloads.",
     },
+    FeatureInfo {
+        bit: FEATURE_SEMANTIC_MAP,
+        name: "FEATURE_SEMANTIC_MAP",
+        spec_section: "Spec §11",
+        description: "File or companion artifact contains COVE-MAP mapping, evidence, identity-equivalence, source-conversion, or projection metadata.",
+    },
+    FeatureInfo {
+        bit: FEATURE_PAGE_PAYLOAD_ELISION,
+        name: "FEATURE_PAGE_PAYLOAD_ELISION",
+        spec_section: "Spec §11",
+        description: "File may contain stats-only constant pages or value-stream-elided pages whose reconstruction depends on page flags and validated page-level stats.",
+    },
 ];
 
 /// All section kinds assigned by Spec §14.
@@ -521,6 +533,87 @@ pub const SECTION_REGISTRY: &[SectionInfo] = &[
         required_feature: Some(FEATURE_HARBOR_PROFILE),
         spec_section: "Spec §14",
         description: "Harbor-specific lease/mount hints.",
+    },
+    SectionInfo {
+        kind: SectionKind::MapSourceCatalog,
+        id: 60,
+        wire_name: "MAP_SOURCE_CATALOG",
+        profiles: &[PrimaryProfile::SemanticMapping],
+        required_feature: Some(FEATURE_SEMANTIC_MAP),
+        spec_section: "Spec §14",
+        description: "Source system, file, table, stream declarations and source-load fingerprints.",
+    },
+    SectionInfo {
+        kind: SectionKind::MapFunctionRegistry,
+        id: 61,
+        wire_name: "MAP_FUNCTION_REGISTRY",
+        profiles: &[PrimaryProfile::SemanticMapping],
+        required_feature: Some(FEATURE_SEMANTIC_MAP),
+        spec_section: "Spec §14",
+        description: "Declared deterministic normalisation, canonicalisation, hashing, and derivation functions.",
+    },
+    SectionInfo {
+        kind: SectionKind::MapIdentityRuleCatalog,
+        id: 62,
+        wire_name: "MAP_IDENTITY_RULE_CATALOG",
+        profiles: &[PrimaryProfile::SemanticMapping],
+        required_feature: Some(FEATURE_SEMANTIC_MAP),
+        spec_section: "Spec §14",
+        description: "Object identity, multi-column join-key, confidence-class, merge, and do-not-merge rules.",
+    },
+    SectionInfo {
+        kind: SectionKind::MapRowSemanticsCatalog,
+        id: 63,
+        wire_name: "MAP_ROW_SEMANTICS_CATALOG",
+        profiles: &[PrimaryProfile::SemanticMapping],
+        required_feature: Some(FEATURE_SEMANTIC_MAP),
+        spec_section: "Spec §14",
+        description: "Source row semantics for objects, events, links, associations, composites, dispatch, projection, and evidence-only rules.",
+    },
+    SectionInfo {
+        kind: SectionKind::MapAssertionLog,
+        id: 64,
+        wire_name: "MAP_ASSERTION_LOG",
+        profiles: &[PrimaryProfile::SemanticMapping],
+        required_feature: Some(FEATURE_SEMANTIC_MAP),
+        spec_section: "Spec §14",
+        description: "Optional canonical semantic assertion stream produced by applying mapping rules.",
+    },
+    SectionInfo {
+        kind: SectionKind::MapIdentityEquivalenceIndex,
+        id: 65,
+        wire_name: "MAP_IDENTITY_EQUIVALENCE_INDEX",
+        profiles: &[PrimaryProfile::SemanticMapping],
+        required_feature: Some(FEATURE_SEMANTIC_MAP),
+        spec_section: "Spec §14",
+        description: "Deterministic identity-key to destination-GOID or equivalence-set index.",
+    },
+    SectionInfo {
+        kind: SectionKind::MapEvidenceIndex,
+        id: 66,
+        wire_name: "MAP_EVIDENCE_INDEX",
+        profiles: &[PrimaryProfile::SemanticMapping],
+        required_feature: Some(FEATURE_SEMANTIC_MAP),
+        spec_section: "Spec §14",
+        description: "Source row, rule, digest, and output assertion evidence.",
+    },
+    SectionInfo {
+        kind: SectionKind::MapConversionReport,
+        id: 67,
+        wire_name: "MAP_CONVERSION_REPORT",
+        profiles: &[PrimaryProfile::SemanticMapping],
+        required_feature: Some(FEATURE_SEMANTIC_MAP),
+        spec_section: "Spec §14",
+        description: "Conversion diagnostics, conflicts, candidate matches, rejected rows, and fidelity report.",
+    },
+    SectionInfo {
+        kind: SectionKind::MapProjectionCatalog,
+        id: 68,
+        wire_name: "MAP_PROJECTION_CATALOG",
+        profiles: &[PrimaryProfile::SemanticMapping],
+        required_feature: Some(FEATURE_SEMANTIC_MAP),
+        spec_section: "Spec §14",
+        description: "Object-and-association to table projection definitions and read-surface declarations.",
     },
     SectionInfo {
         kind: SectionKind::VendorExtension,
@@ -1046,7 +1139,7 @@ mod tests {
             assert_eq!(SectionKind::from_u16(info.id), Some(info.kind));
             assert_eq!(info.kind as u16, info.id);
         }
-        assert_eq!(SECTION_REGISTRY.len(), 34);
+        assert_eq!(SECTION_REGISTRY.len(), 43);
         let exact_set = section_info(SectionKind::ExactSetIndex).unwrap();
         assert!(exact_set.profiles.contains(&PrimaryProfile::TableScan));
         assert!(exact_set

@@ -203,7 +203,8 @@ impl LookupIndex {
         let mut rowref_bytes = Vec::new();
         let mut rowref_start = 0u32;
         for entry in &self.entries {
-            let row_count = u32::try_from(entry.rows.len()).map_err(|_| CoveError::ArithOverflow)?;
+            let row_count =
+                u32::try_from(entry.rows.len()).map_err(|_| CoveError::ArithOverflow)?;
             entry_bytes.extend_from_slice(&entry.key.to_le_bytes());
             entry_bytes.extend_from_slice(&rowref_start.to_le_bytes());
             entry_bytes.extend_from_slice(&row_count.to_le_bytes());
@@ -217,11 +218,13 @@ impl LookupIndex {
         let mut header = self.header.clone();
         header.entry_count = self.entries.len() as u64;
         header.entries_offset = LOOKUP_INDEX_HEADER_LEN as u64;
-        header.entries_length = u64::try_from(entry_bytes.len()).map_err(|_| CoveError::ArithOverflow)?;
+        header.entries_length =
+            u64::try_from(entry_bytes.len()).map_err(|_| CoveError::ArithOverflow)?;
         header.rowref_offset = (LOOKUP_INDEX_HEADER_LEN as u64)
             .checked_add(header.entries_length)
             .ok_or(CoveError::ArithOverflow)?;
-        header.rowref_length = u64::try_from(rowref_bytes.len()).map_err(|_| CoveError::ArithOverflow)?;
+        header.rowref_length =
+            u64::try_from(rowref_bytes.len()).map_err(|_| CoveError::ArithOverflow)?;
         let mut out = header.serialize().to_vec();
         out.extend_from_slice(&entry_bytes);
         out.extend_from_slice(&rowref_bytes);

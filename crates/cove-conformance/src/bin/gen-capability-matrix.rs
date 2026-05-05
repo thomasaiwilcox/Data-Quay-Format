@@ -314,13 +314,13 @@ fn rows() -> Vec<Row> {
         },
         Row {
             section: "§49",
-            capability: "Arrow null↔validity inversion",
+            capability: "Arrow interop and export",
             modeled: "yes",
             parsed: "n/a",
             validated: "yes",
-            written: "n/a",
+            written: "yes",
             corpus: "yes",
-            notes: "interop/arrow.rs plus arrow_bitmap_case accept/reject corpus",
+            notes: "interop/arrow.rs covers null↔validity inversion plus EncodedArray-to-Arrow scalar/export helpers; arrow_bitmap_case and arrow_export_case corpus cover both surfaces",
         },
         Row {
             section: "§50",
@@ -340,7 +340,7 @@ fn rows() -> Vec<Row> {
             validated: "yes",
             written: "yes",
             corpus: "yes",
-            notes: "interop/parquet.rs now converts primitive/temporal/utf8/binary parquet batches into COVE-T scan-profile files with machine-readable reports; parquet_conversion_case corpus covers accept plus null/nested reject cases",
+            notes: "interop/parquet.rs plus cove-convert-parquet CLI convert primitive/temporal/utf8/binary parquet batches into COVE-T scan-profile files with machine-readable reports; parquet_conversion_case corpus covers accept plus null/nested reject cases",
         },
         Row {
             section: "§52",
@@ -483,6 +483,16 @@ fn rows() -> Vec<Row> {
             notes: "artifact/covm.rs; accept/reject manifest corpus; `CovmFile::serialize` round-trips with parser",
         },
         Row {
+            section: "§70",
+            capability: "COVEMAP artifact framing",
+            modeled: "yes",
+            parsed: "yes",
+            validated: "yes",
+            written: "yes",
+            corpus: "yes",
+            notes: "artifact/covemap.rs; accept/reject artifact corpus; `CovemapFile::serialize` round-trips with parser",
+        },
+        Row {
             section: "§71",
             capability: "Writer profiles",
             modeled: "yes",
@@ -530,7 +540,7 @@ fn rows() -> Vec<Row> {
             validated: "yes",
             written: "yes",
             corpus: "yes",
-            notes: "suite_contract_case corpus, CLI smoke tests, release-gate bench smoke, and deterministic robustness harness",
+            notes: "suite_contract_case corpus, CLI smoke tests including cove-convert-parquet, release-gate bench/conformance smoke, and deterministic robustness harness",
         },
     ]
 }

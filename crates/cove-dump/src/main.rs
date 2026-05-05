@@ -1,16 +1,22 @@
 use std::{fs, path::Path, process};
 
 use cove_core::{
-    constants::{SectionKind, StorageClass, FEATURE_FILE_DICTIONARY},
+    compression,
+    constants::{
+        CoveLogicalType, CovePhysicalKind, SectionKind, StorageClass, FEATURE_FILE_DICTIONARY,
+    },
     dictionary::FileDictionary,
+    page::ColumnPageIndex,
     reader::{self, ValidationOptions},
+    segment::TableSegmentPayloadV1,
+    table::TableCatalog,
 };
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: cove-dump <file.cove> [--metadata | --section <id> | --dictionary | --dictionary-entry <code>] [--max-bytes <n>]"
+            "Usage: cove-dump <file.cove> [--metadata | --section <id> | --pages | --stats | --indexes | --nested | --dictionary | --dictionary-entry <code>] [--max-bytes <n>]"
         );
         process::exit(2);
     }
@@ -38,6 +44,10 @@ fn main() {
                 mode = DumpMode::Section(id);
                 i += 1;
             }
+            "--pages" => mode = DumpMode::Pages,
+            "--stats" => mode = DumpMode::Stats,
+            "--indexes" => mode = DumpMode::Indexes,
+            "--nested" => mode = DumpMode::Nested,
             "--dictionary" => mode = DumpMode::Dictionary,
             "--dictionary-entry" => {
                 if i + 1 >= args.len() {
@@ -85,6 +95,10 @@ fn main() {
 enum DumpMode {
     Metadata,
     Section(u32),
+    Pages,
+    Stats,
+    Indexes,
+    Nested,
     Dictionary,
     DictionaryEntry(u64),
 }
@@ -136,6 +150,61 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                 }
                 _ => unreachable!(),
             }
+        }
+        DumpMode::Pages => {
+            let opts = ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+            };
+            let report = reader::validate_bytes_with_options(&data, opts)
+                .map_err(|e| format!("validation: {e}"))?;
+            dump_pages(&data, &report.validated, max_bytes)?;
+        }
+        DumpMode::Stats => {
+            let parsed = reader::validate_bytes(&data).map_err(|e| format!("validation: {e}"))?;
+            dump_section_group(
+                &data,
+                &parsed,
+                "stats",
+                &[
+                    SectionKind::ZoneStats,
+                    SectionKind::AggregateSynopsis,
+                    SectionKind::TopNZoneSummary,
+                ],
+                max_bytes,
+            )?;
+        }
+        DumpMode::Indexes => {
+            let parsed = reader::validate_bytes(&data).map_err(|e| format!("validation: {e}"))?;
+            dump_section_group(
+                &data,
+                &parsed,
+                "indexes",
+                &[
+                    SectionKind::ColumnDomain,
+                    SectionKind::ExactSetIndex,
+                    SectionKind::BloomIndex,
+                    SectionKind::InvertedMorselIndex,
+                    SectionKind::LookupIndex,
+                    SectionKind::CompositeZoneIndex,
+                    SectionKind::TopNZoneSummary,
+                    SectionKind::TemporalBloomIndex,
+                    SectionKind::MapIdentityEquivalenceIndex,
+                    SectionKind::MapEvidenceIndex,
+                ],
+                max_bytes,
+            )?;
+        }
+        DumpMode::Nested => {
+            let opts = ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+            };
+            let report = reader::validate_bytes_with_options(&data, opts)
+                .map_err(|e| format!("validation: {e}"))?;
+            dump_nested_layout(&data, &report.validated)?;
         }
         DumpMode::Dictionary => {
             let opts = ValidationOptions {
@@ -207,6 +276,175 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
     Ok(())
 }
 
+fn dump_pages(
+    data: &[u8],
+    validated: &cove_core::reader::ValidatedCoveFile,
+    max_bytes: usize,
+) -> Result<(), String> {
+    let segments = validated
+        .footer
+        .sections
+        .iter()
+        .filter(|s| s.section_kind == SectionKind::TableSegmentData as u16)
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        println!("(no table segment data sections)");
+        return Ok(());
+    }
+
+    for section in segments {
+        let segment_bytes = compression::section_payload(data, section)
+            .map_err(|e| format!("section payload: {e}"))?;
+        let segment = TableSegmentPayloadV1::parse(segment_bytes.as_ref())
+            .map_err(|e| format!("segment parse: {e}"))?;
+        println!(
+            "segment section_id={} table={} segment={} rows={} columns={}",
+            section.section_id,
+            segment.header.table_id,
+            segment.header.segment_id,
+            segment.header.row_count,
+            segment.columns.len()
+        );
+        for column in &segment.columns {
+            let start = column.page_index_offset as usize;
+            let end = column
+                .page_index_offset
+                .checked_add(column.page_index_length)
+                .ok_or_else(|| "page index offset overflow".to_string())?
+                as usize;
+            let page_index = ColumnPageIndex::parse(&segment_bytes[start..end])
+                .map_err(|e| format!("page index parse: {e}"))?;
+            for (page_idx, page) in page_index.entries.iter().enumerate() {
+                println!(
+                    "  column={} logical={:?} physical={:?} page={} morsel={} rows={} non_null={} nulls={} encoding={} offset={} len={} raw_len={} flags=0x{:08x}",
+                    column.column_id,
+                    column.logical_type,
+                    column.physical_kind,
+                    page_idx,
+                    page.morsel_id,
+                    page.row_count,
+                    page.non_null_count,
+                    page.null_count,
+                    page.encoding_root,
+                    page.page_offset,
+                    page.page_length,
+                    page.uncompressed_length,
+                    page.flags,
+                );
+                if page.page_length != 0 && max_bytes != 0 {
+                    let start = page.page_offset as usize;
+                    let end = page
+                        .page_offset
+                        .checked_add(page.page_length)
+                        .ok_or_else(|| "page payload offset overflow".to_string())?
+                        as usize;
+                    let payload =
+                        compression::column_page_payload(&segment_bytes[start..end], page)
+                            .map_err(|e| format!("page payload: {e}"))?;
+                    let shown = payload.len().min(max_bytes);
+                    println!("    payload_len={} showing={} bytes", payload.len(), shown);
+                    print_hex(&payload[..shown]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dump_section_group(
+    data: &[u8],
+    validated: &cove_core::reader::ValidatedCoveFile,
+    label: &str,
+    kinds: &[SectionKind],
+    max_bytes: usize,
+) -> Result<(), String> {
+    let sections = validated
+        .footer
+        .sections
+        .iter()
+        .filter(|section| {
+            kinds
+                .iter()
+                .any(|kind| section.section_kind == *kind as u16)
+        })
+        .collect::<Vec<_>>();
+    if sections.is_empty() {
+        println!("(no {label} sections)");
+        return Ok(());
+    }
+    for section in sections {
+        let payload = compression::section_payload(data, section)
+            .map_err(|e| format!("section payload: {e}"))?;
+        let shown = payload.len().min(max_bytes);
+        println!(
+            "{} section_id={} kind={} len={} raw_len={} rows={} items={} showing={} bytes",
+            label,
+            section.section_id,
+            section_kind_name(section.section_kind),
+            payload.len(),
+            section.length,
+            section.row_count,
+            section.item_count,
+            shown
+        );
+        print_hex(&payload[..shown]);
+    }
+    Ok(())
+}
+
+fn dump_nested_layout(
+    data: &[u8],
+    validated: &cove_core::reader::ValidatedCoveFile,
+) -> Result<(), String> {
+    let catalog_entry = validated
+        .footer
+        .sections
+        .iter()
+        .find(|s| s.section_kind == SectionKind::TableCatalog as u16);
+    let Some(catalog_entry) = catalog_entry else {
+        println!("(no table catalog section)");
+        return Ok(());
+    };
+    let catalog_bytes = compression::section_payload(data, catalog_entry)
+        .map_err(|e| format!("table catalog payload: {e}"))?;
+    let catalog = TableCatalog::parse(catalog_bytes.as_ref())
+        .map_err(|e| format!("table catalog parse: {e}"))?;
+    let mut found = false;
+    for table in &catalog.tables {
+        for column in &table.columns {
+            if is_nested(column.logical, column.physical) {
+                found = true;
+                println!(
+                    "table={} column={} name={} logical={:?} physical={:?} nullable={} flags=0x{:08x}",
+                    table.table_id,
+                    column.column_id,
+                    column.name,
+                    column.logical,
+                    column.physical,
+                    column.nullable,
+                    column.flags,
+                );
+            }
+        }
+    }
+    if !found {
+        println!("(no nested columns)");
+    }
+    Ok(())
+}
+
+fn is_nested(logical: CoveLogicalType, physical: CovePhysicalKind) -> bool {
+    matches!(
+        (logical, physical),
+        (CoveLogicalType::List, _)
+            | (CoveLogicalType::Struct, _)
+            | (CoveLogicalType::Map, _)
+            | (_, CovePhysicalKind::List)
+            | (_, CovePhysicalKind::Struct)
+            | (_, CovePhysicalKind::Map)
+    )
+}
+
 fn parse_dictionary(
     data: &[u8],
     validated: &cove_core::reader::ValidatedCoveFile,
@@ -244,4 +482,10 @@ fn print_hex(bytes: &[u8]) {
         }
         println!();
     }
+}
+
+fn section_kind_name(kind: u16) -> String {
+    SectionKind::from_u16(kind)
+        .map(|kind| format!("{kind:?}"))
+        .unwrap_or_else(|| format!("Unknown({kind})"))
 }

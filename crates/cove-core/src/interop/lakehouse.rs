@@ -105,13 +105,15 @@ impl LakehouseHints {
         out.extend_from_slice(&(self.partition_values.len() as u32).to_le_bytes());
         for (k, v) in &self.partition_values {
             let kb = k.as_bytes();
-            let key_len = u16::try_from(kb.len())
-                .map_err(|_| CoveError::BadSection("lakehouse partition key exceeds u16 length limit".into()))?;
+            let key_len = u16::try_from(kb.len()).map_err(|_| {
+                CoveError::BadSection("lakehouse partition key exceeds u16 length limit".into())
+            })?;
             out.extend_from_slice(&key_len.to_le_bytes());
             out.extend_from_slice(kb);
             let vb = v.as_bytes();
-            let value_len = u16::try_from(vb.len())
-                .map_err(|_| CoveError::BadSection("lakehouse partition value exceeds u16 length limit".into()))?;
+            let value_len = u16::try_from(vb.len()).map_err(|_| {
+                CoveError::BadSection("lakehouse partition value exceeds u16 length limit".into())
+            })?;
             out.extend_from_slice(&value_len.to_le_bytes());
             out.extend_from_slice(vb);
         }

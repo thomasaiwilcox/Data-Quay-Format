@@ -46,10 +46,7 @@ impl RedactionManifest {
         }
         let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
         let mut pos = 4usize;
-        let max_entries_by_min_size = bytes
-            .len()
-            .saturating_sub(4)
-            / Self::MIN_ENTRY_LEN;
+        let max_entries_by_min_size = bytes.len().saturating_sub(4) / Self::MIN_ENTRY_LEN;
         let mut entries = Vec::with_capacity(count.min(max_entries_by_min_size));
         for _ in 0..count {
             if pos + 8 + 4 + 8 + 2 > bytes.len() {

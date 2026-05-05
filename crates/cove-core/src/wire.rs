@@ -2,9 +2,8 @@
 
 use crate::CoveError;
 
-/// Encodes an unsigned `u64` as LEB128 bytes.
-pub fn encode_u64_leb128(mut value: u64) -> Vec<u8> {
-    let mut out = Vec::new();
+/// Appends an unsigned `u64` as LEB128 bytes.
+pub fn append_u64_leb128(out: &mut Vec<u8>, mut value: u64) {
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
@@ -16,6 +15,12 @@ pub fn encode_u64_leb128(mut value: u64) -> Vec<u8> {
             break;
         }
     }
+}
+
+/// Encodes an unsigned `u64` as LEB128 bytes.
+pub fn encode_u64_leb128(value: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10);
+    append_u64_leb128(&mut out, value);
     out
 }
 
@@ -136,6 +141,17 @@ mod tests {
             let (decoded, consumed) = decode_u64_leb128(&encoded).unwrap();
             assert_eq!(decoded, v);
             assert_eq!(consumed, encoded.len());
+        }
+    }
+
+    #[test]
+    fn append_varint_matches_allocating_helper() {
+        let values = [0u64, 1, 127, 128, 255, 300, u64::MAX];
+        let mut appended = Vec::new();
+        for value in values {
+            let start = appended.len();
+            append_u64_leb128(&mut appended, value);
+            assert_eq!(&appended[start..], encode_u64_leb128(value));
         }
     }
 

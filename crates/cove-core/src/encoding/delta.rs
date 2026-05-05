@@ -38,7 +38,7 @@ impl DeltaPayload {
         out.extend_from_slice(&self.base.to_le_bytes());
         out.extend_from_slice(&(self.deltas.len() as u32).to_le_bytes());
         for d in &self.deltas {
-            out.extend_from_slice(&wire::encode_u64_leb128(wire::zigzag_encode_i64(*d)));
+            wire::append_u64_leb128(&mut out, wire::zigzag_encode_i64(*d));
         }
         out
     }
