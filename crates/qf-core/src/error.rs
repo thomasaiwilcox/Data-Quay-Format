@@ -140,11 +140,87 @@ impl fmt::Display for QfError {
                 f,
                 "QF_E_SIDECAR_STALE: QFX/QFM sidecar does not match QF file"
             ),
-            QfError::BufferTooShort => write!(f, "buffer too short to parse structure"),
-            QfError::ReservedNotZero => write!(f, "reserved field is non-zero"),
+            QfError::BufferTooShort => {
+                write!(f, "QF_E_OFFSET_RANGE: buffer too short to parse structure")
+            }
+            QfError::ReservedNotZero => write!(f, "QF_E_BAD_SECTION: reserved field is non-zero"),
             QfError::Io(s) => write!(f, "I/O error: {s}"),
             QfError::UnsupportedEncoding(s) => write!(f, "QF_E_UNSUPPORTED_ENCODING: {s}"),
         }
+    }
+}
+
+impl QfError {
+    /// Return the closest Spec §75 error code for this error.
+    ///
+    /// Some implementation-level errors such as [`QfError::BufferTooShort`] and
+    /// [`QfError::ReservedNotZero`] are normalized to their Spec §75 structural
+    /// category so callers can report stable conformance diagnostics.
+    pub fn spec_code(&self) -> Option<&'static str> {
+        match self {
+            QfError::BadMagic => Some("QF_E_BAD_MAGIC"),
+            QfError::BadVersion => Some("QF_E_BAD_VERSION"),
+            QfError::UnknownRequiredFeature(_) => Some("QF_E_UNKNOWN_REQUIRED_FEATURE"),
+            QfError::ChecksumMismatch => Some("QF_E_CHECKSUM_MISMATCH"),
+            QfError::DigestMismatch => Some("QF_E_DIGEST_MISMATCH"),
+            QfError::OffsetRange | QfError::BufferTooShort => Some("QF_E_OFFSET_RANGE"),
+            QfError::ArithOverflow => Some("QF_E_ARITH_OVERFLOW"),
+            QfError::BadSection(_) | QfError::ReservedNotZero => Some("QF_E_BAD_SECTION"),
+            QfError::BadSchema(_) => Some("QF_E_BAD_SCHEMA"),
+            QfError::BadLogicalPhysicalPair => Some("QF_E_BAD_LOGICAL_PHYSICAL_PAIR"),
+            QfError::DictMiss => Some("QF_E_DICT_MISS"),
+            QfError::BadFileCode => Some("QF_E_BAD_FILECODE"),
+            QfError::BadNumCode => Some("QF_E_BAD_NUMCODE"),
+            QfError::BadDomain => Some("QF_E_BAD_DOMAIN"),
+            QfError::BadStats => Some("QF_E_BAD_STATS"),
+            QfError::BadIndex => Some("QF_E_BAD_INDEX"),
+            QfError::BadExtension => Some("QF_E_BAD_EXTENSION"),
+            QfError::BadEngineProfile => Some("QF_E_BAD_ENGINE_PROFILE"),
+            QfError::ExecutionCodeMap => Some("QF_E_EXECUTION_CODE_MAP"),
+            QfError::HarborMountLease => Some("QF_E_HARBOR_MOUNT_LEASE"),
+            QfError::RefInvalid => Some("QF_E_REF_INVALID"),
+            QfError::NotSelfContained => Some("QF_E_NOT_SELF_CONTAINED"),
+            QfError::SegmentCorrupt => Some("QF_E_SEGMENT_CORRUPT"),
+            QfError::PageCorrupt => Some("QF_E_PAGE_CORRUPT"),
+            QfError::RedactionPolicy => Some("QF_E_REDACTION_POLICY"),
+            QfError::SidecarStale => Some("QF_E_SIDECAR_STALE"),
+            QfError::Io(_) | QfError::UnsupportedEncoding(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spec_75_errors_expose_stable_codes() {
+        assert_eq!(QfError::BadMagic.spec_code(), Some("QF_E_BAD_MAGIC"));
+        assert_eq!(
+            QfError::UnknownRequiredFeature(1).spec_code(),
+            Some("QF_E_UNKNOWN_REQUIRED_FEATURE")
+        );
+        assert_eq!(
+            QfError::BufferTooShort.spec_code(),
+            Some("QF_E_OFFSET_RANGE")
+        );
+        assert_eq!(
+            QfError::ReservedNotZero.spec_code(),
+            Some("QF_E_BAD_SECTION")
+        );
+        assert_eq!(QfError::Io("disk".into()).spec_code(), None);
+    }
+
+    #[test]
+    fn normalized_structural_errors_render_with_spec_codes() {
+        assert_eq!(
+            QfError::BufferTooShort.to_string(),
+            "QF_E_OFFSET_RANGE: buffer too short to parse structure"
+        );
+        assert_eq!(
+            QfError::ReservedNotZero.to_string(),
+            "QF_E_BAD_SECTION: reserved field is non-zero"
+        );
     }
 }
 

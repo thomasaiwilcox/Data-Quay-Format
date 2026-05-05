@@ -1,0 +1,8 @@
+[package]
+name = "qf-conformance"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+qf-core = { path = "../qf-core" }
+serde_json = "1"

@@ -46,10 +46,37 @@ QF is designed to help engines:
 ## Repository contents
 
 - `Spec.md`: the main Quay Format specification
-- `crates/qf-core`: core format primitives and a minimal writer
-- `crates/qf-validate`: validates QF files (headers, footers, section CRCs, and feature consistency)
+- `crates/qf-core`: core format primitives, staged validation, a minimal writer, and an early QF-T scan-profile writer surface
+- `crates/qf-validate`: validates QF files (headers, footers, section CRCs, feature consistency, and optional semantic/profile checks)
 - `crates/qf-inspect`: prints a readable layout summary for QF files
 - `crates/qf-dump`: dumps metadata or section bytes as hex for debugging
+- `conformance`: generated capability matrix plus whole-file, artifact, and parser-focused accept/reject fixtures
+
+## Implementation status
+
+The repository tracks support with evidence, not a single yes/no claim. See
+[`conformance/capability_matrix.md`](./conformance/capability_matrix.md) for
+the current status of each spec area across these columns:
+
+- modeled: a type, enum, helper, or design scaffold exists
+- parsed: the wire form is read from bytes
+- validated: structural or semantic invariants are enforced
+- written: a writer can emit the structure
+- corpus: conformance fixtures exercise the behavior through the runner
+
+Some areas are intentionally marked as partial or scaffold-only. In particular,
+Parquet conversion is currently a design surface, not a working converter, and
+higher writer profiles still need full writer-emitted page-payload coverage
+before they should be described as complete.
+
+Before making or publishing compliance claims, run the release gate:
+
+```sh
+sh scripts/release-gates.sh
+```
+
+The gate checks formatting, the workspace tests, generated-corpus freshness,
+capability-matrix freshness, and the full conformance corpus.
 
 ## Read the spec
 

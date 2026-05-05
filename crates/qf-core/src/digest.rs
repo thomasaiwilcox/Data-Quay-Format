@@ -1,20 +1,25 @@
-//! Quay Format (QF) v1.0 — Digest manifest skeleton.
+//! Quay Format (QF) v1.0 — Digest manifest (Spec §65).
+//!
+//! Digest manifests bind cryptographic hashes to sections, pages, the whole
+//! file, or custom targets. Validation is policy-aware: a missing digest entry
+//! for a target is _not_ an error (digests are optional), but a present entry
+//! that fails verification is reported as [`QfError::DigestMismatch`].
 
 use crate::{constants::DigestAlgorithm, QfError};
 
-/// A single section digest entry.
-#[derive(Debug, Clone, PartialEq)]
+/// A single digest entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DigestEntry {
     /// Section ID this digest covers.
     pub section_id: u32,
     /// Algorithm used.
     pub algorithm: DigestAlgorithm,
-    /// Digest bytes (up to 32 bytes for SHA-256 / Blake3).
+    /// Digest bytes (32 bytes for SHA-256 / BLAKE3).
     pub digest: Vec<u8>,
 }
 
 /// A parsed digest manifest.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DigestManifest {
     /// All digest entries.
     pub entries: Vec<DigestEntry>,
@@ -24,7 +29,8 @@ impl DigestManifest {
     /// Parse a digest manifest from raw section bytes.
     ///
     /// Wire format: `u32` LE entry count, then entries of:
-    /// `u32` LE `section_id`, `u16` LE `algorithm`, `u16` LE `digest_len`, digest bytes.
+    /// `u32` LE `section_id`, `u16` LE `algorithm`, `u16` LE `digest_len`,
+    /// `digest_len` digest bytes.
     pub fn parse(bytes: &[u8]) -> Result<Self, QfError> {
         if bytes.len() < 4 {
             return Err(QfError::BufferTooShort);
@@ -34,37 +40,44 @@ impl DigestManifest {
         let mut entries = Vec::with_capacity(entry_count as usize);
 
         for _ in 0..entry_count {
-            // u32 section_id
             if pos.checked_add(4).ok_or(QfError::ArithOverflow)? > bytes.len() {
                 return Err(QfError::BufferTooShort);
             }
             let section_id = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
-            pos = pos.checked_add(4).ok_or(QfError::ArithOverflow)?;
+            pos += 4;
 
-            // u16 algorithm
             if pos.checked_add(2).ok_or(QfError::ArithOverflow)? > bytes.len() {
                 return Err(QfError::BufferTooShort);
             }
             let alg_raw = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
-            pos = pos.checked_add(2).ok_or(QfError::ArithOverflow)?;
+            pos += 2;
             let algorithm = DigestAlgorithm::from_u16(alg_raw).ok_or_else(|| {
                 QfError::BadSection(format!("unknown digest algorithm {alg_raw}"))
             })?;
 
-            // u16 digest_len
             if pos.checked_add(2).ok_or(QfError::ArithOverflow)? > bytes.len() {
                 return Err(QfError::BufferTooShort);
             }
             let digest_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
-            pos = pos.checked_add(2).ok_or(QfError::ArithOverflow)?;
+            pos += 2;
 
-            // digest bytes
             let digest_end = pos.checked_add(digest_len).ok_or(QfError::ArithOverflow)?;
             if digest_end > bytes.len() {
                 return Err(QfError::BufferTooShort);
             }
             let digest = bytes[pos..digest_end].to_vec();
             pos = digest_end;
+
+            // Length sanity check per Spec §65: SHA-256 and BLAKE3 always emit 32 bytes.
+            match algorithm {
+                DigestAlgorithm::Sha256 | DigestAlgorithm::Blake3 if digest.len() != 32 => {
+                    return Err(QfError::BadSection(format!(
+                        "digest for algorithm {algorithm:?} must be 32 bytes, got {}",
+                        digest.len()
+                    )));
+                }
+                _ => {}
+            }
 
             entries.push(DigestEntry {
                 section_id,
@@ -76,26 +89,70 @@ impl DigestManifest {
         Ok(Self { entries })
     }
 
-    /// Verify a section's digest.
-    ///
-    /// - [`DigestAlgorithm::None`]: always returns `Ok(())`.
-    /// - [`DigestAlgorithm::Sha256`]: returns [`QfError::UnsupportedEncoding`] (feature not built).
-    /// - [`DigestAlgorithm::Blake3`]: returns [`QfError::UnsupportedEncoding`] (feature not built).
-    pub fn verify_section(&self, section_id: u32, _section_bytes: &[u8]) -> Result<(), QfError> {
+    /// Verify a section's digest. Returns `Ok(())` if no entry exists for the
+    /// section (digests are optional per Spec §65); returns
+    /// [`QfError::DigestMismatch`] if a present entry fails.
+    pub fn verify_section(&self, section_id: u32, section_bytes: &[u8]) -> Result<(), QfError> {
         let entry = match self.entries.iter().find(|e| e.section_id == section_id) {
             Some(e) => e,
             None => return Ok(()),
         };
-        match entry.algorithm {
-            DigestAlgorithm::None => Ok(()),
-            DigestAlgorithm::Sha256 => Err(QfError::UnsupportedEncoding(
-                "SHA-256 digest verification requires the sha2 crate feature".into(),
-            )),
-            DigestAlgorithm::Blake3 => Err(QfError::UnsupportedEncoding(
-                "Blake3 digest verification requires the blake3 crate feature".into(),
-            )),
+        verify_digest(entry.algorithm, section_bytes, &entry.digest)
+    }
+}
+
+/// Compute the digest of `data` under `algorithm`. Algorithms that are not
+/// compiled in return [`QfError::UnsupportedEncoding`].
+pub fn compute_digest(algorithm: DigestAlgorithm, data: &[u8]) -> Result<Vec<u8>, QfError> {
+    match algorithm {
+        DigestAlgorithm::None => Ok(Vec::new()),
+        DigestAlgorithm::Sha256 => sha256_digest(data),
+        DigestAlgorithm::Blake3 => blake3_digest(data),
+    }
+}
+
+/// Verify that `data` hashes to `expected` under `algorithm`.
+pub fn verify_digest(
+    algorithm: DigestAlgorithm,
+    data: &[u8],
+    expected: &[u8],
+) -> Result<(), QfError> {
+    match algorithm {
+        DigestAlgorithm::None => Ok(()),
+        DigestAlgorithm::Sha256 | DigestAlgorithm::Blake3 => {
+            let actual = compute_digest(algorithm, data)?;
+            if actual.as_slice() == expected {
+                Ok(())
+            } else {
+                Err(QfError::DigestMismatch)
+            }
         }
     }
+}
+
+#[cfg(feature = "digest-sha2")]
+fn sha256_digest(data: &[u8]) -> Result<Vec<u8>, QfError> {
+    use sha2::{Digest, Sha256};
+    Ok(Sha256::digest(data).to_vec())
+}
+
+#[cfg(not(feature = "digest-sha2"))]
+fn sha256_digest(_data: &[u8]) -> Result<Vec<u8>, QfError> {
+    Err(QfError::UnsupportedEncoding(
+        "SHA-256 not enabled (build with feature `digest-sha2`)".into(),
+    ))
+}
+
+#[cfg(feature = "digest-blake3")]
+fn blake3_digest(data: &[u8]) -> Result<Vec<u8>, QfError> {
+    Ok(blake3::hash(data).as_bytes().to_vec())
+}
+
+#[cfg(not(feature = "digest-blake3"))]
+fn blake3_digest(_data: &[u8]) -> Result<Vec<u8>, QfError> {
+    Err(QfError::UnsupportedEncoding(
+        "BLAKE3 not enabled (build with feature `digest-blake3`)".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -115,40 +172,68 @@ mod tests {
 
     #[test]
     fn empty_manifest_parses() {
-        let bytes = make_manifest_bytes(&[]);
-        let m = DigestManifest::parse(&bytes).unwrap();
+        let m = DigestManifest::parse(&make_manifest_bytes(&[])).unwrap();
         assert_eq!(m.entries.len(), 0);
     }
 
     #[test]
-    fn parse_manifest_with_entries() {
-        let bytes = make_manifest_bytes(&[(42, 0, b"")]);
-        let m = DigestManifest::parse(&bytes).unwrap();
-        assert_eq!(m.entries.len(), 1);
+    fn parse_manifest_with_none_entry() {
+        let m = DigestManifest::parse(&make_manifest_bytes(&[(42, 0, b"")])).unwrap();
         assert_eq!(m.entries[0].section_id, 42);
         assert_eq!(m.entries[0].algorithm, DigestAlgorithm::None);
     }
 
     #[test]
-    fn verify_none_algorithm_always_passes() {
-        let bytes = make_manifest_bytes(&[(1, 0, b"")]);
-        let m = DigestManifest::parse(&bytes).unwrap();
-        assert!(m.verify_section(1, b"anything").is_ok());
-    }
-
-    #[test]
-    fn verify_sha256_returns_unsupported() {
-        let bytes = make_manifest_bytes(&[(1, 1, &[0u8; 32])]);
-        let m = DigestManifest::parse(&bytes).unwrap();
-        assert!(matches!(
-            m.verify_section(1, b"data"),
-            Err(QfError::UnsupportedEncoding(_))
-        ));
-    }
-
-    #[test]
     fn truncated_manifest_rejected() {
-        let bytes = 1u32.to_le_bytes().to_vec(); // declares 1 entry but has no entry data
+        let bytes = 1u32.to_le_bytes().to_vec();
         assert_eq!(DigestManifest::parse(&bytes), Err(QfError::BufferTooShort));
+    }
+
+    #[test]
+    fn missing_entry_is_not_an_error() {
+        let m = DigestManifest::default();
+        assert!(m.verify_section(7, b"anything").is_ok());
+    }
+
+    #[cfg(feature = "digest-sha2")]
+    #[test]
+    fn sha256_round_trip_verifies() {
+        let payload = b"Quay Format showcase";
+        let digest = compute_digest(DigestAlgorithm::Sha256, payload).unwrap();
+        let bytes = make_manifest_bytes(&[(5, 1, &digest)]);
+        let m = DigestManifest::parse(&bytes).unwrap();
+        assert!(m.verify_section(5, payload).is_ok());
+    }
+
+    #[cfg(feature = "digest-sha2")]
+    #[test]
+    fn sha256_mismatch_reports_digest_mismatch() {
+        let digest = compute_digest(DigestAlgorithm::Sha256, b"original").unwrap();
+        let bytes = make_manifest_bytes(&[(5, 1, &digest)]);
+        let m = DigestManifest::parse(&bytes).unwrap();
+        assert_eq!(
+            m.verify_section(5, b"tampered"),
+            Err(QfError::DigestMismatch)
+        );
+    }
+
+    #[cfg(feature = "digest-blake3")]
+    #[test]
+    fn blake3_round_trip_verifies() {
+        let payload = b"Quay Format showcase";
+        let digest = compute_digest(DigestAlgorithm::Blake3, payload).unwrap();
+        let bytes = make_manifest_bytes(&[(5, 2, &digest)]);
+        let m = DigestManifest::parse(&bytes).unwrap();
+        assert!(m.verify_section(5, payload).is_ok());
+    }
+
+    #[test]
+    fn wrong_length_digest_rejected_at_parse() {
+        // SHA-256 with only 4 bytes of digest is invalid.
+        let bytes = make_manifest_bytes(&[(1, 1, &[0u8; 4])]);
+        assert!(matches!(
+            DigestManifest::parse(&bytes),
+            Err(QfError::BadSection(_))
+        ));
     }
 }
