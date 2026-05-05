@@ -27,8 +27,14 @@
 //! * Per-entry CRC32C checksums on segment-index entries and morsel
 //!   entries are recomputed and verified.
 
-use crate::checksum;
-use crate::CoveError;
+use crate::{
+    checksum, compression,
+    constants::{CoveLogicalType, CovePhysicalKind},
+    encoding::nested::{ListLayoutPayload, MapLayoutPayload, StructLayoutPayload},
+    page::ColumnPageIndex,
+    types::validate_logical_physical_pair,
+    CoveError,
+};
 
 // ── TableSegmentIndexEntryV1 (Spec §25.1) ────────────────────────────────────
 
@@ -222,6 +228,7 @@ impl TableSegmentIndex {
 ///       + page_index_offset(8) + data_offset(8)
 ///       + flags(4) + checksum(4) = 72.
 pub const TABLE_SEGMENT_HEADER_LEN: usize = 72;
+pub const TABLE_COLUMN_DIRECTORY_ENTRY_LEN: usize = 52;
 
 /// Spec §25.2 `TableSegmentHeaderV1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +251,82 @@ pub struct TableSegmentHeaderV1 {
     pub flags: u32,
     /// CRC32C of the 72-byte header with `checksum` zeroed.
     pub checksum: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableSegmentPayloadV1 {
+    pub header: TableSegmentHeaderV1,
+    pub morsels: RowMorselDirectory,
+    pub columns: Vec<TableColumnDirectoryEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableColumnDirectoryEntryV1 {
+    pub column_id: u32,
+    pub logical_type: CoveLogicalType,
+    pub physical_kind: CovePhysicalKind,
+    pub flags: u8,
+    pub page_index_offset: u64,
+    pub page_index_length: u64,
+    pub data_offset: u64,
+    pub data_length: u64,
+    pub stats_ref: u32,
+    pub domain_ref: u32,
+    pub checksum: u32,
+}
+
+impl TableColumnDirectoryEntryV1 {
+    pub fn serialize(&self) -> [u8; TABLE_COLUMN_DIRECTORY_ENTRY_LEN] {
+        let mut out = [0u8; TABLE_COLUMN_DIRECTORY_ENTRY_LEN];
+        out[0..4].copy_from_slice(&self.column_id.to_le_bytes());
+        out[4..6].copy_from_slice(&(self.logical_type as u16).to_le_bytes());
+        out[6] = self.physical_kind as u8;
+        out[7] = self.flags;
+        out[8..16].copy_from_slice(&self.page_index_offset.to_le_bytes());
+        out[16..24].copy_from_slice(&self.page_index_length.to_le_bytes());
+        out[24..32].copy_from_slice(&self.data_offset.to_le_bytes());
+        out[32..40].copy_from_slice(&self.data_length.to_le_bytes());
+        out[40..44].copy_from_slice(&self.stats_ref.to_le_bytes());
+        out[44..48].copy_from_slice(&self.domain_ref.to_le_bytes());
+        let crc = checksum::crc32c(&out);
+        out[48..52].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < TABLE_COLUMN_DIRECTORY_ENTRY_LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let bytes = &bytes[..TABLE_COLUMN_DIRECTORY_ENTRY_LEN];
+        let checksum_field = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
+        let mut for_crc = [0u8; TABLE_COLUMN_DIRECTORY_ENTRY_LEN];
+        for_crc.copy_from_slice(bytes);
+        for_crc[48..52].fill(0);
+        if checksum::crc32c(&for_crc) != checksum_field {
+            return Err(CoveError::ChecksumMismatch);
+        }
+        let logical_raw = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let physical_raw = bytes[6];
+        let logical_type = CoveLogicalType::from_u16(logical_raw)
+            .ok_or_else(|| CoveError::BadSchema(format!("unknown logical type {logical_raw}")))?;
+        let physical_kind = CovePhysicalKind::from_u8(physical_raw)
+            .ok_or_else(|| CoveError::BadSchema(format!("unknown physical kind {physical_raw}")))?;
+        validate_logical_physical_pair(logical_type, physical_kind)?;
+
+        Ok(Self {
+            column_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            logical_type,
+            physical_kind,
+            flags: bytes[7],
+            page_index_offset: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            page_index_length: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            data_offset: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            data_length: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+            stats_ref: u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
+            domain_ref: u32::from_le_bytes(bytes[44..48].try_into().unwrap()),
+            checksum: checksum_field,
+        })
+    }
 }
 
 impl TableSegmentHeaderV1 {
@@ -309,6 +392,164 @@ impl TableSegmentHeaderV1 {
             checksum: checksum_field,
         })
     }
+}
+
+impl TableSegmentPayloadV1 {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let header = TableSegmentHeaderV1::parse(bytes)?;
+        if header.row_count == 0 && header.morsel_count != 0 {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        if header.row_count != 0 && header.morsel_row_count == 0 {
+            return Err(CoveError::SegmentCorrupt);
+        }
+
+        let morsel_offset =
+            usize::try_from(header.morsel_directory_offset).map_err(|_| CoveError::OffsetRange)?;
+        if morsel_offset < TABLE_SEGMENT_HEADER_LEN || morsel_offset > bytes.len() {
+            return Err(CoveError::SegmentCorrupt);
+        }
+
+        let morsel_dir_len = (header.morsel_count as usize)
+            .checked_mul(ROW_MORSEL_ENTRY_LEN)
+            .ok_or(CoveError::ArithOverflow)?;
+        let morsel_end = morsel_offset
+            .checked_add(morsel_dir_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        if morsel_end > bytes.len() {
+            return Err(CoveError::SegmentCorrupt);
+        }
+
+        let column_directory_offset =
+            usize::try_from(header.column_directory_offset).map_err(|_| CoveError::OffsetRange)?;
+        let page_index_offset =
+            usize::try_from(header.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
+        let data_offset =
+            usize::try_from(header.data_offset).map_err(|_| CoveError::OffsetRange)?;
+        if column_directory_offset < morsel_end
+            || page_index_offset < column_directory_offset
+            || data_offset < page_index_offset
+            || data_offset > bytes.len()
+        {
+            return Err(CoveError::SegmentCorrupt);
+        }
+
+        let morsels =
+            RowMorselDirectory::parse(&bytes[morsel_offset..morsel_end], header.morsel_count)?;
+        if morsels.sum_rows() != header.row_count as u64 {
+            return Err(CoveError::SegmentCorrupt);
+        }
+
+        let column_dir_len = (header.column_count as usize)
+            .checked_mul(TABLE_COLUMN_DIRECTORY_ENTRY_LEN)
+            .ok_or(CoveError::ArithOverflow)?;
+        let column_dir_end = column_directory_offset
+            .checked_add(column_dir_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        if column_dir_end > page_index_offset {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        let mut columns = Vec::with_capacity(header.column_count as usize);
+        let mut pos = column_directory_offset;
+        for _ in 0..header.column_count {
+            columns.push(TableColumnDirectoryEntryV1::parse(
+                &bytes[pos..pos + TABLE_COLUMN_DIRECTORY_ENTRY_LEN],
+            )?);
+            pos += TABLE_COLUMN_DIRECTORY_ENTRY_LEN;
+        }
+
+        for column in &columns {
+            let column_page_index_offset =
+                usize::try_from(column.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
+            let column_page_index_length =
+                usize::try_from(column.page_index_length).map_err(|_| CoveError::OffsetRange)?;
+            let column_page_index_end = column_page_index_offset
+                .checked_add(column_page_index_length)
+                .ok_or(CoveError::ArithOverflow)?;
+            if column_page_index_offset < page_index_offset || column_page_index_end > data_offset {
+                return Err(CoveError::SegmentCorrupt);
+            }
+
+            let column_data_offset =
+                usize::try_from(column.data_offset).map_err(|_| CoveError::OffsetRange)?;
+            let column_data_length =
+                usize::try_from(column.data_length).map_err(|_| CoveError::OffsetRange)?;
+            let column_data_end = column_data_offset
+                .checked_add(column_data_length)
+                .ok_or(CoveError::ArithOverflow)?;
+            if column_data_offset < data_offset || column_data_end > bytes.len() {
+                return Err(CoveError::SegmentCorrupt);
+            }
+
+            let page_index =
+                ColumnPageIndex::parse(&bytes[column_page_index_offset..column_page_index_end])?;
+            for page in page_index.entries {
+                if page.column_id != column.column_id {
+                    return Err(CoveError::PageCorrupt);
+                }
+                let morsel = morsels
+                    .entries
+                    .get(page.morsel_id as usize)
+                    .ok_or(CoveError::SegmentCorrupt)?;
+                if page.row_count != morsel.row_count {
+                    return Err(CoveError::PageCorrupt);
+                }
+                let page_offset =
+                    usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
+                let page_length =
+                    usize::try_from(page.page_length).map_err(|_| CoveError::OffsetRange)?;
+                let page_end = page_offset
+                    .checked_add(page_length)
+                    .ok_or(CoveError::ArithOverflow)?;
+                if page_offset < column_data_offset || page_end > column_data_end {
+                    return Err(CoveError::PageCorrupt);
+                }
+                let page_wire = &bytes[page_offset..page_end];
+                if checksum::crc32c(page_wire) != page.checksum {
+                    return Err(CoveError::ChecksumMismatch);
+                }
+                validate_nested_page(column, &page, page_wire)?;
+            }
+        }
+
+        Ok(Self {
+            header,
+            morsels,
+            columns,
+        })
+    }
+}
+
+fn validate_nested_page(
+    column: &TableColumnDirectoryEntryV1,
+    page: &crate::page::ColumnPageIndexEntryV1,
+    page_wire: &[u8],
+) -> Result<(), CoveError> {
+    match column.physical_kind {
+        CovePhysicalKind::List => {
+            let payload = compression::column_page_payload(page_wire, page)?;
+            let layout = ListLayoutPayload::parse(payload.as_ref())?;
+            layout.validate()?;
+            if layout.layout.row_count() != page.row_count as usize {
+                return Err(CoveError::PageCorrupt);
+            }
+        }
+        CovePhysicalKind::Struct => {
+            let payload = compression::column_page_payload(page_wire, page)?;
+            let layout = StructLayoutPayload::parse(payload.as_ref())?;
+            layout.validate(page.row_count as u64)?;
+        }
+        CovePhysicalKind::Map => {
+            let payload = compression::column_page_payload(page_wire, page)?;
+            let layout = MapLayoutPayload::parse(payload.as_ref())?;
+            layout.validate()?;
+            if layout.layout.row_count() != page.row_count as usize {
+                return Err(CoveError::PageCorrupt);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 // ── RowMorselEntryV1 (Spec §26) ──────────────────────────────────────────────
@@ -447,6 +688,7 @@ impl RowMorselDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::page::ColumnPageIndexEntryV1;
 
     fn entry(
         table: u32,
@@ -596,6 +838,28 @@ mod tests {
         }
     }
 
+    fn column(
+        column_id: u32,
+        page_index_offset: u64,
+        page_index_length: u64,
+        data_offset: u64,
+        data_length: u64,
+    ) -> TableColumnDirectoryEntryV1 {
+        TableColumnDirectoryEntryV1 {
+            column_id,
+            logical_type: CoveLogicalType::Int64,
+            physical_kind: CovePhysicalKind::NumCode,
+            flags: 0,
+            page_index_offset,
+            page_index_length,
+            data_offset,
+            data_length,
+            stats_ref: 0,
+            domain_ref: 0,
+            checksum: 0,
+        }
+    }
+
     #[test]
     fn morsel_directory_roundtrip_and_validation() {
         let dir = RowMorselDirectory {
@@ -641,6 +905,232 @@ mod tests {
         assert_eq!(
             RowMorselDirectory::parse(&bytes, 1),
             Err(CoveError::ChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn table_segment_payload_roundtrips_scan_profile_shell() {
+        let header = TableSegmentHeaderV1 {
+            table_id: 1,
+            segment_id: 0,
+            row_start: 0,
+            row_count: 10,
+            morsel_count: 1,
+            morsel_row_count: 4096,
+            column_count: 0,
+            morsel_directory_offset: TABLE_SEGMENT_HEADER_LEN as u64,
+            column_directory_offset: (TABLE_SEGMENT_HEADER_LEN + ROW_MORSEL_ENTRY_LEN) as u64,
+            page_index_offset: (TABLE_SEGMENT_HEADER_LEN + ROW_MORSEL_ENTRY_LEN) as u64,
+            data_offset: (TABLE_SEGMENT_HEADER_LEN + ROW_MORSEL_ENTRY_LEN) as u64,
+            flags: 0,
+            checksum: 0,
+        };
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(0, 0, 10)],
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        bytes.extend_from_slice(&dir.serialize());
+        let payload = TableSegmentPayloadV1::parse(&bytes).unwrap();
+        assert_eq!(payload.header.segment_id, 0);
+        assert_eq!(payload.morsels.entries.len(), 1);
+        assert!(payload.columns.is_empty());
+    }
+
+    #[test]
+    fn table_segment_payload_rejects_morsel_sum_mismatch() {
+        let header = TableSegmentHeaderV1 {
+            table_id: 1,
+            segment_id: 0,
+            row_start: 0,
+            row_count: 10,
+            morsel_count: 1,
+            morsel_row_count: 4096,
+            column_count: 0,
+            morsel_directory_offset: TABLE_SEGMENT_HEADER_LEN as u64,
+            column_directory_offset: (TABLE_SEGMENT_HEADER_LEN + ROW_MORSEL_ENTRY_LEN) as u64,
+            page_index_offset: (TABLE_SEGMENT_HEADER_LEN + ROW_MORSEL_ENTRY_LEN) as u64,
+            data_offset: (TABLE_SEGMENT_HEADER_LEN + ROW_MORSEL_ENTRY_LEN) as u64,
+            flags: 0,
+            checksum: 0,
+        };
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(0, 0, 9)],
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        bytes.extend_from_slice(&dir.serialize());
+        assert_eq!(
+            TableSegmentPayloadV1::parse(&bytes),
+            Err(CoveError::SegmentCorrupt)
+        );
+    }
+
+    #[test]
+    fn table_segment_payload_validates_column_page_indexes() {
+        let column_offset = TABLE_SEGMENT_HEADER_LEN + ROW_MORSEL_ENTRY_LEN;
+        let page_index_offset = column_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN;
+        let data_offset = page_index_offset + crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN;
+        let header = TableSegmentHeaderV1 {
+            table_id: 1,
+            segment_id: 0,
+            row_start: 0,
+            row_count: 10,
+            morsel_count: 1,
+            morsel_row_count: 4096,
+            column_count: 1,
+            morsel_directory_offset: TABLE_SEGMENT_HEADER_LEN as u64,
+            column_directory_offset: column_offset as u64,
+            page_index_offset: page_index_offset as u64,
+            data_offset: data_offset as u64,
+            flags: 0,
+            checksum: 0,
+        };
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(0, 0, 10)],
+        };
+        let column = column(
+            7,
+            page_index_offset as u64,
+            crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64,
+            data_offset as u64,
+            8,
+        );
+        let page_payload = [1u8; 8];
+        let page = ColumnPageIndexEntryV1 {
+            column_id: 7,
+            morsel_id: 0,
+            row_count: 10,
+            non_null_count: 10,
+            null_count: 0,
+            encoding_root: 0,
+            page_offset: data_offset as u64,
+            page_length: 8,
+            uncompressed_length: 8,
+            stats_ref: 0,
+            flags: 0,
+            checksum: checksum::crc32c(&page_payload),
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        bytes.extend_from_slice(&dir.serialize());
+        bytes.extend_from_slice(&column.serialize());
+        bytes.extend_from_slice(&page.serialize());
+        bytes.extend_from_slice(&page_payload);
+        let payload = TableSegmentPayloadV1::parse(&bytes).unwrap();
+        assert_eq!(payload.columns.len(), 1);
+        assert_eq!(payload.columns[0].column_id, 7);
+    }
+
+    #[test]
+    fn table_segment_payload_rejects_page_checksum_mismatch() {
+        let column_offset = TABLE_SEGMENT_HEADER_LEN + ROW_MORSEL_ENTRY_LEN;
+        let page_index_offset = column_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN;
+        let data_offset = page_index_offset + crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN;
+        let header = TableSegmentHeaderV1 {
+            table_id: 1,
+            segment_id: 0,
+            row_start: 0,
+            row_count: 10,
+            morsel_count: 1,
+            morsel_row_count: 4096,
+            column_count: 1,
+            morsel_directory_offset: TABLE_SEGMENT_HEADER_LEN as u64,
+            column_directory_offset: column_offset as u64,
+            page_index_offset: page_index_offset as u64,
+            data_offset: data_offset as u64,
+            flags: 0,
+            checksum: 0,
+        };
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(0, 0, 10)],
+        };
+        let column = column(
+            7,
+            page_index_offset as u64,
+            crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64,
+            data_offset as u64,
+            8,
+        );
+        let page = ColumnPageIndexEntryV1 {
+            column_id: 7,
+            morsel_id: 0,
+            row_count: 10,
+            non_null_count: 10,
+            null_count: 0,
+            encoding_root: 0,
+            page_offset: data_offset as u64,
+            page_length: 8,
+            uncompressed_length: 8,
+            stats_ref: 0,
+            flags: 0,
+            checksum: checksum::crc32c(b"different"),
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        bytes.extend_from_slice(&dir.serialize());
+        bytes.extend_from_slice(&column.serialize());
+        bytes.extend_from_slice(&page.serialize());
+        bytes.extend_from_slice(&[1u8; 8]);
+        assert_eq!(
+            TableSegmentPayloadV1::parse(&bytes),
+            Err(CoveError::ChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn table_segment_payload_rejects_page_row_count_mismatch() {
+        let column_offset = TABLE_SEGMENT_HEADER_LEN + ROW_MORSEL_ENTRY_LEN;
+        let page_index_offset = column_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN;
+        let data_offset = page_index_offset + crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN;
+        let header = TableSegmentHeaderV1 {
+            table_id: 1,
+            segment_id: 0,
+            row_start: 0,
+            row_count: 10,
+            morsel_count: 1,
+            morsel_row_count: 4096,
+            column_count: 1,
+            morsel_directory_offset: TABLE_SEGMENT_HEADER_LEN as u64,
+            column_directory_offset: column_offset as u64,
+            page_index_offset: page_index_offset as u64,
+            data_offset: data_offset as u64,
+            flags: 0,
+            checksum: 0,
+        };
+        let dir = RowMorselDirectory {
+            entries: vec![morsel(0, 0, 10)],
+        };
+        let column = column(
+            7,
+            page_index_offset as u64,
+            crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64,
+            data_offset as u64,
+            8,
+        );
+        let page = ColumnPageIndexEntryV1 {
+            column_id: 7,
+            morsel_id: 0,
+            row_count: 9,
+            non_null_count: 9,
+            null_count: 0,
+            encoding_root: 0,
+            page_offset: data_offset as u64,
+            page_length: 8,
+            uncompressed_length: 8,
+            stats_ref: 0,
+            flags: 0,
+            checksum: 0,
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        bytes.extend_from_slice(&dir.serialize());
+        bytes.extend_from_slice(&column.serialize());
+        bytes.extend_from_slice(&page.serialize());
+        bytes.extend_from_slice(&[1u8; 8]);
+        assert_eq!(
+            TableSegmentPayloadV1::parse(&bytes),
+            Err(CoveError::PageCorrupt)
         );
     }
 }

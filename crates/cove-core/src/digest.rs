@@ -91,6 +91,19 @@ impl DigestManifest {
         Ok(Self { entries })
     }
 
+    /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.entries.len() * 40);
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for entry in &self.entries {
+            out.extend_from_slice(&entry.section_id.to_le_bytes());
+            out.extend_from_slice(&(entry.algorithm as u16).to_le_bytes());
+            out.extend_from_slice(&(entry.digest.len() as u16).to_le_bytes());
+            out.extend_from_slice(&entry.digest);
+        }
+        out
+    }
+
     /// Verify a section's digest. Returns `Ok(())` if no entry exists for the
     /// section (digests are optional per Spec §65); returns
     /// [`CoveError::DigestMismatch`] if a present entry fails.
@@ -240,5 +253,30 @@ mod tests {
             DigestManifest::parse(&bytes),
             Err(CoveError::BadSection(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod serialize_tests {
+    use super::*;
+
+    #[test]
+    fn serialize_round_trip() {
+        let m = DigestManifest {
+            entries: vec![
+                DigestEntry {
+                    section_id: 3,
+                    algorithm: DigestAlgorithm::Sha256,
+                    digest: vec![0xAB; 32],
+                },
+                DigestEntry {
+                    section_id: 5,
+                    algorithm: DigestAlgorithm::Blake3,
+                    digest: vec![0xCD; 32],
+                },
+            ],
+        };
+        let bytes = m.serialize();
+        assert_eq!(DigestManifest::parse(&bytes).unwrap(), m);
     }
 }

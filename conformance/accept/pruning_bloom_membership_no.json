@@ -1,0 +1,24 @@
+{
+  "columns": [
+    {
+      "bloom": {
+        "bit_count": 64,
+        "values": [
+          "alpha",
+          "beta",
+          "gamma"
+        ]
+      },
+      "column_id": 11
+    }
+  ],
+  "expect_evidence": [
+    "BloomFilter"
+  ],
+  "expect_outcome": "no_match",
+  "predicate": {
+    "column_id": 11,
+    "op": "bloom_membership",
+    "value": "delta"
+  }
+}

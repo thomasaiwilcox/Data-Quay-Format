@@ -1,0 +1,15 @@
+{
+  "encoding": "bit_packed",
+  "expect_values": [],
+  "payload": [
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ]
+}

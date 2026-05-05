@@ -88,6 +88,19 @@ impl KernelCapabilities {
             .find(|e| e.encoding == encoding)
             .map(|e| e.flags)
     }
+
+    /// Spec §21 — serialise this kernel-capabilities section into the wire
+    /// format consumed by [`KernelCapabilities::parse`]. Round-trip parity is
+    /// covered by the unit tests below.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.entries.len() * (2 + 4));
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for entry in &self.entries {
+            out.extend_from_slice(&(entry.encoding as u16).to_le_bytes());
+            out.extend_from_slice(&entry.flags.bits().to_le_bytes());
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -127,5 +140,35 @@ mod tests {
             KernelCapabilities::parse(&bytes),
             Err(CoveError::BufferTooShort)
         );
+    }
+
+    #[test]
+    fn serialize_round_trip() {
+        let kc = KernelCapabilities {
+            entries: vec![
+                KernelCapabilityEntry {
+                    encoding: CoveEncodingKind::Rle,
+                    flags: KernelCapabilityFlags::CANONICAL_DECODE
+                        | KernelCapabilityFlags::FAST_DECODE,
+                },
+                KernelCapabilityEntry {
+                    encoding: CoveEncodingKind::PlainFixed,
+                    flags: KernelCapabilityFlags::CANONICAL_DECODE
+                        | KernelCapabilityFlags::PREDICATE_PUSHDOWN
+                        | KernelCapabilityFlags::ENGINE_NATIVE,
+                },
+            ],
+        };
+        let bytes = kc.serialize();
+        let parsed = KernelCapabilities::parse(&bytes).unwrap();
+        assert_eq!(parsed, kc);
+    }
+
+    #[test]
+    fn serialize_empty() {
+        let kc = KernelCapabilities::default();
+        let bytes = kc.serialize();
+        assert_eq!(bytes, 0u32.to_le_bytes().to_vec());
+        assert_eq!(KernelCapabilities::parse(&bytes).unwrap(), kc);
     }
 }

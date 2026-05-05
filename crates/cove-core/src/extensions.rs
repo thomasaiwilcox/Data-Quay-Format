@@ -149,6 +149,37 @@ impl ExtensionRegistry {
         Ok(Self { entries })
     }
 
+    /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
+    /// Header `flags` field is emitted as zero (reserved in v1).
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
+        let mut out = Vec::with_capacity(8 + self.entries.len() * 64);
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags reserved
+        for e in &self.entries {
+            let namespace_len = u16::try_from(e.namespace.len()).map_err(|_| {
+                CoveError::BadSection("extension namespace exceeds u16 length limit".into())
+            })?;
+            let name_len = u16::try_from(e.name.len()).map_err(|_| {
+                CoveError::BadSection("extension name exceeds u16 length limit".into())
+            })?;
+            out.extend_from_slice(&e.extension_id.to_le_bytes());
+            out.extend_from_slice(&namespace_len.to_le_bytes());
+            out.extend_from_slice(&e.namespace);
+            out.extend_from_slice(&name_len.to_le_bytes());
+            out.extend_from_slice(&e.name);
+            out.extend_from_slice(&e.version_major.to_le_bytes());
+            out.extend_from_slice(&e.version_minor.to_le_bytes());
+            out.extend_from_slice(&e.extension_kind.to_le_bytes());
+            out.extend_from_slice(&e.required_feature_bit.to_le_bytes());
+            out.extend_from_slice(&e.optional_feature_bit.to_le_bytes());
+            out.extend_from_slice(&e.fallback_kind.to_le_bytes());
+            out.extend_from_slice(&e.fallback_ref.to_le_bytes());
+            out.extend_from_slice(&e.payload_ref.to_le_bytes());
+            out.extend_from_slice(&e.checksum.to_le_bytes());
+        }
+        Ok(out)
+    }
+
     /// Validate entries against known extensions.
     ///
     /// This skeleton implementation knows no extensions. Entries with a
@@ -253,5 +284,54 @@ mod tests {
             ExtensionRegistry::parse(&bytes),
             Err(CoveError::BufferTooShort)
         );
+    }
+}
+
+#[cfg(test)]
+mod serialize_tests {
+    use super::*;
+
+    #[test]
+    fn serialize_round_trip() {
+        let reg = ExtensionRegistry {
+            entries: vec![ExtensionRegistryEntry {
+                extension_id: 9,
+                namespace: b"org.example".to_vec(),
+                name: b"feature-x".to_vec(),
+                version_major: 1,
+                version_minor: 2,
+                extension_kind: 3,
+                required_feature_bit: 0x1000,
+                optional_feature_bit: 0,
+                fallback_kind: 0,
+                fallback_ref: 0,
+                payload_ref: 11,
+                checksum: 0xDEADBEEF,
+            }],
+        };
+        let bytes = reg.serialize().unwrap();
+        assert_eq!(ExtensionRegistry::parse(&bytes).unwrap(), reg);
+    }
+
+    #[test]
+    fn serialize_rejects_namespace_longer_than_u16() {
+        let reg = ExtensionRegistry {
+            entries: vec![ExtensionRegistryEntry {
+                extension_id: 9,
+                namespace: vec![b'a'; usize::from(u16::MAX) + 1],
+                name: b"feature-x".to_vec(),
+                version_major: 1,
+                version_minor: 2,
+                extension_kind: 3,
+                required_feature_bit: 0x1000,
+                optional_feature_bit: 0,
+                fallback_kind: 0,
+                fallback_ref: 0,
+                payload_ref: 11,
+                checksum: 0xDEADBEEF,
+            }],
+        };
+
+        assert!(matches!(reg.serialize(), Err(CoveError::BadSection(_))));
     }
 }

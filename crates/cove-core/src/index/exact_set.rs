@@ -161,6 +161,18 @@ impl ExactSetIndex {
     pub fn contains(&self, key: u64) -> bool {
         self.keys.binary_search(&key).is_ok()
     }
+
+    /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
+    /// Recomputes header `data_offset`/`data_length`/`checksum` so the caller
+    /// only needs to set semantic fields.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut header = self.header.clone();
+        header.data_offset = EXACT_SET_HEADER_LEN as u64;
+        header.data_length = self.data.len() as u64;
+        let mut out = header.serialize().to_vec();
+        out.extend_from_slice(&self.data);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -220,5 +232,15 @@ mod tests {
             ExactSetIndex::parse(&build(0, &[5, 5])),
             Err(CoveError::BadIndex)
         );
+    }
+
+    #[test]
+    fn serialize_round_trip_full_index() {
+        let bytes = build(7, &[1, 4, 9, 16]);
+        let parsed = ExactSetIndex::parse(&bytes).unwrap();
+        let bytes2 = parsed.serialize();
+        let parsed2 = ExactSetIndex::parse(&bytes2).unwrap();
+        assert_eq!(parsed, parsed2);
+        assert_eq!(parsed2.keys, vec![1, 4, 9, 16]);
     }
 }

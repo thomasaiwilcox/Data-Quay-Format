@@ -170,6 +170,16 @@ impl BloomFilterIndex {
         }
         true
     }
+
+    /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut header = self.header.clone();
+        header.data_offset = BLOOM_INDEX_HEADER_LEN as u64;
+        header.data_length = self.bits.len() as u64;
+        let mut out = header.serialize().to_vec();
+        out.extend_from_slice(&self.bits);
+        out
+    }
 }
 
 fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
@@ -285,5 +295,34 @@ mod tests {
         let mut bytes = header.serialize().to_vec();
         bytes.extend_from_slice(&bits);
         assert_eq!(BloomFilterIndex::parse(&bytes), Err(CoveError::BadIndex));
+    }
+
+    #[test]
+    fn serialize_round_trip_full_index() {
+        let header = BloomIndexHeaderV1 {
+            table_id: 1,
+            column_id: 2,
+            granularity: BloomGranularity::Morsel,
+            hash_domain: BloomHashDomain::CanonicalValueHash,
+            algorithm: BloomAlgorithm::SplitBlock,
+            flags: 0,
+            target_fpr_ppm: 10_000,
+            filter_count: 1,
+            data_offset: BLOOM_INDEX_HEADER_LEN as u64,
+            data_length: 16,
+            checksum: 0,
+        };
+        let mut idx = BloomFilterIndex {
+            header,
+            hash_count: 7,
+            bits: vec![0u8; 16],
+        };
+        idx.insert(b"alpha");
+        idx.insert(b"omega");
+        let bytes = idx.serialize();
+        let parsed = BloomFilterIndex::parse(&bytes).unwrap();
+        assert!(parsed.might_contain(b"alpha"));
+        assert!(parsed.might_contain(b"omega"));
+        assert_eq!(parsed.bits, idx.bits);
     }
 }

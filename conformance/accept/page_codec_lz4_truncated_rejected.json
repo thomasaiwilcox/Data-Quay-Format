@@ -1,0 +1,6 @@
+{
+  "codec": "lz4",
+  "expect": "decode_reject",
+  "payload": "Cove page-level LZ4 corruption sentinel sentinel sentinel",
+  "truncate_wire_bytes": 4
+}

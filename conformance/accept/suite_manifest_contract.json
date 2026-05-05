@@ -1,0 +1,13 @@
+{
+  "minimum_accept": 1,
+  "minimum_reject": 1,
+  "op": "manifest_sections_present",
+  "sections": [
+    "§10",
+    "§20",
+    "§37",
+    "§51",
+    "§75",
+    "§78"
+  ]
+}

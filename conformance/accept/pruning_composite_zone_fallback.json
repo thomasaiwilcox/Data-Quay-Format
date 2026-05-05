@@ -1,0 +1,19 @@
+{
+  "columns": [
+    {
+      "column_id": 15,
+      "composite": {
+        "fail_open": true,
+        "matches_bindings": true
+      }
+    }
+  ],
+  "expect_evidence": [
+    "FallbackToScan"
+  ],
+  "expect_outcome": "unknown",
+  "predicate": {
+    "column_id": 15,
+    "op": "composite_zone"
+  }
+}

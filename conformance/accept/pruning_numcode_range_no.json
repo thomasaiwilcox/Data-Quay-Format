@@ -1,0 +1,38 @@
+{
+  "columns": [
+    {
+      "column_id": 9,
+      "zone_stats": {
+        "flags": [
+          "has_min_max"
+        ],
+        "max": {
+          "kind": "int64",
+          "value": 51
+        },
+        "min": {
+          "kind": "int64",
+          "value": 22
+        },
+        "null_count": 0,
+        "row_count": 8
+      }
+    }
+  ],
+  "expect_evidence": [
+    "ZoneStats"
+  ],
+  "expect_outcome": "no_match",
+  "predicate": {
+    "column_id": 9,
+    "lower": {
+      "kind": "int64",
+      "value": 70
+    },
+    "op": "numcode_range",
+    "upper": {
+      "kind": "int64",
+      "value": 90
+    }
+  }
+}
