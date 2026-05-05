@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "crates/qf-core",
-    "crates/qf-validate",
-    "crates/qf-inspect",
-    "crates/qf-dump",
-    "crates/qf-conformance",
-    "crates/qf-bench",
+    "crates/cove-core",
+    "crates/cove-validate",
+    "crates/cove-inspect",
+    "crates/cove-dump",
+    "crates/cove-conformance",
+    "crates/cove-bench",
 ]
 resolver = "2"

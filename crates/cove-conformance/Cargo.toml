@@ -1,0 +1,8 @@
+[package]
+name = "cove-conformance"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+serde_json = "1"

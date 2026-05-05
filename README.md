@@ -1,8 +1,8 @@
-# Data-Quay-Format
+# Cove Format
 
 A query-optimized open specification for table-based and object-based data.
 
-Data Quay Format (Quay Format / QF) is an open, immutable data format for storing data so that query engines can read and reason about it efficiently.
+Cove Format (COVE: Canonical Offline Value Encoding) is an open, immutable archive format for storing portable logical values and encoded arrays so query engines can read and reason about data efficiently.
 
 The simplest way to think about it is:
 
@@ -10,24 +10,24 @@ The simplest way to think about it is:
 - **unlike a generic columnar format**, it is designed from the start around what query engines need to do at read time
 - it supports both **table-style analytics** and **object/history-oriented data models**
 
-QF is intended for converted datasets, archives, object-store workloads, and engine-facing storage where pruning, lookups, metadata-driven planning, and efficient execution matter.
+COVE is intended for converted datasets, archives, object-store workloads, and engine-facing storage where pruning, lookups, metadata-driven planning, and efficient execution matter.
 
 ## What the project is trying to do
 
-Quay Format aims to define a shared spec for:
+Cove Format aims to define a shared spec for:
 
 - **table-based data** that can be scanned and filtered efficiently
 - **object-based data** including richer object and temporal/history-oriented layouts
 - **query-engine-friendly storage** with dictionaries, encoded arrays, section metadata, checksums, and optional acceleration artifacts
 - **engine-neutral interchange** where logical values stay portable while engines remain free to map them into their own execution model
 
-In short: QF is trying to be an **open spec for queryable offline data**, especially where engine optimization is a first-class concern.
+In short: COVE is trying to be an **open spec for queryable offline data**, especially where engine optimization is a first-class concern.
 
 ## Why it exists
 
 Many existing formats are good at interchange or storage efficiency, but do not always expose enough structure for engines to plan and execute queries as directly as they could.
 
-QF is designed to help engines:
+COVE is designed to help engines:
 
 - skip irrelevant data earlier
 - answer more from metadata
@@ -45,11 +45,11 @@ QF is designed to help engines:
 
 ## Repository contents
 
-- `Spec.md`: the main Quay Format specification
-- `crates/qf-core`: core format primitives, staged validation, a minimal writer, and an early QF-T scan-profile writer surface
-- `crates/qf-validate`: validates QF files (headers, footers, section CRCs, feature consistency, and optional semantic/profile checks)
-- `crates/qf-inspect`: prints a readable layout summary for QF files
-- `crates/qf-dump`: dumps metadata or section bytes as hex for debugging
+- `Spec.md`: the main Cove Format specification
+- `crates/cove-core`: core format primitives, staged validation, a minimal writer, and an early COVE-T scan-profile writer surface
+- `crates/cove-validate`: validates COVE files (headers, footers, section CRCs, feature consistency, and optional semantic/profile checks)
+- `crates/cove-inspect`: prints a readable layout summary for COVE files
+- `crates/cove-dump`: dumps metadata or section bytes as hex for debugging
 - `conformance`: generated capability matrix plus whole-file, artifact, and parser-focused accept/reject fixtures
 
 ## Implementation status

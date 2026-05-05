@@ -1,0 +1,13 @@
+[package]
+name = "cove-validate"
+version = "0.1.0"
+edition = "2021"
+description = "CLI validator for Cove Format (COVE) v1.0 files"
+license = "MIT"
+
+[[bin]]
+name = "cove-validate"
+path = "src/main.rs"
+
+[dependencies]
+cove-core = { path = "../cove-core" }

@@ -60,6 +60,54 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "cove-bench"
+version = "0.1.0"
+dependencies = [
+ "cove-core",
+]
+
+[[package]]
+name = "cove-conformance"
+version = "0.1.0"
+dependencies = [
+ "cove-core",
+ "serde_json",
+]
+
+[[package]]
+name = "cove-core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "lz4_flex",
+ "ruzstd",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "cove-dump"
+version = "0.1.0"
+dependencies = [
+ "cove-core",
+]
+
+[[package]]
+name = "cove-inspect"
+version = "0.1.0"
+dependencies = [
+ "cove-core",
+]
+
+[[package]]
+name = "cove-validate"
+version = "0.1.0"
+dependencies = [
+ "cove-core",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -153,54 +201,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "qf-bench"
-version = "0.1.0"
-dependencies = [
- "qf-core",
-]
-
-[[package]]
-name = "qf-conformance"
-version = "0.1.0"
-dependencies = [
- "qf-core",
- "serde_json",
-]
-
-[[package]]
-name = "qf-core"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "crc32c",
- "lz4_flex",
- "ruzstd",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "qf-dump"
-version = "0.1.0"
-dependencies = [
- "qf-core",
-]
-
-[[package]]
-name = "qf-inspect"
-version = "0.1.0"
-dependencies = [
- "qf-core",
-]
-
-[[package]]
-name = "qf-validate"
-version = "0.1.0"
-dependencies = [
- "qf-core",
 ]
 
 [[package]]
