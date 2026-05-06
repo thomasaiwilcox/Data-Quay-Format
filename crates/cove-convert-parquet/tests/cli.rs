@@ -43,6 +43,7 @@ fn cli_converts_parquet_to_valid_cove_and_prints_report() {
             semantic: true,
             verify_digests: false,
             allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
         },
     )
     .unwrap();

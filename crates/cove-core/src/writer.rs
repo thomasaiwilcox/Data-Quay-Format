@@ -101,7 +101,7 @@ pub struct SectionPayload {
 }
 
 impl MinimalCoveWriter {
-    /// Serialize and durably publish the file to `path` using Spec §74.
+    /// Serialize and durably publish the file to `path` using Spec §75.
     pub fn publish_durable(&self, path: &Path) -> Result<PathBuf, CoveError> {
         durable::durable_replace(path, &self.write())
     }
@@ -916,7 +916,7 @@ fn section_encoded_len(section: &SectionPayload) -> Result<usize, CoveError> {
 }
 
 impl ScanProfileCoveWriter {
-    /// Serialize and durably publish the file to `path` using Spec §74.
+    /// Serialize and durably publish the file to `path` using Spec §75.
     pub fn publish_durable(&self, path: &Path) -> Result<PathBuf, CoveError> {
         let bytes = self.write()?;
         durable::durable_replace(path, &bytes)
@@ -1297,8 +1297,8 @@ mod tests {
     use crate::{
         compression::column_page_payload,
         constants::{
-            CoveLogicalType, CovePhysicalKind, FEATURE_CODEC_LZ4, FEATURE_CODEC_ZSTD,
-            FEATURE_NESTED_COLUMNS, FEATURE_PAGE_PAYLOAD_ELISION,
+            CoveEncodingKind, CoveLogicalType, CovePhysicalKind, FEATURE_CODEC_LZ4,
+            FEATURE_CODEC_ZSTD, FEATURE_NESTED_COLUMNS, FEATURE_PAGE_PAYLOAD_ELISION,
         },
         encoding::local_codebook::{LocalCodebookPayload, LocalCodebookValues, LocalIndexPayload},
         encoding::nested::{ListLayout, ListLayoutPayload},
@@ -1527,6 +1527,7 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .unwrap();
@@ -1592,6 +1593,7 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .unwrap();
@@ -1664,7 +1666,7 @@ mod tests {
             1,
             vec![ScanPageSpec::new(6, local_codebook.encode())
                 .with_compression(codec)
-                .with_encoding_root(17)],
+                .with_encoding_root(CoveEncodingKind::LocalCodebook as u32)],
         );
 
         let mut writer = ScanProfileCoveWriter::new(local_codebook_page_catalog());
@@ -1676,6 +1678,7 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .unwrap();
@@ -1795,6 +1798,7 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .unwrap();
@@ -1879,6 +1883,7 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .unwrap();

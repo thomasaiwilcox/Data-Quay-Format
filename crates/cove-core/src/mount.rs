@@ -22,7 +22,7 @@ use crate::{
         topn::TopNSummary,
     },
     profile::cove_e::{EngineMountPolicyV1, ExecutionCodeDescriptorV1},
-    reader::{self, ValidationOptions},
+    reader::{self, IgnoredOptionalSection, OptionalPushdownPolicy, ValidationOptions},
     table::{ColumnEntry, TableCatalog},
     zone_stats::ZoneStatsSection,
     CoveError,
@@ -74,6 +74,7 @@ pub struct MountedCoveFile {
     pub column_domains: Vec<ColumnDomain>,
     pub zone_stats: Vec<ZoneStatsSection>,
     pub scan_indexes: Vec<MountedScanIndex>,
+    pub ignored_optional_sections: Vec<IgnoredOptionalSection>,
     pub covx_status: SidecarValidationStatus,
     pub covm_status: SidecarValidationStatus,
 }
@@ -165,6 +166,7 @@ pub fn mount_cove_file(
             semantic: true,
             verify_digests: options.verify_digests,
             allow_unknown_optional_extensions: options.allow_unknown_optional_extensions,
+            optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
         },
     )?;
     let header = validation.validated.header;
@@ -219,6 +221,7 @@ pub fn mount_cove_file(
         column_domains,
         zone_stats,
         scan_indexes,
+        ignored_optional_sections: validation.ignored_optional_sections,
         covx_status,
         covm_status,
     })
@@ -430,8 +433,13 @@ fn parse_dictionary(data: &[u8], footer: &CoveFooter) -> Result<Option<FileDicti
 fn parse_column_domains(data: &[u8], footer: &CoveFooter) -> Result<Vec<ColumnDomain>, CoveError> {
     let mut out = Vec::new();
     for entry in find_sections(footer, SectionKind::ColumnDomain) {
-        let payload = compression::section_payload(data, entry)?;
-        out.push(ColumnDomain::parse(&payload)?);
+        let Ok(payload) = compression::section_payload(data, entry) else {
+            continue;
+        };
+        let Ok(domain) = ColumnDomain::parse(&payload) else {
+            continue;
+        };
+        out.push(domain);
     }
     Ok(out)
 }
@@ -480,25 +488,60 @@ fn parse_scan_indexes(
         };
         match kind {
             SectionKind::ExactSetIndex => {
-                ExactSetIndex::parse(&compression::section_payload(data, entry)?)?;
+                let Ok(payload) = compression::section_payload(data, entry) else {
+                    continue;
+                };
+                if ExactSetIndex::parse(&payload).is_err() {
+                    continue;
+                }
             }
             SectionKind::BloomIndex => {
-                BloomFilterIndex::parse(&compression::section_payload(data, entry)?)?;
+                let Ok(payload) = compression::section_payload(data, entry) else {
+                    continue;
+                };
+                if BloomFilterIndex::parse(&payload).is_err() {
+                    continue;
+                }
             }
             SectionKind::InvertedMorselIndex => {
-                InvertedMorselIndex::parse(&compression::section_payload(data, entry)?)?;
+                let Ok(payload) = compression::section_payload(data, entry) else {
+                    continue;
+                };
+                if InvertedMorselIndex::parse(&payload).is_err() {
+                    continue;
+                }
             }
             SectionKind::LookupIndex => {
-                LookupIndex::parse(&compression::section_payload(data, entry)?)?;
+                let Ok(payload) = compression::section_payload(data, entry) else {
+                    continue;
+                };
+                if LookupIndex::parse(&payload).is_err() {
+                    continue;
+                }
             }
             SectionKind::AggregateSynopsis => {
-                AggregateSynopsis::parse(&compression::section_payload(data, entry)?)?;
+                let Ok(payload) = compression::section_payload(data, entry) else {
+                    continue;
+                };
+                if AggregateSynopsis::parse(&payload).is_err() {
+                    continue;
+                }
             }
             SectionKind::CompositeZoneIndex => {
-                CompositeIndex::parse(&compression::section_payload(data, entry)?)?;
+                let Ok(payload) = compression::section_payload(data, entry) else {
+                    continue;
+                };
+                if CompositeIndex::parse(&payload).is_err() {
+                    continue;
+                }
             }
             SectionKind::TopNZoneSummary => {
-                TopNSummary::parse(&compression::section_payload(data, entry)?)?;
+                let Ok(payload) = compression::section_payload(data, entry) else {
+                    continue;
+                };
+                if TopNSummary::parse(&payload).is_err() {
+                    continue;
+                }
             }
             _ => continue,
         }

@@ -297,10 +297,20 @@ impl ColumnPagePayloadV1 {
             )?);
             pos += COVE_ENCODING_NODE_LEN;
         }
-        let root = nodes
+        let mut seen_node_ids = std::collections::BTreeSet::new();
+        for node in &nodes {
+            if !seen_node_ids.insert(node.node_id) {
+                return Err(CoveError::PageCorrupt);
+            }
+        }
+
+        let mut roots = nodes
             .iter()
-            .find(|node| node.node_id == header.root_node_id)
-            .ok_or(CoveError::PageCorrupt)?;
+            .filter(|node| node.node_id == header.root_node_id);
+        let root = roots.next().ok_or(CoveError::PageCorrupt)?;
+        if roots.next().is_some() {
+            return Err(CoveError::PageCorrupt);
+        }
         if root.logical_len != header.row_count {
             return Err(CoveError::PageCorrupt);
         }
@@ -466,10 +476,15 @@ impl ColumnPagePayloadV1 {
     }
 
     pub fn root_node(&self) -> Result<&CoveEncodingNodeV1, CoveError> {
-        self.nodes
+        let mut roots = self
+            .nodes
             .iter()
-            .find(|node| node.node_id == self.header.root_node_id)
-            .ok_or(CoveError::PageCorrupt)
+            .filter(|node| node.node_id == self.header.root_node_id);
+        let root = roots.next().ok_or(CoveError::PageCorrupt)?;
+        if roots.next().is_some() {
+            return Err(CoveError::PageCorrupt);
+        }
+        Ok(root)
     }
 
     pub fn buffer_bytes(&self, kind: PageBufferKind) -> Result<Option<&[u8]>, CoveError> {
@@ -561,6 +576,47 @@ mod tests {
         assert_eq!(
             ColumnPagePayloadV1::parse(&bytes),
             Err(CoveError::ReservedNotZero)
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_node_ids() {
+        let header = ColumnPagePayloadHeaderV1 {
+            magic: COLUMN_PAGE_PAYLOAD_MAGIC,
+            version_major: 1,
+            header_len: COLUMN_PAGE_PAYLOAD_HEADER_LEN as u16,
+            flags: 0,
+            root_node_id: 0,
+            node_count: 2,
+            buffer_count: 0,
+            row_count: 1,
+            nodes_offset: COLUMN_PAGE_PAYLOAD_HEADER_LEN as u32,
+            buffer_directory_offset: (COLUMN_PAGE_PAYLOAD_HEADER_LEN + 2 * COVE_ENCODING_NODE_LEN)
+                as u32,
+            buffers_offset: (COLUMN_PAGE_PAYLOAD_HEADER_LEN + 2 * COVE_ENCODING_NODE_LEN) as u32,
+            reserved: 0,
+        };
+        let node = CoveEncodingNodeV1 {
+            node_id: 0,
+            encoding_kind: CoveEncodingKind::PlainFixed,
+            logical_type: CoveLogicalType::Bool,
+            physical_kind: CovePhysicalKind::Boolean,
+            flags: 0,
+            logical_len: 1,
+            child_count: 0,
+            buffer_count: 0,
+            params_offset: 0,
+            params_length: 0,
+            stats_id: 0,
+            reserved: 0,
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&header.serialize());
+        bytes.extend_from_slice(&node.serialize());
+        bytes.extend_from_slice(&node.serialize());
+        assert_eq!(
+            ColumnPagePayloadV1::parse(&bytes),
+            Err(CoveError::PageCorrupt)
         );
     }
 }

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 cove-core = { path = "../cove-core" }
+cove-map = { path = "../cove-map" }
 serde_json = "1"
 arrow-array = "54"
 parquet = { version = "54", default-features = false, features = ["arrow"] }

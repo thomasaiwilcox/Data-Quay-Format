@@ -249,6 +249,12 @@ impl ExtensionRegistry {
                     return Err(CoveError::BadExtension);
                 }
             }
+            if requires_canonical_fallback(entry.extension_kind)
+                && entry.required_feature_bit == 0
+                && entry.fallback_ref == 0
+            {
+                return Err(CoveError::BadExtension);
+            }
             if entry.payload_ref != 0 {
                 let payload_entry =
                     section_by_id(footer, entry.payload_ref).ok_or(CoveError::BadExtension)?;
@@ -286,6 +292,12 @@ impl ExtensionRegistry {
     /// Compatibility helper for callers that only have a registry payload.
     pub fn validate_known(&self, allow_unknown_optional: bool) -> Result<(), CoveError> {
         for entry in &self.entries {
+            if requires_canonical_fallback(entry.extension_kind)
+                && entry.required_feature_bit == 0
+                && entry.fallback_ref == 0
+            {
+                return Err(CoveError::BadExtension);
+            }
             if entry.required_feature_bit != 0 {
                 return Err(CoveError::BadExtension);
             }
@@ -302,6 +314,13 @@ impl ExtensionRegistry {
         }
         Ok(())
     }
+}
+
+fn requires_canonical_fallback(kind: ExtensionKind) -> bool {
+    matches!(
+        kind,
+        ExtensionKind::PhysicalKind | ExtensionKind::Encoding | ExtensionKind::CompressionCodec
+    )
 }
 
 impl ExtensionRegistryEntry {
@@ -634,6 +653,15 @@ mod tests {
         let reg = ExtensionRegistry {
             flags: 0,
             entries: vec![entry(ExtensionKind::VendorMetadata, 0x20_0000, 0)],
+        };
+        assert_eq!(reg.validate_known(true), Err(CoveError::BadExtension));
+    }
+
+    #[test]
+    fn optional_custom_physical_encoding_requires_fallback() {
+        let reg = ExtensionRegistry {
+            flags: 0,
+            entries: vec![entry(ExtensionKind::Encoding, 0, 0)],
         };
         assert_eq!(reg.validate_known(true), Err(CoveError::BadExtension));
     }

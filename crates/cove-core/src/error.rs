@@ -1,6 +1,6 @@
 //! Cove Format (COVE) v1.0 — Error types.
 //!
-//! Corresponds to Section 75 of the COVE v1.0 specification.
+//! Corresponds to Section 76 of the COVE v1.0 specification.
 
 use std::fmt;
 
@@ -199,7 +199,7 @@ impl fmt::Display for CoveError {
 }
 
 impl CoveError {
-    /// Complete Spec §75 code inventory surfaced by [`Self::spec_code`].
+    /// Complete Spec §76 code inventory surfaced by [`Self::spec_code`].
     pub const ALL_SPEC_CODES: [&'static str; 31] = [
         "COVE_E_BAD_MAGIC",
         "COVE_E_BAD_VERSION",
@@ -234,10 +234,10 @@ impl CoveError {
         "COVE_E_MAP_EVIDENCE_INVALID",
     ];
 
-    /// Return the closest Spec §75 error code for this error.
+    /// Return the closest Spec §76 error code for this error.
     ///
     /// Some implementation-level errors such as [`CoveError::BufferTooShort`] and
-    /// [`CoveError::ReservedNotZero`] are normalized to their Spec §75 structural
+    /// [`CoveError::ReservedNotZero`] are normalized to their Spec §76 structural
     /// category so callers can report stable conformance diagnostics.
     pub fn spec_code(&self) -> Option<&'static str> {
         match self {
@@ -283,7 +283,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn spec_75_errors_expose_stable_codes() {
+    fn spec_76_errors_expose_stable_codes() {
         assert_eq!(CoveError::BadMagic.spec_code(), Some("COVE_E_BAD_MAGIC"));
         assert_eq!(
             CoveError::UnknownRequiredFeature(1).spec_code(),
@@ -317,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_75_code_inventory_is_unique() {
+    fn spec_76_code_inventory_is_unique() {
         let unique = CoveError::ALL_SPEC_CODES
             .into_iter()
             .collect::<BTreeSet<_>>();

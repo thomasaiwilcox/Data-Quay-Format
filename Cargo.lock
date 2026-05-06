@@ -271,6 +271,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "cove-core",
+ "cove-map",
  "parquet",
  "serde_json",
 ]

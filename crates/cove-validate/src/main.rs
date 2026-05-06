@@ -11,7 +11,7 @@
 //!
 //! Usage:
 //! ```text
-//! cove-validate [--semantic] [--verify-digests] [--json] [--explain]
+//! cove-validate [--semantic] [--verify-digests] [--fail-open-optional-pushdown] [--json] [--explain]
 //!             <file.cove|file.covemap> [<file2> ...]
 //! ```
 //!
@@ -25,7 +25,7 @@ use std::{path::Path, process};
 use cove_core::{
     artifact::covemap::CovemapFile,
     constants::{PrimaryProfile, MAGIC_COVE, MAGIC_COVEMAP},
-    reader::{self, ValidationOptions},
+    reader::{self, OptionalPushdownPolicy, ValidationOptions},
 };
 
 fn main() {
@@ -33,6 +33,7 @@ fn main() {
 
     let mut semantic = false;
     let mut verify_digests = false;
+    let mut fail_open_optional_pushdown = false;
     let mut json_out = false;
     let mut explain = false;
     let mut file_paths: Vec<&str> = Vec::new();
@@ -44,6 +45,7 @@ fn main() {
             match arg.as_str() {
                 "--semantic" => semantic = true,
                 "--verify-digests" => verify_digests = true,
+                "--fail-open-optional-pushdown" => fail_open_optional_pushdown = true,
                 "--json" => json_out = true,
                 "--explain" => explain = true,
                 other => {
@@ -59,7 +61,7 @@ fn main() {
 
     if file_paths.is_empty() {
         eprintln!(
-            "Usage: cove-validate [--semantic] [--verify-digests] [--json] [--explain] <file.cove|file.covemap> [<file2> ...]"
+            "Usage: cove-validate [--semantic] [--verify-digests] [--fail-open-optional-pushdown] [--json] [--explain] <file.cove|file.covemap> [<file2> ...]"
         );
         process::exit(2);
     }
@@ -68,6 +70,11 @@ fn main() {
         semantic,
         verify_digests,
         allow_unknown_optional_extensions: true,
+        optional_pushdown_policy: if fail_open_optional_pushdown {
+            OptionalPushdownPolicy::FailOpen
+        } else {
+            OptionalPushdownPolicy::Strict
+        },
     };
 
     let mut all_ok = true;
@@ -96,7 +103,7 @@ fn main() {
     process::exit(if all_ok { 0 } else { 1 });
 }
 
-/// Machine-readable validation output (Spec §72, §75): emits one JSON object
+/// Machine-readable validation output (Spec §73, §76): emits one JSON object
 /// per file with `path`, `ok`, optional `error_code`, and (when --explain)
 /// the validated header/footer summary.
 fn validate_file_json(path: &Path, opts: ValidationOptions, explain: bool) -> bool {
@@ -135,6 +142,21 @@ fn validate_file_json(path: &Path, opts: ValidationOptions, explain: bool) -> bo
                 info.header.primary_profile,
                 info.footer.sections.len()
             );
+            if !report.ignored_optional_sections.is_empty() {
+                print!(",\"ignored_optional_sections\":[");
+                for (index, section) in report.ignored_optional_sections.iter().enumerate() {
+                    if index > 0 {
+                        print!(",");
+                    }
+                    print!(
+                        "{{\"section_id\":{},\"section_kind\":{},\"reason\":{}}}",
+                        section.section_id,
+                        section.section_kind,
+                        json_str(&section.reason)
+                    );
+                }
+                print!("]");
+            }
             if explain {
                 print!(",\"sections\":[");
                 for (i, s) in info.footer.sections.iter().enumerate() {
@@ -277,6 +299,12 @@ fn validate_file(path: &Path, opts: ValidationOptions) -> bool {
             println!("  section_count   : {}", info.footer.sections.len());
             if let Some(n) = report.dict_entry_count {
                 println!("  dict_entries    : {n}");
+            }
+            if !report.ignored_optional_sections.is_empty() {
+                println!(
+                    "  ignored optional: {} section(s)",
+                    report.ignored_optional_sections.len()
+                );
             }
             let metadata_json_preview = String::from_utf8_lossy(&info.footer.metadata_json)
                 .chars()

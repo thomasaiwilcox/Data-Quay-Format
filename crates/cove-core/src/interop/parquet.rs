@@ -1,9 +1,9 @@
 //! Spec §51 — Parquet conversion profile.
 //!
-//! The current implementation materializes a single COVE-T scan-profile file
-//! from Parquet bytes. It supports non-null primitive, temporal, UTF-8, binary,
-//! and decimal128 columns and emits explicit scan page payloads through
-//! [`crate::writer::ScanProfileCoveWriter`].
+//! The current implementation materializes COVE-T scan-profile files from
+//! Parquet bytes. It supports primitive, temporal, UTF-8, binary, decimal128,
+//! and nested JSON-fallback columns and emits explicit scan page payloads
+//! through [`crate::writer::ScanProfileCoveWriter`].
 
 use std::{
     cmp::Ordering,
@@ -11,8 +11,9 @@ use std::{
 };
 
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, StringArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeListArray,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
+    LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
@@ -161,6 +162,7 @@ pub struct ParquetConversionOptions {
     pub table_name: String,
     pub namespace: String,
     pub morsel_row_count: u32,
+    pub segment_row_count: u32,
     pub page_compression: CompressionCodec,
     pub dictionary_policy: ParquetDictionaryPolicy,
     pub stats_policy: ParquetStatsPolicy,
@@ -182,6 +184,7 @@ impl Default for ParquetConversionOptions {
             table_name: "parquet_import".into(),
             namespace: "interop".into(),
             morsel_row_count: 4096,
+            segment_row_count: u32::MAX,
             page_compression: CompressionCodec::None,
             dictionary_policy: ParquetDictionaryPolicy::Auto,
             stats_policy: ParquetStatsPolicy::None,
@@ -214,6 +217,7 @@ pub enum ParquetScalarValue {
     TimestampMicros(i64),
     TimestampNanos(i64),
     Utf8(String),
+    Json(Value),
     Binary(Vec<u8>),
 }
 
@@ -236,6 +240,7 @@ impl ParquetScalarValue {
             ParquetScalarValue::TimestampMicros(value) => json!(value),
             ParquetScalarValue::TimestampNanos(value) => json!(value),
             ParquetScalarValue::Utf8(value) => json!(value),
+            ParquetScalarValue::Json(value) => value.clone(),
             ParquetScalarValue::Binary(value) => Value::String(hex_encode(value)),
         }
     }
@@ -250,6 +255,8 @@ pub struct ParquetColumnReport {
     pub logical: CoveLogicalType,
     pub physical: CovePhysicalKind,
     pub nullable: bool,
+    pub pushdown_limited: bool,
+    pub fallback: Option<UnsupportedNestedFallback>,
     pub notes: Vec<String>,
 }
 
@@ -259,6 +266,7 @@ pub struct ParquetConversionReport {
     pub table_name: String,
     pub namespace: String,
     pub row_count: u64,
+    pub segment_count: u32,
     pub column_count: u32,
     pub required_features: u64,
     pub optional_features: u64,
@@ -269,6 +277,7 @@ pub struct ParquetConversionReport {
     pub generated_section_kinds: Vec<String>,
     pub unsupported_features: Vec<String>,
     pub lossy_features: Vec<String>,
+    pub nested_shape_fallbacks: Vec<String>,
     pub notes: Vec<String>,
     pub columns: Vec<ParquetColumnReport>,
 }
@@ -280,6 +289,7 @@ impl ParquetConversionReport {
             "table_name": self.table_name,
             "namespace": self.namespace,
             "row_count": self.row_count,
+            "segment_count": self.segment_count,
             "column_count": self.column_count,
             "required_features": self.required_features,
             "optional_features": self.optional_features,
@@ -290,6 +300,7 @@ impl ParquetConversionReport {
             "generated_section_kinds": self.generated_section_kinds,
             "unsupported_features": self.unsupported_features,
             "lossy_features": self.lossy_features,
+            "nested_shape_fallbacks": self.nested_shape_fallbacks,
             "notes": self.notes,
             "columns": self
                 .columns
@@ -302,6 +313,8 @@ impl ParquetConversionReport {
                         "logical": format!("{:?}", column.logical),
                         "physical": format!("{:?}", column.physical),
                         "nullable": column.nullable,
+                        "pushdown_limited": column.pushdown_limited,
+                        "fallback": column.fallback.map(|fallback| format!("{fallback:?}")),
                         "notes": column.notes,
                     })
                 })
@@ -423,6 +436,11 @@ pub fn convert_parquet_bytes(
             "morsel_row_count must be greater than zero".into(),
         ));
     }
+    if options.segment_row_count == 0 {
+        return Err(CoveError::BadSchema(
+            "segment_row_count must be greater than zero".into(),
+        ));
+    }
 
     let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
         .map_err(|error| CoveError::BadSection(format!("cannot open parquet source: {error}")))?;
@@ -456,8 +474,8 @@ pub fn convert_parquet_bytes(
         }
     }
 
-    let row_count = u32::try_from(total_rows)
-        .map_err(|_| CoveError::BadSchema("Parquet row count exceeds u32::MAX".into()))?;
+    let row_count = u64::try_from(total_rows).map_err(|_| CoveError::ArithOverflow)?;
+    let segment_layouts = build_segment_layouts(total_rows, options.segment_row_count)?;
     let mut notes = Vec::new();
     let mut unsupported_features = Vec::new();
     let lossy_features = Vec::new();
@@ -477,7 +495,7 @@ pub fn convert_parquet_bytes(
             table_id: 1,
             namespace: options.namespace.clone(),
             name: options.table_name.clone(),
-            row_count: row_count as u64,
+            row_count,
             primary_sort_key_count: 0,
             clustering_key_count: 0,
             flags: 0,
@@ -507,7 +525,9 @@ pub fn convert_parquet_bytes(
             writer.push_column_domain(&domain)?;
             domain_count += 1;
         }
-        if let Some(zone_stats) = build_zone_stats(&columns, options.morsel_row_count)? {
+        if let Some(zone_stats) =
+            build_zone_stats(&columns, &segment_layouts, options.morsel_row_count)?
+        {
             writer.push_zone_stats(&zone_stats)?;
             notes.push(format!(
                 "Recomputed {} morsel-level zone-stat entries from decoded Arrow values",
@@ -516,7 +536,7 @@ pub fn convert_parquet_bytes(
         }
     }
 
-    let acceleration = build_acceleration_artifacts(&columns, options, row_count)?;
+    let acceleration = build_acceleration_artifacts(&columns, options, &segment_layouts)?;
     for index in &acceleration.exact_sets {
         writer.push_exact_set_index(index);
     }
@@ -542,15 +562,28 @@ pub fn convert_parquet_bytes(
         notes.push(format!("Generated {domain_count} ColumnDomain section(s)"));
     }
 
-    let mut segment = ScanSegment::new(1, 0, 0, row_count, columns.len() as u32);
-    segment.morsel_row_count = options.morsel_row_count;
-    for column in &columns {
-        segment.set_column_pages(
-            column.entry.column_id,
-            column.page_specs(options.morsel_row_count, options.page_compression)?,
+    for layout in &segment_layouts {
+        let mut segment = ScanSegment::new(
+            1,
+            layout.segment_id,
+            u64::try_from(layout.row_start).map_err(|_| CoveError::ArithOverflow)?,
+            u32::try_from(layout.row_count).map_err(|_| CoveError::ArithOverflow)?,
+            columns.len() as u32,
         );
+        segment.morsel_row_count = options.morsel_row_count;
+        for column in &columns {
+            segment.set_column_pages(
+                column.entry.column_id,
+                column.page_specs_range(
+                    layout.row_start,
+                    layout.row_count,
+                    options.morsel_row_count,
+                    options.page_compression,
+                )?,
+            );
+        }
+        writer.push_segment(segment);
     }
-    writer.push_segment(segment);
     let cove_bytes = writer.write()?;
     let validated = validate_bytes_with_options(
         &cove_bytes,
@@ -558,6 +591,7 @@ pub fn convert_parquet_bytes(
             semantic: true,
             verify_digests: false,
             allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
         },
     )?;
     let generated_section_kinds = validated
@@ -588,7 +622,7 @@ pub fn convert_parquet_bytes(
             "One or more columns required source-unit normalization during conversion".into(),
         );
     }
-    let sidecars = build_optional_sidecars(&cove_bytes, &validated, options, row_count as u64)?;
+    let sidecars = build_optional_sidecars(&cove_bytes, &validated, options, row_count)?;
     if sidecars.covx_bytes.is_some() {
         notes.push("Emitted COVX accelerator sidecar metadata".into());
     }
@@ -631,7 +665,9 @@ pub fn convert_parquet_bytes(
         report: ParquetConversionReport {
             table_name: options.table_name.clone(),
             namespace: options.namespace.clone(),
-            row_count: row_count as u64,
+            row_count,
+            segment_count: u32::try_from(segment_layouts.len())
+                .map_err(|_| CoveError::ArithOverflow)?,
             column_count: columns.len() as u32,
             required_features: validated.validated.header.required_features,
             optional_features: validated.validated.header.optional_features,
@@ -642,6 +678,17 @@ pub fn convert_parquet_bytes(
             generated_section_kinds,
             unsupported_features,
             lossy_features,
+            nested_shape_fallbacks: columns
+                .iter()
+                .filter(|column| column.fallback.is_some())
+                .map(|column| {
+                    format!(
+                        "{}: {:?} fallback is pushdown-limited",
+                        column.entry.name,
+                        column.fallback.unwrap()
+                    )
+                })
+                .collect(),
             notes,
             columns: columns.into_iter().map(|column| column.report()).collect(),
         },
@@ -671,6 +718,7 @@ enum SourceColumnKind {
     Binary,
     LargeBinary,
     Decimal128,
+    NestedJson,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -680,6 +728,44 @@ enum MaterializedValues {
     NumCode(Vec<u64>),
     VarBytes(Vec<Vec<u8>>),
     FixedBytes { width: usize, values: Vec<Vec<u8>> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentLayout {
+    segment_id: u32,
+    row_start: usize,
+    row_count: usize,
+}
+
+fn build_segment_layouts(
+    total_rows: usize,
+    segment_row_count: u32,
+) -> Result<Vec<SegmentLayout>, CoveError> {
+    if segment_row_count == 0 {
+        return Err(CoveError::BadSchema(
+            "segment_row_count must be greater than zero".into(),
+        ));
+    }
+    if total_rows == 0 {
+        return Ok(vec![SegmentLayout {
+            segment_id: 0,
+            row_start: 0,
+            row_count: 0,
+        }]);
+    }
+    let step = segment_row_count as usize;
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < total_rows {
+        let len = (total_rows - start).min(step);
+        out.push(SegmentLayout {
+            segment_id: u32::try_from(out.len()).map_err(|_| CoveError::ArithOverflow)?,
+            row_start: start,
+            row_count: len,
+        });
+        start = start.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+    }
+    Ok(out)
 }
 
 impl MaterializedValues {
@@ -761,6 +847,8 @@ struct ConvertedColumn {
     source_kind: SourceColumnKind,
     source_type: String,
     encoding: CoveEncodingKind,
+    fallback: Option<UnsupportedNestedFallback>,
+    pushdown_limited: bool,
     notes: Vec<String>,
     values: MaterializedValues,
     nulls: Vec<bool>,
@@ -895,12 +983,17 @@ impl ConvertedColumn {
                     *scale as i16,
                     Vec::new(),
                 ),
-                other if is_nested_arrow_type(other) => {
-                    return Err(CoveError::BadSchema(format!(
-                        "Parquet MVP converter does not support nested source column '{}' with type {other:?}; use JSON/Binary fallback in a future converter",
-                        field.name()
-                    )))
-                }
+                other if is_nested_arrow_type(other) => (
+                    CoveLogicalType::Json,
+                    CovePhysicalKind::VarBytes,
+                    SourceColumnKind::NestedJson,
+                    MaterializedValues::VarBytes(Vec::new()),
+                    0,
+                    0,
+                    vec![format!(
+                        "nested Parquet source type {other:?} encoded as opaque JSON fallback; pushdown-limited"
+                    )],
+                ),
                 other => {
                     return Err(CoveError::BadSchema(format!(
                         "Parquet MVP converter does not support source column '{}' with type {other:?}",
@@ -927,6 +1020,9 @@ impl ConvertedColumn {
             source_kind,
             source_type: format!("{:?}", field.data_type()),
             encoding,
+            fallback: is_nested_arrow_type(field.data_type())
+                .then_some(UnsupportedNestedFallback::Json),
+            pushdown_limited: is_nested_arrow_type(field.data_type()),
             notes,
             values,
             nulls: Vec::new(),
@@ -1204,6 +1300,21 @@ impl ConvertedColumn {
                     |row| Ok(array.value(row).to_le_bytes().to_vec()),
                 )?;
             }
+            SourceColumnKind::NestedJson => {
+                let values = expect_varbytes_values(&mut self.values)?;
+                append_materialized_values(
+                    array.len(),
+                    values,
+                    &mut self.nulls,
+                    b"null".to_vec(),
+                    |row| array.is_null(row),
+                    |row| {
+                        serde_json::to_vec(&arrow_value_to_json(array, row)?).map_err(|error| {
+                            CoveError::BadSection(format!("JSON fallback encode failed: {error}"))
+                        })
+                    },
+                )?;
+            }
         }
         if self.values.row_count() != self.nulls.len() {
             return Err(CoveError::BadSchema(format!(
@@ -1214,8 +1325,10 @@ impl ConvertedColumn {
         Ok(())
     }
 
-    fn page_specs(
+    fn page_specs_range(
         &self,
+        row_start: usize,
+        row_count: usize,
         morsel_row_count: u32,
         compression: CompressionCodec,
     ) -> Result<Vec<ScanPageSpec>, CoveError> {
@@ -1225,7 +1338,16 @@ impl ConvertedColumn {
             ));
         }
         let total_rows = self.values.row_count();
-        if total_rows == 0 {
+        let row_end = row_start
+            .checked_add(row_count)
+            .ok_or(CoveError::ArithOverflow)?;
+        if row_end > total_rows {
+            return Err(CoveError::BadSchema(format!(
+                "column '{}' page range exceeds materialized rows",
+                self.entry.name
+            )));
+        }
+        if row_count == 0 {
             return Ok(Vec::new());
         }
         if self.nulls.len() != total_rows {
@@ -1235,10 +1357,10 @@ impl ConvertedColumn {
             )));
         }
         let mut pages = Vec::new();
-        let mut start = 0usize;
+        let mut start = row_start;
         let step = morsel_row_count as usize;
-        while start < total_rows {
-            let len = (total_rows - start).min(step);
+        while start < row_end {
+            let len = (row_end - start).min(step);
             let physical_payload = self.values.encode_rows(start, len)?;
             let null_count = self.null_count_range(start, len)?;
             let (payload, flags) = if null_count == 0 {
@@ -1389,6 +1511,8 @@ impl ConvertedColumn {
             logical: self.entry.logical,
             physical: self.entry.physical,
             nullable: self.entry.nullable,
+            pushdown_limited: self.pushdown_limited,
+            fallback: self.fallback,
             notes: self.notes,
         }
     }
@@ -1707,20 +1831,28 @@ fn build_column_domains(
 
 fn build_zone_stats(
     columns: &[ConvertedColumn],
+    segments: &[SegmentLayout],
     morsel_row_count: u32,
 ) -> Result<Option<ZoneStatsSection>, CoveError> {
     let mut entries = Vec::new();
     for column in columns {
-        let row_count = column.values.row_count();
-        let mut start = 0usize;
-        let mut morsel_id = 0u32;
-        while start < row_count {
-            let len = (row_count - start).min(morsel_row_count as usize);
-            if let Some(entry) = build_zone_stats_entry(column, start, len, morsel_id)? {
-                entries.push(entry);
+        for segment in segments {
+            let row_end = segment
+                .row_start
+                .checked_add(segment.row_count)
+                .ok_or(CoveError::ArithOverflow)?;
+            let mut start = segment.row_start;
+            let mut morsel_id = 0u32;
+            while start < row_end {
+                let len = (row_end - start).min(morsel_row_count as usize);
+                if let Some(entry) =
+                    build_zone_stats_entry(column, start, len, segment.segment_id, morsel_id)?
+                {
+                    entries.push(entry);
+                }
+                start = start.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+                morsel_id = morsel_id.checked_add(1).ok_or(CoveError::ArithOverflow)?;
             }
-            start = start.checked_add(len).ok_or(CoveError::ArithOverflow)?;
-            morsel_id = morsel_id.checked_add(1).ok_or(CoveError::ArithOverflow)?;
         }
     }
     if entries.is_empty() {
@@ -1734,6 +1866,7 @@ fn build_zone_stats_entry(
     column: &ConvertedColumn,
     start: usize,
     len: usize,
+    segment_id: u32,
     morsel_id: u32,
 ) -> Result<Option<ZoneStatsEntry>, CoveError> {
     if len == 0 {
@@ -1745,6 +1878,7 @@ fn build_zone_stats_entry(
             column,
             len,
             null_count,
+            segment_id,
             morsel_id,
             0,
             0,
@@ -1774,6 +1908,7 @@ fn build_zone_stats_entry(
             column,
             len,
             null_count,
+            segment_id,
             morsel_id,
             distinct_count,
             run_count,
@@ -1803,6 +1938,7 @@ fn build_zone_stats_entry(
         column,
         len,
         null_count,
+        segment_id,
         morsel_id,
         distinct_count,
         run_count,
@@ -1831,6 +1967,7 @@ fn zone_entry(
     column: &ConvertedColumn,
     row_count: usize,
     null_count: usize,
+    segment_id: u32,
     morsel_id: u32,
     distinct_count: u32,
     run_count: u32,
@@ -1840,7 +1977,7 @@ fn zone_entry(
 ) -> ZoneStatsEntry {
     ZoneStatsEntry {
         table_id: 1,
-        segment_id: 0,
+        segment_id,
         morsel_id,
         column_id: column.entry.column_id,
         non_null_count: row_count.saturating_sub(null_count) as u32,
@@ -2075,9 +2212,13 @@ struct AccelerationArtifacts {
 fn build_acceleration_artifacts(
     columns: &[ConvertedColumn],
     options: &ParquetConversionOptions,
-    row_count: u32,
+    segments: &[SegmentLayout],
 ) -> Result<AccelerationArtifacts, CoveError> {
     let mut artifacts = AccelerationArtifacts::default();
+    let row_count = columns
+        .first()
+        .map(|column| column.values.row_count())
+        .unwrap_or(0);
     let point_lookup = options
         .point_lookup_columns
         .iter()
@@ -2110,8 +2251,7 @@ fn build_acceleration_artifacts(
         let key_kind = column.key_kind();
         let unique_keys = column_unique_keys(column)?;
         let low_or_medium = !unique_keys.is_empty()
-            && (unique_keys.len() <= 4096
-                || unique_keys.len().saturating_mul(2) <= row_count as usize);
+            && (unique_keys.len() <= 4096 || unique_keys.len().saturating_mul(2) <= row_count);
         let declared_lookup = point_lookup.contains(&column.entry.name);
 
         if should_emit_exact_set(options.acceleration_policy, declared_lookup, low_or_medium)
@@ -2123,9 +2263,12 @@ fn build_acceleration_artifacts(
         }
         if declared_lookup {
             if let Some(kind) = key_kind {
-                artifacts
-                    .lookups
-                    .push(build_lookup_index(column, kind, options.morsel_row_count)?);
+                artifacts.lookups.push(build_lookup_index(
+                    column,
+                    kind,
+                    segments,
+                    options.morsel_row_count,
+                )?);
                 if !low_or_medium && !unique_keys.is_empty() {
                     artifacts.blooms.push(build_bloom_index(column)?);
                 }
@@ -2140,7 +2283,7 @@ fn build_acceleration_artifacts(
             if key_kind.is_some() {
                 artifacts
                     .topn
-                    .push(build_topn_summary(column, &unique_keys)?);
+                    .extend(build_topn_summaries(column, segments)?);
             } else {
                 artifacts.unsupported.push(format!(
                     "Top-N summary for column '{}' requires FileCode, NumCode, or Boolean materialization",
@@ -2153,7 +2296,7 @@ fn build_acceleration_artifacts(
             aggregate_columns.contains(&column.entry.name),
             key_kind.is_some(),
         ) {
-            if let Some(synopsis) = build_aggregate_synopsis(column)? {
+            if let Some(synopsis) = build_aggregate_synopsis(column, segments)? {
                 artifacts.aggregates.push(synopsis);
             } else {
                 artifacts.unsupported.push(format!(
@@ -2265,22 +2408,27 @@ fn column_unique_keys(column: &ConvertedColumn) -> Result<Vec<u64>, CoveError> {
 
 fn build_aggregate_synopsis(
     column: &ConvertedColumn,
+    segments: &[SegmentLayout],
 ) -> Result<Option<AggregateSynopsis>, CoveError> {
     if column.key_kind().is_none() {
         return Ok(None);
     }
-    let row_count =
-        u32::try_from(column.values.row_count()).map_err(|_| CoveError::ArithOverflow)?;
-    let null_count = u32::try_from(
-        (0..column.values.row_count())
-            .filter(|row| column.is_null(*row))
-            .count(),
-    )
-    .map_err(|_| CoveError::ArithOverflow)?;
-    Ok(Some(AggregateSynopsis {
-        entries: vec![AggregateEntry {
+    let mut entries = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let row_end = segment
+            .row_start
+            .checked_add(segment.row_count)
+            .ok_or(CoveError::ArithOverflow)?;
+        let row_count = u32::try_from(segment.row_count).map_err(|_| CoveError::ArithOverflow)?;
+        let null_count = u32::try_from(
+            (segment.row_start..row_end)
+                .filter(|row| column.is_null(*row))
+                .count(),
+        )
+        .map_err(|_| CoveError::ArithOverflow)?;
+        entries.push(AggregateEntry {
             table_id: 1,
-            segment_id: 0,
+            segment_id: segment.segment_id,
             morsel_id: u32::MAX,
             column_id: column.entry.column_id,
             synopsis_kind: SynopsisKind::Count,
@@ -2295,8 +2443,9 @@ fn build_aggregate_synopsis(
             payload_offset: 0,
             payload_length: 0,
             checksum: 0,
-        }],
-    }))
+        });
+    }
+    Ok(Some(AggregateSynopsis { entries }))
 }
 
 fn build_exact_set(
@@ -2440,6 +2589,7 @@ fn build_bloom_index(column: &ConvertedColumn) -> Result<BloomFilterIndex, CoveE
 fn build_lookup_index(
     column: &ConvertedColumn,
     key_kind: IndexKeyKind,
+    segments: &[SegmentLayout],
     morsel_row_count: u32,
 ) -> Result<LookupIndex, CoveError> {
     let mut rows_by_key: BTreeMap<u64, Vec<RowRef>> = BTreeMap::new();
@@ -2450,16 +2600,22 @@ fn build_lookup_index(
         let (key, _) = column
             .key_u64(row)
             .ok_or_else(|| CoveError::BadSchema("column is not lookup keyable".into()))?;
-        let morsel_id =
-            u32::try_from(row / morsel_row_count as usize).map_err(|_| CoveError::ArithOverflow)?;
-        let row_in_morsel = u16::try_from(row % morsel_row_count as usize).map_err(|_| {
-            CoveError::BadSchema(
-                "lookup row_in_morsel exceeds u16::MAX; choose a smaller morsel_row_count".into(),
-            )
-        })?;
+        let position = segment_position_for_row(row, segments)?;
+        let row_in_segment = row
+            .checked_sub(position.row_start)
+            .ok_or(CoveError::ArithOverflow)?;
+        let morsel_id = u32::try_from(row_in_segment / morsel_row_count as usize)
+            .map_err(|_| CoveError::ArithOverflow)?;
+        let row_in_morsel =
+            u16::try_from(row_in_segment % morsel_row_count as usize).map_err(|_| {
+                CoveError::BadSchema(
+                    "lookup row_in_morsel exceeds u16::MAX; choose a smaller morsel_row_count"
+                        .into(),
+                )
+            })?;
         rows_by_key.entry(key).or_default().push(RowRef {
             table_id: 1,
-            segment_id: 0,
+            segment_id: position.segment_id,
             morsel_id,
             row_in_morsel,
         });
@@ -2491,28 +2647,64 @@ fn build_lookup_index(
     })
 }
 
-fn build_topn_summary(
-    column: &ConvertedColumn,
-    unique_keys: &[u64],
-) -> Result<TopNSummary, CoveError> {
-    let value_count = unique_keys.len().min(16);
-    let mut payload = Vec::with_capacity(value_count * 8);
-    for key in unique_keys.iter().rev().take(value_count) {
-        payload.extend_from_slice(&key.to_le_bytes());
+fn segment_position_for_row(
+    row: usize,
+    segments: &[SegmentLayout],
+) -> Result<SegmentLayout, CoveError> {
+    for segment in segments {
+        let end = segment
+            .row_start
+            .checked_add(segment.row_count)
+            .ok_or(CoveError::ArithOverflow)?;
+        if row >= segment.row_start && row < end {
+            return Ok(*segment);
+        }
     }
-    Ok(TopNSummary {
-        table_id: 1,
-        column_id: column.entry.column_id,
-        segment_id: 0,
-        morsel_id: u32::MAX,
-        direction: TopNDirection::Largest,
-        value_count: u16::try_from(value_count).map_err(|_| CoveError::ArithOverflow)?,
-        flags: 0,
-        payload_offset: 0,
-        payload_length: 0,
-        checksum: 0,
-        payload,
-    })
+    Err(CoveError::BadSchema(format!(
+        "row {row} is not covered by any Parquet conversion segment"
+    )))
+}
+
+fn build_topn_summaries(
+    column: &ConvertedColumn,
+    segments: &[SegmentLayout],
+) -> Result<Vec<TopNSummary>, CoveError> {
+    let mut summaries = Vec::new();
+    for segment in segments {
+        let row_end = segment
+            .row_start
+            .checked_add(segment.row_count)
+            .ok_or(CoveError::ArithOverflow)?;
+        let mut unique_keys = BTreeSet::new();
+        for row in segment.row_start..row_end {
+            if let Some((key, _)) = column.key_u64(row) {
+                unique_keys.insert(key);
+            }
+        }
+        if unique_keys.is_empty() {
+            continue;
+        }
+        let unique_keys = unique_keys.into_iter().collect::<Vec<_>>();
+        let value_count = unique_keys.len().min(16);
+        let mut payload = Vec::with_capacity(value_count * 8);
+        for key in unique_keys.iter().rev().take(value_count) {
+            payload.extend_from_slice(&key.to_le_bytes());
+        }
+        summaries.push(TopNSummary {
+            table_id: 1,
+            column_id: column.entry.column_id,
+            segment_id: segment.segment_id,
+            morsel_id: u32::MAX,
+            direction: TopNDirection::Largest,
+            value_count: u16::try_from(value_count).map_err(|_| CoveError::ArithOverflow)?,
+            flags: 0,
+            payload_offset: 0,
+            payload_length: 0,
+            checksum: 0,
+            payload,
+        });
+    }
+    Ok(summaries)
 }
 
 #[derive(Debug, Default)]
@@ -2715,6 +2907,163 @@ fn is_nested_arrow_type(data_type: &DataType) -> bool {
     )
 }
 
+fn arrow_value_to_json(array: &dyn Array, row: usize) -> Result<Value, CoveError> {
+    if row >= array.len() {
+        return Err(CoveError::BadSchema(
+            "nested JSON fallback row exceeds array length".into(),
+        ));
+    }
+    if array.is_null(row) {
+        return Ok(Value::Null);
+    }
+    match array.data_type() {
+        DataType::Boolean => Ok(json!(
+            downcast_array::<BooleanArray>(array, "json")?.value(row)
+        )),
+        DataType::Int8 => Ok(json!(downcast_array::<Int8Array>(array, "json")?.value(row))),
+        DataType::Int16 => Ok(json!(
+            downcast_array::<Int16Array>(array, "json")?.value(row)
+        )),
+        DataType::Int32 => Ok(json!(
+            downcast_array::<Int32Array>(array, "json")?.value(row)
+        )),
+        DataType::Int64 => Ok(json!(
+            downcast_array::<Int64Array>(array, "json")?.value(row)
+        )),
+        DataType::UInt8 => Ok(json!(
+            downcast_array::<UInt8Array>(array, "json")?.value(row)
+        )),
+        DataType::UInt16 => Ok(json!(
+            downcast_array::<UInt16Array>(array, "json")?.value(row)
+        )),
+        DataType::UInt32 => Ok(json!(
+            downcast_array::<UInt32Array>(array, "json")?.value(row)
+        )),
+        DataType::UInt64 => Ok(json!(
+            downcast_array::<UInt64Array>(array, "json")?.value(row)
+        )),
+        DataType::Float32 => {
+            let value = downcast_array::<Float32Array>(array, "json")?.value(row) as f64;
+            Ok(serde_json::Number::from_f64(value)
+                .map(Value::Number)
+                .unwrap_or_else(|| Value::String(value.to_string())))
+        }
+        DataType::Float64 => {
+            let value = downcast_array::<Float64Array>(array, "json")?.value(row);
+            Ok(serde_json::Number::from_f64(value)
+                .map(Value::Number)
+                .unwrap_or_else(|| Value::String(value.to_string())))
+        }
+        DataType::Date32 => Ok(json!(
+            downcast_array::<Date32Array>(array, "json")?.value(row)
+        )),
+        DataType::Timestamp(TimeUnit::Second, _)
+        | DataType::Timestamp(TimeUnit::Millisecond, _)
+        | DataType::Timestamp(TimeUnit::Microsecond, _)
+        | DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            Ok(Value::String(timestamp_value_to_string(array, row)?))
+        }
+        DataType::Utf8 => Ok(json!(
+            downcast_array::<StringArray>(array, "json")?.value(row)
+        )),
+        DataType::LargeUtf8 => Ok(json!(
+            downcast_array::<LargeStringArray>(array, "json")?.value(row)
+        )),
+        DataType::Binary => Ok(Value::String(hex_encode(
+            downcast_array::<BinaryArray>(array, "json")?.value(row),
+        ))),
+        DataType::LargeBinary => Ok(Value::String(hex_encode(
+            downcast_array::<LargeBinaryArray>(array, "json")?.value(row),
+        ))),
+        DataType::Decimal128(_, _) => Ok(Value::String(
+            downcast_array::<Decimal128Array>(array, "json")?
+                .value(row)
+                .to_string(),
+        )),
+        DataType::List(_) => {
+            let list = downcast_array::<ListArray>(array, "json")?;
+            arrow_list_value_to_json(list.value(row).as_ref())
+        }
+        DataType::LargeList(_) => {
+            let list = downcast_array::<LargeListArray>(array, "json")?;
+            arrow_list_value_to_json(list.value(row).as_ref())
+        }
+        DataType::FixedSizeList(_, _) => {
+            let list = downcast_array::<FixedSizeListArray>(array, "json")?;
+            arrow_list_value_to_json(list.value(row).as_ref())
+        }
+        DataType::Struct(_) => {
+            let struct_array = downcast_array::<StructArray>(array, "json")?;
+            arrow_struct_row_to_json(struct_array, row)
+        }
+        DataType::Map(_, _) => {
+            let map_array = downcast_array::<MapArray>(array, "json")?;
+            let entries = map_array.value(row);
+            let keys = entries.column(0);
+            let values = entries.column(1);
+            let mut rows = Vec::with_capacity(entries.len());
+            for index in 0..entries.len() {
+                rows.push(json!({
+                    "key": arrow_value_to_json(keys.as_ref(), index)?,
+                    "value": arrow_value_to_json(values.as_ref(), index)?,
+                }));
+            }
+            Ok(Value::Array(rows))
+        }
+        other => Ok(Value::String(format!(
+            "unsupported Arrow JSON fallback value for {other:?}: {:?}",
+            array.slice(row, 1)
+        ))),
+    }
+}
+
+fn arrow_list_value_to_json(values: &dyn Array) -> Result<Value, CoveError> {
+    let mut out = Vec::with_capacity(values.len());
+    for row in 0..values.len() {
+        out.push(arrow_value_to_json(values, row)?);
+    }
+    Ok(Value::Array(out))
+}
+
+fn arrow_struct_row_to_json(struct_array: &StructArray, row: usize) -> Result<Value, CoveError> {
+    let mut out = serde_json::Map::new();
+    for (index, field) in struct_array.fields().iter().enumerate() {
+        out.insert(
+            field.name().clone(),
+            arrow_value_to_json(struct_array.column(index).as_ref(), row)?,
+        );
+    }
+    Ok(Value::Object(out))
+}
+
+fn timestamp_value_to_string(array: &dyn Array, row: usize) -> Result<String, CoveError> {
+    match array.data_type() {
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            Ok(downcast_array::<TimestampSecondArray>(array, "json")?
+                .value(row)
+                .to_string())
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            Ok(downcast_array::<TimestampMillisecondArray>(array, "json")?
+                .value(row)
+                .to_string())
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            Ok(downcast_array::<TimestampMicrosecondArray>(array, "json")?
+                .value(row)
+                .to_string())
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            Ok(downcast_array::<TimestampNanosecondArray>(array, "json")?
+                .value(row)
+                .to_string())
+        }
+        _ => Err(CoveError::BadSchema(
+            "expected timestamp array for JSON fallback".into(),
+        )),
+    }
+}
+
 fn downcast_array<'a, T: 'static>(
     array: &'a dyn Array,
     column_name: &str,
@@ -2813,6 +3162,11 @@ fn decoded_value_to_scalar(
                     CoveError::BadSection(format!("invalid UTF-8 page payload: {error}"))
                 })?,
             )),
+            CoveLogicalType::Json => serde_json::from_slice(bytes)
+                .map(ParquetScalarValue::Json)
+                .map_err(|error| {
+                    CoveError::BadSection(format!("invalid JSON page payload: {error}"))
+                }),
             CoveLogicalType::Binary => Ok(ParquetScalarValue::Binary(bytes.to_vec())),
             CoveLogicalType::Decimal128 => {
                 let raw: [u8; 16] = bytes.try_into().map_err(|_| {
@@ -2887,6 +3241,7 @@ mod tests {
     use std::{io::Cursor, sync::Arc};
 
     use arrow_array::{
+        builder::{Int32Builder, ListBuilder},
         ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
         TimestampMicrosecondArray,
     };
@@ -3148,6 +3503,7 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .unwrap();
@@ -3172,6 +3528,106 @@ mod tests {
         assert_eq!(page_index.entries[0].null_count, 1);
     }
 
+    #[test]
+    fn splits_parquet_rows_across_multiple_cove_segments() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8])) as ArrayRef,
+        )])
+        .unwrap();
+        let options = ParquetConversionOptions {
+            segment_row_count: 3,
+            morsel_row_count: 2,
+            stats_policy: ParquetStatsPolicy::Recompute,
+            acceleration_policy: ParquetAccelerationPolicy::DeclaredOnly,
+            point_lookup_columns: vec!["id".into()],
+            ..ParquetConversionOptions::default()
+        };
+
+        let result = convert_parquet_bytes(&parquet_bytes(&batch), &options).unwrap();
+        assert_eq!(result.report.row_count, 8);
+        assert_eq!(result.report.segment_count, 3);
+
+        let report = validate_bytes_with_options(
+            &result.cove_bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        let segment_entries = report
+            .validated
+            .footer
+            .sections
+            .iter()
+            .filter(|entry| entry.section_kind == SectionKind::TableSegmentData as u16)
+            .collect::<Vec<_>>();
+        assert_eq!(segment_entries.len(), 3);
+        let mut starts = Vec::new();
+        let mut counts = Vec::new();
+        for entry in segment_entries {
+            let segment_bytes =
+                &result.cove_bytes[entry.offset as usize..entry.end_offset().unwrap() as usize];
+            let segment = TableSegmentPayloadV1::parse(segment_bytes).unwrap();
+            starts.push(segment.header.row_start);
+            counts.push(segment.header.row_count);
+        }
+        assert_eq!(starts, vec![0, 3, 6]);
+        assert_eq!(counts, vec![3, 3, 2]);
+
+        let catalog = first_table_catalog(&result.cove_bytes);
+        assert_eq!(
+            decoded_table_values(&result.cove_bytes, &catalog)[0],
+            vec![
+                json!(1),
+                json!(2),
+                json!(3),
+                json!(4),
+                json!(5),
+                json!(6),
+                json!(7),
+                json!(8)
+            ]
+        );
+    }
+
+    #[test]
+    fn converts_nested_parquet_columns_to_json_fallback() {
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.values().append_value(1);
+        builder.values().append_value(2);
+        builder.append(true);
+        builder.append(false);
+        builder.values().append_value(3);
+        builder.append(true);
+        let batch =
+            RecordBatch::try_from_iter(vec![("tags", Arc::new(builder.finish()) as ArrayRef)])
+                .unwrap();
+
+        let result =
+            convert_parquet_bytes(&parquet_bytes(&batch), &ParquetConversionOptions::default())
+                .unwrap();
+        assert_eq!(result.report.segment_count, 1);
+        assert_eq!(result.report.nested_shape_fallbacks.len(), 1);
+        assert!(result.report.columns[0].pushdown_limited);
+        assert_eq!(
+            result.report.columns[0].fallback,
+            Some(UnsupportedNestedFallback::Json)
+        );
+
+        let catalog = first_table_catalog(&result.cove_bytes);
+        let column = &catalog.tables[0].columns[0];
+        assert_eq!(column.logical, CoveLogicalType::Json);
+        assert_eq!(column.physical, CovePhysicalKind::VarBytes);
+        assert_eq!(
+            decoded_table_values(&result.cove_bytes, &catalog)[0],
+            vec![json!([1, 2]), Value::Null, json!([3])]
+        );
+    }
+
     fn parquet_bytes(batch: &RecordBatch) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::new());
         {
@@ -3189,6 +3645,7 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .unwrap();
@@ -3210,22 +3667,26 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .unwrap();
-        let entry = report
+        let segment_sections = report
             .validated
             .footer
             .sections
             .iter()
-            .find(|entry| entry.section_kind == SectionKind::TableSegmentData as u16)
-            .unwrap();
-        let segment_bytes = &bytes[entry.offset as usize..entry.end_offset().unwrap() as usize];
-        let segment = TableSegmentPayloadV1::parse(segment_bytes).unwrap();
-        catalog.tables[0]
+            .filter(|entry| entry.section_kind == SectionKind::TableSegmentData as u16)
+            .collect::<Vec<_>>();
+        let mut out = catalog.tables[0]
             .columns
             .iter()
-            .map(|column| {
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<Value>>>();
+        for entry in segment_sections {
+            let segment_bytes = &bytes[entry.offset as usize..entry.end_offset().unwrap() as usize];
+            let segment = TableSegmentPayloadV1::parse(segment_bytes).unwrap();
+            for (column_index, column) in catalog.tables[0].columns.iter().enumerate() {
                 let column_dir = segment
                     .columns
                     .iter()
@@ -3269,8 +3730,9 @@ mod tests {
                         .map(|value| value.to_json_value()),
                     );
                 }
-                rows
-            })
-            .collect()
+                out[column_index].extend(rows);
+            }
+        }
+        out
     }
 }

@@ -92,6 +92,7 @@ pub mod metadata;
 pub mod mount;
 pub mod page;
 pub mod page_payload;
+mod page_validation;
 pub mod postscript;
 pub mod predicate;
 pub mod profile;

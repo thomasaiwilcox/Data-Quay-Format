@@ -216,6 +216,72 @@ fn temporal_segment_section(
     }
 }
 
+fn object_catalog_section() -> SectionPayload {
+    let catalog = cove_core::profile::cove_o::ObjectTypeCatalog {
+        flags: 0,
+        types: vec![cove_core::profile::cove_o::ObjectTypeEntryV1 {
+            object_type_id: 1,
+            type_name: "TestObject".into(),
+            flags: cove_core::profile::cove_o::OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+            properties: Vec::new(),
+        }],
+    };
+    SectionPayload {
+        section_kind: SectionKind::ObjectTypeCatalog as u16,
+        profile: 1,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: catalog.serialize().unwrap(),
+    }
+}
+
+fn temporal_segment_index_section(
+    segments: &[(u32, &[cove_core::profile::cove_o::TemporalRowEntryV1])],
+) -> SectionPayload {
+    let entries = segments
+        .iter()
+        .map(|(segment_id, rows)| {
+            let row_count = rows.len() as u32;
+            cove_core::profile::cove_o::TemporalSegmentIndexEntryV1 {
+                segment_id: *segment_id,
+                object_type_id: 1,
+                time_range_start_us: rows.first().map(|row| row.timestamp_us).unwrap_or(0),
+                time_range_end_us: rows.last().map(|row| row.timestamp_us).unwrap_or(0),
+                csn_min: rows.first().map(|row| row.csn).unwrap_or(0),
+                csn_max: rows.last().map(|row| row.csn).unwrap_or(0),
+                row_count,
+                delta_count: row_count,
+                snapshot_count: 0,
+                baseline_count: 0,
+                tombstone_count: 0,
+                min_goid: rows.iter().map(|row| row.goid).min().unwrap_or([0; 16]),
+                max_goid: rows.iter().map(|row| row.goid).max().unwrap_or([0; 16]),
+                offset: 0,
+                length: temporal_segment_data_bytes(*segment_id, rows).len() as u64,
+                checksum: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    let index = cove_core::profile::cove_o::TemporalSegmentIndex { flags: 0, entries };
+    SectionPayload {
+        section_kind: SectionKind::TemporalSegmentIndex as u16,
+        profile: 1,
+        flags: 0,
+        item_count: index.entries.len() as u64,
+        row_count: segments.iter().map(|(_, rows)| rows.len() as u64).sum(),
+        compression: 0,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: index.serialize().unwrap(),
+    }
+}
+
 fn trust_manifest_bytes(
     segment_id: u32,
     rows: &[cove_core::profile::cove_o::TemporalRowEntryV1],
@@ -457,6 +523,7 @@ fn semantic_cli_rejects_required_cove_o_schema_error() {
         types: vec![cove_core::profile::cove_o::ObjectTypeEntryV1 {
             object_type_id: 1,
             type_name: "Thing".into(),
+            flags: cove_core::profile::cove_o::OBJECT_TYPE_FLAG_ENTITY_OBJECT,
             properties: vec![cove_core::profile::cove_o::PropertyEntryV1 {
                 property_id: 1,
                 property_name: "bad".into(),
@@ -524,6 +591,10 @@ fn semantic_cli_rejects_required_cove_o_bad_trust_manifest() {
     let rows = vec![temporal_row(10, 1, None), temporal_row(20, 2, None)];
     let mut manifest = trust_manifest_bytes(5, &rows);
     *manifest.last_mut().unwrap() ^= 0xFF;
+    writer.sections.push(object_catalog_section());
+    writer
+        .sections
+        .push(temporal_segment_index_section(&[(5, &rows)]));
     writer.sections.push(SectionPayload {
         section_kind: SectionKind::TemporalSegmentData as u16,
         profile: 1,
@@ -571,6 +642,11 @@ fn semantic_cli_accepts_cross_segment_temporal_prev_ref() {
             target_kind: 0,
         }),
     )];
+    writer.sections.push(object_catalog_section());
+    writer.sections.push(temporal_segment_index_section(&[
+        (4, &earlier_rows),
+        (5, &later_rows),
+    ]));
     writer
         .sections
         .push(temporal_segment_section(4, &earlier_rows));

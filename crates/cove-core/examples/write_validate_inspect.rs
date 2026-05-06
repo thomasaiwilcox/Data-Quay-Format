@@ -18,7 +18,7 @@ fn main() {
     let bytes = writer.write();
     println!("wrote {} bytes", bytes.len());
 
-    // 2. Publish via Spec §74 durable-replace into a temp dir.
+    // 2. Publish via Spec §75 durable-replace into a temp dir.
     let dir = std::env::temp_dir();
     let path = dir.join("cove-core-example.cove");
     writer.publish_durable(&path).expect("publish_durable");
@@ -32,6 +32,7 @@ fn main() {
             semantic: true,
             verify_digests: false,
             allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
         },
     )
     .expect("validation");

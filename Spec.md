@@ -4164,6 +4164,8 @@ A `.covemap` artifact may be referenced by COVM or by output COVE metadata using
 
 COVE-MAP artifacts MUST be immutable for a declared mapping version. A new mapping version may produce different output, but the mapping version, source snapshot/load identity, deterministic functions, and conflict rules must make the difference explainable.
 
+The reference implementation defines its supported JSON companion payload schema in `docs/covemap-json-schema-v1.md`. That schema is the authority for JSON `MAP_*` payloads accepted by the reference `cove-map` tool; other payload encodings or richer grammars require a registered extension or a companion schema version.
+
 **Rules:**
 - `magic` MUST be `CMP1`.
 - `mapping_version` identifies the reusable mapping-definition version; a new version MUST produce a new immutable artifact.

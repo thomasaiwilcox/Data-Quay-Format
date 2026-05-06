@@ -25,6 +25,7 @@ fn bootstrap_truncation_campaign_never_panics() {
         semantic: true,
         verify_digests: false,
         allow_unknown_optional_extensions: true,
+        ..ValidationOptions::default()
     };
 
     assert!(validate_bytes_with_options(&bytes, opts.clone()).is_ok());

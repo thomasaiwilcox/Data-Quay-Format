@@ -1,0 +1,12 @@
+{
+  "expect_association_readback_flags": true,
+  "expect_cove_o_valid": true,
+  "expected_conversion": {
+    "association_count": 2,
+    "object_count": 2
+  },
+  "mapping": "accept/cove_map_association_only.covemap",
+  "sources": [
+    "accept/people.csv"
+  ]
+}

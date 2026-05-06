@@ -1,6 +1,7 @@
 //! Cove Format (COVE) v1.0 — reference reader and structural validator.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
@@ -17,7 +18,7 @@ use crate::{
         FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE, MAGIC_COVE,
     },
     dictionary::FileDictionary,
-    digest::DigestManifest,
+    digest::{DigestManifest, DigestTargetKind},
     domain::ColumnDomain,
     extensions::{ExtensionRegistry, ExtensionValidationContext},
     footer::CoveFooter,
@@ -30,7 +31,10 @@ use crate::{
     interop::lakehouse::LakehouseHints,
     kernel::KernelCapabilities,
     page::ColumnPageIndex,
-    page_payload::{ColumnPagePayloadV1, PageBufferKind},
+    page_validation::{
+        validate_column_page_payload, validate_column_page_wire, validate_stats_only_constant_page,
+        PageValidationContext,
+    },
     postscript::{CovePostscriptV1, POSTSCRIPT_TOTAL_SIZE},
     profile::{
         cove_e::{
@@ -40,15 +44,16 @@ use crate::{
         cove_h::HarborMountHintsV1,
         cove_map::{parse_embedded_section, validate_embedded_sections, EmbeddedMapSection},
         cove_o::{
-            validate_self_contained, ObjectTypeCatalog, TemporalBloomIndex, TemporalSegmentData,
-            TemporalSegmentIndex, TrustManifest,
+            validate_self_contained, ObjectTypeCatalog, PropertyEntryV1, RecordKind,
+            TemporalBloomIndex, TemporalPropertyColumn, TemporalSegmentData, TemporalSegmentIndex,
+            TemporalSegmentIndexEntryV1, TrustManifest,
         },
     },
     redaction::RedactionManifest,
     registry,
     segment::{TableColumnDirectoryEntryV1, TableSegmentIndex, TableSegmentPayloadV1},
     table::{ColumnEntry, TableCatalog, TableEntry},
-    zone_stats::ZoneStatsSection,
+    zone_stats::{ZoneStatsEntry, ZoneStatsSection},
     CoveError,
 };
 
@@ -69,6 +74,15 @@ pub fn read_file(path: &Path) -> Result<ValidatedCoveFile, CoveError> {
 }
 
 pub fn validate_bytes(data: &[u8]) -> Result<ValidatedCoveFile, CoveError> {
+    let (validated, _) =
+        validate_bytes_with_optional_pushdown_policy(data, OptionalPushdownPolicy::Strict)?;
+    Ok(validated)
+}
+
+fn validate_bytes_with_optional_pushdown_policy(
+    data: &[u8],
+    optional_pushdown_policy: OptionalPushdownPolicy,
+) -> Result<(ValidatedCoveFile, Vec<IgnoredOptionalSection>), CoveError> {
     if data.len() < HEADER_SIZE + POSTSCRIPT_TOTAL_SIZE {
         return Err(CoveError::BufferTooShort);
     }
@@ -101,7 +115,7 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedCoveFile, CoveError> {
     }
     validate_footer_codec_feature_advertisement(&postscript)?;
     let footer_payload = compression::section_spec_payload(data, &postscript.footer)?;
-    let footer = CoveFooter::parse(&footer_payload)?;
+    let mut footer = CoveFooter::parse(&footer_payload)?;
     if footer.header.total_len()? != postscript.footer.uncompressed_length {
         return Err(CoveError::BadSection(
             "footer header length does not match postscript footer uncompressed_length".to_string(),
@@ -109,7 +123,13 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedCoveFile, CoveError> {
     }
 
     let header = CoveHeaderV1::parse(data)?;
-    validate_sections(data, footer_start, &footer, &header)?;
+    let ignored_optional_sections = validate_sections(
+        data,
+        footer_start,
+        &mut footer,
+        &header,
+        optional_pushdown_policy,
+    )?;
     validate_required_feature_implementation(&header)?;
     validate_primary_profile_features(&header)?;
     if header.required_features != postscript.required_features
@@ -120,11 +140,12 @@ pub fn validate_bytes(data: &[u8]) -> Result<ValidatedCoveFile, CoveError> {
         ));
     }
 
-    Ok(ValidatedCoveFile {
+    let validated = ValidatedCoveFile {
         header,
         postscript,
         footer,
-    })
+    };
+    Ok((validated, ignored_optional_sections))
 }
 
 fn validate_required_feature_implementation(header: &CoveHeaderV1) -> Result<(), CoveError> {
@@ -152,6 +173,25 @@ pub struct ValidationOptions {
     pub verify_digests: bool,
     /// When true, unknown optional extension registry entries are allowed.
     pub allow_unknown_optional_extensions: bool,
+    /// Controls whether optional pushdown/acceleration metadata may fail open.
+    pub optional_pushdown_policy: OptionalPushdownPolicy,
+}
+
+/// Policy for optional pushdown/acceleration sections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionalPushdownPolicy {
+    /// Corrupt optional metadata rejects the file, suitable for audit tooling.
+    Strict,
+    /// Corrupt optional metadata is ignored so readers can scan safely.
+    FailOpen,
+}
+
+/// Optional pushdown metadata ignored under [`OptionalPushdownPolicy::FailOpen`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredOptionalSection {
+    pub section_id: u32,
+    pub section_kind: u16,
+    pub reason: String,
 }
 
 /// Coarse validation stages surfaced by [`ValidationReport`].
@@ -187,6 +227,7 @@ impl Default for ValidationOptions {
             semantic: false,
             verify_digests: false,
             allow_unknown_optional_extensions: true,
+            optional_pushdown_policy: OptionalPushdownPolicy::Strict,
         }
     }
 }
@@ -202,6 +243,8 @@ pub struct ValidationReport {
     pub dict_entry_count: Option<u32>,
     /// Per-stage validation outcomes.
     pub stages: Vec<ValidationStageReport>,
+    /// Optional pushdown sections ignored under fail-open validation.
+    pub ignored_optional_sections: Vec<IgnoredOptionalSection>,
 }
 
 /// Validate a COVE file with configurable options.
@@ -213,7 +256,8 @@ pub fn validate_bytes_with_options(
     data: &[u8],
     opts: ValidationOptions,
 ) -> Result<ValidationReport, CoveError> {
-    let validated = validate_bytes(data)?;
+    let (validated, mut ignored_optional_sections) =
+        validate_bytes_with_optional_pushdown_policy(data, opts.optional_pushdown_policy)?;
     let mut stages = vec![
         ValidationStageReport {
             stage: ValidationStage::Bootstrap,
@@ -234,13 +278,21 @@ pub fn validate_bytes_with_options(
             semantic_checked: false,
             dict_entry_count: None,
             stages,
+            ignored_optional_sections,
         });
     }
 
     let mut dict_entry_count: Option<u32> = None;
-    validate_shared_semantics(data, &validated, &opts, &mut dict_entry_count, &mut stages)?;
+    validate_shared_semantics(
+        data,
+        &validated,
+        &opts,
+        &mut dict_entry_count,
+        &mut stages,
+        &mut ignored_optional_sections,
+    )?;
     if opts.verify_digests {
-        let checked = verify_digest_manifests(data, &validated.footer)?;
+        let checked = verify_digest_manifests(data, &validated.footer, &ignored_optional_sections)?;
         push_stage(
             &mut stages,
             ValidationStage::DigestVerification,
@@ -255,7 +307,13 @@ pub fn validate_bytes_with_options(
             0,
         );
     }
-    validate_cove_t_semantics(data, &validated, &mut stages)?;
+    validate_cove_t_semantics(
+        data,
+        &validated,
+        &opts,
+        &mut stages,
+        &mut ignored_optional_sections,
+    )?;
     validate_cove_o_semantics(data, &validated, &mut stages)?;
     validate_cove_e_semantics(data, &validated, &mut stages)?;
     validate_cove_h_semantics(data, &validated, &mut stages)?;
@@ -266,6 +324,7 @@ pub fn validate_bytes_with_options(
         semantic_checked: opts.semantic,
         dict_entry_count,
         stages,
+        ignored_optional_sections,
     })
 }
 
@@ -310,8 +369,16 @@ fn push_skipped_semantic_stages(stages: &mut Vec<ValidationStageReport>, verify_
     }
 }
 
-fn verify_digest_manifests(data: &[u8], footer: &CoveFooter) -> Result<u32, CoveError> {
+fn verify_digest_manifests(
+    data: &[u8],
+    footer: &CoveFooter,
+    ignored_optional_sections: &[IgnoredOptionalSection],
+) -> Result<u32, CoveError> {
     let mut checked = 0u32;
+    let ignored_ids = ignored_optional_sections
+        .iter()
+        .map(|section| section.section_id)
+        .collect::<BTreeSet<_>>();
     for digest_section in footer
         .sections
         .iter()
@@ -321,22 +388,52 @@ fn verify_digest_manifests(data: &[u8], footer: &CoveFooter) -> Result<u32, Cove
         let digest_bytes = compression::section_payload(data, digest_section)?;
         let manifest = DigestManifest::parse(&digest_bytes)?;
         for entry in &manifest.entries {
-            let target_section = footer
-                .sections
-                .binary_search_by_key(&entry.section_id, |s| s.section_id)
-                .ok()
-                .and_then(|idx| footer.sections.get(idx))
-                .ok_or_else(|| {
-                    CoveError::BadSection(format!(
+            let section_range = if entry.target_kind == DigestTargetKind::Section {
+                let target_section = footer
+                    .sections
+                    .binary_search_by_key(&entry.section_id, |s| s.section_id)
+                    .ok()
+                    .and_then(|idx| footer.sections.get(idx));
+                let Some(target_section) = target_section else {
+                    if ignored_ids.contains(&entry.section_id) {
+                        continue;
+                    }
+                    return Err(CoveError::BadSection(format!(
                         "digest manifest references missing section_id {}",
                         entry.section_id
-                    ))
-                })?;
+                    )));
+                };
 
-            let section_start = target_section.offset as usize;
-            let section_end = target_section.end_offset()? as usize;
-            let section_bytes = &data[section_start..section_end];
-            manifest.verify_section(entry.section_id, section_bytes)?;
+                let section_start =
+                    usize::try_from(target_section.offset).map_err(|_| CoveError::OffsetRange)?;
+                let section_end = usize::try_from(target_section.end_offset()?)
+                    .map_err(|_| CoveError::OffsetRange)?;
+                Some((section_start, section_end))
+            } else {
+                None
+            };
+
+            let range_start = usize::try_from(entry.offset).map_err(|_| CoveError::OffsetRange)?;
+            let range_len = usize::try_from(entry.length).map_err(|_| CoveError::OffsetRange)?;
+            let range_end = range_start
+                .checked_add(range_len)
+                .ok_or(CoveError::ArithOverflow)?;
+            if range_end > data.len() {
+                return Err(CoveError::OffsetRange);
+            }
+
+            if let Some((section_start, section_end)) = section_range {
+                if range_start != section_start || range_end != section_end {
+                    return Err(CoveError::BadSection(format!(
+                        "digest manifest section {} range does not match footer section range",
+                        entry.section_id
+                    )));
+                }
+            }
+
+            // INVARIANT: verification hashes exactly the byte range declared by
+            // the manifest entry after proving that range is inside the host file.
+            manifest.verify_bytes(entry, &data[range_start..range_end])?;
         }
     }
     Ok(checked)
@@ -348,6 +445,7 @@ fn validate_shared_semantics(
     opts: &ValidationOptions,
     dict_entry_count: &mut Option<u32>,
     stages: &mut Vec<ValidationStageReport>,
+    ignored_optional_sections: &mut Vec<IgnoredOptionalSection>,
 ) -> Result<(), CoveError> {
     let footer = &validated.footer;
     let mut checked = 0u32;
@@ -429,19 +527,22 @@ fn validate_shared_semantics(
     }
 
     for entry in &footer.sections {
-        let payload = compression::section_payload(data, entry)?;
-        match SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
+        let kind = SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
             CoveError::BadSection(format!("unknown section_kind {}", entry.section_kind))
-        })? {
+        })?;
+        match kind {
             SectionKind::CollationRegistry => {
+                let payload = compression::section_payload(data, entry)?;
                 CollationRegistry::parse(&payload)?;
                 checked += 1;
             }
             SectionKind::DigestManifest => {
+                let payload = compression::section_payload(data, entry)?;
                 DigestManifest::parse(&payload)?;
                 checked += 1;
             }
             SectionKind::RedactionManifest => {
+                let payload = compression::section_payload(data, entry)?;
                 let manifest = RedactionManifest::parse(&payload)?;
                 redaction_manifest_refs.extend(
                     manifest
@@ -452,10 +553,12 @@ fn validate_shared_semantics(
                 checked += 1;
             }
             SectionKind::LakehouseHints => {
+                let payload = compression::section_payload(data, entry)?;
                 LakehouseHints::parse(&payload)?;
                 checked += 1;
             }
             SectionKind::KernelCapabilities => {
+                let payload = compression::section_payload(data, entry)?;
                 KernelCapabilities::parse(&payload)?;
                 checked += 1;
             }
@@ -496,7 +599,18 @@ fn validate_shared_semantics(
             | SectionKind::MapIdentityEquivalenceIndex
             | SectionKind::MapEvidenceIndex
             | SectionKind::MapConversionReport
-            | SectionKind::MapProjectionCatalog => {}
+            | SectionKind::MapProjectionCatalog => {
+                if is_optional_pushdown_section(kind)
+                    && opts.optional_pushdown_policy == OptionalPushdownPolicy::FailOpen
+                {
+                    let _ = optional_section_payload(
+                        data,
+                        entry,
+                        opts.optional_pushdown_policy,
+                        ignored_optional_sections,
+                    )?;
+                }
+            }
         }
     }
 
@@ -571,28 +685,34 @@ fn validate_redaction_manifest_links(
 fn validate_cove_t_semantics(
     data: &[u8],
     validated: &ValidatedCoveFile,
+    opts: &ValidationOptions,
     stages: &mut Vec<ValidationStageReport>,
+    ignored_optional_sections: &mut Vec<IgnoredOptionalSection>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
     let mut catalogs = Vec::new();
     let mut segment_indexes = Vec::new();
     let mut segment_payloads = Vec::new();
+    let mut zone_stats_entries = Vec::new();
     let dictionary = parse_validation_dictionary(data, &validated.footer)?;
 
     for entry in &validated.footer.sections {
-        let payload = compression::section_payload(data, entry)?;
-        match SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
+        let kind = SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
             CoveError::BadSection(format!("unknown section_kind {}", entry.section_kind))
-        })? {
+        })?;
+        match kind {
             SectionKind::TableCatalog => {
+                let payload = compression::section_payload(data, entry)?;
                 catalogs.push((entry.section_id, TableCatalog::parse(&payload)?));
                 checked += 1;
             }
             SectionKind::TableSegmentIndex => {
+                let payload = compression::section_payload(data, entry)?;
                 segment_indexes.push((entry.section_id, TableSegmentIndex::parse(&payload)?));
                 checked += 1;
             }
             SectionKind::TableSegmentData => {
+                let payload = compression::section_payload(data, entry)?;
                 segment_payloads.push((
                     entry.section_id,
                     entry.offset,
@@ -605,39 +725,168 @@ fn validate_cove_t_semantics(
                 checked += 1;
             }
             SectionKind::ColumnDomain => {
-                ColumnDomain::parse(&payload)?;
-                checked += 1;
+                if let Some(payload) = optional_section_payload(
+                    data,
+                    entry,
+                    opts.optional_pushdown_policy,
+                    ignored_optional_sections,
+                )? {
+                    match ColumnDomain::parse(&payload) {
+                        Ok(_) => checked += 1,
+                        Err(error) => {
+                            optional_section_parse_error(
+                                entry,
+                                opts.optional_pushdown_policy,
+                                ignored_optional_sections,
+                                error,
+                            )?;
+                        }
+                    }
+                }
             }
             SectionKind::ExactSetIndex => {
-                ExactSetIndex::parse(&payload)?;
-                checked += 1;
+                if let Some(payload) = optional_section_payload(
+                    data,
+                    entry,
+                    opts.optional_pushdown_policy,
+                    ignored_optional_sections,
+                )? {
+                    match ExactSetIndex::parse(&payload) {
+                        Ok(_) => checked += 1,
+                        Err(error) => {
+                            optional_section_parse_error(
+                                entry,
+                                opts.optional_pushdown_policy,
+                                ignored_optional_sections,
+                                error,
+                            )?;
+                        }
+                    }
+                }
             }
             SectionKind::BloomIndex => {
-                BloomFilterIndex::parse(&payload)?;
-                checked += 1;
+                if let Some(payload) = optional_section_payload(
+                    data,
+                    entry,
+                    opts.optional_pushdown_policy,
+                    ignored_optional_sections,
+                )? {
+                    match BloomFilterIndex::parse(&payload) {
+                        Ok(_) => checked += 1,
+                        Err(error) => {
+                            optional_section_parse_error(
+                                entry,
+                                opts.optional_pushdown_policy,
+                                ignored_optional_sections,
+                                error,
+                            )?;
+                        }
+                    }
+                }
             }
             SectionKind::InvertedMorselIndex => {
-                InvertedMorselIndex::parse(&payload)?;
-                checked += 1;
+                if let Some(payload) = optional_section_payload(
+                    data,
+                    entry,
+                    opts.optional_pushdown_policy,
+                    ignored_optional_sections,
+                )? {
+                    match InvertedMorselIndex::parse(&payload) {
+                        Ok(_) => checked += 1,
+                        Err(error) => {
+                            optional_section_parse_error(
+                                entry,
+                                opts.optional_pushdown_policy,
+                                ignored_optional_sections,
+                                error,
+                            )?;
+                        }
+                    }
+                }
             }
             SectionKind::LookupIndex => {
-                LookupIndex::parse(&payload)?;
-                checked += 1;
+                if let Some(payload) = optional_section_payload(
+                    data,
+                    entry,
+                    opts.optional_pushdown_policy,
+                    ignored_optional_sections,
+                )? {
+                    match LookupIndex::parse(&payload) {
+                        Ok(_) => checked += 1,
+                        Err(error) => {
+                            optional_section_parse_error(
+                                entry,
+                                opts.optional_pushdown_policy,
+                                ignored_optional_sections,
+                                error,
+                            )?;
+                        }
+                    }
+                }
             }
             SectionKind::AggregateSynopsis => {
-                AggregateSynopsis::parse(&payload)?;
-                checked += 1;
+                if let Some(payload) = optional_section_payload(
+                    data,
+                    entry,
+                    opts.optional_pushdown_policy,
+                    ignored_optional_sections,
+                )? {
+                    match AggregateSynopsis::parse(&payload) {
+                        Ok(_) => checked += 1,
+                        Err(error) => {
+                            optional_section_parse_error(
+                                entry,
+                                opts.optional_pushdown_policy,
+                                ignored_optional_sections,
+                                error,
+                            )?;
+                        }
+                    }
+                }
             }
             SectionKind::CompositeZoneIndex => {
-                CompositeIndex::parse(&payload)?;
-                checked += 1;
+                if let Some(payload) = optional_section_payload(
+                    data,
+                    entry,
+                    opts.optional_pushdown_policy,
+                    ignored_optional_sections,
+                )? {
+                    match CompositeIndex::parse(&payload) {
+                        Ok(_) => checked += 1,
+                        Err(error) => {
+                            optional_section_parse_error(
+                                entry,
+                                opts.optional_pushdown_policy,
+                                ignored_optional_sections,
+                                error,
+                            )?;
+                        }
+                    }
+                }
             }
             SectionKind::TopNZoneSummary => {
-                TopNSummary::parse(&payload)?;
-                checked += 1;
+                if let Some(payload) = optional_section_payload(
+                    data,
+                    entry,
+                    opts.optional_pushdown_policy,
+                    ignored_optional_sections,
+                )? {
+                    match TopNSummary::parse(&payload) {
+                        Ok(_) => checked += 1,
+                        Err(error) => {
+                            optional_section_parse_error(
+                                entry,
+                                opts.optional_pushdown_policy,
+                                ignored_optional_sections,
+                                error,
+                            )?;
+                        }
+                    }
+                }
             }
             SectionKind::ZoneStats => {
-                ZoneStatsSection::parse(&payload)?;
+                let payload = compression::section_payload(data, entry)?;
+                zone_stats_entries.extend(ZoneStatsSection::parse(&payload)?.entries);
                 checked += 1;
             }
             SectionKind::FileDictionaryIndex
@@ -678,6 +927,7 @@ fn validate_cove_t_semantics(
         &segment_indexes,
         &segment_payloads,
         dictionary.as_ref(),
+        &zone_stats_entries,
     )?;
     push_stage(
         stages,
@@ -711,11 +961,71 @@ fn parse_validation_dictionary(
     FileDictionary::parse(&index_bytes, &payload_bytes).map(Some)
 }
 
+fn optional_section_payload<'a>(
+    data: &'a [u8],
+    entry: &CoveSectionEntryV1,
+    policy: OptionalPushdownPolicy,
+    ignored_optional_sections: &mut Vec<IgnoredOptionalSection>,
+) -> Result<Option<Cow<'a, [u8]>>, CoveError> {
+    match compression::section_payload(data, entry) {
+        Ok(payload) => Ok(Some(payload)),
+        Err(error) => {
+            optional_section_parse_error(entry, policy, ignored_optional_sections, error)?;
+            Ok(None)
+        }
+    }
+}
+
+fn optional_section_parse_error(
+    entry: &CoveSectionEntryV1,
+    policy: OptionalPushdownPolicy,
+    ignored_optional_sections: &mut Vec<IgnoredOptionalSection>,
+    error: CoveError,
+) -> Result<(), CoveError> {
+    if policy == OptionalPushdownPolicy::FailOpen && is_optional_pushdown_entry(entry) {
+        if ignored_optional_sections
+            .iter()
+            .any(|ignored| ignored.section_id == entry.section_id)
+        {
+            return Ok(());
+        }
+        ignored_optional_sections.push(IgnoredOptionalSection {
+            section_id: entry.section_id,
+            section_kind: entry.section_kind,
+            reason: error.to_string(),
+        });
+        return Ok(());
+    }
+    Err(error)
+}
+
+fn is_optional_pushdown_entry(entry: &CoveSectionEntryV1) -> bool {
+    entry.required_features == 0
+        && SectionKind::from_u16(entry.section_kind)
+            .map(is_optional_pushdown_section)
+            .unwrap_or(false)
+}
+
+fn is_optional_pushdown_section(kind: SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::ColumnDomain
+            | SectionKind::ExactSetIndex
+            | SectionKind::BloomIndex
+            | SectionKind::InvertedMorselIndex
+            | SectionKind::LookupIndex
+            | SectionKind::AggregateSynopsis
+            | SectionKind::CompositeZoneIndex
+            | SectionKind::TopNZoneSummary
+    )
+}
+
 fn validate_cove_t_cross_sections(
     catalogs: &[(u32, TableCatalog)],
     segment_indexes: &[(u32, TableSegmentIndex)],
     segment_payloads: &[(u32, u64, TableSegmentPayloadV1, Vec<u8>)],
     dictionary: Option<&FileDictionary>,
+    zone_stats: &[ZoneStatsEntry],
 ) -> Result<(), CoveError> {
     if catalogs.is_empty() && segment_indexes.is_empty() && segment_payloads.is_empty() {
         return Ok(());
@@ -787,7 +1097,7 @@ fn validate_cove_t_cross_sections(
             return Err(CoveError::SegmentCorrupt);
         }
         *rows_by_table.entry(entry.table_id).or_default() += u64::from(entry.row_count);
-        validate_segment_against_catalog(table, payload, bytes, dictionary)?;
+        validate_segment_against_catalog(table, payload, bytes, dictionary, zone_stats)?;
     }
     for table in &catalog.tables {
         if rows_by_table.get(&table.table_id).copied().unwrap_or(0) != table.row_count {
@@ -805,6 +1115,7 @@ fn validate_segment_against_catalog(
     segment: &TableSegmentPayloadV1,
     segment_bytes: &[u8],
     dictionary: Option<&FileDictionary>,
+    zone_stats: &[ZoneStatsEntry],
 ) -> Result<(), CoveError> {
     if segment.header.table_id != table.table_id {
         return Err(CoveError::SegmentCorrupt);
@@ -834,6 +1145,7 @@ fn validate_segment_against_catalog(
             segment,
             segment_bytes,
             dictionary,
+            zone_stats,
         )?;
     }
     Ok(())
@@ -845,6 +1157,7 @@ fn validate_column_pages_against_catalog(
     segment: &TableSegmentPayloadV1,
     segment_bytes: &[u8],
     dictionary: Option<&FileDictionary>,
+    zone_stats: &[ZoneStatsEntry],
 ) -> Result<(), CoveError> {
     let page_index_start =
         usize::try_from(column_dir.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
@@ -866,7 +1179,17 @@ fn validate_column_pages_against_catalog(
                 column.column_id, page.null_count
             )));
         }
+        let context = PageValidationContext {
+            table_id: Some(segment.header.table_id),
+            segment_id: Some(segment.header.segment_id),
+            column_id: column.column_id,
+            logical_type: column.logical,
+            physical_kind: column.physical,
+            dictionary,
+            zone_stats: Some(zone_stats),
+        };
         if page.page_length == 0 {
+            validate_stats_only_constant_page(&context, page)?;
             continue;
         }
         let start = usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
@@ -876,46 +1199,7 @@ fn validate_column_pages_against_catalog(
                 .ok_or(CoveError::ArithOverflow)?,
         )
         .map_err(|_| CoveError::OffsetRange)?;
-        let decoded = compression::column_page_payload(&segment_bytes[start..end], page)?;
-        let payload = ColumnPagePayloadV1::parse(decoded.as_ref())?;
-        let root = payload.root_node()?;
-        if root.logical_type != column.logical
-            || root.physical_kind != column.physical
-            || root.logical_len != page.row_count
-            || page.encoding_root != root.encoding_kind as u32
-        {
-            return Err(CoveError::PageCorrupt);
-        }
-        if page.null_count == 0 && payload.buffer_bytes(PageBufferKind::NullBitmap)?.is_some() {
-            return Err(CoveError::PageCorrupt);
-        }
-        if column.physical == crate::constants::CovePhysicalKind::FileCode {
-            validate_filecodes_in_page(&payload, page.row_count, dictionary)?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_filecodes_in_page(
-    payload: &ColumnPagePayloadV1,
-    row_count: u32,
-    dictionary: Option<&FileDictionary>,
-) -> Result<(), CoveError> {
-    let dictionary = dictionary.ok_or(CoveError::BadFileCode)?;
-    let values = payload
-        .buffer_bytes(PageBufferKind::Values)?
-        .ok_or(CoveError::PageCorrupt)?;
-    let expected = (row_count as usize)
-        .checked_mul(4)
-        .ok_or(CoveError::ArithOverflow)?;
-    if values.len() != expected {
-        return Err(CoveError::PageCorrupt);
-    }
-    for chunk in values.chunks_exact(4) {
-        let code = u32::from_le_bytes(chunk.try_into().unwrap());
-        if code >= dictionary.len() {
-            return Err(CoveError::BadFileCode);
-        }
+        validate_column_page_wire(&context, page, &segment_bytes[start..end])?;
     }
     Ok(())
 }
@@ -926,8 +1210,11 @@ fn validate_cove_o_semantics(
     stages: &mut Vec<ValidationStageReport>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
+    let mut object_catalogs = Vec::new();
+    let mut temporal_indexes = Vec::new();
     let mut temporal_segments = Vec::new();
     let mut trust_manifests = Vec::new();
+    let dictionary = parse_validation_dictionary(data, &validated.footer)?;
     for entry in &validated.footer.sections {
         let kind = SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
             CoveError::BadSection(format!("unknown section_kind {}", entry.section_kind))
@@ -935,16 +1222,20 @@ fn validate_cove_o_semantics(
         let result = match kind {
             SectionKind::ObjectTypeCatalog => {
                 let payload = compression::section_payload(data, entry)?;
-                ObjectTypeCatalog::parse(&payload).map(|_| ())
+                ObjectTypeCatalog::parse(&payload).map(|catalog| {
+                    object_catalogs.push(catalog);
+                })
             }
             SectionKind::TemporalSegmentIndex => {
                 let payload = compression::section_payload(data, entry)?;
-                TemporalSegmentIndex::parse(&payload).map(|_| ())
+                TemporalSegmentIndex::parse(&payload).map(|index| {
+                    temporal_indexes.push(index);
+                })
             }
             SectionKind::TemporalSegmentData => {
                 let payload = compression::section_payload(data, entry)?;
                 TemporalSegmentData::parse(&payload).map(|segment| {
-                    temporal_segments.push(segment);
+                    temporal_segments.push((entry.offset, payload.into_owned(), segment));
                 })
             }
             SectionKind::TemporalBloomIndex => {
@@ -966,14 +1257,83 @@ fn validate_cove_o_semantics(
             }
         }
     }
-    let file_local_record_ids = temporal_segments
+    validate_cove_o_cross_sections(
+        &object_catalogs,
+        &temporal_indexes,
+        &temporal_segments,
+        &trust_manifests,
+        dictionary.as_ref(),
+    )?;
+    push_stage(
+        stages,
+        ValidationStage::CoveObject,
+        ValidationStageStatus::Checked,
+        checked,
+    );
+    Ok(())
+}
+
+fn validate_cove_o_cross_sections(
+    catalogs: &[ObjectTypeCatalog],
+    indexes: &[TemporalSegmentIndex],
+    segments: &[(u64, Vec<u8>, TemporalSegmentData)],
+    trust_manifests: &[TrustManifest],
+    dictionary: Option<&FileDictionary>,
+) -> Result<(), CoveError> {
+    if catalogs.is_empty()
+        && indexes.is_empty()
+        && segments.is_empty()
+        && trust_manifests.is_empty()
+    {
+        return Ok(());
+    }
+    if catalogs.len() != 1 {
+        return Err(CoveError::BadSchema(
+            "COVE-O validation requires exactly one ObjectTypeCatalog section".into(),
+        ));
+    }
+    if !segments.is_empty() && indexes.len() != 1 {
+        return Err(CoveError::SegmentCorrupt);
+    }
+    if segments.is_empty() {
+        if indexes.iter().all(|index| index.entries.is_empty()) {
+            return Ok(());
+        }
+        return Err(CoveError::SegmentCorrupt);
+    }
+
+    let catalog = &catalogs[0];
+    let object_types = catalog
+        .types
+        .iter()
+        .map(|ty| (ty.object_type_id, ty))
+        .collect::<BTreeMap<_, _>>();
+    let index = &indexes[0];
+    let index_entries = index
+        .entries
+        .iter()
+        .map(|entry| ((entry.object_type_id, entry.segment_id), entry))
+        .collect::<BTreeMap<_, _>>();
+    if index_entries.len() != index.entries.len() {
+        return Err(CoveError::SegmentCorrupt);
+    }
+
+    let segment_refs = segments
+        .iter()
+        .map(|(_, _, segment)| segment)
+        .collect::<Vec<_>>();
+    let segment_values = segments
+        .iter()
+        .map(|(_, _, segment)| segment.clone())
+        .collect::<Vec<_>>();
+    let file_local_record_ids = segment_refs
         .iter()
         .flat_map(|segment| {
             (0..segment.rows.len())
                 .map(move |row_index| ((segment.header.segment_id as u64) << 32) | row_index as u64)
         })
         .collect::<Vec<_>>();
-    let file_prev_refs = temporal_segments
+    let file_prev_refs = segment_refs
         .iter()
         .flat_map(|segment| {
             segment.rows.iter().map(|row| {
@@ -984,15 +1344,298 @@ fn validate_cove_o_semantics(
         })
         .collect::<Vec<_>>();
     validate_self_contained(&file_prev_refs, &file_local_record_ids)?;
-    for manifest in trust_manifests {
-        manifest.verify_against(&temporal_segments)?;
+    validate_temporal_chains(&segment_refs)?;
+
+    let mut payloads_by_key = BTreeMap::new();
+    for (section_offset, bytes, segment) in segments {
+        let object_type = object_types
+            .get(&segment.header.object_type_id)
+            .ok_or_else(|| {
+                CoveError::BadSchema(format!(
+                    "temporal segment references unknown object_type_id {}",
+                    segment.header.object_type_id
+                ))
+            })?;
+        let key = (segment.header.object_type_id, segment.header.segment_id);
+        if payloads_by_key
+            .insert(key, (*section_offset, bytes, segment))
+            .is_some()
+        {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        let index_entry = index_entries.get(&key).ok_or(CoveError::SegmentCorrupt)?;
+        validate_temporal_segment_against_index(index_entry, *section_offset, bytes, segment)?;
+        validate_temporal_property_columns(object_type, segment, dictionary)?;
     }
-    push_stage(
-        stages,
-        ValidationStage::CoveObject,
-        ValidationStageStatus::Checked,
-        checked,
-    );
+    if payloads_by_key.len() != index.entries.len() {
+        return Err(CoveError::SegmentCorrupt);
+    }
+
+    for manifest in trust_manifests {
+        validate_trust_manifest_references(manifest, &segment_refs)?;
+        manifest.verify_against(&segment_values)?;
+    }
+    Ok(())
+}
+
+fn validate_temporal_segment_against_index(
+    index: &TemporalSegmentIndexEntryV1,
+    section_offset: u64,
+    bytes: &[u8],
+    segment: &TemporalSegmentData,
+) -> Result<(), CoveError> {
+    if index.segment_id != segment.header.segment_id
+        || index.object_type_id != segment.header.object_type_id
+        || index.time_range_start_us != segment.header.time_range_start_us
+        || index.time_range_end_us != segment.header.time_range_end_us
+        || index.csn_min != segment.header.csn_min
+        || index.csn_max != segment.header.csn_max
+        || index.row_count != segment.header.row_count
+        || index.length != bytes.len() as u64
+    {
+        return Err(CoveError::SegmentCorrupt);
+    }
+    if index.offset != 0 && index.offset != section_offset {
+        return Err(CoveError::SegmentCorrupt);
+    }
+    let counts = temporal_record_kind_counts(segment);
+    if index.delta_count != counts.0
+        || index.snapshot_count != counts.1
+        || index.baseline_count != counts.2
+        || index.tombstone_count != counts.3
+    {
+        return Err(CoveError::SegmentCorrupt);
+    }
+    if !segment.rows.is_empty() {
+        let min_goid = segment.rows.iter().map(|row| row.goid).min().unwrap();
+        let max_goid = segment.rows.iter().map(|row| row.goid).max().unwrap();
+        if index.min_goid != min_goid || index.max_goid != max_goid {
+            return Err(CoveError::SegmentCorrupt);
+        }
+    }
+    Ok(())
+}
+
+fn temporal_record_kind_counts(segment: &TemporalSegmentData) -> (u32, u32, u32, u32) {
+    let mut delta = 0u32;
+    let mut snapshot = 0u32;
+    let mut baseline = 0u32;
+    let mut tombstone = 0u32;
+    for row in &segment.rows {
+        match row.record_kind {
+            RecordKind::Delta => delta += 1,
+            RecordKind::Snapshot => snapshot += 1,
+            RecordKind::Baseline => baseline += 1,
+            RecordKind::Tombstone => tombstone += 1,
+            RecordKind::ReservedLegacyMaterializedDelta => {}
+        }
+    }
+    (delta, snapshot, baseline, tombstone)
+}
+
+fn validate_temporal_property_columns(
+    object_type: &crate::profile::cove_o::ObjectTypeEntryV1,
+    segment: &TemporalSegmentData,
+    dictionary: Option<&FileDictionary>,
+) -> Result<(), CoveError> {
+    let properties = object_type
+        .properties
+        .iter()
+        .map(|property| (property.property_id, property))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    for column in &segment.property_columns {
+        if !seen.insert(column.directory.column_id) {
+            return Err(CoveError::BadSchema(format!(
+                "duplicate temporal property column_id {}",
+                column.directory.column_id
+            )));
+        }
+        let property = properties.get(&column.directory.column_id).ok_or_else(|| {
+            CoveError::BadSchema(format!(
+                "temporal segment references unknown property_id {} for object_type_id {}",
+                column.directory.column_id, object_type.object_type_id
+            ))
+        })?;
+        if column.directory.logical_type != property.logical_type
+            || column.directory.physical_kind != property.physical_kind
+        {
+            return Err(CoveError::PageCorrupt);
+        }
+        validate_temporal_property_pages(property, segment, column, dictionary)?;
+    }
+    if segment.header.column_count as usize != segment.property_columns.len() {
+        return Err(CoveError::SegmentCorrupt);
+    }
+    Ok(())
+}
+
+fn validate_temporal_property_pages(
+    property: &PropertyEntryV1,
+    segment: &TemporalSegmentData,
+    column: &TemporalPropertyColumn,
+    dictionary: Option<&FileDictionary>,
+) -> Result<(), CoveError> {
+    if column.page_index.entries.len() != expected_temporal_morsel_count(segment)? {
+        return Err(CoveError::PageCorrupt);
+    }
+    let mut seen_morsels = BTreeSet::new();
+    let mut rows_seen = 0u64;
+    for page in &column.pages {
+        if !seen_morsels.insert(page.index_entry.morsel_id) {
+            return Err(CoveError::PageCorrupt);
+        }
+        let expected_rows = temporal_morsel_row_count(segment, page.index_entry.morsel_id)?;
+        if page.index_entry.row_count != expected_rows {
+            return Err(CoveError::PageCorrupt);
+        }
+        if !property.nullable && page.index_entry.null_count != 0 {
+            return Err(CoveError::BadSchema(format!(
+                "non-nullable property {} has page null_count {}",
+                property.property_id, page.index_entry.null_count
+            )));
+        }
+        rows_seen = rows_seen
+            .checked_add(u64::from(page.index_entry.row_count))
+            .ok_or(CoveError::ArithOverflow)?;
+        let context = PageValidationContext {
+            table_id: None,
+            segment_id: Some(segment.header.segment_id),
+            column_id: property.property_id,
+            logical_type: property.logical_type,
+            physical_kind: property.physical_kind,
+            dictionary,
+            zone_stats: None,
+        };
+        if let Some(payload) = &page.payload {
+            validate_column_page_payload(&context, &page.index_entry, payload)?;
+        } else {
+            validate_stats_only_constant_page(&context, &page.index_entry)?;
+        }
+    }
+    if rows_seen != u64::from(segment.header.row_count) {
+        return Err(CoveError::PageCorrupt);
+    }
+    Ok(())
+}
+
+fn expected_temporal_morsel_count(segment: &TemporalSegmentData) -> Result<usize, CoveError> {
+    if segment.header.row_count == 0 {
+        return Ok(0);
+    }
+    if segment.header.morsel_count == 0 || segment.header.morsel_row_count == 0 {
+        return Err(CoveError::SegmentCorrupt);
+    }
+    Ok(segment.header.morsel_count as usize)
+}
+
+fn temporal_morsel_row_count(
+    segment: &TemporalSegmentData,
+    morsel_id: u32,
+) -> Result<u32, CoveError> {
+    if morsel_id >= segment.header.morsel_count {
+        return Err(CoveError::SegmentCorrupt);
+    }
+    let first_row = morsel_id
+        .checked_mul(segment.header.morsel_row_count)
+        .ok_or(CoveError::ArithOverflow)?;
+    if first_row >= segment.header.row_count {
+        return Err(CoveError::SegmentCorrupt);
+    }
+    let remaining = segment.header.row_count - first_row;
+    Ok(remaining.min(segment.header.morsel_row_count))
+}
+
+fn validate_temporal_chains(segments: &[&TemporalSegmentData]) -> Result<(), CoveError> {
+    let rows = segments
+        .iter()
+        .flat_map(|segment| {
+            segment
+                .rows
+                .iter()
+                .enumerate()
+                .map(move |(row_index, row)| ((segment.header.segment_id, row_index as u32), row))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for ((segment_id, row_index), row) in &rows {
+        validate_prev_ref_target_kind(row.prev_ref, &rows)?;
+        if matches!(row.record_kind, RecordKind::Delta | RecordKind::Tombstone) {
+            let mut seen = BTreeSet::new();
+            let mut current = Some((*segment_id, *row_index));
+            let mut anchored = false;
+            while let Some(key) = current {
+                if !seen.insert(key) {
+                    return Err(CoveError::RefInvalid);
+                }
+                let current_row = rows.get(&key).ok_or(CoveError::NotSelfContained)?;
+                if matches!(
+                    current_row.record_kind,
+                    RecordKind::Baseline | RecordKind::Snapshot
+                ) {
+                    anchored = true;
+                    break;
+                }
+                if current_row.prev_ref.is_none() {
+                    anchored = true;
+                    break;
+                }
+                current = current_row
+                    .prev_ref
+                    .map(|prev_ref| (prev_ref.segment_id, prev_ref.row_index));
+            }
+            if !anchored && row.prev_ref.is_some() {
+                return Err(CoveError::NotSelfContained);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_prev_ref_target_kind(
+    prev_ref: Option<crate::profile::cove_o::CoveRecordRefV1>,
+    rows: &BTreeMap<(u32, u32), &crate::profile::cove_o::TemporalRowEntryV1>,
+) -> Result<(), CoveError> {
+    let Some(prev_ref) = prev_ref else {
+        return Ok(());
+    };
+    let target = rows
+        .get(&(prev_ref.segment_id, prev_ref.row_index))
+        .ok_or(CoveError::NotSelfContained)?;
+    if prev_ref.target_kind != target_kind_for_record_kind(target.record_kind) {
+        return Err(CoveError::RefInvalid);
+    }
+    Ok(())
+}
+
+fn target_kind_for_record_kind(kind: RecordKind) -> u8 {
+    match kind {
+        RecordKind::Snapshot | RecordKind::Baseline => 1,
+        RecordKind::Delta | RecordKind::Tombstone | RecordKind::ReservedLegacyMaterializedDelta => {
+            0
+        }
+    }
+}
+
+fn validate_trust_manifest_references(
+    manifest: &TrustManifest,
+    segments: &[&TemporalSegmentData],
+) -> Result<(), CoveError> {
+    let row_counts = segments
+        .iter()
+        .map(|segment| (segment.header.segment_id, segment.rows.len()))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    for entry in &manifest.entries {
+        if !seen.insert((entry.segment_id, entry.row_index)) {
+            return Err(CoveError::RefInvalid);
+        }
+        let row_count = row_counts
+            .get(&entry.segment_id)
+            .ok_or(CoveError::RefInvalid)?;
+        if entry.row_index as usize >= *row_count {
+            return Err(CoveError::RefInvalid);
+        }
+    }
     Ok(())
 }
 
@@ -1240,11 +1883,13 @@ fn profile_error_is_fatal(header: &CoveHeaderV1, entry: &CoveSectionEntryV1, fea
 fn validate_sections(
     data: &[u8],
     footer_start: usize,
-    footer: &CoveFooter,
+    footer: &mut CoveFooter,
     header: &CoveHeaderV1,
-) -> Result<(), CoveError> {
+    optional_pushdown_policy: OptionalPushdownPolicy,
+) -> Result<Vec<IgnoredOptionalSection>, CoveError> {
     let mut ranges: Vec<(u64, u64, u32)> = Vec::new();
     let mut last_section_id: Option<u32> = None;
+    let mut ignored_optional_sections = Vec::new();
 
     for entry in &footer.sections {
         if let Some(last) = last_section_id {
@@ -1279,14 +1924,36 @@ fn validate_sections(
             }
         }
 
+        ranges.push((entry.offset, section_end, entry.section_id));
+
         let section_bytes = &data[entry.offset as usize..section_end as usize];
         if checksum::crc32c(section_bytes) != entry.crc32c {
+            if optional_pushdown_policy == OptionalPushdownPolicy::FailOpen
+                && is_optional_pushdown_entry(entry)
+            {
+                ignored_optional_sections.push(IgnoredOptionalSection {
+                    section_id: entry.section_id,
+                    section_kind: entry.section_kind,
+                    reason: CoveError::ChecksumMismatch.to_string(),
+                });
+                continue;
+            }
             return Err(CoveError::ChecksumMismatch);
         }
-        ranges.push((entry.offset, section_end, entry.section_id));
     }
 
-    Ok(())
+    if !ignored_optional_sections.is_empty() {
+        let ignored_ids = ignored_optional_sections
+            .iter()
+            .map(|section| section.section_id)
+            .collect::<BTreeSet<_>>();
+        footer
+            .sections
+            .retain(|entry| !ignored_ids.contains(&entry.section_id));
+        footer.header.section_count = footer.sections.len() as u32;
+    }
+
+    Ok(ignored_optional_sections)
 }
 
 fn validate_footer_codec_feature_advertisement(
@@ -1473,10 +2140,11 @@ mod tests {
     use super::*;
     use crate::{
         constants::{
-            CompressionCodec, SectionKind, FEATURE_CODEC_LZ4, FEATURE_ENGINE_PROFILE,
-            FEATURE_EXTENSION_REGISTRY, FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE,
-            FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE,
+            CompressionCodec, SectionKind, FEATURE_BLOOM_FILTERS, FEATURE_CODEC_LZ4,
+            FEATURE_ENGINE_PROFILE, FEATURE_EXTENSION_REGISTRY, FEATURE_FILE_DICTIONARY,
+            FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE,
         },
+        digest::{DigestEntry, DigestManifest, DigestScope, DigestTargetKind},
         extensions::{ExtensionKind, ExtensionRegistry, ExtensionRegistryEntry},
         footer::CoveFooter,
         postscript::POSTSCRIPT_TOTAL_SIZE,
@@ -1484,6 +2152,31 @@ mod tests {
         table::{ColumnEntry, TableEntry},
         writer::{MinimalCoveWriter, ScanProfileCoveWriter, ScanSegment, SectionPayload},
     };
+
+    fn optional_bloom_fixture(data: Vec<u8>) -> Vec<u8> {
+        let mut writer = MinimalCoveWriter::new();
+        writer.required_features = FEATURE_TABLE_PROFILE;
+        writer.optional_features = FEATURE_BLOOM_FILTERS;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::BloomIndex as u16,
+            profile: 2,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: FEATURE_BLOOM_FILTERS,
+            data,
+        });
+        writer.write()
+    }
+
+    fn corrupt_first_section_byte(bytes: &mut [u8]) {
+        let validated = validate_bytes(bytes).unwrap();
+        let entry = validated.footer.sections.first().unwrap();
+        bytes[entry.offset as usize] ^= 0x01;
+    }
 
     fn rewrite_postscript(bytes: &mut [u8], postscript: CovePostscriptV1) {
         let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
@@ -1542,6 +2235,64 @@ mod tests {
             validate_bytes(&bytes),
             Err(CoveError::ChecksumMismatch)
         ));
+    }
+
+    #[test]
+    fn fail_open_ignores_optional_pushdown_crc_mismatch() {
+        let mut bytes = optional_bloom_fixture(vec![0; 64]);
+        corrupt_first_section_byte(&mut bytes);
+
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(CoveError::ChecksumMismatch)
+        ));
+
+        let report = validate_bytes_with_options(
+            &bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.validated.footer.sections.len(), 0);
+        assert_eq!(report.ignored_optional_sections.len(), 1);
+        assert_eq!(
+            report.ignored_optional_sections[0].section_kind,
+            SectionKind::BloomIndex as u16
+        );
+    }
+
+    #[test]
+    fn fail_open_ignores_malformed_optional_pushdown_payload() {
+        let bytes = optional_bloom_fixture(vec![0; 64]);
+
+        assert!(matches!(
+            validate_bytes_with_options(
+                &bytes,
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    optional_pushdown_policy: OptionalPushdownPolicy::Strict,
+                },
+            ),
+            Err(CoveError::BadIndex | CoveError::ChecksumMismatch | CoveError::BufferTooShort)
+        ));
+
+        let report = validate_bytes_with_options(
+            &bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                optional_pushdown_policy: OptionalPushdownPolicy::FailOpen,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.ignored_optional_sections.len(), 1);
     }
 
     #[test]
@@ -1960,6 +2711,7 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .is_ok());
@@ -2000,6 +2752,7 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .unwrap();
@@ -2065,6 +2818,7 @@ mod tests {
                     semantic: true,
                     verify_digests: false,
                     allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
                 },
             )
             .unwrap_err(),
@@ -2304,6 +3058,7 @@ mod tests {
             semantic: true,
             verify_digests: false,
             allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
         };
         let report = validate_bytes_with_options(&bytes, opts).expect("should validate");
         assert!(report.semantic_checked);
@@ -2367,6 +3122,7 @@ mod tests {
                     semantic: true,
                     verify_digests: false,
                     allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
                 },
             )
             .unwrap_err(),
@@ -2398,6 +3154,7 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .unwrap();
@@ -2552,6 +3309,7 @@ mod tests {
                     semantic: true,
                     verify_digests: false,
                     allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
                 },
             )
             .unwrap_err(),
@@ -2621,6 +3379,7 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .unwrap();
@@ -2645,6 +3404,7 @@ mod tests {
             types: vec![crate::profile::cove_o::ObjectTypeEntryV1 {
                 object_type_id: 1,
                 type_name: "Thing".into(),
+                flags: crate::profile::cove_o::OBJECT_TYPE_FLAG_ENTITY_OBJECT,
                 properties: vec![crate::profile::cove_o::PropertyEntryV1 {
                     property_id: 1,
                     property_name: "bad".into(),
@@ -2677,6 +3437,7 @@ mod tests {
                     semantic: true,
                     verify_digests: false,
                     allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
                 },
             ),
             Err(CoveError::BadSchema(_))
@@ -2723,6 +3484,7 @@ mod tests {
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .is_ok());
@@ -2749,6 +3511,7 @@ mod tests {
             semantic: true,
             verify_digests: false,
             allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
         };
         assert_eq!(
             validate_bytes_with_options(&bytes, opts).unwrap_err(),
@@ -2765,6 +3528,7 @@ mod tests {
             semantic: true,
             verify_digests: false,
             allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
         };
         assert!(matches!(
             validate_bytes_with_options(&bytes, opts),
@@ -2798,6 +3562,7 @@ mod tests {
             semantic: true,
             verify_digests: false,
             allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
         };
         // Should succeed: empty registry, no required extensions.
         assert!(validate_bytes_with_options(&bytes, opts).is_ok());
@@ -2825,6 +3590,7 @@ mod tests {
             semantic: true,
             verify_digests: false,
             allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
         };
         // The registry section is present and contains a required unknown extension — must reject.
         assert_eq!(
@@ -2840,6 +3606,7 @@ mod tests {
             semantic: true,
             verify_digests: true,
             allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
         };
         assert!(validate_bytes_with_options(&bytes, opts).is_ok());
     }
@@ -2847,11 +3614,21 @@ mod tests {
     #[test]
     fn verify_digests_rejects_missing_referenced_section() {
         let mut writer = MinimalCoveWriter::new();
-        let mut digest = Vec::new();
-        digest.extend_from_slice(&1u32.to_le_bytes()); // entry count
-        digest.extend_from_slice(&99u32.to_le_bytes()); // section_id
-        digest.extend_from_slice(&0u16.to_le_bytes()); // algorithm: None
-        digest.extend_from_slice(&0u16.to_le_bytes()); // digest length
+        let digest = DigestManifest {
+            algorithm: crate::constants::DigestAlgorithm::Sha256,
+            scope: DigestScope::Section,
+            root_digest: [0; 32],
+            entries: vec![DigestEntry {
+                target_kind: DigestTargetKind::Section,
+                section_id: 99,
+                local_id: 0,
+                offset: 0,
+                length: 0,
+                digest: vec![0; 32],
+            }],
+        }
+        .serialize()
+        .unwrap();
         writer.sections.push(SectionPayload {
             section_kind: SectionKind::DigestManifest as u16,
             profile: 0,
@@ -2869,6 +3646,7 @@ mod tests {
             semantic: true,
             verify_digests: true,
             allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
         };
         assert!(matches!(
             validate_bytes_with_options(&bytes, opts),

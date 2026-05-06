@@ -8,40 +8,22 @@
 
 use crate::{constants::CoveEncodingKind, CoveError};
 
-/// Capability flags (Spec §21.2). Stored as a 32-bit bitset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KernelCapabilityFlags(pub u32);
-
-impl KernelCapabilityFlags {
-    pub const CANONICAL_DECODE: Self = Self(1 << 0);
-    pub const FAST_DECODE: Self = Self(1 << 1);
-    pub const PREDICATE_PUSHDOWN: Self = Self(1 << 2);
-    pub const ENGINE_NATIVE: Self = Self(1 << 3);
-
-    pub const fn empty() -> Self {
-        Self(0)
-    }
-
-    pub const fn contains(self, other: Self) -> bool {
-        (self.0 & other.0) == other.0
-    }
-
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl std::ops::BitOr for KernelCapabilityFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
-}
+const KERNEL_CAPABILITY_ENTRY_LEN: usize = 18;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelCapabilityEntry {
     pub encoding: CoveEncodingKind,
-    pub flags: KernelCapabilityFlags,
+    pub supports_eq: u8,
+    pub supports_in: u8,
+    pub supports_range: u8,
+    pub supports_is_null: u8,
+    pub supports_count: u8,
+    pub supports_min_max: u8,
+    pub supports_selection_decode: u8,
+    pub supports_direct_executioncode_remap: u8,
+    pub decode_cost_class: u8,
+    pub predicate_cost_class: u8,
+    pub reserved: [u8; 6],
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,9 +37,8 @@ impl KernelCapabilities {
             return Err(CoveError::BufferTooShort);
         }
         let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let entry_size = 2usize + 4;
         let entries_bytes = count
-            .checked_mul(entry_size)
+            .checked_mul(KERNEL_CAPABILITY_ENTRY_LEN)
             .ok_or(CoveError::ArithOverflow)?;
         let required_len = 4usize
             .checked_add(entries_bytes)
@@ -65,41 +46,99 @@ impl KernelCapabilities {
         if required_len > bytes.len() {
             return Err(CoveError::BufferTooShort);
         }
+        if required_len != bytes.len() {
+            return Err(CoveError::BadSection(
+                "kernel capabilities section has trailing bytes".into(),
+            ));
+        }
         let mut entries = Vec::with_capacity(count);
         let mut pos = 4;
         for _ in 0..count {
             let enc_raw = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
             pos += 2;
-            let flag_raw = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
-            pos += 4;
             let encoding = CoveEncodingKind::from_u16(enc_raw)
                 .ok_or_else(|| CoveError::BadSection(format!("unknown encoding {enc_raw}")))?;
+            let supports_eq = parse_support_byte(bytes[pos], "supports_eq")?;
+            pos += 1;
+            let supports_in = parse_support_byte(bytes[pos], "supports_in")?;
+            pos += 1;
+            let supports_range = parse_support_byte(bytes[pos], "supports_range")?;
+            pos += 1;
+            let supports_is_null = parse_support_byte(bytes[pos], "supports_is_null")?;
+            pos += 1;
+            let supports_count = parse_support_byte(bytes[pos], "supports_count")?;
+            pos += 1;
+            let supports_min_max = parse_support_byte(bytes[pos], "supports_min_max")?;
+            pos += 1;
+            let supports_selection_decode =
+                parse_support_byte(bytes[pos], "supports_selection_decode")?;
+            pos += 1;
+            let supports_direct_executioncode_remap =
+                parse_support_byte(bytes[pos], "supports_direct_executioncode_remap")?;
+            pos += 1;
+            let decode_cost_class = bytes[pos];
+            pos += 1;
+            let predicate_cost_class = bytes[pos];
+            pos += 1;
+            let mut reserved = [0u8; 6];
+            reserved.copy_from_slice(&bytes[pos..pos + 6]);
+            pos += 6;
+            if reserved != [0; 6] {
+                return Err(CoveError::ReservedNotZero);
+            }
             entries.push(KernelCapabilityEntry {
                 encoding,
-                flags: KernelCapabilityFlags(flag_raw),
+                supports_eq,
+                supports_in,
+                supports_range,
+                supports_is_null,
+                supports_count,
+                supports_min_max,
+                supports_selection_decode,
+                supports_direct_executioncode_remap,
+                decode_cost_class,
+                predicate_cost_class,
+                reserved,
             });
         }
         Ok(Self { entries })
     }
 
-    pub fn capability_for(&self, encoding: CoveEncodingKind) -> Option<KernelCapabilityFlags> {
-        self.entries
-            .iter()
-            .find(|e| e.encoding == encoding)
-            .map(|e| e.flags)
+    pub fn capability_for(&self, encoding: CoveEncodingKind) -> Option<&KernelCapabilityEntry> {
+        self.entries.iter().find(|e| e.encoding == encoding)
     }
 
     /// Spec §21 — serialise this kernel-capabilities section into the wire
     /// format consumed by [`KernelCapabilities::parse`]. Round-trip parity is
     /// covered by the unit tests below.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + self.entries.len() * (2 + 4));
+        let mut out = Vec::with_capacity(4 + self.entries.len() * KERNEL_CAPABILITY_ENTRY_LEN);
         out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for entry in &self.entries {
             out.extend_from_slice(&(entry.encoding as u16).to_le_bytes());
-            out.extend_from_slice(&entry.flags.bits().to_le_bytes());
+            out.push(entry.supports_eq);
+            out.push(entry.supports_in);
+            out.push(entry.supports_range);
+            out.push(entry.supports_is_null);
+            out.push(entry.supports_count);
+            out.push(entry.supports_min_max);
+            out.push(entry.supports_selection_decode);
+            out.push(entry.supports_direct_executioncode_remap);
+            out.push(entry.decode_cost_class);
+            out.push(entry.predicate_cost_class);
+            out.extend_from_slice(&entry.reserved);
         }
         out
+    }
+}
+
+fn parse_support_byte(value: u8, field: &str) -> Result<u8, CoveError> {
+    if value <= 1 {
+        Ok(value)
+    } else {
+        Err(CoveError::BadSection(format!(
+            "kernel capability {field} must be 0 or 1, got {value}"
+        )))
     }
 }
 
@@ -107,18 +146,33 @@ impl KernelCapabilities {
 mod tests {
     use super::*;
 
+    fn entry(encoding: CoveEncodingKind) -> KernelCapabilityEntry {
+        KernelCapabilityEntry {
+            encoding,
+            supports_eq: 1,
+            supports_in: 1,
+            supports_range: 0,
+            supports_is_null: 1,
+            supports_count: 1,
+            supports_min_max: 0,
+            supports_selection_decode: 1,
+            supports_direct_executioncode_remap: 0,
+            decode_cost_class: 2,
+            predicate_cost_class: 3,
+            reserved: [0; 6],
+        }
+    }
+
     #[test]
     fn round_trip_capabilities() {
-        let mut bytes = 1u32.to_le_bytes().to_vec();
-        bytes.extend_from_slice(&(CoveEncodingKind::Rle as u16).to_le_bytes());
-        bytes.extend_from_slice(
-            &(KernelCapabilityFlags::CANONICAL_DECODE | KernelCapabilityFlags::FAST_DECODE)
-                .bits()
-                .to_le_bytes(),
-        );
+        let bytes = KernelCapabilities {
+            entries: vec![entry(CoveEncodingKind::Rle)],
+        }
+        .serialize();
         let kc = KernelCapabilities::parse(&bytes).unwrap();
-        let f = kc.capability_for(CoveEncodingKind::Rle).unwrap();
-        assert!(f.contains(KernelCapabilityFlags::FAST_DECODE));
+        let capability = kc.capability_for(CoveEncodingKind::Rle).unwrap();
+        assert_eq!(capability.supports_eq, 1);
+        assert_eq!(capability.supports_selection_decode, 1);
         assert!(kc.capability_for(CoveEncodingKind::Sparse).is_none());
     }
 
@@ -126,7 +180,7 @@ mod tests {
     fn rejects_unknown_encoding() {
         let mut bytes = 1u32.to_le_bytes().to_vec();
         bytes.extend_from_slice(&0xfffeu16.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; KERNEL_CAPABILITY_ENTRY_LEN - 2]);
         assert!(matches!(
             KernelCapabilities::parse(&bytes),
             Err(CoveError::BadSection(_))
@@ -146,22 +200,39 @@ mod tests {
     fn serialize_round_trip() {
         let kc = KernelCapabilities {
             entries: vec![
-                KernelCapabilityEntry {
-                    encoding: CoveEncodingKind::Rle,
-                    flags: KernelCapabilityFlags::CANONICAL_DECODE
-                        | KernelCapabilityFlags::FAST_DECODE,
-                },
-                KernelCapabilityEntry {
-                    encoding: CoveEncodingKind::PlainFixed,
-                    flags: KernelCapabilityFlags::CANONICAL_DECODE
-                        | KernelCapabilityFlags::PREDICATE_PUSHDOWN
-                        | KernelCapabilityFlags::ENGINE_NATIVE,
-                },
+                entry(CoveEncodingKind::Rle),
+                entry(CoveEncodingKind::PlainFixed),
             ],
         };
         let bytes = kc.serialize();
         let parsed = KernelCapabilities::parse(&bytes).unwrap();
         assert_eq!(parsed, kc);
+    }
+
+    #[test]
+    fn rejects_reserved_bytes() {
+        let mut bytes = KernelCapabilities {
+            entries: vec![entry(CoveEncodingKind::Rle)],
+        }
+        .serialize();
+        *bytes.last_mut().unwrap() = 1;
+        assert_eq!(
+            KernelCapabilities::parse(&bytes),
+            Err(CoveError::ReservedNotZero)
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_bytes() {
+        let mut bytes = KernelCapabilities {
+            entries: vec![entry(CoveEncodingKind::Rle)],
+        }
+        .serialize();
+        bytes.push(0);
+        assert!(matches!(
+            KernelCapabilities::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
     }
 
     #[test]

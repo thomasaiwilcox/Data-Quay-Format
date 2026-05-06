@@ -2,6 +2,7 @@ use std::{env, fs, path::PathBuf, process::ExitCode};
 
 use cove_core::{
     constants::CompressionCodec,
+    durable,
     interop::parquet::{
         convert_parquet_bytes, ParquetAccelerationPolicy, ParquetAggregatePolicy,
         ParquetClusteringPolicy, ParquetConversionOptions, ParquetDictionaryPolicy,
@@ -42,17 +43,17 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let input = fs::read(&command.input)
         .map_err(|err| format!("cannot read {}: {err}", command.input.display()))?;
     let result = convert_parquet_bytes(&input, &command.options).map_err(|err| err.to_string())?;
-    fs::write(&command.output, &result.cove_bytes)
-        .map_err(|err| format!("cannot write {}: {err}", command.output.display()))?;
+    durable::durable_replace(&command.output, &result.cove_bytes)
+        .map_err(|err| format!("cannot durably publish {}: {err}", command.output.display()))?;
     if let Some(covx_bytes) = &result.covx_bytes {
         let path = command.output.with_extension("covx");
-        fs::write(&path, covx_bytes)
-            .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+        durable::durable_replace(&path, covx_bytes)
+            .map_err(|err| format!("cannot durably publish {}: {err}", path.display()))?;
     }
     if let Some(covm_bytes) = &result.covm_bytes {
         let path = command.output.with_extension("covm");
-        fs::write(&path, covm_bytes)
-            .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+        durable::durable_replace(&path, covm_bytes)
+            .map_err(|err| format!("cannot durably publish {}: {err}", path.display()))?;
     }
 
     if let Some(target) = command.report {
@@ -92,6 +93,15 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Command>,
                     .map_err(|_| "--morsel-row-count must be a u32".to_string())?;
                 if options.morsel_row_count == 0 {
                     return Err("--morsel-row-count must be greater than zero".into());
+                }
+            }
+            "--segment-row-count" => {
+                let raw = next_value(&mut iter, "--segment-row-count")?;
+                options.segment_row_count = raw
+                    .parse::<u32>()
+                    .map_err(|_| "--segment-row-count must be a u32".to_string())?;
+                if options.segment_row_count == 0 {
+                    return Err("--segment-row-count must be greater than zero".into());
                 }
             }
             "--compression" => {
@@ -228,6 +238,7 @@ Options:\n  \
 --table-name <name>         Output COVE table name (default: parquet_import)\n  \
 --namespace <name>          Output COVE namespace (default: interop)\n  \
 --morsel-row-count <rows>   Rows per COVE morsel/page (default: 4096)\n  \
+--segment-row-count <rows>  Rows per COVE segment (default: u32::MAX)\n  \
 --compression <codec>       Page compression: none, lz4, zstd (default: none)\n  \
 --dictionary-policy <mode>  Dictionary synthesis policy: auto, never, always\n  \
 --stats-policy <mode>       Stats policy: none, recompute\n  \
@@ -259,6 +270,8 @@ mod tests {
             "sales".to_string(),
             "--morsel-row-count".to_string(),
             "128".to_string(),
+            "--segment-row-count".to_string(),
+            "256".to_string(),
             "--compression".to_string(),
             "none".to_string(),
             "--dictionary-policy".to_string(),
@@ -293,6 +306,7 @@ mod tests {
         assert_eq!(command.options.table_name, "orders");
         assert_eq!(command.options.namespace, "sales");
         assert_eq!(command.options.morsel_row_count, 128);
+        assert_eq!(command.options.segment_row_count, 256);
         assert_eq!(
             command.options.dictionary_policy,
             ParquetDictionaryPolicy::Never

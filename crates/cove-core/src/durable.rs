@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Durable replace publisher (Spec §74).
+//! Cove Format (COVE) v1.0 — Durable replace publisher (Spec §75).
 //!
 //! The durable-replace protocol is the recommended publication strategy for
 //! mutable filesystems. A writer:

@@ -156,6 +156,7 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             };
             let report = reader::validate_bytes_with_options(&data, opts)
                 .map_err(|e| format!("validation: {e}"))?;
@@ -201,6 +202,7 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             };
             let report = reader::validate_bytes_with_options(&data, opts)
                 .map_err(|e| format!("validation: {e}"))?;
@@ -211,6 +213,7 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             };
             let report = reader::validate_bytes_with_options(&data, opts)
                 .map_err(|e| format!("validation: {e}"))?;
@@ -244,6 +247,7 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             };
             let report = reader::validate_bytes_with_options(&data, opts)
                 .map_err(|e| format!("validation: {e}"))?;
