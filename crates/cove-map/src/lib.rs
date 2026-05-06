@@ -835,7 +835,7 @@ fn build_cove_o_with_source_states(
         serde_json::to_vec_pretty(&materialized.conversion_report)
             .map_err(|err| err.to_string())?,
     ));
-    let bytes = writer.write();
+    let bytes = writer.write().map_err(|err| err.to_string())?;
     validate_bytes_with_options(
         &bytes,
         ValidationOptions {
@@ -2229,6 +2229,7 @@ fn append_property_value_bytes(
         CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => {
             return Err("COVE-MAP writer does not materialize nested properties yet".into())
         }
+        _ => return Err("unsupported future COVE physical kind".into()),
     }
     Ok(())
 }
@@ -2250,6 +2251,7 @@ fn append_null_placeholder(property: &PropertyEntryV1, out: &mut Vec<u8>) -> Res
         CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => {
             return Err("nested null placeholders are not supported".into())
         }
+        _ => return Err("unsupported future COVE physical kind".into()),
     }
     Ok(())
 }
@@ -2308,6 +2310,7 @@ fn row_kind_counts(rows: &[ObjectRow]) -> (u32, u32, u32, u32) {
             RecordKind::Baseline => baseline += 1,
             RecordKind::Tombstone => tombstone += 1,
             RecordKind::ReservedLegacyMaterializedDelta => {}
+            _ => {}
         }
     }
     (delta, snapshot, baseline, tombstone)
@@ -3255,6 +3258,7 @@ fn mapping_identity(file: &CovemapFile) -> Result<(String, String), String> {
             EmbeddedMapSection::ProjectionCatalog(section) => {
                 return Ok((section.mapping_id, section.mapping_version));
             }
+            _ => {}
         }
     }
     Err("mapping contains no embedded sections".into())
@@ -3321,6 +3325,7 @@ fn encoding_for_physical(physical: CovePhysicalKind) -> CoveEncodingKind {
         CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => {
             CoveEncodingKind::Canonical
         }
+        _ => CoveEncodingKind::Canonical,
     }
 }
 

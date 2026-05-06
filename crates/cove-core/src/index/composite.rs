@@ -12,6 +12,7 @@ pub const COMPOSITE_ZONE_INDEX_HEADER_LEN: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum CompositeTransformKind {
     Tuple = 0,
     ZOrder = 1,

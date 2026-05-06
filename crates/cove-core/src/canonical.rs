@@ -17,6 +17,7 @@ pub struct CanonicalField<'a> {
 /// A logical canonical value, suitable for dictionary equality and trust-chain
 /// hashing (Spec §63).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum CanonicalValue<'a> {
     /// Empty payload.
     Null,

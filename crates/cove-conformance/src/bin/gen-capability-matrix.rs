@@ -104,6 +104,15 @@ fn rows() -> Vec<Row> {
             notes: "canonical.rs `validate_canonical_payload` is a structural parser that consumes encoded payloads, paired with `CanonicalValue::encode` and the recursive `canonicalize_*` helpers; round-trip exercised by spec_17 unit tests and the dictionary corpus",
         },
         Row {
+            section: "§19",
+            capability: "Logical/physical compatibility",
+            modeled: "yes",
+            parsed: "n/a",
+            validated: "yes",
+            written: "yes",
+            notes: "types.rs validates strict/default pairs plus explicit Bool-as-NumCode declarations through table, segment, and COVE-O property flags; full-file accept/reject corpus covers declared and missing Bool NumCode cases",
+        },
+        Row {
             section: "§20",
             capability: "Encoding cascades",
             modeled: "yes",
@@ -308,7 +317,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "profile/cove_h.rs; mount-hints plus required/optional corpus; `HarborMountHintsV1::serialize` round-trips with parser",
+            notes: "profile/cove_h.rs parses hints; mount.rs exposes Harbor-specific mount_cove_h_file that reuses or rebuilds FileCode-to-Harbor maps; corpus covers hint parsing plus mount map rebuild/reuse",
         },
         Row {
             section: "§45",
@@ -344,7 +353,7 @@ fn rows() -> Vec<Row> {
             parsed: "n/a",
             validated: "yes",
             written: "yes",
-            notes: "interop/arrow.rs covers null↔validity inversion, strict/reporting EncodedArray-to-Arrow export, UUID FixedSizeBinary, decimal precision/scale context, and fidelity diagnostics; arrow_bitmap_case and arrow_export_case corpus cover both surfaces",
+            notes: "interop/arrow.rs covers null↔validity inversion, strict/reporting EncodedArray-to-Arrow export, UUID FixedSizeBinary, JSON extension-or-lossy enforcement, decimal precision/scale context, and fidelity diagnostics; arrow_bitmap_case and arrow_export_case corpus cover both surfaces",
         },
         Row {
             section: "§50",
@@ -353,7 +362,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "interop/lakehouse.rs; accept/reject corpus; `LakehouseHints::serialize` round-trips with parser",
+            notes: "interop/lakehouse.rs parses descriptive hints and visibility overlay references, with guard helpers for physical pruning, candidate filtering, and visible exactness/aggregate restrictions; full external catalog filtering remains out of scope",
         },
         Row {
             section: "§51",
@@ -411,12 +420,12 @@ fn rows() -> Vec<Row> {
         },
         Row {
             section: "§58",
-            capability: "COVE-O lex row order",
+            capability: "COVE-O temporal row order",
             modeled: "yes",
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "profile/cove_o.rs temporal segment parser plus semantic reader integration; full-file accept/reject corpus; segment serializer enforces lex order on round-trip",
+            notes: "profile/cove_o.rs temporal segment parser plus semantic reader integration; full-file accept/reject corpus covers lexicographic order and CSN nondecreasing row-order enforcement",
         },
         Row {
             section: "§60",
@@ -970,7 +979,7 @@ fn main() {
     out.push_str(&format!(
         "\n**Fully gated capabilities:** {fully_gated} / {total}\n"
     ));
-    out.push_str("\n**Intentionally contextual or indirectly tracked sections:** §1-§7, §11, §14, §18-§19, §38-§39, §48, §55, §59, §71, §80-§81. These sections define terminology, invariants, registries, or suite process rather than a single reference-code capability row.\n");
+    out.push_str("\n**Intentionally contextual or indirectly tracked sections:** §1-§7, §11, §14, §18, §38-§39, §48, §55, §59, §71, §80-§81. These sections define terminology, invariants, registries, or suite process rather than a single reference-code capability row.\n");
 
     if check_mode() {
         assert!(

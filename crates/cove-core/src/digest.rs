@@ -12,6 +12,7 @@ pub const DIGEST_ENTRY_FIXED_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum DigestScope {
     File = 0,
     Section = 1,
@@ -33,6 +34,7 @@ impl DigestScope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum DigestTargetKind {
     Section = 0,
     Page = 1,
@@ -341,6 +343,7 @@ fn blake3_digest(_data: &[u8]) -> Result<Vec<u8>, CoveError> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "digest-sha2")]
     fn section_entry(section_id: u32, payload: &[u8]) -> DigestEntry {
         DigestEntry {
             target_kind: DigestTargetKind::Section,

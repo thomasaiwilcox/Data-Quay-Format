@@ -17,6 +17,7 @@ pub const PAGE_BUFFER_DESCRIPTOR_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum PageBufferKind {
     NullBitmap = 0,
     Values = 1,

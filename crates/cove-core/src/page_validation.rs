@@ -1,7 +1,7 @@
 use crate::{
     checksum, compression,
     constants::{CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
-    dictionary::FileDictionary,
+    dictionary::FileDictionaryView,
     encoding::{
         bit_packed::{BitPacked, BitPackedPayload},
         constant::ConstantPayload,
@@ -30,7 +30,7 @@ pub(crate) struct PageValidationContext<'a> {
     pub column_id: u32,
     pub logical_type: CoveLogicalType,
     pub physical_kind: CovePhysicalKind,
-    pub dictionary: Option<&'a FileDictionary>,
+    pub dictionary: Option<&'a FileDictionaryView<'a>>,
     pub zone_stats: Option<&'a [ZoneStatsEntry]>,
 }
 
@@ -234,7 +234,7 @@ fn validate_values_buffer(
     encoding_kind: CoveEncodingKind,
     row_count: u32,
     values: &[u8],
-    dictionary: Option<&FileDictionary>,
+    dictionary: Option<&FileDictionaryView<'_>>,
 ) -> Result<(), CoveError> {
     match encoding_kind {
         CoveEncodingKind::FileCode => validate_filecodes(values, row_count, dictionary),
@@ -393,7 +393,7 @@ fn validate_values_buffer(
 fn validate_filecodes(
     values: &[u8],
     row_count: u32,
-    dictionary: Option<&FileDictionary>,
+    dictionary: Option<&FileDictionaryView<'_>>,
 ) -> Result<(), CoveError> {
     require_len(values.len(), fixed_rows_len(row_count, 4)?)?;
     if let Some(dictionary) = dictionary {
@@ -411,7 +411,7 @@ fn validate_i64_values(
     values: Vec<i64>,
     physical_kind: CovePhysicalKind,
     row_count: u32,
-    dictionary: Option<&FileDictionary>,
+    dictionary: Option<&FileDictionaryView<'_>>,
 ) -> Result<(), CoveError> {
     if values.len() != row_count as usize {
         return Err(CoveError::PageCorrupt);
@@ -445,7 +445,7 @@ fn validate_i64_values(
 fn validate_local_codebook_values(
     values: &[LocalCodebookValue],
     physical_kind: CovePhysicalKind,
-    dictionary: Option<&FileDictionary>,
+    dictionary: Option<&FileDictionaryView<'_>>,
 ) -> Result<(), CoveError> {
     for value in values {
         match (physical_kind, value) {

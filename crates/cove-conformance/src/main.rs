@@ -75,7 +75,7 @@ use cove_core::{
     },
     interop::{
         arrow::{arrow_validity_to_cove_null, cove_null_to_arrow_validity, encoded_array_to_arrow},
-        lakehouse::LakehouseHints,
+        lakehouse::{LakehouseHints, LakehouseMetadataUse, LakehouseOverlayDecision},
         parquet::{
             convert_parquet_bytes, decode_materialized_page_values_with_nulls,
             ParquetConversionOptions,
@@ -84,7 +84,10 @@ use cove_core::{
     io_hints::IoHints,
     kernel::KernelCapabilities,
     metadata::MetadataJson,
-    mount::{mount_cove_file, MountOptions, SidecarValidationStatus},
+    mount::{
+        mount_cove_file, mount_cove_h_file, ExecutionCodeRequest, ExecutionCodeResolver,
+        ExecutionCodeValue, HarborMountOptions, MountOptions, SidecarValidationStatus,
+    },
     page::{ColumnPageIndex, ColumnPageIndexEntryV1, PageIndex},
     page_payload::{ColumnPagePayloadV1, PageBufferKind},
     profile::{
@@ -272,6 +275,7 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
         "redaction_manifest" => RedactionManifest::parse(bytes).map(|_| ()),
         "io_hints" => IoHints::parse(bytes).map(|_| ()),
         "lakehouse_hints" => LakehouseHints::parse(bytes).map(|_| ()),
+        "lakehouse_overlay_guard_case" => validate_lakehouse_overlay_guard_fixture(bytes),
         "kernel_capabilities" => KernelCapabilities::parse(bytes).map(|_| ()),
         "page_index" => PageIndex::parse(bytes).map(|_| ()),
         "column_domain" => ColumnDomain::parse(bytes).map(|_| ()),
@@ -301,6 +305,7 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
         "cove_e_code_space" => CodeSpaceDescriptorV1::parse(bytes).map(|_| ()),
         "cove_e_mount_policy" => EngineMountPolicyV1::parse(bytes).map(|_| ()),
         "cove_h_mount_hints" => HarborMountHintsV1::parse(bytes).map(|_| ()),
+        "cove_h_mount_case" => validate_harbor_mount_fixture(bytes),
         "cove_o_object_catalog" => ObjectTypeCatalog::parse(bytes).map(|_| ()),
         "cove_o_temporal_segment_index" => TemporalSegmentIndex::parse(bytes).map(|_| ()),
         "cove_o_temporal_bloom_index" => TemporalBloomIndex::parse(bytes).map(|_| ()),
@@ -319,6 +324,88 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
 fn validate_extension_registry_fixture(bytes: &[u8]) -> Result<(), CoveError> {
     let registry = ExtensionRegistry::parse(bytes)?;
     registry.validate_known(true)
+}
+
+struct HarborFixtureResolver;
+
+impl ExecutionCodeResolver for HarborFixtureResolver {
+    fn resolve(&self, request: ExecutionCodeRequest<'_>) -> Result<ExecutionCodeValue, CoveError> {
+        Ok(ExecutionCodeValue::Unsigned(
+            10_000 + u64::from(request.file_code),
+        ))
+    }
+}
+
+fn validate_harbor_mount_fixture(bytes: &[u8]) -> Result<(), CoveError> {
+    let mounted = mount_cove_h_file(
+        bytes,
+        MountOptions::default(),
+        HarborMountOptions::default(),
+        Some(&HarborFixtureResolver),
+    )?;
+    if mounted.harbor_maps.is_empty() {
+        return Err(CoveError::BadSection(
+            "harbor mount fixture did not build any maps".into(),
+        ));
+    }
+    let reused = mount_cove_h_file(
+        bytes,
+        MountOptions::default(),
+        HarborMountOptions {
+            existing_maps: Some(&mounted.harbor_maps),
+            rebuild_missing_or_stale: false,
+        },
+        None,
+    )?;
+    if reused.harbor_maps != mounted.harbor_maps {
+        return Err(CoveError::BadSection(
+            "harbor mount fixture did not reuse valid maps".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lakehouse_overlay_guard_fixture(bytes: &[u8]) -> Result<(), CoveError> {
+    let hints = LakehouseHints::parse(bytes)?;
+    if hints.visibility_overlay.is_none() {
+        return Err(CoveError::BadSection(
+            "lakehouse overlay guard fixture missing overlay".into(),
+        ));
+    }
+    let expected = [
+        (
+            LakehouseMetadataUse::PhysicalPruning,
+            false,
+            false,
+            LakehouseOverlayDecision::Allow,
+        ),
+        (
+            LakehouseMetadataUse::LookupOrInvertedCandidates,
+            false,
+            false,
+            LakehouseOverlayDecision::RequireOverlayApplication,
+        ),
+        (
+            LakehouseMetadataUse::VisibleExactDomain,
+            false,
+            false,
+            LakehouseOverlayDecision::ForbidVisibleExactness,
+        ),
+        (
+            LakehouseMetadataUse::VisibleAggregateAnswer,
+            false,
+            true,
+            LakehouseOverlayDecision::Allow,
+        ),
+    ];
+    for (metadata_use, overlay_empty, overlay_aware, decision) in expected {
+        if hints.overlay_decision(metadata_use, overlay_empty, overlay_aware) != decision {
+            return Err(CoveError::BadSection(
+                "lakehouse overlay guard decision mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_sidecar_freshness_fixture(bytes: &[u8]) -> Result<(), CoveError> {
@@ -382,6 +469,7 @@ fn sidecar_status_name(status: SidecarValidationStatus) -> &'static str {
         SidecarValidationStatus::NotProvided => "NotProvided",
         SidecarValidationStatus::Valid => "Valid",
         SidecarValidationStatus::StaleIgnored => "StaleIgnored",
+        _ => "Future",
     }
 }
 
@@ -427,12 +515,11 @@ fn validate_durable_publish_fixture(bytes: &[u8]) -> Result<(), CoveError> {
             .and_then(Value::as_str)
             .unwrap_or("case")
     ));
-    std::fs::create_dir_all(&dir).map_err(|error| CoveError::Io(error.to_string()))?;
+    std::fs::create_dir_all(&dir).map_err(CoveError::from)?;
     let path = dir.join("published.cove");
-    std::fs::write(&path, b"old-authoritative")
-        .map_err(|error| CoveError::Io(error.to_string()))?;
-    durable::durable_replace(&path, &payload).map_err(|error| CoveError::Io(error.to_string()))?;
-    let actual = std::fs::read(&path).map_err(|error| CoveError::Io(error.to_string()))?;
+    std::fs::write(&path, b"old-authoritative").map_err(CoveError::from)?;
+    durable::durable_replace(&path, &payload)?;
+    let actual = std::fs::read(&path).map_err(CoveError::from)?;
     let _ = std::fs::remove_dir_all(&dir);
     if actual != payload {
         return Err(CoveError::BadSection(
@@ -1143,6 +1230,9 @@ fn array_value_to_json(
         CoveArrayValue::OwnedBytes(bytes) => bytes_value_to_json(logical, &bytes),
         CoveArrayValue::DictValue(_) => Err(CoveError::BadSection(
             "array decode conformance fixtures do not use dictionaries".into(),
+        )),
+        _ => Err(CoveError::BadSection(
+            "array decode fixture produced a future value kind".into(),
         )),
     }
 }
@@ -2396,6 +2486,11 @@ fn parse_pruning_stat_scalar(value: &Value, field: &str) -> Result<StatScalar, C
                 "{field} uses unsupported pruning stat kind {kind_name}"
             )))
         }
+        _ => {
+            return Err(CoveError::BadSection(format!(
+                "{field} uses future pruning stat kind {kind_name}"
+            )))
+        }
     };
 
     Ok(StatScalar {
@@ -2823,5 +2918,6 @@ fn pruning_evidence_name(evidence: PruningEvidence) -> &'static str {
         PruningEvidence::AggregateSynopsis => "AggregateSynopsis",
         PruningEvidence::TopNSummary => "TopNSummary",
         PruningEvidence::FallbackToScan => "FallbackToScan",
+        _ => "Future",
     }
 }

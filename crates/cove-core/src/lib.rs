@@ -32,7 +32,7 @@
 //! ```rust
 //! use cove_core::writer::MinimalCoveWriter;
 //!
-//! let file_bytes = MinimalCoveWriter::write_empty_file();
+//! let file_bytes = MinimalCoveWriter::write_empty_file().unwrap();
 //! println!("Written {} bytes", file_bytes.len());
 //! ```
 //!
@@ -47,7 +47,7 @@
 //!     writer::MinimalCoveWriter,
 //! };
 //!
-//! let bytes = MinimalCoveWriter::write_empty_file();
+//! let bytes = MinimalCoveWriter::write_empty_file().unwrap();
 //!
 //! // 1. Parse header.
 //! let header = CoveHeaderV1::parse(&bytes).unwrap();

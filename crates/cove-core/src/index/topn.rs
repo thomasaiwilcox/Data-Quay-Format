@@ -8,6 +8,7 @@ pub const TOPN_ZONE_SUMMARY_LEN: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum TopNDirection {
     Largest = 0,
     Smallest = 1,

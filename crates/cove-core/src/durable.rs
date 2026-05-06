@@ -51,6 +51,43 @@ pub fn durable_replace(final_path: &Path, bytes: &[u8]) -> Result<PathBuf, CoveE
     durable_replace_with_backend(&mut backend, final_path, bytes)
 }
 
+/// Atomically publish bytes produced by `write` at `final_path` via the
+/// durable-replace protocol.
+///
+/// This avoids forcing callers to build the complete file in memory before
+/// publication. The supplied writer callback runs against a newly created
+/// sibling temporary file. The result is not considered durable until the file
+/// and parent directory sync steps complete.
+pub fn durable_replace_with_writer<F>(final_path: &Path, write: F) -> Result<PathBuf, CoveError>
+where
+    F: FnOnce(&mut File) -> Result<(), CoveError>,
+{
+    let tmp = temp_path_for(final_path);
+    let result = (|| -> Result<(), CoveError> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        write(&mut file)?;
+        file.sync_all()?;
+        fs::rename(&tmp, final_path)?;
+        let parent = final_path.parent().ok_or_else(|| {
+            CoveError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot fsync parent directory for {}: no parent path",
+                    final_path.display()
+                ),
+            ))
+        })?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result?;
+    Ok(tmp)
+}
+
 trait DurableReplaceBackend {
     fn write_new_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), CoveError>;
     fn sync_file(&mut self, path: &Path) -> Result<(), CoveError>;
@@ -85,9 +122,12 @@ impl DurableReplaceBackend for StdDurableReplaceBackend {
 
     fn sync_parent_dir(&mut self, final_path: &Path) -> Result<(), CoveError> {
         let parent = final_path.parent().ok_or_else(|| {
-            CoveError::Io(format!(
-                "cannot fsync parent directory for {}: no parent path",
-                final_path.display()
+            CoveError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot fsync parent directory for {}: no parent path",
+                    final_path.display()
+                ),
             ))
         })?;
         File::open(parent)?.sync_all()?;
@@ -224,6 +264,29 @@ mod tests {
         durable_replace(&target, payload).unwrap();
         let read_back = std::fs::read(&target).unwrap();
         assert_eq!(read_back, payload);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn durable_replace_with_writer_streams_to_temp_file() {
+        let dir = test_dir("writer");
+        let target = dir.join("example.cove");
+        let tmp = durable_replace_with_writer(&target, |file| {
+            file.write_all(b"streamed ")?;
+            file.write_all(b"bytes")?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"streamed bytes");
+        assert!(
+            !tmp.exists(),
+            "temporary path should have been renamed away on success"
+        );
+        assert!(
+            temp_siblings_for(&target).is_empty(),
+            "no durable temp siblings should remain"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

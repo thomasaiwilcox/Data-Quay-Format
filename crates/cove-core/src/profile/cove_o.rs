@@ -8,15 +8,17 @@
 
 use crate::{
     checksum, compression,
-    constants::{CoveLogicalType, CovePhysicalKind},
-    page::{ColumnPageIndex, ColumnPageIndexEntryV1},
+    constants::{CoveLogicalType, CovePhysicalKind, FEATURE_PAGE_PAYLOAD_ELISION},
+    page::{
+        page_uses_payload_elision, ColumnPageIndex, ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL,
+    },
     page_payload::ColumnPagePayloadV1,
     page_validation::{
         validate_column_page_payload, validate_stats_only_constant_page, PageValidationContext,
     },
     segment::{TableColumnDirectoryEntryV1, TABLE_COLUMN_DIRECTORY_ENTRY_LEN},
     trust_chain,
-    types::validate_logical_physical_pair,
+    types::{validate_logical_physical_pair_with_options, LogicalPhysicalOptions},
     CoveError,
 };
 
@@ -28,6 +30,7 @@ pub const TRUST_MANIFEST_ENTRY_LEN: usize = 40;
 
 /// Record kinds (Spec §59.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RecordKind {
     Delta,
     Snapshot,
@@ -161,6 +164,7 @@ pub const PROPERTY_FLAG_ASSOCIATION_VALID_TO: u32 = 0x0000_0010;
 pub const PROPERTY_FLAG_ASSOCIATION_OBSERVED_AT: u32 = 0x0000_0020;
 pub const PROPERTY_FLAG_EVIDENCE_REF: u32 = 0x0000_0040;
 pub const PROPERTY_FLAG_MAPPING_RULE_REF: u32 = 0x0000_0080;
+pub const PROPERTY_FLAG_BOOL_DECLARED_NUMERIC: u32 = 0x0000_0100;
 
 impl ObjectTypeCatalog {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
@@ -221,7 +225,16 @@ impl ObjectTypeCatalog {
                         prop.property_id
                     )));
                 }
-                if validate_logical_physical_pair(prop.logical_type, prop.physical_kind).is_err() {
+                if validate_logical_physical_pair_with_options(
+                    prop.logical_type,
+                    prop.physical_kind,
+                    LogicalPhysicalOptions {
+                        bool_declared_numeric: prop.flags & PROPERTY_FLAG_BOOL_DECLARED_NUMERIC
+                            != 0,
+                    },
+                )
+                .is_err()
+                {
                     return Err(CoveError::BadLogicalPhysicalPair);
                 }
             }
@@ -732,6 +745,17 @@ pub struct TemporalPropertyPage {
 
 impl TemporalSegmentData {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        Self::parse_inner(bytes, None)
+    }
+
+    pub fn parse_with_required_features(
+        bytes: &[u8],
+        required_features: u64,
+    ) -> Result<Self, CoveError> {
+        Self::parse_inner(bytes, Some(required_features))
+    }
+
+    fn parse_inner(bytes: &[u8], required_features: Option<u64>) -> Result<Self, CoveError> {
         let header = TemporalSegmentHeaderV1::parse(bytes)?;
         if header.row_count == 0 && header.morsel_count != 0 {
             return Err(CoveError::BadSchema(
@@ -791,8 +815,12 @@ impl TemporalSegmentData {
             )?);
             pos += TEMPORAL_ROW_ENTRY_LEN;
         }
-        let property_columns =
-            parse_temporal_property_columns(bytes, &header, column_directory_offset)?;
+        let property_columns = parse_temporal_property_columns(
+            bytes,
+            &header,
+            column_directory_offset,
+            required_features,
+        )?;
         let segment = Self {
             header,
             rows,
@@ -809,6 +837,13 @@ impl TemporalSegmentData {
             .map(TemporalRowEntryV1::row_key)
             .collect::<Vec<_>>();
         validate_temporal_order(&row_keys)?;
+        for pair in self.rows.windows(2) {
+            if pair[1].csn < pair[0].csn {
+                return Err(CoveError::BadSchema(
+                    "temporal segment csn decreases in row order".into(),
+                ));
+            }
+        }
 
         for (row_index, row) in self.rows.iter().enumerate() {
             if let Some(prev_ref) = row.prev_ref {
@@ -848,6 +883,7 @@ fn parse_temporal_property_columns(
     bytes: &[u8],
     header: &TemporalSegmentHeaderV1,
     column_directory_offset: usize,
+    required_features: Option<u64>,
 ) -> Result<Vec<TemporalPropertyColumn>, CoveError> {
     let page_index_offset =
         usize::try_from(header.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
@@ -892,6 +928,7 @@ fn parse_temporal_property_columns(
             if page.column_id != directory.column_id {
                 return Err(CoveError::PageCorrupt);
             }
+            validate_temporal_property_page_elision_features(page, required_features)?;
             let context = PageValidationContext {
                 table_id: None,
                 segment_id: Some(header.segment_id),
@@ -902,7 +939,7 @@ fn parse_temporal_property_columns(
                 zone_stats: None,
             };
             if page.page_length == 0 {
-                validate_stats_only_constant_page(&context, page)?;
+                validate_temporal_property_stats_only_page(&context, page)?;
                 pages.push(TemporalPropertyPage {
                     index_entry: page.clone(),
                     payload: None,
@@ -935,6 +972,32 @@ fn parse_temporal_property_columns(
         });
     }
     Ok(out)
+}
+
+pub(crate) fn validate_temporal_property_page_elision_features(
+    page: &ColumnPageIndexEntryV1,
+    required_features: Option<u64>,
+) -> Result<(), CoveError> {
+    if page_uses_payload_elision(page.flags)
+        && required_features.is_some_and(|bits| bits & FEATURE_PAGE_PAYLOAD_ELISION == 0)
+    {
+        return Err(CoveError::BadSection(
+            "COVE-O property page payload-elision flags require FEATURE_PAGE_PAYLOAD_ELISION in required_features"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_temporal_property_stats_only_page(
+    context: &PageValidationContext<'_>,
+    page: &ColumnPageIndexEntryV1,
+) -> Result<(), CoveError> {
+    validate_stats_only_constant_page(context, page)?;
+    if page.flags & PAGE_FLAG_ALL_NON_NULL != 0 {
+        return Err(CoveError::PageCorrupt);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1161,6 +1224,10 @@ fn write_str(out: &mut Vec<u8>, s: &str, what: &str) -> Result<(), CoveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        constants::{FEATURE_OBJECT_PROFILE, FEATURE_PAGE_PAYLOAD_ELISION},
+        page::{PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT},
+    };
 
     fn k(t: i64, csn: u64) -> TemporalRowKey {
         TemporalRowKey {
@@ -1372,6 +1439,78 @@ mod tests {
         bytes
     }
 
+    fn temporal_segment_with_stats_only_property_page(
+        rows: &[TemporalRowEntryV1],
+        non_null_count: u32,
+        null_count: u32,
+        flags: u32,
+    ) -> Vec<u8> {
+        let row_directory_offset = TEMPORAL_SEGMENT_HEADER_LEN as u64;
+        let row_bytes = (rows.len() * TEMPORAL_ROW_ENTRY_LEN) as u64;
+        let row_end = row_directory_offset + row_bytes;
+        let column_directory_offset = row_end;
+        let page_index_offset = column_directory_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN as u64;
+        let page_index_length = crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64;
+        let data_offset = page_index_offset + page_index_length;
+        let header = TemporalSegmentHeaderV1 {
+            segment_id: 7,
+            object_type_id: 1,
+            time_range_start_us: rows.first().map(|row| row.timestamp_us).unwrap_or(0),
+            time_range_end_us: rows.last().map(|row| row.timestamp_us).unwrap_or(0),
+            csn_min: rows.first().map(|row| row.csn).unwrap_or(0),
+            csn_max: rows.last().map(|row| row.csn).unwrap_or(0),
+            row_count: rows.len() as u32,
+            morsel_count: u32::from(!rows.is_empty()),
+            morsel_row_count: if rows.is_empty() {
+                0
+            } else {
+                rows.len() as u32
+            },
+            column_count: 1,
+            row_directory_offset,
+            column_directory_offset,
+            page_index_offset,
+            data_offset,
+            flags: 0,
+            checksum: 0,
+        };
+        let directory = TableColumnDirectoryEntryV1 {
+            column_id: 1,
+            logical_type: CoveLogicalType::Bool,
+            physical_kind: CovePhysicalKind::Boolean,
+            flags: 0,
+            page_index_offset,
+            page_index_length,
+            data_offset,
+            data_length: 0,
+            stats_ref: u32::MAX,
+            domain_ref: u32::MAX,
+            checksum: 0,
+        };
+        let page = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 0,
+            row_count: rows.len() as u32,
+            non_null_count,
+            null_count,
+            encoding_root: u32::MAX,
+            page_offset: 0,
+            page_length: 0,
+            uncompressed_length: 0,
+            stats_ref: 0,
+            flags,
+            checksum: checksum::crc32c(&[]),
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        for row in rows {
+            bytes.extend_from_slice(&row.serialize());
+        }
+        bytes.extend_from_slice(&directory.serialize());
+        bytes.extend_from_slice(&page.serialize());
+        bytes
+    }
+
     #[test]
     fn temporal_segment_data_roundtrip_validates() {
         let bytes = temporal_segment_bytes(&[temporal_row(10, 1), temporal_row(20, 2)]);
@@ -1381,12 +1520,59 @@ mod tests {
     }
 
     #[test]
+    fn temporal_property_all_null_stats_only_requires_elision_feature() {
+        let bytes = temporal_segment_with_stats_only_property_page(
+            &[temporal_row(10, 1)],
+            0,
+            1,
+            PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL,
+        );
+        assert!(matches!(
+            TemporalSegmentData::parse_with_required_features(&bytes, FEATURE_OBJECT_PROFILE),
+            Err(CoveError::BadSection(_))
+        ));
+        assert!(TemporalSegmentData::parse_with_required_features(
+            &bytes,
+            FEATURE_OBJECT_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn temporal_property_all_non_null_stats_only_requires_validated_stats() {
+        let bytes = temporal_segment_with_stats_only_property_page(
+            &[temporal_row(10, 1)],
+            1,
+            0,
+            PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL,
+        );
+        assert_eq!(
+            TemporalSegmentData::parse_with_required_features(
+                &bytes,
+                FEATURE_OBJECT_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
     fn temporal_segment_data_rejects_out_of_order_rows() {
         let bytes = temporal_segment_bytes(&[temporal_row(20, 2), temporal_row(10, 1)]);
         assert!(matches!(
             TemporalSegmentData::parse(&bytes),
             Err(CoveError::BadSchema(_))
         ));
+    }
+
+    #[test]
+    fn temporal_segment_data_rejects_csn_decrease_in_row_order() {
+        let bytes = temporal_segment_bytes(&[temporal_row(10, 100), temporal_row(20, 50)]);
+        assert_eq!(
+            TemporalSegmentData::parse(&bytes),
+            Err(CoveError::BadSchema(
+                "temporal segment csn decreases in row order".into()
+            ))
+        );
     }
 
     #[test]
@@ -1443,6 +1629,7 @@ mod tests {
         assert_eq!(parsed.entries[0].segment_id, 7);
     }
 
+    #[cfg(feature = "digest-sha2")]
     fn trust_manifest_bytes(segment: &TemporalSegmentData) -> Vec<u8> {
         let mut bytes = 2u32.to_le_bytes().to_vec();
         let mut prev = [0u8; 32];
@@ -1455,6 +1642,7 @@ mod tests {
         bytes
     }
 
+    #[cfg(feature = "digest-sha2")]
     #[test]
     fn trust_manifest_verifies_temporal_rows() {
         let segment = TemporalSegmentData::parse(&temporal_segment_bytes(&[
@@ -1466,6 +1654,7 @@ mod tests {
         assert!(manifest.verify_against(&[segment]).is_ok());
     }
 
+    #[cfg(feature = "digest-sha2")]
     #[test]
     fn trust_manifest_rejects_bad_digest() {
         let segment = TemporalSegmentData::parse(&temporal_segment_bytes(&[

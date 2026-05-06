@@ -20,7 +20,7 @@ use cove_core::{
 
 #[test]
 fn bootstrap_truncation_campaign_never_panics() {
-    let bytes = MinimalCoveWriter::write_empty_file();
+    let bytes = MinimalCoveWriter::write_empty_file().unwrap();
     let opts = ValidationOptions {
         semantic: true,
         verify_digests: false,

@@ -32,7 +32,7 @@ use crate::{
     constants::{CoveLogicalType, CovePhysicalKind, FEATURE_PAGE_PAYLOAD_ELISION},
     page::{page_uses_payload_elision, ColumnPageIndex, PAGE_FLAG_STATS_ONLY_CONSTANT},
     page_validation::{validate_column_page_wire, PageValidationContext},
-    types::validate_logical_physical_pair,
+    types::{validate_logical_physical_pair_with_options, LogicalPhysicalOptions},
     CoveError,
 };
 
@@ -229,6 +229,7 @@ impl TableSegmentIndex {
 ///       + flags(4) + checksum(4) = 72.
 pub const TABLE_SEGMENT_HEADER_LEN: usize = 72;
 pub const TABLE_COLUMN_DIRECTORY_ENTRY_LEN: usize = 52;
+pub const SEGMENT_COLUMN_FLAG_BOOL_DECLARED_NUMERIC: u8 = 0x01;
 
 /// Spec §25.2 `TableSegmentHeaderV1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,13 +312,20 @@ impl TableColumnDirectoryEntryV1 {
             .ok_or_else(|| CoveError::BadSchema(format!("unknown logical type {logical_raw}")))?;
         let physical_kind = CovePhysicalKind::from_u8(physical_raw)
             .ok_or_else(|| CoveError::BadSchema(format!("unknown physical kind {physical_raw}")))?;
-        validate_logical_physical_pair(logical_type, physical_kind)?;
+        let flags = bytes[7];
+        validate_logical_physical_pair_with_options(
+            logical_type,
+            physical_kind,
+            LogicalPhysicalOptions {
+                bool_declared_numeric: flags & SEGMENT_COLUMN_FLAG_BOOL_DECLARED_NUMERIC != 0,
+            },
+        )?;
 
         Ok(Self {
             column_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
             logical_type,
             physical_kind,
-            flags: bytes[7],
+            flags,
             page_index_offset: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
             page_index_length: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
             data_offset: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
@@ -913,6 +921,20 @@ mod tests {
             RowMorselDirectory::parse(&bytes, 1),
             Err(CoveError::ChecksumMismatch)
         );
+    }
+
+    #[test]
+    fn bool_numcode_column_directory_requires_numeric_declaration_flag() {
+        let mut dir = column(1, 0, 0, 0, 0);
+        dir.logical_type = CoveLogicalType::Bool;
+        dir.physical_kind = CovePhysicalKind::NumCode;
+        assert_eq!(
+            TableColumnDirectoryEntryV1::parse(&dir.serialize()),
+            Err(CoveError::BadLogicalPhysicalPair)
+        );
+
+        dir.flags = SEGMENT_COLUMN_FLAG_BOOL_DECLARED_NUMERIC;
+        assert!(TableColumnDirectoryEntryV1::parse(&dir.serialize()).is_ok());
     }
 
     #[test]

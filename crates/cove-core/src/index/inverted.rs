@@ -12,6 +12,7 @@ pub const INVERTED_MORSEL_ENTRY_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum InvertedKeyKind {
     FileCode = 0,
     NumCode = 1,

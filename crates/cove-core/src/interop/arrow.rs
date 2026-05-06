@@ -71,6 +71,7 @@ pub fn arrow_validity_to_cove_null(
 
 /// Policy for exporting FileCode-backed scalar columns to Arrow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ArrowDictionaryPolicy {
     /// Decode FileCodes to their logical values before building the Arrow array.
     DecodeValues,
@@ -91,6 +92,7 @@ pub struct ArrowDecimalContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ArrowFidelitySeverity {
     Informational,
     Lossy,
@@ -187,6 +189,7 @@ impl<'a> ArrowExportColumn<'a> {
 }
 
 /// A layout-aware Arrow export node.
+#[non_exhaustive]
 pub enum ArrowExportNode<'a> {
     Scalar {
         array: &'a EncodedArray<'a>,
@@ -808,7 +811,7 @@ fn arrow_data_type_with_report(
                 report.push(
                     None,
                     logical,
-                    ArrowFidelitySeverity::Informational,
+                    ArrowFidelitySeverity::Lossy,
                     "Json exported as Utf8 without Arrow extension metadata",
                 );
             }
@@ -1221,6 +1224,62 @@ mod tests {
             .unwrap();
         assert_eq!(strings.value(0), "hi");
         assert_eq!(strings.value(1), "there");
+    }
+
+    #[test]
+    fn strict_export_rejects_json_without_extension_metadata() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&7u32.to_le_bytes());
+        values.extend_from_slice(br#"{"a":1}"#);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Json,
+            CovePhysicalKind::VarBytes,
+            1,
+            CoveEncodingKind::VarBytes,
+            None,
+            &values,
+            None,
+        );
+
+        assert!(matches!(
+            encoded_array_to_arrow(&cove),
+            Err(CoveError::UnsupportedEncoding(_))
+        ));
+        let result = encoded_array_to_arrow_with_report(&cove).unwrap();
+        assert!(result.report.has_lossy_or_unsupported());
+        assert_eq!(result.value.data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn record_batch_emits_json_extension_metadata_when_requested() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&7u32.to_le_bytes());
+        values.extend_from_slice(br#"{"a":1}"#);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Json,
+            CovePhysicalKind::VarBytes,
+            1,
+            CoveEncodingKind::VarBytes,
+            None,
+            &values,
+            None,
+        );
+
+        let result = encoded_columns_to_record_batch_with_options(
+            &[("payload", &cove)],
+            ArrowExportOptions {
+                emit_json_extension_metadata: true,
+                ..ArrowExportOptions::default()
+            },
+        )
+        .unwrap();
+        let schema = result.value.schema();
+        let field = schema.field(0);
+        assert_eq!(
+            field.metadata().get("ARROW:extension:name"),
+            Some(&"cove.json".to_string())
+        );
+        assert!(result.report.issues.is_empty());
     }
 
     #[test]

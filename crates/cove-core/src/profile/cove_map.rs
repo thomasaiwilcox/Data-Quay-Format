@@ -239,6 +239,7 @@ pub struct MapProjectionCatalog {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EmbeddedMapSection {
     SourceCatalog(MapSourceCatalog),
     FunctionRegistry(MapFunctionRegistry),

@@ -42,11 +42,13 @@
 
 use crate::{
     constants::{CoveLogicalType, CovePhysicalKind},
-    types::validate_logical_physical_pair,
+    types::{validate_logical_physical_pair_with_options, LogicalPhysicalOptions},
     CoveError,
 };
 
 // ── ColumnEntry ──────────────────────────────────────────────────────────────
+
+pub const COLUMN_FLAG_BOOL_DECLARED_NUMERIC: u32 = 0x0000_0001;
 
 /// Spec §24 `TableColumnEntryV1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,7 +313,15 @@ impl TableCatalog {
                         c.column_id
                     )));
                 }
-                if validate_logical_physical_pair(c.logical, c.physical).is_err() {
+                if validate_logical_physical_pair_with_options(
+                    c.logical,
+                    c.physical,
+                    LogicalPhysicalOptions {
+                        bool_declared_numeric: c.flags & COLUMN_FLAG_BOOL_DECLARED_NUMERIC != 0,
+                    },
+                )
+                .is_err()
+                {
                     return Err(CoveError::BadLogicalPhysicalPair);
                 }
             }
@@ -455,6 +465,21 @@ mod tests {
             TableCatalog::parse(&bytes),
             Err(CoveError::BadLogicalPhysicalPair)
         );
+    }
+
+    #[test]
+    fn bool_numcode_requires_numeric_declaration_flag() {
+        let mut cat = sample_catalog();
+        cat.tables[0].columns[1].physical = CovePhysicalKind::NumCode;
+        let bytes = cat.serialize().unwrap();
+        assert_eq!(
+            TableCatalog::parse(&bytes),
+            Err(CoveError::BadLogicalPhysicalPair)
+        );
+
+        cat.tables[0].columns[1].flags = COLUMN_FLAG_BOOL_DECLARED_NUMERIC;
+        let bytes = cat.serialize().unwrap();
+        assert!(TableCatalog::parse(&bytes).is_ok());
     }
 
     #[test]

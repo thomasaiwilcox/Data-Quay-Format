@@ -236,6 +236,7 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                     Some(StorageClass::Inline) => "inline",
                     Some(StorageClass::Payload) => "payload",
                     Some(StorageClass::Redacted) => "redacted",
+                    Some(_) => "future",
                     None => "unknown",
                 };
                 let tag_str = format!("{}", entry.value_tag);
@@ -273,6 +274,7 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                     let n = bytes.len().min(max_bytes);
                     print_hex(&bytes[..n]);
                 }
+                _ => return Err("unsupported future dictionary value kind".into()),
             }
         }
     }

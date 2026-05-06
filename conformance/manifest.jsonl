@@ -1,5 +1,6 @@
 {"expect":"accept","kind":"cove","path":"accept/min_empty.cove","sections":["§9","§10","§12","§13","§72.1"]}
 {"expect":"accept","kind":"cove","path":"accept/cove_t_scan_table.cove","sections":["§24","§25","§26","§27","§72.2","§72.3","§73"]}
+{"expect":"accept","kind":"cove","path":"accept/cove_t_bool_numcode_declared.cove","sections":["§19","§24","§25","§73"]}
 {"expect":"accept","kind":"cove","path":"accept/cove_t_payload_elision_stats_only_all_null_valid.cove","sections":["§27.2","§72.2","§73"]}
 {"expect":"accept","kind":"cove","path":"accept/cove_t_payload_elision_stats_only_all_non_null_valid.cove","sections":["§27.2","§28","§72.2","§73"]}
 {"expect":"accept","kind":"cove","path":"accept/cove_t_payload_elision_value_stream_mixed_constant.cove","sections":["§20.6","§27.2","§72.2","§73"]}
@@ -37,6 +38,9 @@
 {"expect":"accept","kind":"sidecar_freshness_case","path":"accept/sidecar_freshness_digest_stale.json","sections":["§48","§68","§69"]}
 {"expect":"accept","kind":"sidecar_freshness_case","path":"accept/sidecar_freshness_corrupt_ignored.json","sections":["§48","§68","§69"]}
 {"expect":"accept","kind":"covemap","path":"accept/covemap_valid.covemap","sections":["§70"]}
+{"error_code":"COVE_E_UNKNOWN_REQUIRED_FEATURE","expect":"reject","kind":"covemap","path":"reject/covemap_unknown_required_feature.covemap","sections":["§70","§74","§77","§76"]}
+{"error_code":"COVE_E_BAD_SECTION","expect":"reject","kind":"covemap","path":"reject/covemap_missing_semantic_map_feature.covemap","sections":["§11","§70","§76"]}
+{"error_code":"COVE_E_BAD_SECTION","expect":"reject","kind":"covemap","path":"reject/covemap_lz4_missing_feature.covemap","sections":["§66","§70","§76"]}
 {"expect":"accept","kind":"metadata_json","path":"accept/metadata_json_valid.json","sections":["§15"]}
 {"expect":"accept","kind":"encoding_case","path":"accept/encoding_constant_valid.json","sections":["§20"]}
 {"expect":"accept","kind":"encoding_case","path":"accept/encoding_rle_valid.json","sections":["§20"]}
@@ -53,6 +57,7 @@
 {"expect":"accept","kind":"encoded_array_decode_case","path":"accept/encoded_array_decode_rle_valid.json","sections":["§20","§72.3"]}
 {"expect":"accept","kind":"encoded_array_decode_case","path":"accept/encoded_array_decode_local_codebook_varbytes_valid.json","sections":["§20","§72.3"]}
 {"expect":"accept","kind":"arrow_export_case","path":"accept/arrow_export_utf8_valid.json","sections":["§49","§20","§72.3"]}
+{"expect":"reject","kind":"arrow_export_case","path":"reject/arrow_export_json_requires_report.json","sections":["§49","§20","§76"]}
 {"expect":"accept","kind":"nested_case","path":"accept/nested_list_valid.json","sections":["§52"]}
 {"expect":"accept","kind":"nested_case","path":"accept/nested_struct_valid.json","sections":["§52"]}
 {"expect":"accept","kind":"nested_case","path":"accept/nested_map_valid.json","sections":["§52"]}
@@ -115,6 +120,7 @@
 {"expect":"accept","kind":"redaction_manifest","path":"accept/redaction_manifest_valid.bin","sections":["§64"]}
 {"expect":"accept","kind":"io_hints","path":"accept/io_hints_valid.bin","sections":["§67"]}
 {"expect":"accept","kind":"lakehouse_hints","path":"accept/lakehouse_hints_valid.bin","sections":["§50"]}
+{"expect":"accept","kind":"lakehouse_overlay_guard_case","path":"accept/lakehouse_overlay_guard_valid.bin","sections":["§50"]}
 {"expect":"accept","kind":"arrow_bitmap_case","path":"accept/arrow_bitmap_cove_to_arrow_valid.json","sections":["§49"]}
 {"expect":"accept","kind":"arrow_bitmap_case","path":"accept/arrow_bitmap_arrow_to_cove_partial_valid.json","sections":["§49"]}
 {"error_code":"COVE_E_OFFSET_RANGE","expect":"reject","kind":"arrow_bitmap_case","path":"reject/arrow_bitmap_cove_short.json","sections":["§49","§76"]}
@@ -133,6 +139,7 @@
 {"expect":"accept","kind":"cove_e_code_space","path":"accept/cove_e_code_space_valid.bin","sections":["§42"]}
 {"expect":"accept","kind":"cove_e_mount_policy","path":"accept/cove_e_mount_policy_valid.bin","sections":["§43"]}
 {"expect":"accept","kind":"cove_h_mount_hints","path":"accept/cove_h_mount_hints_valid.bin","sections":["§44"]}
+{"expect":"accept","kind":"cove_h_mount_case","path":"accept/cove_h_mount_rebuild_reuse.cove","sections":["§44","§48","§73"]}
 {"expect":"accept","kind":"cove_o_object_catalog","path":"accept/cove_o_object_catalog_valid.bin","sections":["§56","§61"]}
 {"error_code":"COVE_E_OFFSET_RANGE","expect":"reject","kind":"cove_o_object_catalog","path":"reject/cove_o_object_catalog_old_layout.bin","sections":["§56","§76"]}
 {"expect":"accept","kind":"cove_o_temporal_segment_index","path":"accept/cove_o_temporal_segment_index_valid.bin","sections":["§57"]}
@@ -194,6 +201,7 @@
 {"error_code":"COVE_E_BAD_DOMAIN","expect":"reject","kind":"cove","path":"reject/cove_t_bad_column_domain.cove","sections":["§23","§73","§76"]}
 {"error_code":"COVE_E_BAD_STATS","expect":"reject","kind":"cove","path":"reject/cove_t_bad_zone_stats.cove","sections":["§28","§73","§76"]}
 {"error_code":"COVE_E_BAD_SCHEMA","expect":"reject","kind":"cove","path":"reject/cove_t_duplicate_table_id.cove","sections":["§24","§73","§76"]}
+{"error_code":"COVE_E_BAD_LOGICAL_PHYSICAL_PAIR","expect":"reject","kind":"cove","path":"reject/cove_t_bool_numcode_missing_declaration.cove","sections":["§19","§24","§73","§76"]}
 {"error_code":"COVE_E_SEGMENT_CORRUPT","expect":"reject","kind":"cove","path":"reject/cove_t_bad_segment_gap.cove","sections":["§25","§73","§76"]}
 {"error_code":"COVE_E_PAGE_CORRUPT","expect":"reject","kind":"cove","path":"reject/cove_t_nested_list_bad_child_count.cove","sections":["§27","§52","§73","§76"]}
 {"error_code":"COVE_E_PAGE_CORRUPT","expect":"reject","kind":"cove","path":"reject/cove_t_nested_struct_missing_null_handling.cove","sections":["§27","§52","§73","§76"]}
@@ -262,7 +270,10 @@
 {"error_code":"COVE_E_BAD_SECTION","expect":"reject","kind":"cove","path":"reject/cove_h_required_bad_hints.cove","sections":["§44","§74","§77","§76"]}
 {"error_code":"COVE_E_BAD_SCHEMA","expect":"reject","kind":"cove","path":"reject/cove_o_required_bad_catalog.cove","sections":["§56","§74","§77","§76"]}
 {"error_code":"COVE_E_BAD_SCHEMA","expect":"reject","kind":"cove","path":"reject/cove_o_temporal_bad_order.cove","sections":["§58","§73","§76"]}
+{"error_code":"COVE_E_BAD_SCHEMA","expect":"reject","kind":"cove","path":"reject/cove_o_temporal_csn_decreases.cove","sections":["§58","§73","§76"]}
 {"error_code":"COVE_E_REF_INVALID","expect":"reject","kind":"cove","path":"reject/cove_o_temporal_bad_prev_ref.cove","sections":["§60","§73","§76"]}
+{"error_code":"COVE_E_BAD_SECTION","expect":"reject","kind":"cove","path":"reject/cove_o_property_elision_missing_feature.cove","sections":["§61","§66","§74","§76"]}
+{"error_code":"COVE_E_PAGE_CORRUPT","expect":"reject","kind":"cove","path":"reject/cove_o_property_stats_only_all_non_null_missing_stats.cove","sections":["§61","§66","§76"]}
 {"error_code":"COVE_E_DIGEST_MISMATCH","expect":"reject","kind":"cove","path":"reject/cove_o_trust_manifest_bad_digest.cove","sections":["§63","§73","§76"]}
 {"error_code":"COVE_E_BAD_VERSION","expect":"reject","kind":"error_surface_case","path":"reject/error_surface_bad_version.json","sections":["§76"]}
 {"error_code":"COVE_E_ARITH_OVERFLOW","expect":"reject","kind":"error_surface_case","path":"reject/error_surface_arith_overflow.json","sections":["§76"]}

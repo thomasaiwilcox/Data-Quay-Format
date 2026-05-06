@@ -13,6 +13,7 @@ pub const AGGREGATE_SYNOPSIS_ENTRY_LEN: usize = 48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum SynopsisKind {
     Count,
     MinMax,
@@ -46,6 +47,7 @@ impl SynopsisKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum SynopsisAccuracy {
     Exact = 0,
     Approximate = 1,

@@ -152,6 +152,7 @@ impl EngineProfileEntryV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ExecutionCodeKind {
     UnsignedInteger = 0,
     SignedInteger = 1,
@@ -175,6 +176,7 @@ impl ExecutionCodeKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ExecutionCodeLifetime {
     Query = 0,
     Scan = 1,
@@ -200,6 +202,7 @@ impl ExecutionCodeLifetime {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ExecutionCodeComparisonScope {
     NotComparable = 0,
     File = 1,
@@ -225,6 +228,7 @@ impl ExecutionCodeComparisonScope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ExecutionCodeCanonicality {
     Transient = 0,
     Leased = 1,
@@ -246,6 +250,7 @@ impl ExecutionCodeCanonicality {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum NullCodePolicy {
     NoNullCode = 0,
     EngineDefinesNullCode = 1,
@@ -345,6 +350,7 @@ impl ExecutionCodeDescriptorV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum ExecutionScopeKind {
     None = 0,
     Tenant = 1,
@@ -474,6 +480,7 @@ impl CodeSpaceDescriptorV1 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum FileCodeMappingKind {
     DecodeToValue = 0,
     MapToExecutionCode = 1,
@@ -495,6 +502,7 @@ impl FileCodeMappingKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum MissingValuePolicy {
     Error = 0,
     DecodeValueOnly = 1,
@@ -516,6 +524,7 @@ impl MissingValuePolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum StaleMappingPolicy {
     Rebuild = 0,
     Reject = 1,
@@ -535,6 +544,7 @@ impl StaleMappingPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ReverseLookupPolicy {
     NotAvailable = 0,
     BuildFromDictionary = 1,

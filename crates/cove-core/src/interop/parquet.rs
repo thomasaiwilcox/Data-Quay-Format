@@ -72,6 +72,7 @@ use crate::{
 
 /// One step in the Parquet → COVE conversion pipeline (Spec §51.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConversionStep {
     DecodeSource,
     PartitionSegments,
@@ -118,12 +119,14 @@ pub fn canonical_plan() -> Vec<ConversionStep> {
 /// Spec §51.3: unsupported nested source shapes MUST be downgraded to JSON
 /// or Binary and marked pushdown-limited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UnsupportedNestedFallback {
     Json,
     Binary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParquetDictionaryPolicy {
     Auto,
     Never,
@@ -131,12 +134,14 @@ pub enum ParquetDictionaryPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParquetStatsPolicy {
     None,
     Recompute,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParquetAccelerationPolicy {
     None,
     DeclaredOnly,
@@ -144,6 +149,7 @@ pub enum ParquetAccelerationPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParquetAggregatePolicy {
     None,
     Auto,
@@ -151,6 +157,7 @@ pub enum ParquetAggregatePolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParquetClusteringPolicy {
     PreserveSourceOrder,
     StableClusterDeclaredColumns,
@@ -204,6 +211,7 @@ impl Default for ParquetConversionOptions {
 
 /// A scalar value decoded from a materialized Parquet conversion page.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ParquetScalarValue {
     Null,
     Bool(bool),
@@ -3357,6 +3365,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "digest-sha2")]
     #[test]
     fn emits_dictionary_stats_indexes_and_sidecars_when_requested() {
         let batch = RecordBatch::try_from_iter(vec![

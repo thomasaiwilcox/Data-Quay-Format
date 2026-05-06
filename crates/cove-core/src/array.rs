@@ -23,6 +23,7 @@ use crate::{
 
 /// A decoded value from an encoded array row.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum CoveArrayValue<'a> {
     /// The row is null.
     Null,

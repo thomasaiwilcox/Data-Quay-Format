@@ -15,7 +15,7 @@ use cove_core::{
 fn main() {
     // 1. Build an empty but structurally valid COVE-T file.
     let writer = MinimalCoveWriter::new();
-    let bytes = writer.write();
+    let bytes = writer.write().unwrap();
     println!("wrote {} bytes", bytes.len());
 
     // 2. Publish via Spec §75 durable-replace into a temp dir.

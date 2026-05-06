@@ -9,7 +9,8 @@ use std::borrow::Cow;
 use crate::{
     checksum, compression,
     constants::{
-        CompressionCodec, SectionKind, FEATURE_SEMANTIC_MAP, MAGIC_COVEMAP, POSTSCRIPT_VERSION_V1,
+        CompressionCodec, SectionKind, FEATURE_CODEC_LZ4, FEATURE_CODEC_ZSTD, FEATURE_SEMANTIC_MAP,
+        KNOWN_FEATURE_BITS_MASK, MAGIC_COVEMAP, POSTSCRIPT_VERSION_V1,
     },
     postscript::CoveSectionSpecV1,
     profile::cove_map::{parse_embedded_section, validate_embedded_sections, EmbeddedMapSection},
@@ -369,6 +370,8 @@ impl CovemapFile {
                 "COVEMAP header and postscript feature bits disagree".into(),
             ));
         }
+        validate_covemap_feature_bits(header.required_features, header.optional_features)?;
+        let advertised_features = header.required_features | header.optional_features;
 
         let fixed_len = usize::from(header.header_len);
         let mapping_version_len = usize::from(header.mapping_version_len);
@@ -403,6 +406,7 @@ impl CovemapFile {
         let mut entry_offset = version_end;
         for _ in 0..header.section_count {
             let entry = CovemapSectionEntryV1::parse(&header_region[entry_offset..])?;
+            validate_covemap_section_codec_feature_advertisement(advertised_features, &entry)?;
             entry_offset = entry_offset
                 .checked_add(COVEMAP_SECTION_ENTRY_LEN as usize)
                 .ok_or(CoveError::ArithOverflow)?;
@@ -442,10 +446,18 @@ impl CovemapFile {
         let mut encoded_sections = Vec::with_capacity(self.sections.len());
         let mut section_entries = Vec::with_capacity(self.sections.len());
         let mut payload_offset = header_region_len as u64;
+        let mut required_codec_features = 0u64;
+        let mut optional_codec_features = 0u64;
 
         for section in &self.sections {
             let encoded =
                 compression::encode_payload_for_codec(&section.payload, section.entry.compression)?;
+            let codec_feature = covemap_codec_feature_bit(section.entry.compression)?;
+            if section.entry.required {
+                required_codec_features |= codec_feature;
+            } else {
+                optional_codec_features |= codec_feature;
+            }
             let length = encoded.len() as u64;
             let uncompressed_length = section.payload.len() as u64;
             if length == 0 && uncompressed_length != 0 {
@@ -484,6 +496,10 @@ impl CovemapFile {
         header.mapping_version_len = mapping_version_len;
         header.reserved0 = 0;
         header.reserved = [0u8; 32];
+        header.required_features |= FEATURE_SEMANTIC_MAP | required_codec_features;
+        header.optional_features |= optional_codec_features;
+        header.optional_features &= !header.required_features;
+        validate_covemap_feature_bits(header.required_features, header.optional_features)?;
         let header_bytes = header.serialize();
 
         let mut out = Vec::with_capacity(file_len as usize);
@@ -570,9 +586,53 @@ fn decode_section_payload<'a>(
     compression::section_spec_payload(file_data, &spec)
 }
 
+fn validate_covemap_feature_bits(
+    required_features: u64,
+    _optional_features: u64,
+) -> Result<(), CoveError> {
+    let unknown_required = required_features & !KNOWN_FEATURE_BITS_MASK;
+    if unknown_required != 0 {
+        return Err(CoveError::UnknownRequiredFeature(unknown_required));
+    }
+    if required_features & FEATURE_SEMANTIC_MAP == 0 {
+        return Err(CoveError::BadSection(
+            "COVEMAP artifacts require FEATURE_SEMANTIC_MAP in required_features".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_covemap_section_codec_feature_advertisement(
+    advertised_features: u64,
+    entry: &CovemapSectionEntryV1,
+) -> Result<(), CoveError> {
+    let codec_feature = covemap_codec_feature_bit(entry.compression)?;
+    if codec_feature != 0 && advertised_features & codec_feature == 0 {
+        return Err(CoveError::BadSection(format!(
+            "COVEMAP section {} uses compression codec {} but codec feature bit is not advertised",
+            entry.section_id, entry.compression
+        )));
+    }
+    Ok(())
+}
+
+fn covemap_codec_feature_bit(compression: u8) -> Result<u64, CoveError> {
+    match CompressionCodec::from_u8(compression).ok_or_else(|| {
+        CoveError::BadSection(format!("unknown COVEMAP compression codec {compression}"))
+    })? {
+        CompressionCodec::None => Ok(0),
+        CompressionCodec::Lz4 => Ok(FEATURE_CODEC_LZ4),
+        CompressionCodec::Zstd => Ok(FEATURE_CODEC_ZSTD),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "compression-lz4")]
+    use crate::constants::FEATURE_CODEC_LZ4;
+    #[cfg(feature = "compression-zstd")]
+    use crate::constants::FEATURE_CODEC_ZSTD;
 
     fn sample_file() -> CovemapFile {
         CovemapFile {
@@ -619,6 +679,24 @@ mod tests {
         }
     }
 
+    fn rewrite_covemap_feature_bits(
+        bytes: &mut [u8],
+        required_features: u64,
+        optional_features: u64,
+    ) {
+        let mut header = CovemapHeaderV1::parse(bytes).unwrap();
+        header.required_features = required_features;
+        header.optional_features = optional_features;
+        bytes[..COVEMAP_HEADER_LEN as usize].copy_from_slice(&header.serialize());
+
+        let mut postscript = CovemapPostscriptV1::parse_from_tail(bytes).unwrap();
+        postscript.required_features = required_features;
+        postscript.optional_features = optional_features;
+        let tail_start =
+            bytes.len() - (COVEMAP_POSTSCRIPT_LEN as usize + COVEMAP_POSTSCRIPT_TAIL_SIZE);
+        bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+    }
+
     #[test]
     fn header_roundtrip_and_checksum() {
         let mut header = CovemapHeaderV1::new([0x11; 16], 42);
@@ -661,6 +739,54 @@ mod tests {
             br#"{"mapping_id":"m1","mapping_version":"example/v1","functions":[]}"#
         );
         assert_eq!(parsed.postscript.file_len, bytes.len() as u64);
+    }
+
+    #[test]
+    fn file_rejects_unknown_required_feature() {
+        let mut bytes = sample_file().serialize().unwrap();
+        rewrite_covemap_feature_bits(&mut bytes, FEATURE_SEMANTIC_MAP | (1u64 << 63), 0);
+        assert!(matches!(
+            CovemapFile::parse(&bytes),
+            Err(CoveError::UnknownRequiredFeature(bits)) if bits == 1u64 << 63
+        ));
+    }
+
+    #[test]
+    fn file_requires_semantic_map_feature() {
+        let mut bytes = sample_file().serialize().unwrap();
+        rewrite_covemap_feature_bits(&mut bytes, 0, 0);
+        assert!(matches!(
+            CovemapFile::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[cfg(feature = "compression-lz4")]
+    #[test]
+    fn file_rejects_compressed_section_without_codec_feature() {
+        let mut file = sample_file();
+        file.sections[0].entry.compression = CompressionCodec::Lz4 as u8;
+        let mut bytes = file.serialize().unwrap();
+        rewrite_covemap_feature_bits(&mut bytes, FEATURE_SEMANTIC_MAP, 0);
+        assert!(matches!(
+            CovemapFile::parse(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
+    }
+
+    #[cfg(all(feature = "compression-lz4", feature = "compression-zstd"))]
+    #[test]
+    fn serialize_advertises_required_and_optional_section_codecs() {
+        let mut file = sample_file();
+        file.sections[0].entry.compression = CompressionCodec::Lz4 as u8;
+        file.sections[1].entry.compression = CompressionCodec::Zstd as u8;
+        let bytes = file.serialize().unwrap();
+        let parsed = CovemapFile::parse(&bytes).unwrap();
+        assert_ne!(parsed.header.required_features & FEATURE_CODEC_LZ4, 0);
+        assert_eq!(parsed.header.optional_features & FEATURE_CODEC_LZ4, 0);
+        assert_ne!(parsed.header.optional_features & FEATURE_CODEC_ZSTD, 0);
+        assert_eq!(parsed.sections[0].payload, file.sections[0].payload);
+        assert_eq!(parsed.sections[1].payload, file.sections[1].payload);
     }
 
     #[test]

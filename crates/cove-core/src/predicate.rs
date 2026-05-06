@@ -9,6 +9,7 @@
 /// Outcome of evaluating a predicate against a zone using only its metadata
 /// (ColumnDomain, ZoneStats, exact sets, blooms, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum PredicateZoneOutcome {
     /// Every row in the zone satisfies the predicate (Spec §29.1).
     AllMatch,

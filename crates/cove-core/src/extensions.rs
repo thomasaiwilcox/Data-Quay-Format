@@ -21,6 +21,7 @@ pub const EXTENSION_INDEX_DESCRIPTOR_LEN: usize = 18;
 /// Spec §45 `ExtensionKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum ExtensionKind {
     LogicalType = 0,
     PhysicalKind = 1,
@@ -99,6 +100,7 @@ pub struct ExtensionLogicalTypeV1 {
 /// Spec §47 proof capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ExtensionProofCapability {
     None = 0,
     DefinitelyNo = 1,
@@ -119,6 +121,7 @@ impl ExtensionProofCapability {
 /// Spec §47 false-negative policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ExtensionFalseNegativePolicy {
     MustNotHaveFalseNegatives = 0,
     MayHaveFalseNegatives = 1,

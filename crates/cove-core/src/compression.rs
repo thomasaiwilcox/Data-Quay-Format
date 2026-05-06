@@ -342,6 +342,21 @@ mod tests {
         assert_eq!(&*decoded, payload);
     }
 
+    #[cfg(not(feature = "compression-lz4"))]
+    #[test]
+    fn disabled_lz4_returns_unsupported_encoding() {
+        let payload = b"not decoded without lz4 support";
+        let entry = make_entry(0, payload.len() as u64, 128, CompressionCodec::Lz4 as u8);
+        assert!(matches!(
+            section_payload(payload, &entry),
+            Err(CoveError::UnsupportedEncoding(_))
+        ));
+        assert!(matches!(
+            encode_payload_for_codec(payload, CompressionCodec::Lz4 as u8),
+            Err(CoveError::UnsupportedEncoding(_))
+        ));
+    }
+
     #[cfg(feature = "compression-zstd")]
     #[test]
     fn zstd_writer_payload_round_trip() {
@@ -353,6 +368,21 @@ mod tests {
         let entry = make_entry(offset, compressed.len() as u64, payload.len() as u64, 2);
         let decoded = section_payload(&file, &entry).unwrap();
         assert_eq!(&*decoded, payload);
+    }
+
+    #[cfg(not(feature = "compression-zstd"))]
+    #[test]
+    fn disabled_zstd_returns_unsupported_encoding() {
+        let payload = b"not decoded without zstd support";
+        let entry = make_entry(0, payload.len() as u64, 128, CompressionCodec::Zstd as u8);
+        assert!(matches!(
+            section_payload(payload, &entry),
+            Err(CoveError::UnsupportedEncoding(_))
+        ));
+        assert!(matches!(
+            encode_payload_for_codec(payload, CompressionCodec::Zstd as u8),
+            Err(CoveError::UnsupportedEncoding(_))
+        ));
     }
 
     fn page_entry(

@@ -9,6 +9,7 @@ use crate::CoveError;
 
 /// Total order produced by comparing two values under a collation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum Ordering3 {
     Less,
     Equal,
@@ -27,6 +28,7 @@ impl From<std::cmp::Ordering> for Ordering3 {
 
 /// One of the six v1 collations, plus `None` for unspecified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CollationKind {
     /// `none` — equality only, no ordering allowed.
     None,

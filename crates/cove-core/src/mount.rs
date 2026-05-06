@@ -21,7 +21,10 @@ use crate::{
         exact_set::ExactSetIndex, inverted::InvertedMorselIndex, lookup::LookupIndex,
         topn::TopNSummary,
     },
-    profile::cove_e::{EngineMountPolicyV1, ExecutionCodeDescriptorV1},
+    profile::{
+        cove_e::{EngineMountPolicyV1, ExecutionCodeDescriptorV1},
+        cove_h::HarborMountHintsV1,
+    },
     reader::{self, IgnoredOptionalSection, OptionalPushdownPolicy, ValidationOptions},
     table::{ColumnEntry, TableCatalog},
     zone_stats::ZoneStatsSection,
@@ -30,6 +33,7 @@ use crate::{
 
 /// Requested output representation for dictionary-backed columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OutputRepresentation {
     DecodeToValue,
     MapToArrowDictionary,
@@ -79,6 +83,28 @@ pub struct MountedCoveFile {
     pub covm_status: SidecarValidationStatus,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct HarborMountOptions<'a> {
+    pub existing_maps: Option<&'a [HarborMountCodeMap]>,
+    pub rebuild_missing_or_stale: bool,
+}
+
+impl Default for HarborMountOptions<'_> {
+    fn default() -> Self {
+        Self {
+            existing_maps: None,
+            rebuild_missing_or_stale: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MountedHarborCoveFile {
+    pub mounted: MountedCoveFile,
+    pub hints: HarborMountHintsV1,
+    pub harbor_maps: Vec<HarborMountCodeMap>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountedTable {
     pub table_id: u32,
@@ -106,6 +132,7 @@ pub struct MountedScanIndex {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SidecarValidationStatus {
     NotProvided,
     Valid,
@@ -121,6 +148,7 @@ pub struct ReverseLookup {
 
 /// Engine-local execution code materialized for a FileCode.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExecutionCodeValue {
     Unsigned(u64),
     Signed(i64),
@@ -224,6 +252,57 @@ pub fn mount_cove_file(
         ignored_optional_sections: validation.ignored_optional_sections,
         covx_status,
         covm_status,
+    })
+}
+
+pub fn mount_cove_h_file(
+    data: &[u8],
+    mount_options: MountOptions<'_>,
+    harbor_options: HarborMountOptions<'_>,
+    resolver: Option<&dyn ExecutionCodeResolver>,
+) -> Result<MountedHarborCoveFile, CoveError> {
+    let mounted = mount_cove_file(data, mount_options, resolver)?;
+    let hints = parse_harbor_mount_hints(data, &mounted.footer)?;
+    let table_catalog = mounted
+        .table_catalog
+        .as_ref()
+        .ok_or(CoveError::BadEngineProfile)?;
+    let dictionary = mounted
+        .dictionary
+        .as_ref()
+        .ok_or(CoveError::ExecutionCodeMap)?;
+    let descriptor = mounted.execution_descriptors.first();
+    let mut harbor_maps = Vec::with_capacity(table_catalog.tables.len());
+    for table in &table_catalog.tables {
+        let existing = harbor_options.existing_maps.and_then(|maps| {
+            maps.iter()
+                .find(|map| map.table_id == table.table_id && map.file_id == mounted.header.file_id)
+        });
+        if !harbor_options.rebuild_missing_or_stale {
+            let existing = existing.ok_or(CoveError::SidecarStale)?;
+            existing.validate_for(
+                mounted.header.file_id,
+                table.table_id,
+                dictionary,
+                hints.lease_epoch,
+            )?;
+            harbor_maps.push(existing.clone());
+            continue;
+        }
+        harbor_maps.push(validate_or_rebuild_harbor_map(
+            existing,
+            mounted.header.file_id,
+            table.table_id,
+            dictionary,
+            hints.lease_epoch,
+            descriptor,
+            resolver,
+        )?);
+    }
+    Ok(MountedHarborCoveFile {
+        mounted,
+        hints,
+        harbor_maps,
     })
 }
 
@@ -396,6 +475,19 @@ fn mounted_column(column: &ColumnEntry, representation: OutputRepresentation) ->
         nullable: column.nullable,
         representation,
     }
+}
+
+fn parse_harbor_mount_hints(
+    data: &[u8],
+    footer: &CoveFooter,
+) -> Result<HarborMountHintsV1, CoveError> {
+    let mut sections = find_sections(footer, SectionKind::HarborMountHints);
+    if sections.len() != 1 {
+        return Err(CoveError::BadEngineProfile);
+    }
+    let entry = sections.pop().ok_or(CoveError::BadEngineProfile)?;
+    let payload = compression::section_payload(data, entry)?;
+    HarborMountHintsV1::parse(&payload)
 }
 
 fn parse_table_catalog(
@@ -652,17 +744,17 @@ fn find_sections(footer: &CoveFooter, kind: SectionKind) -> Vec<&CoveSectionEntr
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "digest-sha2")]
+    use crate::artifact::covm::{CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1};
+    #[cfg(feature = "digest-sha2")]
+    use crate::digest::compute_digest;
     use crate::{
-        artifact::{
-            covm::{CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
-            covx::{CovxHeaderV1, CovxPostscriptV1, CovxReferencedFileV1},
-        },
+        artifact::covx::{CovxHeaderV1, CovxPostscriptV1, CovxReferencedFileV1},
         constants::{
             CoveLogicalType, CovePhysicalKind, DigestAlgorithm, PrimaryProfile, StorageClass,
-            FEATURE_FILE_DICTIONARY, FEATURE_TABLE_PROFILE,
+            FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_TABLE_PROFILE,
         },
         dictionary::{FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
-        digest::compute_digest,
         table::{ColumnEntry, TableEntry},
         wire,
         writer::{MinimalCoveWriter, ScanProfileCoveWriter, SectionPayload},
@@ -750,6 +842,7 @@ mod tests {
         assert_eq!(mounted.covx_status, SidecarValidationStatus::StaleIgnored);
     }
 
+    #[cfg(feature = "digest-sha2")]
     #[test]
     fn sidecar_digest_match_is_valid() {
         let bytes = ScanProfileCoveWriter::new(sample_catalog())
@@ -894,6 +987,68 @@ mod tests {
         assert_eq!(reused, existing);
     }
 
+    #[test]
+    fn harbor_mount_rebuilds_missing_map() {
+        let bytes = harbor_dictionary_file();
+        let mounted = mount_cove_h_file(
+            &bytes,
+            MountOptions::default(),
+            HarborMountOptions::default(),
+            Some(&TestResolver),
+        )
+        .unwrap();
+        assert_eq!(mounted.hints.lease_epoch, 42);
+        assert_eq!(mounted.harbor_maps.len(), 1);
+        assert_eq!(mounted.harbor_maps[0].table_id, 7);
+        assert_eq!(mounted.harbor_maps[0].lease_epoch, 42);
+        assert_eq!(
+            mounted.harbor_maps[0].filecode_to_enginecode,
+            vec![10_000, 10_001]
+        );
+    }
+
+    #[test]
+    fn harbor_mount_reuses_valid_map_without_resolver() {
+        let bytes = harbor_dictionary_file();
+        let mounted = mount_cove_file(&bytes, MountOptions::default(), None).unwrap();
+        let existing = HarborMountCodeMap::rebuild(
+            mounted.header.file_id,
+            7,
+            mounted.dictionary.as_ref().unwrap(),
+            42,
+            None,
+            &TestResolver,
+        )
+        .unwrap();
+        let harbor = mount_cove_h_file(
+            &bytes,
+            MountOptions::default(),
+            HarborMountOptions {
+                existing_maps: Some(std::slice::from_ref(&existing)),
+                rebuild_missing_or_stale: false,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(harbor.harbor_maps, vec![existing]);
+    }
+
+    #[test]
+    fn harbor_mount_rejects_missing_map_when_rebuild_disabled() {
+        let bytes = harbor_dictionary_file();
+        let err = mount_cove_h_file(
+            &bytes,
+            MountOptions::default(),
+            HarborMountOptions {
+                existing_maps: None,
+                rebuild_missing_or_stale: false,
+            },
+            Some(&TestResolver),
+        )
+        .unwrap_err();
+        assert_eq!(err, CoveError::SidecarStale);
+    }
+
     fn sample_catalog() -> TableCatalog {
         TableCatalog {
             flags: 0,
@@ -980,7 +1135,95 @@ mod tests {
             optional_features: 0,
             data: table_catalog,
         });
-        writer.write()
+        writer.write().unwrap()
+    }
+
+    fn harbor_dictionary_file() -> Vec<u8> {
+        let dictionary = sample_dictionary();
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 7,
+                namespace: "public".into(),
+                name: "items".into(),
+                row_count: 0,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "name".into(),
+                    logical: CoveLogicalType::Utf8,
+                    physical: CovePhysicalKind::FileCode,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut dictionary_index = Vec::new();
+        dictionary_index.extend_from_slice(&dictionary.header.serialize());
+        for entry in &dictionary.entries {
+            dictionary_index.extend_from_slice(&entry.serialize());
+        }
+        let mut writer = MinimalCoveWriter::new();
+        writer.primary_profile = PrimaryProfile::HarborExecution as u8;
+        writer.required_features =
+            FEATURE_TABLE_PROFILE | FEATURE_FILE_DICTIONARY | FEATURE_HARBOR_PROFILE;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::FileDictionaryIndex as u16,
+            profile: PrimaryProfile::Mixed as u8,
+            flags: 0,
+            item_count: dictionary.len() as u64,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_FILE_DICTIONARY,
+            optional_features: 0,
+            data: dictionary_index,
+        });
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::TableCatalog as u16,
+            profile: PrimaryProfile::TableScan as u8,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_TABLE_PROFILE,
+            optional_features: 0,
+            data: catalog.serialize().unwrap(),
+        });
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::HarborMountHints as u16,
+            profile: PrimaryProfile::HarborExecution as u8,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_HARBOR_PROFILE,
+            optional_features: 0,
+            data: HarborMountHintsV1 {
+                harbor_profile_version_major: 1,
+                harbor_profile_version_minor: 0,
+                tenant_scope_ref: 0,
+                code_space_ref: 0,
+                lease_epoch: 42,
+                dictionary_digest_ref: 0,
+                catalog_digest_ref: 0,
+                mount_cache_policy: 0,
+                reserved: [0; 7],
+                private_payload_ref: 0,
+                checksum: 0,
+            }
+            .serialize()
+            .to_vec(),
+        });
+        writer.write().unwrap()
     }
 
     fn sample_dictionary() -> FileDictionary {

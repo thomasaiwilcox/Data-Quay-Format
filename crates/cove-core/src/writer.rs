@@ -1,18 +1,27 @@
 //! Cove Format (COVE) v1.0 — Minimal reference writer.
 //!
-//! Produces a valid, structurally complete COVE file in memory.
-//! The produced file satisfies the COVE-Core Minimal Profile (Section 71.1).
+//! Produces a valid, structurally complete COVE file.
+//! The produced file satisfies the COVE-Core Minimal Profile (Section 72.1).
+//!
+//! `write()` is a convenience wrapper that buffers the complete file in memory.
+//! `write_to()` streams the file to a `Write + Seek` target, and durable
+//! publication uses that path so it does not require a second full-file buffer;
+//! transient allocation is bounded by the largest section or encoded page that
+//! must be compressed before its footer entry can be written.
 //!
 //! # Example
 //!
 //! ```rust
 //! use cove_core::writer::MinimalCoveWriter;
 //!
-//! let bytes = MinimalCoveWriter::write_empty_file();
+//! let bytes = MinimalCoveWriter::write_empty_file().unwrap();
 //! assert!(bytes.len() > 128);
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::{Cursor, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
 
 use crate::{
     checksum, compression,
@@ -25,8 +34,8 @@ use crate::{
         FEATURE_INVERTED_INDEXES, FEATURE_LOOKUP_INDEXES, FEATURE_NESTED_COLUMNS,
         FEATURE_OBJECT_PROFILE, FEATURE_PAGE_PAYLOAD_ELISION, FEATURE_SEMANTIC_MAP,
         FEATURE_TABLE_PROFILE, FEATURE_TOPN_SUMMARIES, FOOTER_VERSION_V1, HEADER_LEN_V1,
-        KNOWN_FEATURE_BITS_MASK, MAGIC_COVE, MAGIC_COVE_FOOTER, METADATA_LEN_MAX,
-        SECTION_ENTRY_LEN, VERSION_MAJOR_V1,
+        KNOWN_FEATURE_BITS_MASK, MAGIC_COVE, MAGIC_COVE_FOOTER, SECTION_ENTRY_LEN,
+        VERSION_MAJOR_V1,
     },
     dictionary::FileDictionary,
     domain::ColumnDomain,
@@ -48,16 +57,17 @@ use crate::{
     segment::{
         RowMorselDirectory, RowMorselEntryV1, TableColumnDirectoryEntryV1, TableSegmentHeaderV1,
         TableSegmentIndex, TableSegmentIndexEntryV1, ROW_MORSEL_ENTRY_LEN,
-        TABLE_COLUMN_DIRECTORY_ENTRY_LEN, TABLE_SEGMENT_HEADER_LEN, TABLE_SEGMENT_INDEX_ENTRY_LEN,
+        SEGMENT_COLUMN_FLAG_BOOL_DECLARED_NUMERIC, TABLE_COLUMN_DIRECTORY_ENTRY_LEN,
+        TABLE_SEGMENT_HEADER_LEN, TABLE_SEGMENT_INDEX_ENTRY_LEN,
     },
-    table::{ColumnEntry, TableCatalog},
+    table::{ColumnEntry, TableCatalog, COLUMN_FLAG_BOOL_DECLARED_NUMERIC},
     zone_stats::ZoneStatsSection,
     CoveError,
 };
 
 /// A simple builder for minimal valid COVE files.
 ///
-/// Produces files that conform to the COVE-Core Minimal Profile (Section 71.1):
+/// Produces files that conform to the COVE-Core Minimal Profile (Section 72.1):
 /// - valid header,
 /// - valid postscript,
 /// - valid footer,
@@ -103,65 +113,58 @@ pub struct SectionPayload {
 impl MinimalCoveWriter {
     /// Serialize and durably publish the file to `path` using Spec §75.
     pub fn publish_durable(&self, path: &Path) -> Result<PathBuf, CoveError> {
-        durable::durable_replace(path, &self.write())
+        durable::durable_replace_with_writer(path, |file| self.write_to(file))
     }
 
     /// Validate builder inputs that have strict on-disk bounds in v1.
-    fn validate_inputs(&self) {
-        assert!(
-            self.metadata_json.len() <= METADATA_LEN_MAX as usize,
-            "metadata_json exceeds v1 limit of {} bytes",
-            METADATA_LEN_MAX
-        );
-        assert!(
-            std::str::from_utf8(&self.metadata_json).is_ok(),
-            "metadata_json must be valid UTF-8"
-        );
-        assert!(
-            metadata::validate(&self.metadata_json).is_ok(),
-            "metadata_json must be syntactically valid JSON"
-        );
-        assert!(
-            self.sections.len() <= u32::MAX as usize,
-            "section count exceeds u32::MAX"
-        );
-        assert!(
-            PrimaryProfile::from_u8(self.primary_profile).is_some(),
-            "unknown primary_profile {}",
-            self.primary_profile
-        );
-        assert!(
-            ProducerScopeKind::from_u16(self.producer_scope_kind).is_some(),
-            "unknown producer_scope_kind {}",
-            self.producer_scope_kind
-        );
-        assert!(
-            self.required_features & !KNOWN_FEATURE_BITS_MASK == 0,
-            "unknown required feature bits 0x{:016x}",
-            self.required_features & !KNOWN_FEATURE_BITS_MASK
-        );
-        for section in &self.sections {
-            assert!(
-                SectionKind::from_u16(section.section_kind).is_some(),
-                "unknown section_kind {}",
-                section.section_kind
-            );
-            assert!(
-                PrimaryProfile::from_u8(section.profile).is_some(),
-                "unknown section profile {}",
-                section.profile
-            );
-            assert!(
-                CompressionCodec::from_u8(section.compression).is_some(),
-                "unknown compression codec {}",
-                section.compression
-            );
-            assert!(
-                section.required_features & !KNOWN_FEATURE_BITS_MASK == 0,
-                "unknown section required feature bits 0x{:016x}",
-                section.required_features & !KNOWN_FEATURE_BITS_MASK
-            );
+    fn validate_inputs(&self) -> Result<(), CoveError> {
+        metadata::validate(&self.metadata_json)?;
+        if self.sections.len() > u32::MAX as usize {
+            return Err(CoveError::ArithOverflow);
         }
+        if PrimaryProfile::from_u8(self.primary_profile).is_none() {
+            return Err(CoveError::BadSection(format!(
+                "unknown primary_profile {}",
+                self.primary_profile
+            )));
+        }
+        if ProducerScopeKind::from_u16(self.producer_scope_kind).is_none() {
+            return Err(CoveError::BadSection(format!(
+                "unknown producer_scope_kind {}",
+                self.producer_scope_kind
+            )));
+        }
+        if self.required_features & !KNOWN_FEATURE_BITS_MASK != 0 {
+            return Err(CoveError::UnknownRequiredFeature(
+                self.required_features & !KNOWN_FEATURE_BITS_MASK,
+            ));
+        }
+        for section in &self.sections {
+            if SectionKind::from_u16(section.section_kind).is_none() {
+                return Err(CoveError::BadSection(format!(
+                    "unknown section_kind {}",
+                    section.section_kind
+                )));
+            }
+            if PrimaryProfile::from_u8(section.profile).is_none() {
+                return Err(CoveError::BadSection(format!(
+                    "unknown section profile {}",
+                    section.profile
+                )));
+            }
+            if CompressionCodec::from_u8(section.compression).is_none() {
+                return Err(CoveError::BadSection(format!(
+                    "unknown compression codec {}",
+                    section.compression
+                )));
+            }
+            if section.required_features & !KNOWN_FEATURE_BITS_MASK != 0 {
+                return Err(CoveError::UnknownRequiredFeature(
+                    section.required_features & !KNOWN_FEATURE_BITS_MASK,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Create a writer with all-zero defaults (empty table-scan file).
@@ -179,43 +182,35 @@ impl MinimalCoveWriter {
         }
     }
 
-    /// Serialise the file to a byte vector.
+    /// Stream the file to `writer`.
     ///
-    /// Layout:
-    /// ```text
-    /// [Header: 128 bytes]
-    /// [Section payloads ...]
-    /// [Footer header: 44 bytes]
-    /// [Section entries: section_count × 76 bytes]
-    /// [Metadata JSON: metadata_len bytes]
-    /// [Postscript: 64 bytes]
-    /// [postscript_version: u16]
-    /// [postscript_len: u16]
-    /// [Magic: "COV1"]
-    /// ```
-    pub fn write(&self) -> Vec<u8> {
-        self.validate_inputs();
+    /// The writer must be positioned at byte 0 for a new, truncated output
+    /// target. COVE offsets are absolute from the start of the file.
+    pub fn write_to<W: Write + Seek>(&self, writer: &mut W) -> Result<(), CoveError> {
+        self.validate_inputs()?;
+        if writer.stream_position()? != 0 {
+            return Err(CoveError::BadSection(
+                "MinimalCoveWriter::write_to requires a writer positioned at byte 0".into(),
+            ));
+        }
 
-        let mut buf: Vec<u8> = Vec::new();
+        writer.write_all(&[0u8; HEADER_SIZE])?;
 
-        // ── 1. Reserve space for header (filled in at the end) ─────────────
-        buf.extend_from_slice(&[0u8; HEADER_SIZE]);
-
-        // ── 2. Write section payloads and track their offsets ───────────────
         let mut section_entries: Vec<CoveSectionEntryV1> = Vec::new();
         for (idx, section) in self.sections.iter().enumerate() {
-            let section_offset = buf.len() as u64;
+            let section_offset = writer.stream_position()?;
             let section_data =
-                compression::encode_payload_for_codec(&section.data, section.compression)
-                    .unwrap_or_else(|err| panic!("section {} compression failed: {err}", idx + 1));
-            let section_len = section_data.len() as u64;
-            let section_uncompressed_len = section.data.len() as u64;
+                compression::encode_payload_for_codec(&section.data, section.compression)?;
+            let section_len =
+                u64::try_from(section_data.len()).map_err(|_| CoveError::ArithOverflow)?;
+            let section_uncompressed_len =
+                u64::try_from(section.data.len()).map_err(|_| CoveError::ArithOverflow)?;
             let section_crc = checksum::crc32c(&section_data);
 
-            buf.extend_from_slice(&section_data);
+            writer.write_all(&section_data)?;
 
             section_entries.push(CoveSectionEntryV1 {
-                section_id: (idx + 1) as u32,
+                section_id: u32::try_from(idx + 1).map_err(|_| CoveError::ArithOverflow)?,
                 section_kind: section.section_kind,
                 profile: section.profile,
                 flags: section.flags,
@@ -235,10 +230,11 @@ impl MinimalCoveWriter {
             });
         }
 
-        // ── 3. Build and write footer ────────────────────────────────────────
-        let footer_offset = buf.len() as u64;
-        let section_count = section_entries.len() as u32;
-        let metadata_len = self.metadata_json.len() as u32;
+        let footer_offset = writer.stream_position()?;
+        let section_count =
+            u32::try_from(section_entries.len()).map_err(|_| CoveError::ArithOverflow)?;
+        let metadata_len =
+            u32::try_from(self.metadata_json.len()).map_err(|_| CoveError::ArithOverflow)?;
 
         let footer_header = CoveFooterHeaderV1 {
             footer_magic: MAGIC_COVE_FOOTER,
@@ -250,19 +246,26 @@ impl MinimalCoveWriter {
             metadata_len,
             reserved: [0u8; 24],
         };
-        buf.extend_from_slice(&footer_header.serialize());
+        let mut footer_bytes = Vec::with_capacity(
+            FOOTER_HEADER_SIZE
+                + section_entries.len() * usize::from(SECTION_ENTRY_LEN)
+                + self.metadata_json.len(),
+        );
+        footer_bytes.extend_from_slice(&footer_header.serialize());
         for entry in &section_entries {
-            buf.extend_from_slice(&entry.serialize());
+            footer_bytes.extend_from_slice(&entry.serialize());
         }
-        buf.extend_from_slice(&self.metadata_json);
+        footer_bytes.extend_from_slice(&self.metadata_json);
+        let footer_len = u64::try_from(footer_bytes.len()).map_err(|_| CoveError::ArithOverflow)?;
+        let footer_crc = checksum::crc32c(&footer_bytes);
+        writer.write_all(&footer_bytes)?;
 
-        let footer_len = buf.len() as u64 - footer_offset;
-        let footer_crc = checksum::crc32c(&buf[footer_offset as usize..]);
-
-        // ── 4. Write postscript ──────────────────────────────────────────────
-        // file_len includes the entire postscript tail (payload + version + len + magic)
-        let file_len_before_tail = buf.len() as u64;
-        let total_file_len = file_len_before_tail + POSTSCRIPT_SIZE as u64 + 2 + 2 + 4;
+        // file_len includes the entire postscript tail (payload + version + len + magic).
+        let file_len_before_tail = writer.stream_position()?;
+        let total_file_len = file_len_before_tail
+            .checked_add(POSTSCRIPT_SIZE as u64)
+            .and_then(|len| len.checked_add(2 + 2 + 4))
+            .ok_or(CoveError::ArithOverflow)?;
 
         let postscript = CovePostscriptV1 {
             required_features: self.required_features,
@@ -279,11 +282,10 @@ impl MinimalCoveWriter {
                 crc32c: footer_crc,
                 reserved: 0,
             },
-            checksum: 0, // recomputed by serialize_tail
+            checksum: 0,
         };
-        buf.extend_from_slice(&postscript.serialize_tail());
+        writer.write_all(&postscript.serialize_tail())?;
 
-        // ── 5. Back-fill the header ──────────────────────────────────────────
         let header = CoveHeaderV1 {
             magic: MAGIC_COVE,
             header_len: HEADER_LEN_V1,
@@ -300,16 +302,40 @@ impl MinimalCoveWriter {
             reserved_scope_flags: 0,
             created_at_us: self.created_at_us,
             reserved: [0u8; 48],
-            checksum: 0, // recomputed by serialize()
+            checksum: 0,
         };
         let header_bytes = header.serialize();
-        buf[..HEADER_SIZE].copy_from_slice(&header_bytes);
+        // INVARIANT: the header checksum covers final feature bits and IDs, and
+        // the placeholder may be replaced only after every offset and file_len
+        // has been computed from bytes already written to the stream.
+        writer.seek(SeekFrom::Start(0))?;
+        writer.write_all(&header_bytes)?;
+        writer.seek(SeekFrom::Start(total_file_len))?;
+        Ok(())
+    }
 
-        buf
+    /// Serialise the file to a byte vector.
+    ///
+    /// Layout:
+    /// ```text
+    /// [Header: 128 bytes]
+    /// [Section payloads ...]
+    /// [Footer header: 44 bytes]
+    /// [Section entries: section_count × 76 bytes]
+    /// [Metadata JSON: metadata_len bytes]
+    /// [Postscript: 64 bytes]
+    /// [postscript_version: u16]
+    /// [postscript_len: u16]
+    /// [Magic: "COV1"]
+    /// ```
+    pub fn write(&self) -> Result<Vec<u8>, CoveError> {
+        let mut cursor = Cursor::new(Vec::new());
+        self.write_to(&mut cursor)?;
+        Ok(cursor.into_inner())
     }
 
     /// Convenience wrapper: write an empty COVE-T file with no sections.
-    pub fn write_empty_file() -> Vec<u8> {
+    pub fn write_empty_file() -> Result<Vec<u8>, CoveError> {
         Self::new().write()
     }
 }
@@ -352,6 +378,12 @@ pub struct ScanPageSpec {
     pub stats_ref: u32,
     /// Logical value payload bytes; the writer wraps them in the §27.3
     /// self-describing page container before applying `compression`.
+    ///
+    /// When `null_count > 0`, this buffer MUST start with the packed COVE null
+    /// bitmap for exactly `row_count` rows (`1` bit means null, LSB-first).
+    /// Unused bits in the final bitmap byte MUST be zero and the number of set
+    /// bits MUST equal `null_count`; all remaining bytes are the non-null value
+    /// stream for `encoding_root`.
     pub payload: Vec<u8>,
 }
 
@@ -678,7 +710,7 @@ impl ScanSegment {
                 column_id: column.column_id,
                 logical_type: column.logical,
                 physical_kind: column.physical,
-                flags: 0,
+                flags: segment_column_flags(column),
                 page_index_offset: column_page_index_offset,
                 page_index_length,
                 data_offset: column_data_offset,
@@ -794,10 +826,25 @@ fn encode_scan_page_payload(
         if spec.payload.len() < validity_len {
             return Err(CoveError::PageCorrupt);
         }
-        (
-            Some(spec.payload[..validity_len].to_vec()),
-            spec.payload[validity_len..].to_vec(),
-        )
+        let bitmap = &spec.payload[..validity_len];
+        // INVARIANT: a writer-created non-elided mixed/null page must carry an
+        // exact §27 null bitmap prefix; counts and tail bits are part of the
+        // decode contract, not optional metadata.
+        if spec.row_count % 8 != 0 && validity_len != 0 {
+            let valid_bits = spec.row_count % 8;
+            let mask = (1u8 << valid_bits) - 1;
+            if bitmap[validity_len - 1] & !mask != 0 {
+                return Err(CoveError::PageCorrupt);
+            }
+        }
+        let counted = bitmap.iter().try_fold(0u32, |acc, byte| {
+            acc.checked_add(byte.count_ones())
+                .ok_or(CoveError::ArithOverflow)
+        })?;
+        if counted != spec.null_count {
+            return Err(CoveError::PageCorrupt);
+        }
+        (Some(bitmap.to_vec()), spec.payload[validity_len..].to_vec())
     };
     ColumnPagePayloadV1::build_single_node(
         spec.row_count,
@@ -818,6 +865,14 @@ fn default_encoding_kind(column: &ColumnEntry) -> CoveEncodingKind {
         CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => {
             CoveEncodingKind::Canonical
         }
+    }
+}
+
+fn segment_column_flags(column: &ColumnEntry) -> u8 {
+    if column.flags & COLUMN_FLAG_BOOL_DECLARED_NUMERIC != 0 {
+        SEGMENT_COLUMN_FLAG_BOOL_DECLARED_NUMERIC
+    } else {
+        0
     }
 }
 
@@ -918,8 +973,7 @@ fn section_encoded_len(section: &SectionPayload) -> Result<usize, CoveError> {
 impl ScanProfileCoveWriter {
     /// Serialize and durably publish the file to `path` using Spec §75.
     pub fn publish_durable(&self, path: &Path) -> Result<PathBuf, CoveError> {
-        let bytes = self.write()?;
-        durable::durable_replace(path, &bytes)
+        durable::durable_replace_with_writer(path, |file| self.write_to(file))
     }
 
     pub fn new(table_catalog: TableCatalog) -> Self {
@@ -1097,7 +1151,18 @@ impl ScanProfileCoveWriter {
         });
     }
 
+    pub fn write_to<W: Write + Seek>(&self, writer: &mut W) -> Result<(), CoveError> {
+        let inner = self.prepare_inner_writer()?;
+        inner.write_to(writer)
+    }
+
     pub fn write(&self) -> Result<Vec<u8>, CoveError> {
+        let mut cursor = Cursor::new(Vec::new());
+        self.write_to(&mut cursor)?;
+        Ok(cursor.into_inner())
+    }
+
+    fn prepare_inner_writer(&self) -> Result<MinimalCoveWriter, CoveError> {
         self.table_catalog.validate()?;
         self.validate_segments_against_catalog()?;
 
@@ -1249,7 +1314,7 @@ impl ScanProfileCoveWriter {
                 data: payload,
             });
         }
-        Ok(inner.write())
+        Ok(inner)
     }
 
     fn validate_segments_against_catalog(&self) -> Result<(), CoveError> {
@@ -1294,54 +1359,57 @@ impl ScanProfileCoveWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "compression-lz4")]
+    use crate::constants::FEATURE_CODEC_LZ4;
+    #[cfg(feature = "compression-zstd")]
+    use crate::constants::FEATURE_CODEC_ZSTD;
     use crate::{
         compression::column_page_payload,
         constants::{
-            CoveEncodingKind, CoveLogicalType, CovePhysicalKind, FEATURE_CODEC_LZ4,
-            FEATURE_CODEC_ZSTD, FEATURE_NESTED_COLUMNS, FEATURE_PAGE_PAYLOAD_ELISION,
+            CoveLogicalType, CovePhysicalKind, FEATURE_NESTED_COLUMNS,
+            FEATURE_PAGE_PAYLOAD_ELISION, METADATA_LEN_MAX,
         },
-        encoding::local_codebook::{LocalCodebookPayload, LocalCodebookValues, LocalIndexPayload},
         encoding::nested::{ListLayout, ListLayoutPayload},
         footer::CoveFooter,
         header::CoveHeaderV1,
-        page::{
-            ColumnPageIndex, PAGE_FLAG_ALL_NULL, PAGE_FLAG_CODEC_MASK,
-            PAGE_FLAG_STATS_ONLY_CONSTANT,
-        },
+        page::{ColumnPageIndex, PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT},
         page_payload::{ColumnPagePayloadV1, PageBufferKind},
         postscript::CovePostscriptV1,
         reader::{validate_bytes_with_options, ValidationOptions},
         segment::TableSegmentPayloadV1,
         table::{ColumnEntry, TableEntry},
     };
+    #[cfg(any(feature = "compression-lz4", feature = "compression-zstd"))]
+    use crate::{
+        constants::CoveEncodingKind,
+        encoding::local_codebook::{LocalCodebookPayload, LocalCodebookValues, LocalIndexPayload},
+        page::PAGE_FLAG_CODEC_MASK,
+    };
 
     #[test]
-    #[should_panic(expected = "metadata_json exceeds v1 limit")]
     fn write_rejects_oversized_metadata() {
         let mut w = MinimalCoveWriter::new();
         w.metadata_json = vec![0u8; (METADATA_LEN_MAX as usize) + 1];
-        let _ = w.write();
+        assert!(matches!(w.write(), Err(CoveError::BadSection(_))));
     }
 
     #[test]
-    #[should_panic(expected = "metadata_json must be valid UTF-8")]
     fn write_rejects_invalid_metadata_utf8() {
         let mut w = MinimalCoveWriter::new();
         w.metadata_json = vec![0xff];
-        let _ = w.write();
+        assert!(matches!(w.write(), Err(CoveError::BadSection(_))));
     }
 
     #[test]
-    #[should_panic(expected = "metadata_json must be syntactically valid JSON")]
     fn write_rejects_invalid_metadata_json() {
         let mut w = MinimalCoveWriter::new();
         w.metadata_json = b"{not-json".to_vec();
-        let _ = w.write();
+        assert!(matches!(w.write(), Err(CoveError::BadSection(_))));
     }
 
     #[test]
     fn empty_file_is_valid() {
-        let bytes = MinimalCoveWriter::write_empty_file();
+        let bytes = MinimalCoveWriter::write_empty_file().unwrap();
 
         // Parse and validate header.
         let header = CoveHeaderV1::parse(&bytes).expect("header parse should succeed");
@@ -1386,7 +1454,7 @@ mod tests {
         writer.required_features =
             FEATURE_TABLE_PROFILE | crate::constants::FEATURE_FILE_DICTIONARY;
 
-        let bytes = writer.write();
+        let bytes = writer.write().unwrap();
 
         let ps = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
         assert_eq!(ps.file_len, bytes.len() as u64);
@@ -1405,6 +1473,31 @@ mod tests {
         let section_data = &bytes[s.offset as usize..(s.offset + s.length) as usize];
         assert_eq!(checksum::crc32c(section_data), s.crc32c);
         assert_eq!(section_data, payload_data.as_slice());
+    }
+
+    #[test]
+    fn minimal_write_to_matches_vec_writer() {
+        let mut writer = MinimalCoveWriter::new();
+        writer.metadata_json = br#"{"fixture":"streaming"}"#.to_vec();
+        writer.required_features =
+            FEATURE_TABLE_PROFILE | crate::constants::FEATURE_FILE_DICTIONARY;
+        writer.sections.push(SectionPayload {
+            section_kind: crate::constants::SectionKind::FileDictionaryIndex as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: crate::constants::FEATURE_FILE_DICTIONARY,
+            optional_features: 0,
+            data: Vec::new(),
+        });
+
+        let buffered = writer.write().unwrap();
+        let mut streamed = std::io::Cursor::new(Vec::new());
+        writer.write_to(&mut streamed).unwrap();
+        assert_eq!(streamed.into_inner(), buffered);
     }
 
     #[test]
@@ -1443,7 +1536,7 @@ mod tests {
         writer.required_features =
             FEATURE_TABLE_PROFILE | crate::constants::FEATURE_FILE_DICTIONARY;
 
-        let bytes = writer.write();
+        let bytes = writer.write().unwrap();
         let ps = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
         let footer_bytes =
             &bytes[ps.footer.offset as usize..(ps.footer.offset + ps.footer.length) as usize];
@@ -1478,7 +1571,7 @@ mod tests {
         writer.required_features =
             FEATURE_TABLE_PROFILE | crate::constants::FEATURE_FILE_DICTIONARY;
 
-        let bytes = writer.write();
+        let bytes = writer.write().unwrap();
         let ps = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
         let footer_bytes =
             &bytes[ps.footer.offset as usize..(ps.footer.offset + ps.footer.length) as usize];
@@ -1555,6 +1648,41 @@ mod tests {
     }
 
     #[test]
+    fn scan_profile_write_to_matches_vec_writer() {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 2,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "active".into(),
+                    logical: CoveLogicalType::Bool,
+                    physical: CovePhysicalKind::Boolean,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_segment(ScanSegment::new(1, 0, 0, 2, 1));
+
+        let buffered = writer.write().unwrap();
+        let mut streamed = std::io::Cursor::new(Vec::new());
+        writer.write_to(&mut streamed).unwrap();
+        assert_eq!(streamed.into_inner(), buffered);
+    }
+
+    #[test]
     fn scan_profile_writer_accounts_for_extra_sections_before_segment_data() {
         let catalog = TableCatalog {
             flags: 0,
@@ -1623,6 +1751,7 @@ mod tests {
         assert_eq!(segment_index.entries[0].offset, segment_data_entry.offset);
     }
 
+    #[cfg(any(feature = "compression-lz4", feature = "compression-zstd"))]
     fn local_codebook_page_catalog() -> TableCatalog {
         TableCatalog {
             flags: 0,
@@ -1650,6 +1779,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "compression-lz4", feature = "compression-zstd"))]
     fn assert_scan_writer_emits_compressed_local_codebook_page(
         codec: CompressionCodec,
         feature_bit: u64,
@@ -1751,6 +1881,80 @@ mod tests {
         let mut writer = ScanProfileCoveWriter::new(catalog);
         writer.push_segment(ScanSegment::new(1, 0, 0, 10, 0));
         assert!(matches!(writer.write(), Err(CoveError::BadSchema(_))));
+    }
+
+    #[test]
+    fn scan_profile_writer_propagates_inner_metadata_errors() {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 0,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![],
+            }],
+        };
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.metadata_json = vec![0xff];
+        assert!(matches!(writer.write(), Err(CoveError::BadSection(_))));
+    }
+
+    fn nullable_bool_writer_for_page(spec: ScanPageSpec) -> ScanProfileCoveWriter {
+        let row_count = spec.row_count;
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: u64::from(row_count),
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "active".into(),
+                    logical: CoveLogicalType::Bool,
+                    physical: CovePhysicalKind::Boolean,
+                    nullable: true,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut segment = ScanSegment::new(1, 0, 0, row_count, 1);
+        segment.set_column_pages(1, vec![spec]);
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_segment(segment);
+        writer
+    }
+
+    #[test]
+    fn scan_page_null_bitmap_validation_matches_spec_counts() {
+        let too_short = ScanPageSpec::new(9, vec![0x01]).with_counts(8, 1);
+        assert!(matches!(
+            nullable_bool_writer_for_page(too_short).write(),
+            Err(CoveError::PageCorrupt)
+        ));
+
+        let tail_bits_set = ScanPageSpec::new(9, vec![0x01, 0x02]).with_counts(8, 1);
+        assert!(matches!(
+            nullable_bool_writer_for_page(tail_bits_set).write(),
+            Err(CoveError::PageCorrupt)
+        ));
+
+        let count_mismatch = ScanPageSpec::new(9, vec![0x01, 0x00]).with_counts(7, 2);
+        assert!(matches!(
+            nullable_bool_writer_for_page(count_mismatch).write(),
+            Err(CoveError::PageCorrupt)
+        ));
     }
 
     #[test]

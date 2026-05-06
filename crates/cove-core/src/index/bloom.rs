@@ -16,6 +16,7 @@ pub const BLOOM_INDEX_HEADER_LEN: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum BloomGranularity {
     Segment = 0,
     Morsel = 1,
@@ -33,6 +34,7 @@ impl BloomGranularity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum BloomHashDomain {
     FileCode = 0,
     NumCode = 1,
@@ -52,6 +54,7 @@ impl BloomHashDomain {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum BloomAlgorithm {
     SplitBlock = 0,
 }

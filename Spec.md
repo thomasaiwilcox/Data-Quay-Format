@@ -1229,6 +1229,10 @@ DateDays
 TimestampMicros
 TimestampNanos
 **Rules:**
+- In v1, `Bool if explicitly declared numeric` is declared with the
+  per-column/property numeric flag: `TableColumnEntryV1.flags bit 0`,
+  `TableColumnDirectoryEntryV1.flags bit 0`, and `PropertyEntryV1.flags bit 8`.
+  Catalog and segment declarations for the same column/property MUST agree.
 - NumCode MUST be interpreted by declared logical_type.
 - NumCode MUST NOT be dictionary-resolved.
 - Numeric min/max statistics use logical ordering.
@@ -3136,6 +3140,14 @@ COVE predicate metadata and indexes describe the physical rows present in the im
 - Aggregate synopses over a COVE file are exact only for the physical COVE rows. They MUST NOT answer visible-table aggregate queries when a non-empty external overlay is active unless an overlay-aware correction or proof is applied.
 
 External overlays that reference physical positions SHOULD identify the target COVE file by file_id plus file length, footer CRC, and cryptographic digest where available. Rewritten or compacted COVE files receive new physical row references; overlays for old files MUST NOT be silently applied to rewritten files.
+
+In v1 `LAKEHOUSE_HINTS` may reference an external visibility overlay by setting
+hint flag bit 2. The overlay reference is encoded after `conversion_digest` as
+`overlay_kind: u8`, `fingerprint_flags: u8`, optional fingerprint fields in
+flag order (`file_id`, `file_len`, `footer_crc32c`, `digest`), then
+`reference_len: u16` and UTF-8 `reference` bytes. This reference is descriptive;
+the external table format or catalog remains authoritative for overlay
+semantics.
 
 ### 50.4 Append, Streaming, CDC, and Compaction Boundary
 
