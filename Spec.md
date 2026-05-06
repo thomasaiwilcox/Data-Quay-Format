@@ -1303,8 +1303,11 @@ struct CoveEncodingNodeV1 {
     params_length: u32,
 
     stats_id: u32,
+    reserved: u16,       // MUST be 0
 }
 ```
+
+Encoded length: 30 bytes.
 
 **Rules:**
 - The root node describes the page payload.
@@ -1784,6 +1787,51 @@ struct ColumnPageIndexEntryV1 {
 [encoding node descriptors]
 [buffer directory]
 [buffers]
+
+```rust
+struct ColumnPagePayloadHeaderV1 {
+    magic: [u8; 4],          // "CPG1"
+    version_major: u16,      // 1
+    header_len: u16,         // 36
+    flags: u16,              // reserved, MUST be 0
+    root_node_id: u16,
+    node_count: u16,
+    buffer_count: u16,
+    row_count: u32,
+    nodes_offset: u32,
+    buffer_directory_offset: u32,
+    buffers_offset: u32,
+    reserved: u32,           // MUST be 0
+}
+
+enum PageBufferKind {
+    NullBitmap = 0,
+    Values = 1,
+    Offsets = 2,
+    ChildLayout = 3,
+    Other = 255,
+}
+
+struct PageBufferDescriptorV1 {
+    buffer_id: u16,           // dense 0..buffer_count-1
+    kind: u16,                // PageBufferKind
+    flags: u32,               // reserved, MUST be 0
+    offset: u64,              // byte offset within this page payload
+    length: u64,
+    checksum: u32,            // CRC32C of this buffer
+    reserved: u32,            // MUST be 0
+}
+```
+
+**Container rules:**
+- `nodes_offset` MUST equal `header_len`.
+- `buffer_directory_offset` MUST equal `nodes_offset + node_count * 30`.
+- `buffers_offset` MUST equal `buffer_directory_offset + buffer_count * 32`.
+- `root_node_id` MUST identify exactly one `CoveEncodingNodeV1`, and that node's `logical_len` MUST equal the page row count.
+- Buffer descriptors MUST be dense by `buffer_id`, in ascending non-overlapping offset order, and every buffer MUST lie inside the page payload.
+- A non-elided page payload MUST be fully consumed by its buffer descriptors; trailing bytes are invalid.
+- A buffer descriptor checksum mismatch is a page checksum failure.
+
 **Logical row reconstruction:**
 1. if PAGE_FLAG_STATS_ONLY_CONSTANT is set, reconstruct all rows from page index counts and, for all-non-null pages, the validated page-level stats entry;
 2. otherwise read the null bitmap if present,

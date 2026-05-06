@@ -26,6 +26,7 @@ use crate::CoveError;
 /// assert_eq!(bm.is_null(0).unwrap(), true);
 /// assert_eq!(bm.is_null(1).unwrap(), false);
 /// ```
+#[derive(Debug, Clone, Copy)]
 pub struct ValidityBitmap<'a> {
     bytes: &'a [u8],
     row_count: u64,

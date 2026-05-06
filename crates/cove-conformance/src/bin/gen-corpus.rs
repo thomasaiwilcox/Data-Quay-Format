@@ -281,17 +281,29 @@ fn main() {
         parquet_primitives_valid_file(),
     );
 
+    let mut parquet_nullable = fixture(
+        "accept/parquet_nullable_valid.parquet",
+        "parquet_conversion_case",
+        "accept",
+        None,
+        &["§6.6", "§24", "§25", "§27", "§51", "§71.3"],
+    );
+    parquet_nullable["table_name"] = json!("parquet_nullable");
+    parquet_nullable["namespace"] = json!("interop");
+    parquet_nullable["expected_row_count"] = json!(3u64);
+    parquet_nullable["expected_columns"] = json!([
+        {
+            "name": "id",
+            "logical": "Int64",
+            "physical": "NumCode",
+            "values": [1, null, 3]
+        }
+    ]);
     write_fixture(
         &root,
         &mut entries,
-        fixture(
-            "reject/parquet_nulls_unsupported.parquet",
-            "parquet_conversion_case",
-            "reject",
-            Some("COVE_E_BAD_SCHEMA"),
-            &["§51", "§75"],
-        ),
-        parquet_nulls_unsupported_file(),
+        parquet_nullable,
+        parquet_nullable_valid_file(),
     );
 
     write_fixture(
@@ -4058,7 +4070,7 @@ fn parquet_primitives_valid_file() -> Vec<u8> {
     parquet_file_bytes(&batch)
 }
 
-fn parquet_nulls_unsupported_file() -> Vec<u8> {
+fn parquet_nullable_valid_file() -> Vec<u8> {
     let batch = RecordBatch::try_from_iter(vec![(
         "id",
         Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
@@ -5354,6 +5366,8 @@ fn cove_map_identity_conflict_file() -> Vec<u8> {
                 "property_conflicts_declared": true,
                 "function_ids": ["trim_lower"],
                 "join_keys": [{
+                    "role_id": "customer_id",
+                    "source_column": "customer_id",
                     "logical_type": "utf8",
                     "canonicalization": "trim_lower",
                     "null_policy": "reject",
@@ -5482,6 +5496,8 @@ fn valid_map_sections() -> Vec<SectionPayload> {
                     "property_conflicts_declared": true,
                     "function_ids": ["trim_lower"],
                     "join_keys": [{
+                        "role_id": "customer_id",
+                        "source_column": "customer_id",
                         "logical_type": "utf8",
                         "canonicalization": "trim_lower",
                         "null_policy": "reject",

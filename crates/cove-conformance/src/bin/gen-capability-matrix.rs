@@ -340,7 +340,7 @@ fn rows() -> Vec<Row> {
             validated: "yes",
             written: "yes",
             corpus: "yes",
-            notes: "interop/parquet.rs plus cove-convert-parquet CLI convert primitive/temporal/utf8/binary parquet batches into COVE-T scan-profile files with machine-readable reports; parquet_conversion_case corpus covers accept plus null/nested reject cases",
+            notes: "interop/parquet.rs plus cove-convert-parquet CLI convert primitive/temporal/utf8/binary parquet batches into COVE-T scan-profile files with machine-readable reports; parquet_conversion_case corpus covers primitive and nullable accept cases plus nested reject cases",
         },
         Row {
             section: "§52",

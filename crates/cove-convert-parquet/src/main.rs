@@ -2,7 +2,11 @@ use std::{env, fs, path::PathBuf, process::ExitCode};
 
 use cove_core::{
     constants::CompressionCodec,
-    interop::parquet::{convert_parquet_bytes, ParquetConversionOptions},
+    interop::parquet::{
+        convert_parquet_bytes, ParquetAccelerationPolicy, ParquetAggregatePolicy,
+        ParquetClusteringPolicy, ParquetConversionOptions, ParquetDictionaryPolicy,
+        ParquetStatsPolicy,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +44,16 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     let result = convert_parquet_bytes(&input, &command.options).map_err(|err| err.to_string())?;
     fs::write(&command.output, &result.cove_bytes)
         .map_err(|err| format!("cannot write {}: {err}", command.output.display()))?;
+    if let Some(covx_bytes) = &result.covx_bytes {
+        let path = command.output.with_extension("covx");
+        fs::write(&path, covx_bytes)
+            .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+    }
+    if let Some(covm_bytes) = &result.covm_bytes {
+        let path = command.output.with_extension("covm");
+        fs::write(&path, covm_bytes)
+            .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+    }
 
     if let Some(target) = command.report {
         let report = serde_json::to_string_pretty(&result.report.to_json_value())
@@ -84,6 +98,47 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Command>,
                 options.page_compression =
                     parse_compression(&next_value(&mut iter, "--compression")?)?;
             }
+            "--dictionary-policy" => {
+                options.dictionary_policy =
+                    parse_dictionary_policy(&next_value(&mut iter, "--dictionary-policy")?)?;
+            }
+            "--stats-policy" => {
+                options.stats_policy =
+                    parse_stats_policy(&next_value(&mut iter, "--stats-policy")?)?;
+            }
+            "--acceleration-policy" => {
+                options.acceleration_policy =
+                    parse_acceleration_policy(&next_value(&mut iter, "--acceleration-policy")?)?;
+            }
+            "--point-lookup-columns" => {
+                options.point_lookup_columns =
+                    parse_csv_list(&next_value(&mut iter, "--point-lookup-columns")?);
+            }
+            "--cluster-columns" => {
+                options.cluster_columns =
+                    parse_csv_list(&next_value(&mut iter, "--cluster-columns")?);
+            }
+            "--topn-columns" => {
+                options.topn_columns = parse_csv_list(&next_value(&mut iter, "--topn-columns")?);
+            }
+            "--aggregate-synopsis" => {
+                options.aggregate_policy =
+                    parse_aggregate_policy(&next_value(&mut iter, "--aggregate-synopsis")?)?;
+            }
+            "--aggregate-columns" => {
+                options.aggregate_columns =
+                    parse_csv_list(&next_value(&mut iter, "--aggregate-columns")?);
+            }
+            "--composite-zone" => {
+                options
+                    .composite_zone_groups
+                    .push(parse_csv_list(&next_value(&mut iter, "--composite-zone")?));
+            }
+            "--emit-covx" => options.emit_covx = true,
+            "--emit-covm" => options.emit_covm = true,
+            "--stable-clustering" => {
+                options.clustering_policy = ParquetClusteringPolicy::StableClusterDeclaredColumns;
+            }
             "--report" => {
                 let raw = next_value(&mut iter, "--report")?;
                 report = Some(if raw == "-" {
@@ -122,6 +177,50 @@ fn parse_compression(value: &str) -> Result<CompressionCodec, String> {
     }
 }
 
+fn parse_dictionary_policy(value: &str) -> Result<ParquetDictionaryPolicy, String> {
+    match value {
+        "auto" => Ok(ParquetDictionaryPolicy::Auto),
+        "never" => Ok(ParquetDictionaryPolicy::Never),
+        "always" => Ok(ParquetDictionaryPolicy::Always),
+        _ => Err("--dictionary-policy must be one of: auto, never, always".into()),
+    }
+}
+
+fn parse_stats_policy(value: &str) -> Result<ParquetStatsPolicy, String> {
+    match value {
+        "none" => Ok(ParquetStatsPolicy::None),
+        "recompute" => Ok(ParquetStatsPolicy::Recompute),
+        _ => Err("--stats-policy must be one of: none, recompute".into()),
+    }
+}
+
+fn parse_acceleration_policy(value: &str) -> Result<ParquetAccelerationPolicy, String> {
+    match value {
+        "none" => Ok(ParquetAccelerationPolicy::None),
+        "declared-only" => Ok(ParquetAccelerationPolicy::DeclaredOnly),
+        "auto" => Ok(ParquetAccelerationPolicy::Auto),
+        _ => Err("--acceleration-policy must be one of: none, declared-only, auto".into()),
+    }
+}
+
+fn parse_aggregate_policy(value: &str) -> Result<ParquetAggregatePolicy, String> {
+    match value {
+        "none" => Ok(ParquetAggregatePolicy::None),
+        "declared-only" => Ok(ParquetAggregatePolicy::DeclaredOnly),
+        "auto" => Ok(ParquetAggregatePolicy::Auto),
+        _ => Err("--aggregate-synopsis must be one of: none, declared-only, auto".into()),
+    }
+}
+
+fn parse_csv_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn print_usage() {
     println!(
         "Usage: cove-convert-parquet [options] <input.parquet> <output.cove>\n\n\
@@ -130,6 +229,18 @@ Options:\n  \
 --namespace <name>          Output COVE namespace (default: interop)\n  \
 --morsel-row-count <rows>   Rows per COVE morsel/page (default: 4096)\n  \
 --compression <codec>       Page compression: none, lz4, zstd (default: none)\n  \
+--dictionary-policy <mode>  Dictionary synthesis policy: auto, never, always\n  \
+--stats-policy <mode>       Stats policy: none, recompute\n  \
+--acceleration-policy <m>   Index policy: none, declared-only, auto\n  \
+--point-lookup-columns <c>  Comma-separated columns eligible for lookup indexes\n  \
+--cluster-columns <cols>    Comma-separated stable clustering columns\n  \
+--topn-columns <cols>       Comma-separated ordered hot columns for Top-N summaries\n  \
+--aggregate-synopsis <m>    Aggregate synopsis policy: none, declared-only, auto\n  \
+--aggregate-columns <cols>  Comma-separated columns for declared aggregate synopsis\n  \
+--composite-zone <cols>     Comma-separated composite zone group; may be repeated\n  \
+--stable-clustering         Opt in to stable clustering when implemented\n  \
+--emit-covx                 Request COVX artifact emission\n  \
+--emit-covm                 Request COVM artifact emission\n  \
 --report <path|->           Write the machine-readable conversion report\n  \
 -h, --help                  Show this help"
     );
@@ -150,6 +261,27 @@ mod tests {
             "128".to_string(),
             "--compression".to_string(),
             "none".to_string(),
+            "--dictionary-policy".to_string(),
+            "never".to_string(),
+            "--stats-policy".to_string(),
+            "recompute".to_string(),
+            "--acceleration-policy".to_string(),
+            "declared-only".to_string(),
+            "--point-lookup-columns".to_string(),
+            "id,email".to_string(),
+            "--cluster-columns".to_string(),
+            "tenant_id".to_string(),
+            "--topn-columns".to_string(),
+            "score".to_string(),
+            "--aggregate-synopsis".to_string(),
+            "declared-only".to_string(),
+            "--aggregate-columns".to_string(),
+            "score".to_string(),
+            "--composite-zone".to_string(),
+            "tenant_id,score".to_string(),
+            "--emit-covx".to_string(),
+            "--emit-covm".to_string(),
+            "--stable-clustering".to_string(),
             "--report".to_string(),
             "-".to_string(),
             "in.parquet".to_string(),
@@ -161,6 +293,33 @@ mod tests {
         assert_eq!(command.options.table_name, "orders");
         assert_eq!(command.options.namespace, "sales");
         assert_eq!(command.options.morsel_row_count, 128);
+        assert_eq!(
+            command.options.dictionary_policy,
+            ParquetDictionaryPolicy::Never
+        );
+        assert_eq!(command.options.stats_policy, ParquetStatsPolicy::Recompute);
+        assert_eq!(
+            command.options.acceleration_policy,
+            ParquetAccelerationPolicy::DeclaredOnly
+        );
+        assert_eq!(command.options.point_lookup_columns, vec!["id", "email"]);
+        assert_eq!(command.options.cluster_columns, vec!["tenant_id"]);
+        assert_eq!(command.options.topn_columns, vec!["score"]);
+        assert_eq!(
+            command.options.aggregate_policy,
+            ParquetAggregatePolicy::DeclaredOnly
+        );
+        assert_eq!(command.options.aggregate_columns, vec!["score"]);
+        assert_eq!(
+            command.options.composite_zone_groups,
+            vec![vec!["tenant_id".to_string(), "score".to_string()]]
+        );
+        assert!(command.options.emit_covx);
+        assert!(command.options.emit_covm);
+        assert_eq!(
+            command.options.clustering_policy,
+            ParquetClusteringPolicy::StableClusterDeclaredColumns
+        );
         assert_eq!(command.report, Some(ReportTarget::Stdout));
     }
 

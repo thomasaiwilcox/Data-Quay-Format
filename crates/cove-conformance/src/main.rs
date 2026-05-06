@@ -67,13 +67,15 @@ use cove_core::{
         arrow::{arrow_validity_to_cove_null, cove_null_to_arrow_validity, encoded_array_to_arrow},
         lakehouse::LakehouseHints,
         parquet::{
-            convert_parquet_bytes, decode_materialized_page_values, ParquetConversionOptions,
+            convert_parquet_bytes, decode_materialized_page_values_with_nulls,
+            ParquetConversionOptions,
         },
     },
     io_hints::IoHints,
     kernel::KernelCapabilities,
     metadata::MetadataJson,
     page::{ColumnPageIndex, ColumnPageIndexEntryV1, PageIndex},
+    page_payload::{ColumnPagePayloadV1, PageBufferKind},
     profile::{
         cove_e::{
             CodeSpaceDescriptorV1, EngineMountPolicyV1, EngineProfileRegistry,
@@ -1145,10 +1147,31 @@ fn decode_segment_column_values(
         let page_wire = &segment_bytes
             [page.page_offset as usize..(page.page_offset + page.page_length) as usize];
         let payload = column_page_payload(page_wire, page)?;
-        out.extend(decode_materialized_page_values(
+        let page_payload = ColumnPagePayloadV1::parse(payload.as_ref())?;
+        let root = page_payload.root_node()?;
+        if root.logical_type != column.logical
+            || root.physical_kind != column.physical
+            || root.logical_len != page.row_count
+        {
+            return Err(CoveError::PageCorrupt);
+        }
+        let values = page_payload
+            .buffer_bytes(PageBufferKind::Values)?
+            .unwrap_or(&[]);
+        let decode_payload = match page_payload.buffer_bytes(PageBufferKind::NullBitmap)? {
+            Some(nulls) => {
+                let mut bytes = Vec::with_capacity(nulls.len() + values.len());
+                bytes.extend_from_slice(nulls);
+                bytes.extend_from_slice(values);
+                Cow::Owned(bytes)
+            }
+            None => Cow::Borrowed(values),
+        };
+        out.extend(decode_materialized_page_values_with_nulls(
             column,
             page.row_count,
-            payload.as_ref(),
+            page.null_count,
+            decode_payload.as_ref(),
         )?);
     }
     Ok(out)

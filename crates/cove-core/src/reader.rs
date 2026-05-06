@@ -1,6 +1,10 @@
 //! Cove Format (COVE) v1.0 — reference reader and structural validator.
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use crate::{
     checksum,
@@ -15,7 +19,7 @@ use crate::{
     dictionary::FileDictionary,
     digest::DigestManifest,
     domain::ColumnDomain,
-    extensions::ExtensionRegistry,
+    extensions::{ExtensionRegistry, ExtensionValidationContext},
     footer::CoveFooter,
     header::{CoveHeaderV1, HEADER_SIZE},
     index::{
@@ -25,6 +29,8 @@ use crate::{
     },
     interop::lakehouse::LakehouseHints,
     kernel::KernelCapabilities,
+    page::ColumnPageIndex,
+    page_payload::{ColumnPagePayloadV1, PageBufferKind},
     postscript::{CovePostscriptV1, POSTSCRIPT_TOTAL_SIZE},
     profile::{
         cove_e::{
@@ -40,8 +46,8 @@ use crate::{
     },
     redaction::RedactionManifest,
     registry,
-    segment::{TableSegmentIndex, TableSegmentPayloadV1},
-    table::TableCatalog,
+    segment::{TableColumnDirectoryEntryV1, TableSegmentIndex, TableSegmentPayloadV1},
+    table::{ColumnEntry, TableCatalog, TableEntry},
     zone_stats::ZoneStatsSection,
     CoveError,
 };
@@ -386,6 +392,15 @@ fn validate_shared_semantics(
     let ext_registry_is_optional =
         validated.header.optional_features & FEATURE_EXTENSION_REGISTRY != 0;
     if ext_registry_is_required || ext_registry_is_optional {
+        let collation_count = footer
+            .sections
+            .iter()
+            .find(|s| s.section_kind == SectionKind::CollationRegistry as u16)
+            .map(|entry| {
+                let bytes = compression::section_payload(data, entry)?;
+                CollationRegistry::parse(&bytes).map(|registry| registry.entries.len())
+            })
+            .transpose()?;
         let ext_entry = footer
             .sections
             .iter()
@@ -401,7 +416,12 @@ fn validate_shared_semantics(
             (_, Some(entry)) => {
                 let ext_bytes = compression::section_payload(data, entry)?;
                 let registry = ExtensionRegistry::parse(&ext_bytes)?;
-                registry.validate_known(opts.allow_unknown_optional_extensions)?;
+                registry.validate_in_file(
+                    data,
+                    footer,
+                    opts.allow_unknown_optional_extensions,
+                    ExtensionValidationContext { collation_count },
+                )?;
                 checked += 1;
             }
             (false, None) => {}
@@ -554,24 +574,34 @@ fn validate_cove_t_semantics(
     stages: &mut Vec<ValidationStageReport>,
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
+    let mut catalogs = Vec::new();
+    let mut segment_indexes = Vec::new();
+    let mut segment_payloads = Vec::new();
+    let dictionary = parse_validation_dictionary(data, &validated.footer)?;
+
     for entry in &validated.footer.sections {
         let payload = compression::section_payload(data, entry)?;
         match SectionKind::from_u16(entry.section_kind).ok_or_else(|| {
             CoveError::BadSection(format!("unknown section_kind {}", entry.section_kind))
         })? {
             SectionKind::TableCatalog => {
-                TableCatalog::parse(&payload)?;
+                catalogs.push((entry.section_id, TableCatalog::parse(&payload)?));
                 checked += 1;
             }
             SectionKind::TableSegmentIndex => {
-                TableSegmentIndex::parse(&payload)?;
+                segment_indexes.push((entry.section_id, TableSegmentIndex::parse(&payload)?));
                 checked += 1;
             }
             SectionKind::TableSegmentData => {
-                TableSegmentPayloadV1::parse_with_required_features(
-                    &payload,
-                    validated.header.required_features,
-                )?;
+                segment_payloads.push((
+                    entry.section_id,
+                    entry.offset,
+                    TableSegmentPayloadV1::parse_with_required_features(
+                        &payload,
+                        validated.header.required_features,
+                    )?,
+                    payload.into_owned(),
+                ));
                 checked += 1;
             }
             SectionKind::ColumnDomain => {
@@ -643,12 +673,250 @@ fn validate_cove_t_semantics(
             | SectionKind::VendorExtension => {}
         }
     }
+    validate_cove_t_cross_sections(
+        &catalogs,
+        &segment_indexes,
+        &segment_payloads,
+        dictionary.as_ref(),
+    )?;
     push_stage(
         stages,
         ValidationStage::CoveTable,
         ValidationStageStatus::Checked,
         checked,
     );
+    Ok(())
+}
+
+fn parse_validation_dictionary(
+    data: &[u8],
+    footer: &CoveFooter,
+) -> Result<Option<FileDictionary>, CoveError> {
+    let Some(index_entry) = footer
+        .sections
+        .iter()
+        .find(|entry| entry.section_kind == SectionKind::FileDictionaryIndex as u16)
+    else {
+        return Ok(None);
+    };
+    let index_bytes = compression::section_payload(data, index_entry)?;
+    let payload_bytes = match footer
+        .sections
+        .iter()
+        .find(|entry| entry.section_kind == SectionKind::FileDictionaryPayload as u16)
+    {
+        Some(payload_entry) => compression::section_payload(data, payload_entry)?,
+        None => std::borrow::Cow::Borrowed(&[][..]),
+    };
+    FileDictionary::parse(&index_bytes, &payload_bytes).map(Some)
+}
+
+fn validate_cove_t_cross_sections(
+    catalogs: &[(u32, TableCatalog)],
+    segment_indexes: &[(u32, TableSegmentIndex)],
+    segment_payloads: &[(u32, u64, TableSegmentPayloadV1, Vec<u8>)],
+    dictionary: Option<&FileDictionary>,
+) -> Result<(), CoveError> {
+    if catalogs.is_empty() && segment_indexes.is_empty() && segment_payloads.is_empty() {
+        return Ok(());
+    }
+    if catalogs.len() != 1 {
+        return Err(CoveError::BadSchema(
+            "COVE-T validation requires exactly one TableCatalog section".into(),
+        ));
+    }
+    if segment_indexes.is_empty() && segment_payloads.is_empty() {
+        if catalogs[0]
+            .1
+            .tables
+            .iter()
+            .all(|table| table.row_count == 0)
+        {
+            return Ok(());
+        }
+        return Err(CoveError::SegmentCorrupt);
+    }
+    if segment_indexes.len() != 1 {
+        return Err(CoveError::SegmentCorrupt);
+    }
+    let catalog = &catalogs[0].1;
+    let segment_index = &segment_indexes[0].1;
+    let tables = catalog
+        .tables
+        .iter()
+        .map(|table| (table.table_id, table))
+        .collect::<BTreeMap<_, _>>();
+    let mut payloads_by_key = BTreeMap::new();
+    for (_section_id, file_offset, payload, bytes) in segment_payloads {
+        if payloads_by_key
+            .insert(
+                (payload.header.table_id, payload.header.segment_id),
+                (*file_offset, payload, bytes),
+            )
+            .is_some()
+        {
+            return Err(CoveError::SegmentCorrupt);
+        }
+    }
+    let mut rows_by_table = BTreeMap::<u32, u64>::new();
+    for entry in &segment_index.entries {
+        let table = tables.get(&entry.table_id).ok_or_else(|| {
+            CoveError::BadSchema(format!(
+                "segment index references unknown table_id {}",
+                entry.table_id
+            ))
+        })?;
+        if entry.column_count != table.columns.len() as u32 {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        let Some((file_offset, payload, bytes)) =
+            payloads_by_key.get(&(entry.table_id, entry.segment_id))
+        else {
+            return Err(CoveError::SegmentCorrupt);
+        };
+        if *file_offset != entry.offset
+            || payload.header.row_start != entry.row_start
+            || payload.header.row_count != entry.row_count
+            || payload.header.morsel_count != entry.morsel_count
+            || payload.header.morsel_row_count != entry.morsel_row_count
+            || payload.header.column_count != entry.column_count
+        {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        if entry.length != bytes.len() as u64 {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        *rows_by_table.entry(entry.table_id).or_default() += u64::from(entry.row_count);
+        validate_segment_against_catalog(table, payload, bytes, dictionary)?;
+    }
+    for table in &catalog.tables {
+        if rows_by_table.get(&table.table_id).copied().unwrap_or(0) != table.row_count {
+            return Err(CoveError::SegmentCorrupt);
+        }
+    }
+    if payloads_by_key.len() != segment_index.entries.len() {
+        return Err(CoveError::SegmentCorrupt);
+    }
+    Ok(())
+}
+
+fn validate_segment_against_catalog(
+    table: &TableEntry,
+    segment: &TableSegmentPayloadV1,
+    segment_bytes: &[u8],
+    dictionary: Option<&FileDictionary>,
+) -> Result<(), CoveError> {
+    if segment.header.table_id != table.table_id {
+        return Err(CoveError::SegmentCorrupt);
+    }
+    let columns = table
+        .columns
+        .iter()
+        .map(|column| (column.column_id, column))
+        .collect::<BTreeMap<_, _>>();
+    if segment.columns.len() != table.columns.len() {
+        return Err(CoveError::SegmentCorrupt);
+    }
+    for column_dir in &segment.columns {
+        let column = columns.get(&column_dir.column_id).ok_or_else(|| {
+            CoveError::BadSchema(format!(
+                "segment references unknown column_id {}",
+                column_dir.column_id
+            ))
+        })?;
+        if column_dir.logical_type != column.logical || column_dir.physical_kind != column.physical
+        {
+            return Err(CoveError::PageCorrupt);
+        }
+        validate_column_pages_against_catalog(
+            column,
+            column_dir,
+            segment,
+            segment_bytes,
+            dictionary,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_column_pages_against_catalog(
+    column: &ColumnEntry,
+    column_dir: &TableColumnDirectoryEntryV1,
+    segment: &TableSegmentPayloadV1,
+    segment_bytes: &[u8],
+    dictionary: Option<&FileDictionary>,
+) -> Result<(), CoveError> {
+    let page_index_start =
+        usize::try_from(column_dir.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
+    let page_index_end = usize::try_from(
+        column_dir
+            .page_index_offset
+            .checked_add(column_dir.page_index_length)
+            .ok_or(CoveError::ArithOverflow)?,
+    )
+    .map_err(|_| CoveError::OffsetRange)?;
+    let page_index = ColumnPageIndex::parse(&segment_bytes[page_index_start..page_index_end])?;
+    if page_index.entries.len() != segment.morsels.entries.len() {
+        return Err(CoveError::PageCorrupt);
+    }
+    for page in &page_index.entries {
+        if !column.nullable && page.null_count != 0 {
+            return Err(CoveError::BadSchema(format!(
+                "non-nullable column {} has page null_count {}",
+                column.column_id, page.null_count
+            )));
+        }
+        if page.page_length == 0 {
+            continue;
+        }
+        let start = usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
+        let end = usize::try_from(
+            page.page_offset
+                .checked_add(page.page_length)
+                .ok_or(CoveError::ArithOverflow)?,
+        )
+        .map_err(|_| CoveError::OffsetRange)?;
+        let decoded = compression::column_page_payload(&segment_bytes[start..end], page)?;
+        let payload = ColumnPagePayloadV1::parse(decoded.as_ref())?;
+        let root = payload.root_node()?;
+        if root.logical_type != column.logical
+            || root.physical_kind != column.physical
+            || root.logical_len != page.row_count
+            || page.encoding_root != root.encoding_kind as u32
+        {
+            return Err(CoveError::PageCorrupt);
+        }
+        if page.null_count == 0 && payload.buffer_bytes(PageBufferKind::NullBitmap)?.is_some() {
+            return Err(CoveError::PageCorrupt);
+        }
+        if column.physical == crate::constants::CovePhysicalKind::FileCode {
+            validate_filecodes_in_page(&payload, page.row_count, dictionary)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_filecodes_in_page(
+    payload: &ColumnPagePayloadV1,
+    row_count: u32,
+    dictionary: Option<&FileDictionary>,
+) -> Result<(), CoveError> {
+    let dictionary = dictionary.ok_or(CoveError::BadFileCode)?;
+    let values = payload
+        .buffer_bytes(PageBufferKind::Values)?
+        .ok_or(CoveError::PageCorrupt)?;
+    let expected = (row_count as usize)
+        .checked_mul(4)
+        .ok_or(CoveError::ArithOverflow)?;
+    if values.len() != expected {
+        return Err(CoveError::PageCorrupt);
+    }
+    for chunk in values.chunks_exact(4) {
+        let code = u32::from_le_bytes(chunk.try_into().unwrap());
+        if code >= dictionary.len() {
+            return Err(CoveError::BadFileCode);
+        }
+    }
     Ok(())
 }
 
@@ -1209,14 +1477,39 @@ mod tests {
             FEATURE_EXTENSION_REGISTRY, FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE,
             FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE,
         },
+        extensions::{ExtensionKind, ExtensionRegistry, ExtensionRegistryEntry},
         footer::CoveFooter,
         postscript::POSTSCRIPT_TOTAL_SIZE,
-        writer::{MinimalCoveWriter, SectionPayload},
+        segment::TableSegmentPayloadV1,
+        table::{ColumnEntry, TableEntry},
+        writer::{MinimalCoveWriter, ScanProfileCoveWriter, ScanSegment, SectionPayload},
     };
 
     fn rewrite_postscript(bytes: &mut [u8], postscript: CovePostscriptV1) {
         let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
         bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+    }
+
+    fn required_unknown_extension_registry_payload() -> Vec<u8> {
+        ExtensionRegistry {
+            flags: 0,
+            entries: vec![ExtensionRegistryEntry {
+                extension_id: 1,
+                namespace: "org".into(),
+                name: "test".into(),
+                version_major: 1,
+                version_minor: 0,
+                extension_kind: ExtensionKind::VendorMetadata,
+                required_feature_bit: 0x0020_0000,
+                optional_feature_bit: 0,
+                fallback_kind: 0,
+                fallback_ref: 0,
+                payload_ref: 0,
+                checksum: 0,
+            }],
+        }
+        .serialize()
+        .unwrap()
     }
 
     #[test]
@@ -1670,6 +1963,64 @@ mod tests {
             },
         )
         .is_ok());
+    }
+
+    #[test]
+    fn cove_t_semantic_validation_rejects_page_null_count_without_bitmap() {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: String::new(),
+                name: "t".into(),
+                row_count: 4,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![ColumnEntry {
+                    column_id: 1,
+                    name: "active".into(),
+                    logical: crate::constants::CoveLogicalType::Bool,
+                    physical: crate::constants::CovePhysicalKind::Boolean,
+                    nullable: false,
+                    sort_order: 0,
+                    collation_id: 0,
+                    precision: 0,
+                    scale: 0,
+                    flags: 0,
+                }],
+            }],
+        };
+        let mut writer = ScanProfileCoveWriter::new(catalog.clone());
+        writer.push_segment(ScanSegment::new(1, 0, 0, 4, 1));
+        let bytes = writer.write().unwrap();
+        let report = validate_bytes_with_options(
+            &bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+            },
+        )
+        .unwrap();
+        let entry = report
+            .validated
+            .footer
+            .sections
+            .iter()
+            .find(|entry| entry.section_kind == SectionKind::TableSegmentData as u16)
+            .unwrap();
+        let mut segment_bytes =
+            bytes[entry.offset as usize..entry.end_offset().unwrap() as usize].to_vec();
+        let segment = TableSegmentPayloadV1::parse(&segment_bytes).unwrap();
+        let column = &segment.columns[0];
+        let page_offset = column.page_index_offset as usize;
+        segment_bytes[page_offset + 12..page_offset + 16].copy_from_slice(&3u32.to_le_bytes());
+        segment_bytes[page_offset + 16..page_offset + 20].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            TableSegmentPayloadV1::parse(&segment_bytes),
+            Err(CoveError::PageCorrupt)
+        );
     }
 
     #[test]
@@ -2381,25 +2732,6 @@ mod tests {
     fn semantic_validation_rejects_required_unknown_extension_registry() {
         let mut writer = MinimalCoveWriter::new();
         writer.required_features |= FEATURE_EXTENSION_REGISTRY;
-        // Build a Spec §45 registry payload with one required unknown extension.
-        let mut ext = Vec::new();
-        ext.extend_from_slice(&1u32.to_le_bytes()); // extension_count
-        ext.extend_from_slice(&0u32.to_le_bytes()); // flags
-                                                    // ExtensionEntryV1
-        ext.extend_from_slice(&1u32.to_le_bytes()); // extension_id
-        ext.extend_from_slice(&3u16.to_le_bytes()); // namespace_len
-        ext.extend_from_slice(b"org"); // namespace
-        ext.extend_from_slice(&4u16.to_le_bytes()); // name_len
-        ext.extend_from_slice(b"test"); // name
-        ext.extend_from_slice(&1u16.to_le_bytes()); // version_major
-        ext.extend_from_slice(&0u16.to_le_bytes()); // version_minor
-        ext.extend_from_slice(&0u16.to_le_bytes()); // extension_kind
-        ext.extend_from_slice(&0x0020_0000u64.to_le_bytes()); // required_feature_bit (non-zero → required)
-        ext.extend_from_slice(&0u64.to_le_bytes()); // optional_feature_bit
-        ext.extend_from_slice(&0u16.to_le_bytes()); // fallback_kind
-        ext.extend_from_slice(&0u32.to_le_bytes()); // fallback_ref
-        ext.extend_from_slice(&0u32.to_le_bytes()); // payload_ref
-        ext.extend_from_slice(&0u32.to_le_bytes()); // checksum
         writer.sections.push(SectionPayload {
             section_kind: SectionKind::ExtensionRegistry as u16,
             profile: 0,
@@ -2410,7 +2742,7 @@ mod tests {
             alignment_log2: 0,
             required_features: FEATURE_EXTENSION_REGISTRY,
             optional_features: 0,
-            data: ext,
+            data: required_unknown_extension_registry_payload(),
         });
         let bytes = writer.write();
         let opts = ValidationOptions {
@@ -2476,24 +2808,6 @@ mod tests {
         let mut writer = MinimalCoveWriter::new();
         // Feature advertised as optional in the file header.
         writer.optional_features |= FEATURE_EXTENSION_REGISTRY;
-        // Build a Spec §45 registry payload with one required unknown extension.
-        let mut ext = Vec::new();
-        ext.extend_from_slice(&1u32.to_le_bytes()); // extension_count
-        ext.extend_from_slice(&0u32.to_le_bytes()); // flags
-        ext.extend_from_slice(&1u32.to_le_bytes()); // extension_id
-        ext.extend_from_slice(&3u16.to_le_bytes()); // namespace_len
-        ext.extend_from_slice(b"org"); // namespace
-        ext.extend_from_slice(&4u16.to_le_bytes()); // name_len
-        ext.extend_from_slice(b"test"); // name
-        ext.extend_from_slice(&1u16.to_le_bytes()); // version_major
-        ext.extend_from_slice(&0u16.to_le_bytes()); // version_minor
-        ext.extend_from_slice(&0u16.to_le_bytes()); // extension_kind
-        ext.extend_from_slice(&0x0020_0000u64.to_le_bytes()); // required_feature_bit (non-zero)
-        ext.extend_from_slice(&0u64.to_le_bytes()); // optional_feature_bit
-        ext.extend_from_slice(&0u16.to_le_bytes()); // fallback_kind
-        ext.extend_from_slice(&0u32.to_le_bytes()); // fallback_ref
-        ext.extend_from_slice(&0u32.to_le_bytes()); // payload_ref
-        ext.extend_from_slice(&0u32.to_le_bytes()); // checksum
         writer.sections.push(SectionPayload {
             section_kind: SectionKind::ExtensionRegistry as u16,
             profile: 0,
@@ -2504,7 +2818,7 @@ mod tests {
             alignment_log2: 0,
             required_features: 0,
             optional_features: FEATURE_EXTENSION_REGISTRY,
-            data: ext,
+            data: required_unknown_extension_registry_payload(),
         });
         let bytes = writer.write();
         let opts = ValidationOptions {

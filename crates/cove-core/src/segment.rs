@@ -32,6 +32,7 @@ use crate::{
     constants::{CoveLogicalType, CovePhysicalKind, FEATURE_PAGE_PAYLOAD_ELISION},
     encoding::nested::{ListLayoutPayload, MapLayoutPayload, StructLayoutPayload},
     page::{page_uses_payload_elision, ColumnPageIndex, PAGE_FLAG_STATS_ONLY_CONSTANT},
+    page_payload::{ColumnPagePayloadV1, PageBufferKind},
     types::validate_logical_physical_pair,
     CoveError,
 };
@@ -537,7 +538,7 @@ impl TableSegmentPayloadV1 {
                     if checksum::crc32c(page_wire) != page.checksum {
                         return Err(CoveError::ChecksumMismatch);
                     }
-                    validate_nested_page(column, &page, page_wire)?;
+                    validate_column_page_payload(column, &page, page_wire)?;
                 }
             }
         }
@@ -550,28 +551,52 @@ impl TableSegmentPayloadV1 {
     }
 }
 
-fn validate_nested_page(
+fn validate_column_page_payload(
     column: &TableColumnDirectoryEntryV1,
     page: &crate::page::ColumnPageIndexEntryV1,
     page_wire: &[u8],
 ) -> Result<(), CoveError> {
+    let payload = compression::column_page_payload(page_wire, page)?;
+    let payload = ColumnPagePayloadV1::parse(payload.as_ref())?;
+    let root = payload.root_node()?;
+    if root.logical_type != column.logical_type
+        || root.physical_kind != column.physical_kind
+        || root.logical_len != page.row_count
+    {
+        return Err(CoveError::PageCorrupt);
+    }
+    if page.encoding_root != root.encoding_kind as u32 {
+        return Err(CoveError::PageCorrupt);
+    }
+    if page.null_count == 0 && payload.buffer_bytes(PageBufferKind::NullBitmap)?.is_some() {
+        return Err(CoveError::PageCorrupt);
+    }
+    if page.null_count != 0 && payload.buffer_bytes(PageBufferKind::NullBitmap)?.is_none() {
+        return Err(CoveError::PageCorrupt);
+    }
     match column.physical_kind {
         CovePhysicalKind::List => {
-            let payload = compression::column_page_payload(page_wire, page)?;
-            let layout = ListLayoutPayload::parse(payload.as_ref())?;
+            let values = payload
+                .buffer_bytes(PageBufferKind::Values)?
+                .ok_or(CoveError::PageCorrupt)?;
+            let layout = ListLayoutPayload::parse(values)?;
             layout.validate()?;
             if layout.layout.row_count() != page.row_count as usize {
                 return Err(CoveError::PageCorrupt);
             }
         }
         CovePhysicalKind::Struct => {
-            let payload = compression::column_page_payload(page_wire, page)?;
-            let layout = StructLayoutPayload::parse(payload.as_ref())?;
+            let values = payload
+                .buffer_bytes(PageBufferKind::Values)?
+                .ok_or(CoveError::PageCorrupt)?;
+            let layout = StructLayoutPayload::parse(values)?;
             layout.validate(page.row_count as u64)?;
         }
         CovePhysicalKind::Map => {
-            let payload = compression::column_page_payload(page_wire, page)?;
-            let layout = MapLayoutPayload::parse(payload.as_ref())?;
+            let values = payload
+                .buffer_bytes(PageBufferKind::Values)?
+                .ok_or(CoveError::PageCorrupt)?;
+            let layout = MapLayoutPayload::parse(values)?;
             layout.validate()?;
             if layout.layout.row_count() != page.row_count as usize {
                 return Err(CoveError::PageCorrupt);
@@ -1019,24 +1044,32 @@ mod tests {
         let dir = RowMorselDirectory {
             entries: vec![morsel(0, 0, 10)],
         };
+        let page_payload = ColumnPagePayloadV1::build_single_node(
+            10,
+            crate::constants::CoveEncodingKind::NumCode,
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
+            None,
+            vec![1u8; 80],
+        )
+        .unwrap();
         let column = column(
             7,
             page_index_offset as u64,
             crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64,
             data_offset as u64,
-            8,
+            page_payload.len() as u64,
         );
-        let page_payload = [1u8; 8];
         let page = ColumnPageIndexEntryV1 {
             column_id: 7,
             morsel_id: 0,
             row_count: 10,
             non_null_count: 10,
             null_count: 0,
-            encoding_root: 0,
+            encoding_root: crate::constants::CoveEncodingKind::NumCode as u32,
             page_offset: data_offset as u64,
-            page_length: 8,
-            uncompressed_length: 8,
+            page_length: page_payload.len() as u64,
+            uncompressed_length: page_payload.len() as u64,
             stats_ref: 0,
             flags: 0,
             checksum: checksum::crc32c(&page_payload),

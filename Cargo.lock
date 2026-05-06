@@ -290,6 +290,7 @@ name = "cove-core"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-schema",
  "blake3",
  "bytes",
@@ -314,6 +315,15 @@ name = "cove-inspect"
 version = "0.1.0"
 dependencies = [
  "cove-core",
+]
+
+[[package]]
+name = "cove-map"
+version = "0.1.0"
+dependencies = [
+ "cove-core",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

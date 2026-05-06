@@ -8,16 +8,21 @@ use std::{borrow::Cow, sync::Arc};
 
 use arrow_array::{
     builder::{BinaryBuilder, StringBuilder},
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, RecordBatch, TimestampMicrosecondArray,
-    TimestampNanosecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    types::UInt32Type,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, DictionaryArray, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, RecordBatch,
+    StructArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt16Array, UInt32Array,
+    UInt64Array, UInt8Array,
 };
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 
 use crate::{
     array::{CoveArrayValue, EncodedArray},
     constants::CoveLogicalType,
     dictionary::DictionaryValue,
+    encoding::nested::{ListLayoutPayload, MapLayoutPayload, StructLayoutPayload},
+    validity::ValidityBitmap,
     wire, CoveError,
 };
 
@@ -64,8 +69,227 @@ pub fn arrow_validity_to_cove_null(
     Ok(out)
 }
 
+/// Policy for exporting FileCode-backed scalar columns to Arrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrowDictionaryPolicy {
+    /// Decode FileCodes to their logical values before building the Arrow array.
+    DecodeValues,
+    /// Export FileCodes as Arrow dictionary keys when values are representable.
+    DictionaryKeys,
+}
+
+impl Default for ArrowDictionaryPolicy {
+    fn default() -> Self {
+        Self::DictionaryKeys
+    }
+}
+
+/// A named top-level Arrow export column.
+pub struct ArrowExportColumn<'a> {
+    pub name: &'a str,
+    pub node: ArrowExportNode<'a>,
+    pub nullable: bool,
+}
+
+impl<'a> ArrowExportColumn<'a> {
+    pub fn scalar(name: &'a str, array: &'a EncodedArray<'a>) -> Self {
+        Self {
+            name,
+            node: ArrowExportNode::scalar(array),
+            nullable: array.validity.is_some() || array.logical == CoveLogicalType::Null,
+        }
+    }
+}
+
+/// A layout-aware Arrow export node.
+pub enum ArrowExportNode<'a> {
+    Scalar {
+        array: &'a EncodedArray<'a>,
+        dictionary_policy: ArrowDictionaryPolicy,
+    },
+    List {
+        layout: &'a ListLayoutPayload,
+        child: Box<ArrowExportNode<'a>>,
+        validity: Option<ValidityBitmap<'a>>,
+    },
+    Struct {
+        layout: &'a StructLayoutPayload,
+        fields: Vec<ArrowExportColumn<'a>>,
+        validity: Option<ValidityBitmap<'a>>,
+    },
+    Map {
+        layout: &'a MapLayoutPayload,
+        keys: Box<ArrowExportNode<'a>>,
+        values: Box<ArrowExportNode<'a>>,
+        validity: Option<ValidityBitmap<'a>>,
+        ordered: bool,
+    },
+}
+
+impl<'a> ArrowExportNode<'a> {
+    pub fn scalar(array: &'a EncodedArray<'a>) -> Self {
+        Self::Scalar {
+            array,
+            dictionary_policy: ArrowDictionaryPolicy::default(),
+        }
+    }
+
+    pub fn scalar_with_policy(
+        array: &'a EncodedArray<'a>,
+        dictionary_policy: ArrowDictionaryPolicy,
+    ) -> Self {
+        Self::Scalar {
+            array,
+            dictionary_policy,
+        }
+    }
+}
+
+/// Export one layout-aware COVE node as an Arrow array.
+pub fn arrow_export_node_to_array(node: &ArrowExportNode<'_>) -> Result<ArrayRef, CoveError> {
+    match node {
+        ArrowExportNode::Scalar {
+            array,
+            dictionary_policy,
+        } => encoded_array_to_arrow_with_policy(array, *dictionary_policy),
+        ArrowExportNode::List {
+            layout,
+            child,
+            validity,
+        } => {
+            layout.validate()?;
+            let offsets = arrow_i32_offsets(&layout.layout.offsets)?;
+            let child_array = arrow_export_node_to_array(child)?;
+            if child_array.len()
+                != usize::try_from(layout.child_row_count).map_err(|_| CoveError::ArithOverflow)?
+            {
+                return Err(CoveError::PageCorrupt);
+            }
+            let row_count = layout.layout.row_count();
+            let nulls = arrow_null_buffer(*validity, row_count)?;
+            let field = Arc::new(Field::new(
+                "item",
+                child_array.data_type().clone(),
+                arrow_node_nullable(child),
+            ));
+            ListArray::try_new(field, offsets, child_array, nulls)
+                .map(|array| Arc::new(array) as ArrayRef)
+                .map_err(|err| CoveError::BadSection(format!("Arrow ListArray: {err}")))
+        }
+        ArrowExportNode::Struct {
+            layout,
+            fields,
+            validity,
+        } => {
+            let row_count = usize::try_from(layout.layout.row_count()?)
+                .map_err(|_| CoveError::ArithOverflow)?;
+            layout.validate(row_count as u64)?;
+            if fields.len() != layout.layout.field_row_counts.len() {
+                return Err(CoveError::PageCorrupt);
+            }
+
+            let mut arrow_fields = Vec::with_capacity(fields.len());
+            let mut arrays = Vec::with_capacity(fields.len());
+            for (index, column) in fields.iter().enumerate() {
+                let array = arrow_export_node_to_array(&column.node)?;
+                let expected = usize::try_from(layout.layout.field_row_counts[index])
+                    .map_err(|_| CoveError::ArithOverflow)?;
+                if array.len() != expected || expected != row_count {
+                    return Err(CoveError::PageCorrupt);
+                }
+                arrow_fields.push(Field::new(
+                    column.name,
+                    array.data_type().clone(),
+                    column.nullable || arrow_node_nullable(&column.node),
+                ));
+                arrays.push(array);
+            }
+            let nulls = arrow_null_buffer(*validity, row_count)?;
+            StructArray::try_new(Fields::from(arrow_fields), arrays, nulls)
+                .map(|array| Arc::new(array) as ArrayRef)
+                .map_err(|err| CoveError::BadSection(format!("Arrow StructArray: {err}")))
+        }
+        ArrowExportNode::Map {
+            layout,
+            keys,
+            values,
+            validity,
+            ordered,
+        } => {
+            layout.validate()?;
+            let offsets = arrow_i32_offsets(&layout.layout.offsets)?;
+            if !matches!(keys.as_ref(), ArrowExportNode::Scalar { .. }) {
+                return Err(CoveError::PageCorrupt);
+            }
+            let key_array = arrow_export_node_to_array(keys)?;
+            if key_array.null_count() != 0 {
+                return Err(CoveError::UnsupportedEncoding(
+                    "Arrow map export requires non-null map keys".into(),
+                ));
+            }
+            let value_array = arrow_export_node_to_array(values)?;
+            let key_count = usize::try_from(layout.layout.key_row_count)
+                .map_err(|_| CoveError::ArithOverflow)?;
+            let value_count = usize::try_from(layout.layout.value_row_count)
+                .map_err(|_| CoveError::ArithOverflow)?;
+            if key_array.len() != key_count || value_array.len() != value_count {
+                return Err(CoveError::PageCorrupt);
+            }
+            let entry_fields = Fields::from(vec![
+                Field::new("key", key_array.data_type().clone(), false),
+                Field::new(
+                    "value",
+                    value_array.data_type().clone(),
+                    arrow_node_nullable(values),
+                ),
+            ]);
+            let entries = StructArray::try_new(entry_fields, vec![key_array, value_array], None)
+                .map_err(|err| CoveError::BadSection(format!("Arrow Map entries: {err}")))?;
+            let row_count = layout.layout.row_count();
+            let nulls = arrow_null_buffer(*validity, row_count)?;
+            let entries_field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+            MapArray::try_new(entries_field, offsets, entries, nulls, *ordered)
+                .map(|array| Arc::new(array) as ArrayRef)
+                .map_err(|err| CoveError::BadSection(format!("Arrow MapArray: {err}")))
+        }
+    }
+}
+
+/// Export layout-aware COVE columns as an Arrow [`RecordBatch`].
+pub fn arrow_export_columns_to_record_batch(
+    columns: &[ArrowExportColumn<'_>],
+) -> Result<RecordBatch, CoveError> {
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut arrays = Vec::with_capacity(columns.len());
+    for column in columns {
+        let arrow_array = arrow_export_node_to_array(&column.node)?;
+        fields.push(Field::new(
+            column.name,
+            arrow_array.data_type().clone(),
+            column.nullable || arrow_node_nullable(&column.node),
+        ));
+        arrays.push(arrow_array);
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        .map_err(|err| CoveError::BadSection(format!("Arrow RecordBatch: {err}")))
+}
+
 /// Export one decoded COVE array view as an Arrow array.
 pub fn encoded_array_to_arrow(array: &EncodedArray<'_>) -> Result<ArrayRef, CoveError> {
+    let node = ArrowExportNode::scalar_with_policy(array, ArrowDictionaryPolicy::DecodeValues);
+    arrow_export_node_to_array(&node)
+}
+
+/// Export one scalar COVE array with explicit dictionary handling.
+pub fn encoded_array_to_arrow_with_policy(
+    array: &EncodedArray<'_>,
+    dictionary_policy: ArrowDictionaryPolicy,
+) -> Result<ArrayRef, CoveError> {
+    if dictionary_policy == ArrowDictionaryPolicy::DictionaryKeys {
+        if let Some(dictionary_array) = try_filecode_dictionary_array(array)? {
+            return Ok(dictionary_array);
+        }
+    }
     let values = array.decode_all_rows()?;
     match arrow_data_type(array.logical)? {
         DataType::Boolean => Ok(Arc::new(BooleanArray::from(collect_bool(&values)?))),
@@ -147,6 +371,153 @@ pub fn encoded_columns_to_record_batch(
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
         .map_err(|err| CoveError::BadSection(format!("Arrow RecordBatch: {err}")))
+}
+
+fn arrow_node_nullable(node: &ArrowExportNode<'_>) -> bool {
+    match node {
+        ArrowExportNode::Scalar { array, .. } => {
+            array.validity.is_some() || array.logical == CoveLogicalType::Null
+        }
+        ArrowExportNode::List { validity, .. }
+        | ArrowExportNode::Struct { validity, .. }
+        | ArrowExportNode::Map { validity, .. } => validity.is_some(),
+    }
+}
+
+fn arrow_i32_offsets(offsets: &[u32]) -> Result<OffsetBuffer<i32>, CoveError> {
+    let mut converted = Vec::with_capacity(offsets.len());
+    for &offset in offsets {
+        converted.push(i32::try_from(offset).map_err(|_| {
+            CoveError::UnsupportedEncoding(
+                "Arrow ListArray/MapArray export requires i32 offsets; chunk the column first"
+                    .into(),
+            )
+        })?);
+    }
+    Ok(OffsetBuffer::new(ScalarBuffer::from(converted)))
+}
+
+fn arrow_null_buffer(
+    validity: Option<ValidityBitmap<'_>>,
+    row_count: usize,
+) -> Result<Option<NullBuffer>, CoveError> {
+    let Some(validity) = validity else {
+        return Ok(None);
+    };
+    let row_count_u64 = u64::try_from(row_count).map_err(|_| CoveError::ArithOverflow)?;
+    validity.validate_len(row_count_u64)?;
+    let mut any_null = false;
+    let mut bits = Vec::with_capacity(row_count);
+    for row in 0..row_count_u64 {
+        let valid = validity.is_valid(row)?;
+        any_null |= !valid;
+        bits.push(valid);
+    }
+    if any_null {
+        Ok(Some(NullBuffer::from(bits)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn try_filecode_dictionary_array(array: &EncodedArray<'_>) -> Result<Option<ArrayRef>, CoveError> {
+    if array.encoding != crate::constants::CoveEncodingKind::FileCode {
+        return Ok(None);
+    }
+    let Some(dictionary) = array.dictionary else {
+        return Ok(None);
+    };
+    let values = file_dictionary_values_to_arrow(array.logical, dictionary)?;
+    let mut keys = Vec::with_capacity(usize::try_from(array.row_count).map_err(|_| {
+        CoveError::UnsupportedEncoding("Arrow export row count exceeds usize".into())
+    })?);
+    for row in 0..array.row_count {
+        if array.is_null(row)? {
+            keys.push(None);
+            continue;
+        }
+        let offset = usize::try_from(row)
+            .map_err(|_| CoveError::ArithOverflow)?
+            .checked_mul(4)
+            .ok_or(CoveError::ArithOverflow)?;
+        keys.push(Some(read_u32_le(array.data, offset)?));
+    }
+    let keys = UInt32Array::from(keys);
+    DictionaryArray::<UInt32Type>::try_new(keys, values)
+        .map(|array| Some(Arc::new(array) as ArrayRef))
+        .map_err(|err| CoveError::BadSection(format!("Arrow DictionaryArray: {err}")))
+}
+
+fn file_dictionary_values_to_arrow(
+    logical: CoveLogicalType,
+    dictionary: &crate::dictionary::FileDictionary,
+) -> Result<ArrayRef, CoveError> {
+    let mut values = Vec::with_capacity(dictionary.entries.len());
+    for code in 0..dictionary.len() {
+        values.push(CoveArrayValue::DictValue(dictionary.decode_value(code)?));
+    }
+    match arrow_data_type(logical)? {
+        DataType::Boolean => Ok(Arc::new(BooleanArray::from(collect_bool(&values)?))),
+        DataType::Int8 => Ok(Arc::new(Int8Array::from(collect_i64(
+            logical,
+            &values,
+            |v| i8::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::Int16 => Ok(Arc::new(Int16Array::from(collect_i64(
+            logical,
+            &values,
+            |v| i16::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::Int32 => Ok(Arc::new(Int32Array::from(collect_i64(
+            logical,
+            &values,
+            |v| i32::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::Date32 => Ok(Arc::new(Date32Array::from(collect_i64(
+            logical,
+            &values,
+            |v| i32::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::Int64 => Ok(Arc::new(Int64Array::from(collect_i64(
+            logical, &values, Ok,
+        )?))),
+        DataType::UInt8 => Ok(Arc::new(UInt8Array::from(collect_u64(
+            logical,
+            &values,
+            |v| u8::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::UInt16 => Ok(Arc::new(UInt16Array::from(collect_u64(
+            logical,
+            &values,
+            |v| u16::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::UInt32 => Ok(Arc::new(UInt32Array::from(collect_u64(
+            logical,
+            &values,
+            |v| u32::try_from(v).map_err(|_| CoveError::PageCorrupt),
+        )?))),
+        DataType::UInt64 => Ok(Arc::new(UInt64Array::from(collect_u64(
+            logical, &values, Ok,
+        )?))),
+        DataType::Float32 => Ok(Arc::new(Float32Array::from(collect_f32(&values)?))),
+        DataType::Float64 => Ok(Arc::new(Float64Array::from(collect_f64(&values)?))),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => Ok(Arc::new(
+            TimestampMicrosecondArray::from(collect_i64(logical, &values, Ok)?),
+        )),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(Arc::new(
+            TimestampNanosecondArray::from(collect_i64(logical, &values, Ok)?),
+        )),
+        DataType::Utf8 => Ok(Arc::new(collect_utf8(logical, &values)?)),
+        DataType::Binary => Ok(Arc::new(collect_binary(logical, &values)?)),
+        other => Err(CoveError::UnsupportedEncoding(format!(
+            "Arrow dictionary export for {other:?}"
+        ))),
+    }
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
+    let slice = wire::read_range_checked(bytes, offset, 4)?;
+    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
 }
 
 fn arrow_data_type(logical: CoveLogicalType) -> Result<DataType, CoveError> {
@@ -437,6 +808,10 @@ mod tests {
         array::EncodedArray,
         constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind, StorageClass, ValueTag},
         dictionary::{FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
+        encoding::nested::{
+            ListLayout, ListLayoutPayload, MapLayout, MapLayoutPayload, StructLayout,
+            StructLayoutPayload,
+        },
         validity::ValidityBitmapBuilder,
     };
 
@@ -561,6 +936,339 @@ mod tests {
             .unwrap();
         assert_eq!(strings.value(0), "blue");
         assert_eq!(strings.value(1), "red");
+    }
+
+    #[test]
+    fn exports_filecode_dictionary_keys_when_requested() {
+        let dictionary = FileDictionary {
+            header: FileDictionaryHeaderV1 {
+                entry_count: 2,
+                flags: 0,
+                index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+                value_hash_algorithm: 0,
+                payload_length: 0,
+                reserved: [0; 24],
+            },
+            entries: vec![inline_utf8_entry("red"), inline_utf8_entry("blue")],
+            payload: Vec::new(),
+        };
+        let mut codes = Vec::new();
+        codes.extend_from_slice(&1u32.to_le_bytes());
+        codes.extend_from_slice(&0u32.to_le_bytes());
+        let cove = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::FileCode,
+            2,
+            CoveEncodingKind::FileCode,
+            None,
+            &codes,
+            Some(&dictionary),
+        );
+
+        let arrow = arrow_export_node_to_array(&ArrowExportNode::scalar(&cove)).unwrap();
+        let dictionary = arrow
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .unwrap();
+        assert_eq!(dictionary.keys().value(0), 1);
+        assert_eq!(dictionary.keys().value(1), 0);
+        let values = dictionary
+            .values()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(values.value(0), "red");
+        assert_eq!(values.value(1), "blue");
+    }
+
+    #[test]
+    fn exports_list_of_int32() {
+        let values = [1i32.to_le_bytes(), 2i32.to_le_bytes(), 3i32.to_le_bytes()].concat();
+        let child = EncodedArray::new(
+            CoveLogicalType::Int32,
+            CovePhysicalKind::FixedBytes,
+            3,
+            CoveEncodingKind::PlainFixed,
+            None,
+            &values,
+            None,
+        );
+        let layout = ListLayoutPayload {
+            layout: ListLayout {
+                offsets: vec![0, 2, 3],
+            },
+            child_row_count: 3,
+        };
+        let node = ArrowExportNode::List {
+            layout: &layout,
+            child: Box::new(ArrowExportNode::scalar(&child)),
+            validity: None,
+        };
+
+        let arrow = arrow_export_node_to_array(&node).unwrap();
+        let lists = arrow.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(lists.len(), 2);
+        assert_eq!(lists.value(0).len(), 2);
+        assert_eq!(lists.value(1).len(), 1);
+    }
+
+    #[test]
+    fn exports_nullable_list() {
+        let values = [1i32.to_le_bytes(), 2i32.to_le_bytes()].concat();
+        let child = EncodedArray::new(
+            CoveLogicalType::Int32,
+            CovePhysicalKind::FixedBytes,
+            2,
+            CoveEncodingKind::PlainFixed,
+            None,
+            &values,
+            None,
+        );
+        let layout = ListLayoutPayload {
+            layout: ListLayout {
+                offsets: vec![0, 2, 2],
+            },
+            child_row_count: 2,
+        };
+        let mut validity = ValidityBitmapBuilder::new(2).unwrap();
+        validity.set_null(1).unwrap();
+        let validity_bytes = validity.into_bytes();
+        let bitmap = crate::validity::ValidityBitmap::new(&validity_bytes, 2);
+        let node = ArrowExportNode::List {
+            layout: &layout,
+            child: Box::new(ArrowExportNode::scalar(&child)),
+            validity: Some(bitmap),
+        };
+
+        let arrow = arrow_export_node_to_array(&node).unwrap();
+        let lists = arrow.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(lists.len(), 2);
+        assert!(lists.is_null(1));
+    }
+
+    #[test]
+    fn exports_struct_with_nullable_parent() {
+        let ids = [10i32.to_le_bytes(), 20i32.to_le_bytes()].concat();
+        let id_array = EncodedArray::new(
+            CoveLogicalType::Int32,
+            CovePhysicalKind::FixedBytes,
+            2,
+            CoveEncodingKind::PlainFixed,
+            None,
+            &ids,
+            None,
+        );
+        let flags = [1u8, 0u8];
+        let flag_array = EncodedArray::new(
+            CoveLogicalType::Bool,
+            CovePhysicalKind::FixedBytes,
+            2,
+            CoveEncodingKind::PlainFixed,
+            None,
+            &flags,
+            None,
+        );
+        let layout = StructLayoutPayload {
+            layout: StructLayout {
+                field_row_counts: vec![2, 2],
+            },
+            parent_null_handling_declared: true,
+        };
+        let mut validity = ValidityBitmapBuilder::new(2).unwrap();
+        validity.set_null(1).unwrap();
+        let validity_bytes = validity.into_bytes();
+        let bitmap = crate::validity::ValidityBitmap::new(&validity_bytes, 2);
+        let node = ArrowExportNode::Struct {
+            layout: &layout,
+            fields: vec![
+                ArrowExportColumn::scalar("id", &id_array),
+                ArrowExportColumn::scalar("flag", &flag_array),
+            ],
+            validity: Some(bitmap),
+        };
+
+        let arrow = arrow_export_node_to_array(&node).unwrap();
+        let structs = arrow.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(structs.len(), 2);
+        assert!(structs.is_null(1));
+    }
+
+    #[test]
+    fn exports_map_with_scalar_keys() {
+        let mut keys_data = Vec::new();
+        keys_data.extend_from_slice(&1u32.to_le_bytes());
+        keys_data.extend_from_slice(b"a");
+        keys_data.extend_from_slice(&1u32.to_le_bytes());
+        keys_data.extend_from_slice(b"b");
+        let keys = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            2,
+            CoveEncodingKind::VarBytes,
+            None,
+            &keys_data,
+            None,
+        );
+        let values_data = [7i32.to_le_bytes(), 9i32.to_le_bytes()].concat();
+        let values = EncodedArray::new(
+            CoveLogicalType::Int32,
+            CovePhysicalKind::FixedBytes,
+            2,
+            CoveEncodingKind::PlainFixed,
+            None,
+            &values_data,
+            None,
+        );
+        let layout = MapLayoutPayload {
+            layout: MapLayout {
+                offsets: vec![0, 2],
+                key_row_count: 2,
+                value_row_count: 2,
+                keys_are_scalar: true,
+                allow_duplicate_keys: false,
+                canonical_keys: vec![b"a".to_vec(), b"b".to_vec()],
+            },
+        };
+        let node = ArrowExportNode::Map {
+            layout: &layout,
+            keys: Box::new(ArrowExportNode::scalar(&keys)),
+            values: Box::new(ArrowExportNode::scalar(&values)),
+            validity: None,
+            ordered: false,
+        };
+
+        let arrow = arrow_export_node_to_array(&node).unwrap();
+        let map = arrow.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.entries().len(), 2);
+    }
+
+    #[test]
+    fn rejects_duplicate_map_keys() {
+        let key_bytes = [0u8; 10];
+        let keys = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            2,
+            CoveEncodingKind::VarBytes,
+            None,
+            &key_bytes,
+            None,
+        );
+        let value_bytes = [0u8; 8];
+        let values = EncodedArray::new(
+            CoveLogicalType::Int32,
+            CovePhysicalKind::FixedBytes,
+            2,
+            CoveEncodingKind::PlainFixed,
+            None,
+            &value_bytes,
+            None,
+        );
+        let layout = MapLayoutPayload {
+            layout: MapLayout {
+                offsets: vec![0, 2],
+                key_row_count: 2,
+                value_row_count: 2,
+                keys_are_scalar: true,
+                allow_duplicate_keys: false,
+                canonical_keys: vec![b"a".to_vec(), b"a".to_vec()],
+            },
+        };
+        let node = ArrowExportNode::Map {
+            layout: &layout,
+            keys: Box::new(ArrowExportNode::scalar(&keys)),
+            values: Box::new(ArrowExportNode::scalar(&values)),
+            validity: None,
+            ordered: false,
+        };
+
+        assert!(matches!(
+            arrow_export_node_to_array(&node),
+            Err(CoveError::PageCorrupt)
+        ));
+    }
+
+    #[test]
+    fn rejects_null_map_key_arrow_export() {
+        let mut keys_data = Vec::new();
+        keys_data.extend_from_slice(&1u32.to_le_bytes());
+        keys_data.extend_from_slice(b"a");
+        let mut validity = ValidityBitmapBuilder::new(1).unwrap();
+        validity.set_null(0).unwrap();
+        let validity_bytes = validity.into_bytes();
+        let key_bitmap = crate::validity::ValidityBitmap::new(&validity_bytes, 1);
+        let keys = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            1,
+            CoveEncodingKind::VarBytes,
+            Some(key_bitmap),
+            &keys_data,
+            None,
+        );
+        let values_data = [7i32.to_le_bytes()].concat();
+        let values = EncodedArray::new(
+            CoveLogicalType::Int32,
+            CovePhysicalKind::FixedBytes,
+            1,
+            CoveEncodingKind::PlainFixed,
+            None,
+            &values_data,
+            None,
+        );
+        let layout = MapLayoutPayload {
+            layout: MapLayout {
+                offsets: vec![0, 1],
+                key_row_count: 1,
+                value_row_count: 1,
+                keys_are_scalar: true,
+                allow_duplicate_keys: false,
+                canonical_keys: vec![b"a".to_vec()],
+            },
+        };
+        let node = ArrowExportNode::Map {
+            layout: &layout,
+            keys: Box::new(ArrowExportNode::scalar(&keys)),
+            values: Box::new(ArrowExportNode::scalar(&values)),
+            validity: None,
+            ordered: false,
+        };
+
+        assert!(matches!(
+            arrow_export_node_to_array(&node),
+            Err(CoveError::UnsupportedEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_arrow_offsets() {
+        let values = [1i32.to_le_bytes()].concat();
+        let child = EncodedArray::new(
+            CoveLogicalType::Int32,
+            CovePhysicalKind::FixedBytes,
+            1,
+            CoveEncodingKind::PlainFixed,
+            None,
+            &values,
+            None,
+        );
+        let layout = ListLayoutPayload {
+            layout: ListLayout {
+                offsets: vec![0, i32::MAX as u32 + 1],
+            },
+            child_row_count: i32::MAX as u32 + 1,
+        };
+        let node = ArrowExportNode::List {
+            layout: &layout,
+            child: Box::new(ArrowExportNode::scalar(&child)),
+            validity: None,
+        };
+
+        assert!(matches!(
+            arrow_export_node_to_array(&node),
+            Err(CoveError::UnsupportedEncoding(_))
+        ));
     }
 
     #[test]

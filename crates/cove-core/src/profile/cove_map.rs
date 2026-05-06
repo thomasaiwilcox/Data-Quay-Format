@@ -45,6 +45,8 @@ pub struct MapFunctionRegistry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapJoinKeyComponent {
+    pub role_id: String,
+    pub source_column: String,
     pub logical_type: String,
     pub canonicalization: String,
     pub null_policy: String,
@@ -85,6 +87,24 @@ pub struct MapRowSemanticRule {
     pub function_ids: Vec<String>,
     pub output_assertion_ids: Vec<String>,
     pub association_endpoints: Vec<String>,
+    pub property_bindings: Vec<MapPropertyBinding>,
+    pub association_bindings: Vec<MapAssociationBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapPropertyBinding {
+    pub assertion_id: String,
+    pub property_id: String,
+    pub property_name: String,
+    pub source_column: String,
+    pub logical_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapAssociationBinding {
+    pub assertion_id: String,
+    pub association_type: String,
+    pub target_identity_rule_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,6 +399,29 @@ pub fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Result<(),
         {
             return Err(CoveError::MapInvalid);
         }
+        if !assertion_ids.is_empty()
+            && rule
+                .property_bindings
+                .iter()
+                .any(|binding| !assertion_ids.contains(&binding.assertion_id))
+        {
+            return Err(CoveError::MapInvalid);
+        }
+        if !assertion_ids.is_empty()
+            && rule
+                .association_bindings
+                .iter()
+                .any(|binding| !assertion_ids.contains(&binding.assertion_id))
+        {
+            return Err(CoveError::MapInvalid);
+        }
+        if rule
+            .association_bindings
+            .iter()
+            .any(|binding| !identity_rule_ids.contains(&binding.target_identity_rule_id))
+        {
+            return Err(CoveError::MapInvalid);
+        }
     }
 
     for pair in equivalence_pairs {
@@ -520,6 +563,8 @@ impl MapIdentityRuleCatalog {
                 for join_key in required_array(entry, "join_keys")? {
                     let join_key = as_object(join_key)?;
                     join_keys.push(MapJoinKeyComponent {
+                        role_id: required_non_empty_str(join_key, "role_id")?,
+                        source_column: required_non_empty_str(join_key, "source_column")?,
                         logical_type: required_non_empty_str(join_key, "logical_type")?,
                         canonicalization: required_non_empty_str(join_key, "canonicalization")?,
                         null_policy: required_non_empty_str(join_key, "null_policy")?,
@@ -572,6 +617,10 @@ impl MapRowSemanticsCatalog {
         if let Some(values) = optional_array(object, "rules")? {
             for value in values {
                 let entry = as_object(value)?;
+                let property_bindings =
+                    parse_property_bindings(optional_array(entry, "property_bindings")?)?;
+                let association_bindings =
+                    parse_association_bindings(optional_array(entry, "association_bindings")?)?;
                 rules.push(MapRowSemanticRule {
                     rule_id: required_non_empty_str(entry, "rule_id")?,
                     source_id: required_non_empty_str(entry, "source_id")?,
@@ -579,6 +628,8 @@ impl MapRowSemanticsCatalog {
                     function_ids: optional_string_list(entry, "function_ids")?,
                     output_assertion_ids: optional_string_list(entry, "output_assertion_ids")?,
                     association_endpoints: optional_string_list(entry, "association_endpoints")?,
+                    property_bindings,
+                    association_bindings,
                 });
             }
         }
@@ -588,6 +639,46 @@ impl MapRowSemanticsCatalog {
             rules,
         })
     }
+}
+
+fn parse_property_bindings(
+    values: Option<&Vec<Value>>,
+) -> Result<Vec<MapPropertyBinding>, CoveError> {
+    let Some(values) = values else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            let entry = as_object(value)?;
+            Ok(MapPropertyBinding {
+                assertion_id: required_non_empty_str(entry, "assertion_id")?,
+                property_id: required_non_empty_str(entry, "property_id")?,
+                property_name: required_non_empty_str(entry, "property_name")?,
+                source_column: required_non_empty_str(entry, "source_column")?,
+                logical_type: required_non_empty_str(entry, "logical_type")?,
+            })
+        })
+        .collect()
+}
+
+fn parse_association_bindings(
+    values: Option<&Vec<Value>>,
+) -> Result<Vec<MapAssociationBinding>, CoveError> {
+    let Some(values) = values else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            let entry = as_object(value)?;
+            Ok(MapAssociationBinding {
+                assertion_id: required_non_empty_str(entry, "assertion_id")?,
+                association_type: required_non_empty_str(entry, "association_type")?,
+                target_identity_rule_id: required_non_empty_str(entry, "target_identity_rule_id")?,
+            })
+        })
+        .collect()
 }
 
 impl MapAssertionLog {
@@ -879,6 +970,8 @@ mod tests {
                         "property_conflicts_declared": true,
                         "function_ids": ["trim_lower"],
                         "join_keys": [{
+                            "role_id": "customer_id",
+                            "source_column": "customer_id",
                             "logical_type": "utf8",
                             "canonicalization": "trim_lower",
                             "null_policy": "reject",
@@ -997,6 +1090,8 @@ mod tests {
                     "property_conflicts_declared": true,
                     "function_ids": ["trim_lower"],
                     "join_keys": [{
+                        "role_id": "customer_id",
+                        "source_column": "customer_id",
                         "logical_type": "utf8",
                         "canonicalization": "trim_lower",
                         "null_policy": "reject",
