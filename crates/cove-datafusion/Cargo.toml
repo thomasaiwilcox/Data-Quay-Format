@@ -1,0 +1,36 @@
+[package]
+name = "cove-datafusion"
+version = "0.1.0"
+edition = "2021"
+description = "DataFusion integration for the Cove Format (COVE)"
+license = "MIT"
+
+[features]
+default = ["native", "compat"]
+native = []
+compat = []
+covm = []
+covx = []
+dynamic-filters = []
+parquet-compare = ["datafusion/parquet"]
+
+[dependencies]
+cove-arrow = { path = "../cove-arrow" }
+cove-core = { path = "../cove-core" }
+arrow-array = "58"
+arrow-schema = "58"
+async-trait = "0.1"
+datafusion = { version = "53.1.0", default-features = false, features = ["sql"] }
+datafusion-datasource = { version = "53.1.0", default-features = false }
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+bytes = "1"
+criterion = "0.5"
+parquet = { version = "58", default-features = false, features = ["arrow"] }
+url = "2"
+
+[[bench]]
+name = "m6"
+harness = false

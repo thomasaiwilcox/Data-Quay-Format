@@ -1,0 +1,22 @@
+[package]
+name = "cove-arrow"
+version = "0.1.0"
+edition = "2021"
+description = "Arrow and Parquet interop for the Cove Format (COVE)"
+license = "MIT"
+
+[features]
+default = ["compression-lz4", "compression-zstd", "digest-sha2", "digest-blake3"]
+compression-lz4 = ["cove-core/compression-lz4"]
+compression-zstd = ["cove-core/compression-zstd"]
+digest-sha2 = ["cove-core/digest-sha2"]
+digest-blake3 = ["cove-core/digest-blake3"]
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+arrow-array = "58"
+arrow-buffer = "58"
+arrow-schema = "58"
+bytes = "1"
+parquet = { version = "58", default-features = false, features = ["arrow"] }
+serde_json = "1"

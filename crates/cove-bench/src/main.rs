@@ -7,7 +7,8 @@
 
 use std::time::Instant;
 
-use cove_core::{canonical::CanonicalValue, checksum, interop::arrow};
+use cove_arrow::arrow;
+use cove_core::{canonical::CanonicalValue, checksum};
 
 fn main() {
     bench_crc32c();

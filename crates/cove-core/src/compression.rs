@@ -71,6 +71,31 @@ pub fn section_spec_payload<'a>(
     )
 }
 
+/// Returns the decompressed payload bytes for an already-isolated section.
+///
+/// INVARIANT: callers that use range I/O must validate the section's absolute
+/// offset and bounds before fetching `raw`; this helper validates the fetched
+/// byte count, checksum, codec, and uncompressed length.
+pub fn section_payload_from_raw<'a>(
+    raw: &'a [u8],
+    length: u64,
+    uncompressed_length: u64,
+    compression: u8,
+    crc32c: u32,
+) -> Result<Cow<'a, [u8]>, CoveError> {
+    if raw.len() as u64 != length {
+        return Err(CoveError::BadSection(format!(
+            "section raw length {} does not match declared length {}",
+            raw.len(),
+            length
+        )));
+    }
+    if checksum::crc32c(raw) != crc32c {
+        return Err(CoveError::ChecksumMismatch);
+    }
+    payload_from_raw(raw, length, uncompressed_length, compression)
+}
+
 fn payload_from_spec<'a>(
     file_data: &'a [u8],
     offset: u64,
@@ -79,6 +104,15 @@ fn payload_from_spec<'a>(
     compression: u8,
 ) -> Result<Cow<'a, [u8]>, CoveError> {
     let raw = payload_raw_bytes(file_data, offset, length)?;
+    payload_from_raw(raw, length, uncompressed_length, compression)
+}
+
+fn payload_from_raw<'a>(
+    raw: &'a [u8],
+    length: u64,
+    uncompressed_length: u64,
+    compression: u8,
+) -> Result<Cow<'a, [u8]>, CoveError> {
     let codec = CompressionCodec::from_u8(compression)
         .ok_or_else(|| CoveError::BadSection(format!("unknown compression codec {compression}")))?;
     match codec {

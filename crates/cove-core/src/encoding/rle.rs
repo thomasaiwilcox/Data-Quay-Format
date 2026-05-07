@@ -75,9 +75,7 @@ impl Encoding for Rle {
         let total: u64 = payload.runs.iter().map(|(_, l)| *l as u64).sum();
         let mut out = Vec::with_capacity(total as usize);
         for (v, len) in &payload.runs {
-            for _ in 0..*len {
-                out.push(*v);
-            }
+            out.resize(out.len() + *len as usize, *v);
         }
         Ok(out)
     }

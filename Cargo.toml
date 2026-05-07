@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/cove-core",
+    "crates/cove-arrow",
+    "crates/cove-datafusion",
     "crates/cove-validate",
     "crates/cove-inspect",
     "crates/cove-dump",

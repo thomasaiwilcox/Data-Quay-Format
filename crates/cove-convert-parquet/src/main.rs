@@ -1,14 +1,10 @@
 use std::{env, fs, path::PathBuf, process::ExitCode};
 
-use cove_core::{
-    constants::CompressionCodec,
-    durable,
-    interop::parquet::{
-        convert_parquet_bytes, ParquetAccelerationPolicy, ParquetAggregatePolicy,
-        ParquetClusteringPolicy, ParquetConversionOptions, ParquetDictionaryPolicy,
-        ParquetStatsPolicy,
-    },
+use cove_arrow::parquet::{
+    convert_parquet_bytes, ParquetAccelerationPolicy, ParquetAggregatePolicy,
+    ParquetClusteringPolicy, ParquetConversionOptions, ParquetDictionaryPolicy, ParquetStatsPolicy,
 };
+use cove_core::{constants::CompressionCodec, durable};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Command {

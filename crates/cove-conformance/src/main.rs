@@ -27,6 +27,13 @@ use std::{
 };
 
 use arrow_array::{Array, BinaryArray, BooleanArray, Int32Array, StringArray, UInt64Array};
+use cove_arrow::{
+    arrow::{arrow_validity_to_cove_null, cove_null_to_arrow_validity, encoded_array_to_arrow},
+    parquet::{
+        convert_parquet_bytes, decode_materialized_page_values_with_nulls,
+        ParquetConversionOptions, ParquetScalarValue,
+    },
+};
 use serde_json::{json, Value};
 
 use cove_core::{
@@ -73,14 +80,7 @@ use cove_core::{
         lookup::LookupIndex,
         topn::TopNSummary,
     },
-    interop::{
-        arrow::{arrow_validity_to_cove_null, cove_null_to_arrow_validity, encoded_array_to_arrow},
-        lakehouse::{LakehouseHints, LakehouseMetadataUse, LakehouseOverlayDecision},
-        parquet::{
-            convert_parquet_bytes, decode_materialized_page_values_with_nulls,
-            ParquetConversionOptions,
-        },
-    },
+    interop::lakehouse::{LakehouseHints, LakehouseMetadataUse, LakehouseOverlayDecision},
     io_hints::IoHints,
     kernel::KernelCapabilities,
     metadata::MetadataJson,
@@ -1556,7 +1556,7 @@ fn decode_segment_column_values(
     segment_bytes: &[u8],
     segment: &TableSegmentPayloadV1,
     column: &cove_core::table::ColumnEntry,
-) -> Result<Vec<cove_core::interop::parquet::ParquetScalarValue>, CoveError> {
+) -> Result<Vec<ParquetScalarValue>, CoveError> {
     let column_directory = segment
         .columns
         .iter()

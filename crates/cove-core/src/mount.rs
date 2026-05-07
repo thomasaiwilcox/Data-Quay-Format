@@ -22,7 +22,10 @@ use crate::{
         topn::TopNSummary,
     },
     profile::{
-        cove_e::{EngineMountPolicyV1, ExecutionCodeDescriptorV1},
+        cove_e::{
+            CodeSpaceDescriptorV1, EngineMountPolicyV1, EngineProfileRegistry,
+            ExecutionCodeDescriptorV1, ExecutionScopeDescriptorV1,
+        },
         cove_h::HarborMountHintsV1,
     },
     reader::{self, IgnoredOptionalSection, OptionalPushdownPolicy, ValidationOptions},
@@ -73,7 +76,11 @@ pub struct MountedCoveFile {
     pub representation: OutputRepresentation,
     pub reverse_lookup: Option<ReverseLookup>,
     pub execution_code_map: Option<ExecutionCodeMap>,
+    pub engine_metadata: EngineMetadata,
     pub execution_descriptors: Vec<ExecutionCodeDescriptorV1>,
+    pub execution_scopes: Vec<ExecutionScopeDescriptorV1>,
+    pub code_spaces: Vec<CodeSpaceDescriptorV1>,
+    pub engine_profile_registries: Vec<EngineProfileRegistry>,
     pub engine_mount_policies: Vec<EngineMountPolicyV1>,
     pub column_domains: Vec<ColumnDomain>,
     pub zone_stats: Vec<ZoneStatsSection>,
@@ -81,6 +88,20 @@ pub struct MountedCoveFile {
     pub ignored_optional_sections: Vec<IgnoredOptionalSection>,
     pub covx_status: SidecarValidationStatus,
     pub covm_status: SidecarValidationStatus,
+}
+
+/// Parsed COVE-E metadata carried through mount and dataset bootstrap.
+///
+/// INVARIANT: COVE-E metadata is advisory until a consumer proves that the
+/// active descriptor, scope, code space, and mount policy are compatible with
+/// the requested operation. It never changes COVE logical values.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineMetadata {
+    pub engine_profile_registries: Vec<EngineProfileRegistry>,
+    pub execution_descriptors: Vec<ExecutionCodeDescriptorV1>,
+    pub execution_scopes: Vec<ExecutionScopeDescriptorV1>,
+    pub code_spaces: Vec<CodeSpaceDescriptorV1>,
+    pub engine_mount_policies: Vec<EngineMountPolicyV1>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -203,13 +224,12 @@ pub fn mount_cove_file(
     let table_catalog = parse_table_catalog(data, &footer)?;
     let dictionary = parse_dictionary(data, &footer)?;
     let reverse_lookup = dictionary.as_ref().map(build_reverse_lookup).transpose()?;
-    let execution_descriptors = parse_execution_descriptors(data, &footer)?;
-    let engine_mount_policies = parse_engine_mount_policies(data, &footer)?;
+    let engine_metadata = parse_engine_metadata(data, &footer)?;
     let execution_code_map = if options.representation == OutputRepresentation::MapToExecutionCode {
         let dictionary = dictionary.as_ref().ok_or(CoveError::ExecutionCodeMap)?;
         Some(build_execution_code_map(
             dictionary,
-            execution_descriptors.first(),
+            engine_metadata.execution_descriptors.first(),
             resolver.ok_or(CoveError::ExecutionCodeMap)?,
         )?)
     } else {
@@ -244,8 +264,12 @@ pub fn mount_cove_file(
         representation: options.representation,
         reverse_lookup,
         execution_code_map,
-        execution_descriptors,
-        engine_mount_policies,
+        execution_descriptors: engine_metadata.execution_descriptors.clone(),
+        execution_scopes: engine_metadata.execution_scopes.clone(),
+        code_spaces: engine_metadata.code_spaces.clone(),
+        engine_profile_registries: engine_metadata.engine_profile_registries.clone(),
+        engine_mount_policies: engine_metadata.engine_mount_policies.clone(),
+        engine_metadata,
         column_domains,
         zone_stats,
         scan_indexes,
@@ -545,6 +569,32 @@ fn parse_zone_stats(data: &[u8], footer: &CoveFooter) -> Result<Vec<ZoneStatsSec
     Ok(out)
 }
 
+/// Parse every standardized COVE-E metadata section in a mounted file.
+pub fn parse_engine_metadata(
+    data: &[u8],
+    footer: &CoveFooter,
+) -> Result<EngineMetadata, CoveError> {
+    Ok(EngineMetadata {
+        engine_profile_registries: parse_engine_profile_registries(data, footer)?,
+        execution_descriptors: parse_execution_descriptors(data, footer)?,
+        execution_scopes: parse_execution_scopes(data, footer)?,
+        code_spaces: parse_code_spaces(data, footer)?,
+        engine_mount_policies: parse_engine_mount_policies(data, footer)?,
+    })
+}
+
+fn parse_engine_profile_registries(
+    data: &[u8],
+    footer: &CoveFooter,
+) -> Result<Vec<EngineProfileRegistry>, CoveError> {
+    let mut out = Vec::new();
+    for entry in find_sections(footer, SectionKind::EngineProfileRegistry) {
+        let payload = compression::section_payload(data, entry)?;
+        out.push(EngineProfileRegistry::parse(&payload)?);
+    }
+    Ok(out)
+}
+
 fn parse_execution_descriptors(
     data: &[u8],
     footer: &CoveFooter,
@@ -553,6 +603,30 @@ fn parse_execution_descriptors(
     for entry in find_sections(footer, SectionKind::ExecutionCodeDescriptor) {
         let payload = compression::section_payload(data, entry)?;
         out.push(ExecutionCodeDescriptorV1::parse(&payload)?);
+    }
+    Ok(out)
+}
+
+fn parse_execution_scopes(
+    data: &[u8],
+    footer: &CoveFooter,
+) -> Result<Vec<ExecutionScopeDescriptorV1>, CoveError> {
+    let mut out = Vec::new();
+    for entry in find_sections(footer, SectionKind::ExecutionScopeDescriptor) {
+        let payload = compression::section_payload(data, entry)?;
+        out.push(ExecutionScopeDescriptorV1::parse(&payload)?);
+    }
+    Ok(out)
+}
+
+fn parse_code_spaces(
+    data: &[u8],
+    footer: &CoveFooter,
+) -> Result<Vec<CodeSpaceDescriptorV1>, CoveError> {
+    let mut out = Vec::new();
+    for entry in find_sections(footer, SectionKind::CodeSpaceDescriptor) {
+        let payload = compression::section_payload(data, entry)?;
+        out.push(CodeSpaceDescriptorV1::parse(&payload)?);
     }
     Ok(out)
 }
