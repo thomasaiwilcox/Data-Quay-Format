@@ -11,6 +11,7 @@ pub const EXACT_SET_HEADER_LEN: usize = 36;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ExactSetGranularity {
     Segment = 0,
     Morsel = 1,
@@ -28,6 +29,7 @@ impl ExactSetGranularity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ExactSetKeyKind {
     FileCode = 0,
     NumCode = 1,
@@ -47,6 +49,7 @@ impl ExactSetKeyKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ExactSetRepresentation {
     SortedList = 0,
     Bitset = 1,

@@ -9,6 +9,13 @@ use crate::{
 
 // ── Compatibility validation ───────────────────────────────────────────────────
 
+/// Context needed to validate logical/physical pairs whose compatibility
+/// depends on an explicit declaration outside the logical/physical fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogicalPhysicalOptions {
+    pub bool_declared_numeric: bool,
+}
+
 /// Returns `Ok(())` if `logical` and `physical` form a valid combination, or
 /// `Err(CoveError::BadLogicalPhysicalPair)` if they are incompatible.
 ///
@@ -28,6 +35,18 @@ pub fn validate_logical_physical_pair(
     logical: CoveLogicalType,
     physical: CovePhysicalKind,
 ) -> Result<(), CoveError> {
+    validate_logical_physical_pair_with_options(
+        logical,
+        physical,
+        LogicalPhysicalOptions::default(),
+    )
+}
+
+pub fn validate_logical_physical_pair_with_options(
+    logical: CoveLogicalType,
+    physical: CovePhysicalKind,
+    options: LogicalPhysicalOptions,
+) -> Result<(), CoveError> {
     let ok = match physical {
         // FileCode accepts any scalar / variable-length / special type; the
         // dictionary maps it to a canonical logical value.  Container types
@@ -37,27 +56,30 @@ pub fn validate_logical_physical_pair(
             CoveLogicalType::List | CoveLogicalType::Struct | CoveLogicalType::Map
         ),
 
-        // NumCode is restricted to numeric/temporal types only.
-        // Bool is excluded: Spec §19.1 only permits Bool with NumCode when it
-        // is "explicitly declared numeric", a constraint that cannot be enforced
-        // from logical/physical kinds alone.
-        CovePhysicalKind::NumCode => matches!(
-            logical,
-            CoveLogicalType::Int8
-                | CoveLogicalType::Int16
-                | CoveLogicalType::Int32
-                | CoveLogicalType::Int64
-                | CoveLogicalType::UInt8
-                | CoveLogicalType::UInt16
-                | CoveLogicalType::UInt32
-                | CoveLogicalType::UInt64
-                | CoveLogicalType::Float32
-                | CoveLogicalType::Float64
-                | CoveLogicalType::Decimal64
-                | CoveLogicalType::DateDays
-                | CoveLogicalType::TimestampMicros
-                | CoveLogicalType::TimestampNanos
-        ),
+        // NumCode is restricted to numeric/temporal types only. Bool requires
+        // an explicit numeric declaration carried by the owning column/property.
+        CovePhysicalKind::NumCode => {
+            matches!(
+                logical,
+                CoveLogicalType::Bool if options.bool_declared_numeric
+            ) || matches!(
+                logical,
+                CoveLogicalType::Int8
+                    | CoveLogicalType::Int16
+                    | CoveLogicalType::Int32
+                    | CoveLogicalType::Int64
+                    | CoveLogicalType::UInt8
+                    | CoveLogicalType::UInt16
+                    | CoveLogicalType::UInt32
+                    | CoveLogicalType::UInt64
+                    | CoveLogicalType::Float32
+                    | CoveLogicalType::Float64
+                    | CoveLogicalType::Decimal64
+                    | CoveLogicalType::DateDays
+                    | CoveLogicalType::TimestampMicros
+                    | CoveLogicalType::TimestampNanos
+            )
+        }
 
         // Boolean physical storage only makes sense for the Bool logical type.
         CovePhysicalKind::Boolean => matches!(logical, CoveLogicalType::Bool),
@@ -277,6 +299,18 @@ mod tests {
                 "expected NumCode to reject {lt:?}"
             );
         }
+    }
+
+    #[test]
+    fn numcode_bool_pair_accepts_explicit_numeric_declaration() {
+        assert!(validate_logical_physical_pair_with_options(
+            CoveLogicalType::Bool,
+            CovePhysicalKind::NumCode,
+            LogicalPhysicalOptions {
+                bool_declared_numeric: true,
+            },
+        )
+        .is_ok());
     }
 
     #[test]

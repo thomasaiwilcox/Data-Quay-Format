@@ -137,6 +137,7 @@ pub const KNOWN_FEATURE_BITS_MASK: u64 = FEATURE_OBJECT_PROFILE
 /// Profile identifier used in the header `primary_profile` field and section `profile` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum PrimaryProfile {
     /// Mixed / unknown profile.
     Mixed = 0,
@@ -175,6 +176,7 @@ impl PrimaryProfile {
 /// Scope kind stored in the header `producer_scope_kind` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum ProducerScopeKind {
     None = 0,
     Tenant = 1,
@@ -207,6 +209,7 @@ impl ProducerScopeKind {
 /// Identifies the logical kind of a section listed in the footer directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum SectionKind {
     // Shared sections (profile = 0)
     FileDictionaryIndex = 1,
@@ -321,6 +324,7 @@ impl SectionKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum CompressionCodec {
     None = 0,
     Lz4 = 1,
@@ -342,6 +346,7 @@ impl CompressionCodec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum CoveLogicalType {
     Null = 0,
     Bool = 1,
@@ -405,6 +410,7 @@ impl CoveLogicalType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum CovePhysicalKind {
     FileCode = 0,
     NumCode = 1,
@@ -436,6 +442,7 @@ impl CovePhysicalKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum ValueTag {
     Null = 0,
     BoolFalse = 1,
@@ -489,6 +496,7 @@ impl ValueTag {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum StorageClass {
     Inline = 0,
     Payload = 1,
@@ -510,6 +518,7 @@ impl StorageClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum CoveEncodingKind {
     Canonical = 0,
     Validity = 1,
@@ -563,6 +572,7 @@ impl CoveEncodingKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum DigestAlgorithm {
     None = 0,
     Sha256 = 1,
@@ -585,6 +595,7 @@ impl DigestAlgorithm {
 /// The result of evaluating a predicate against a zone's metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum PredicateZoneOutcome {
     /// No row in the zone can satisfy the predicate.
     DefinitelyNo = 0,
@@ -598,6 +609,7 @@ pub enum PredicateZoneOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum RecordKind {
     Delta = 0,
     Snapshot = 1,

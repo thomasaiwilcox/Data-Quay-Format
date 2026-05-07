@@ -1,0 +1,239 @@
+//! COVE-native scan program compilation.
+//!
+//! This module is intentionally DataFusion-agnostic. It records the predicate
+//! shape Cove has promised to evaluate and the conservative exactness contract
+//! used by DataFusion pushdown classification.
+
+use cove_core::{constants::CovePhysicalKind, index::lookup::LookupKeyKind};
+
+use crate::{
+    dataset_state::DatasetState,
+    planner::{CoveFilterUse, CovePredicate, FilterPlan, NumericPredicateOp},
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredicateExactness {
+    PruningOnly,
+    FullRowPredicateExact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeKernel {
+    NullBitmap,
+    DirectFileCode,
+    PreparedFileCode,
+    PreparedNumCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanOp {
+    Null {
+        column_index: usize,
+        column_id: u32,
+        exactness: PredicateExactness,
+        kernel: DecodeKernel,
+    },
+    Numeric {
+        column_index: usize,
+        column_id: u32,
+        exactness: PredicateExactness,
+        kernel: DecodeKernel,
+    },
+    FileCodeIn {
+        column_index: usize,
+        column_id: u32,
+        exactness: PredicateExactness,
+        kernel: DecodeKernel,
+        literal_count: usize,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoveScanProgram {
+    pub ops: Vec<ScanOp>,
+    pub exact_filters: usize,
+    pub inexact_filters: usize,
+    pub lookup_rowref_eligible: bool,
+}
+
+impl CoveScanProgram {
+    pub fn display_summary(&self) -> String {
+        format!(
+            "ops={}, exact_filters={}, inexact_filters={}, lookup_rowref_eligible={}",
+            self.ops.len(),
+            self.exact_filters,
+            self.inexact_filters,
+            self.lookup_rowref_eligible
+        )
+    }
+}
+
+/// Promote a lowered filter only when Cove can evaluate the full row predicate
+/// itself. Unsupported or advisory-only predicates stay pruning-only so
+/// DataFusion keeps the residual filter.
+pub fn promote_filter_exactness(state: &DatasetState, filter: &mut FilterPlan) {
+    if filter.use_kind == CoveFilterUse::Unsupported {
+        return;
+    }
+    filter.use_kind = match filter_exactness(state, filter) {
+        PredicateExactness::FullRowPredicateExact => CoveFilterUse::FullRowPredicateExact,
+        PredicateExactness::PruningOnly => CoveFilterUse::PruningOnly,
+    };
+}
+
+pub fn compile_scan_program(state: &DatasetState, filters: &[FilterPlan]) -> CoveScanProgram {
+    let mut program = CoveScanProgram::default();
+    for filter in filters {
+        let exactness = match filter.use_kind {
+            CoveFilterUse::FullRowPredicateExact => {
+                program.exact_filters += 1;
+                PredicateExactness::FullRowPredicateExact
+            }
+            CoveFilterUse::PruningOnly => {
+                program.inexact_filters += 1;
+                PredicateExactness::PruningOnly
+            }
+            CoveFilterUse::Unsupported => continue,
+        };
+        let Some(predicate) = &filter.predicate else {
+            continue;
+        };
+        let Some(column_index) = predicate_column_index(predicate) else {
+            continue;
+        };
+        let Some(column) = state.table().columns.get(column_index) else {
+            continue;
+        };
+        let kernel = predicate_kernel(predicate);
+        let op = match predicate {
+            CovePredicate::Null { .. } => ScanOp::Null {
+                column_index,
+                column_id: column.column_id,
+                exactness,
+                kernel,
+            },
+            CovePredicate::Numeric { .. } => ScanOp::Numeric {
+                column_index,
+                column_id: column.column_id,
+                exactness,
+                kernel,
+            },
+            CovePredicate::FileCodeIn {
+                file_codes,
+                canonical_values,
+                ..
+            } => ScanOp::FileCodeIn {
+                column_index,
+                column_id: column.column_id,
+                exactness,
+                kernel,
+                literal_count: file_codes.len().max(canonical_values.len()),
+            },
+        };
+        program.ops.push(op);
+    }
+    program.lookup_rowref_eligible = lookup_rowref_eligible(state, filters);
+    program
+}
+
+fn filter_exactness(state: &DatasetState, filter: &FilterPlan) -> PredicateExactness {
+    let Some(predicate) = &filter.predicate else {
+        return PredicateExactness::PruningOnly;
+    };
+    match predicate {
+        CovePredicate::Null { .. } => PredicateExactness::PruningOnly,
+        CovePredicate::Numeric { column_index, .. } => {
+            let Some(column) = state.table().columns.get(*column_index) else {
+                return PredicateExactness::PruningOnly;
+            };
+            if column.physical == CovePhysicalKind::NumCode {
+                PredicateExactness::FullRowPredicateExact
+            } else {
+                PredicateExactness::PruningOnly
+            }
+        }
+        CovePredicate::FileCodeIn {
+            column_index,
+            canonical_values,
+            ..
+        } => {
+            let Some(column) = state.table().columns.get(*column_index) else {
+                return PredicateExactness::PruningOnly;
+            };
+            if column.physical != CovePhysicalKind::FileCode {
+                return PredicateExactness::PruningOnly;
+            }
+            if state.files().iter().any(|file| file.has_redaction()) {
+                return PredicateExactness::PruningOnly;
+            }
+            if !canonical_values.is_empty()
+                && state
+                    .files()
+                    .iter()
+                    .any(|file| file.mounted().reverse_lookup.is_none())
+            {
+                return PredicateExactness::PruningOnly;
+            }
+            PredicateExactness::FullRowPredicateExact
+        }
+    }
+}
+
+fn lookup_rowref_eligible(state: &DatasetState, filters: &[FilterPlan]) -> bool {
+    let exact_row_predicates = filters
+        .iter()
+        .filter(|filter| filter.use_kind == CoveFilterUse::FullRowPredicateExact)
+        .filter(|filter| {
+            matches!(
+                filter.predicate,
+                Some(
+                    CovePredicate::Numeric {
+                        op: NumericPredicateOp::Eq,
+                        ..
+                    } | CovePredicate::FileCodeIn { .. }
+                )
+            )
+        })
+        .collect::<Vec<_>>();
+    if exact_row_predicates.len() != 1 || filters.len() != 1 {
+        return false;
+    }
+    let Some(predicate) = &exact_row_predicates[0].predicate else {
+        return false;
+    };
+    let (column_index, key_kind) = match predicate {
+        CovePredicate::FileCodeIn { column_index, .. } => (*column_index, LookupKeyKind::FileCode),
+        CovePredicate::Numeric {
+            column_index,
+            op: NumericPredicateOp::Eq,
+            literal,
+        } if crate::decode::numeric_lookup_key(*literal).is_some() => {
+            (*column_index, LookupKeyKind::NumCode)
+        }
+        _ => return false,
+    };
+    let Some(column) = state.table().columns.get(column_index) else {
+        return false;
+    };
+    state.files().iter().all(|file| {
+        file.pruning().lookups.iter().any(|index| {
+            index.header.column_id == column.column_id && index.header.key_kind == key_kind
+        })
+    })
+}
+
+fn predicate_kernel(predicate: &CovePredicate) -> DecodeKernel {
+    match predicate {
+        CovePredicate::Null { .. } => DecodeKernel::NullBitmap,
+        CovePredicate::Numeric { .. } => DecodeKernel::PreparedNumCode,
+        CovePredicate::FileCodeIn { .. } => DecodeKernel::PreparedFileCode,
+    }
+}
+
+fn predicate_column_index(predicate: &CovePredicate) -> Option<usize> {
+    match predicate {
+        CovePredicate::Null { column_index, .. }
+        | CovePredicate::Numeric { column_index, .. }
+        | CovePredicate::FileCodeIn { column_index, .. } => Some(*column_index),
+    }
+}

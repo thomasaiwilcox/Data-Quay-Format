@@ -129,6 +129,7 @@ fn write_len_prefixed(out: &mut Vec<u8>, bytes: &[u8], what: &str) -> Result<(),
 
 /// Reader policy that decides how a redacted value is surfaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RedactionPolicy {
     /// Treat redacted values as missing (return `None`).
     Hide,

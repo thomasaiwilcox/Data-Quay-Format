@@ -19,6 +19,7 @@ const STAT_SCALAR_KNOWN_FLAGS: u8 = STAT_SCALAR_FLAG_TRUNCATED;
 
 /// Scope at which a [`ZoneStats`] applies (Spec §28.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ZoneScope {
     File,
     Table,
@@ -42,6 +43,7 @@ impl ZoneScope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum StatKind {
     None = 0,
     Int64 = 1,
@@ -135,6 +137,7 @@ pub struct StatScalar {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum NumericStatValue {
     Int64(i64),
     UInt64(u64),

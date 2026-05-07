@@ -19,6 +19,7 @@ use super::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LocalIndexEncoding {
     Rle,
     BitPacked,
@@ -42,6 +43,7 @@ impl LocalIndexEncoding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LocalIndexPayload {
     Rle(RlePayload),
     BitPacked(BitPackedPayload),
@@ -75,6 +77,7 @@ impl LocalIndexPayload {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LocalCodebookValueKind {
     FileCode,
     NumCode,
@@ -112,6 +115,7 @@ impl LocalCodebookValueKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LocalCodebookValue {
     FileCode(u32),
     NumCode(u64),
@@ -120,6 +124,7 @@ pub enum LocalCodebookValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LocalCodebookValues {
     FileCode(Vec<u32>),
     NumCode(Vec<u64>),

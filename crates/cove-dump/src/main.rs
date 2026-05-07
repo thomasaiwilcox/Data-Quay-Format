@@ -156,6 +156,7 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             };
             let report = reader::validate_bytes_with_options(&data, opts)
                 .map_err(|e| format!("validation: {e}"))?;
@@ -201,6 +202,7 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             };
             let report = reader::validate_bytes_with_options(&data, opts)
                 .map_err(|e| format!("validation: {e}"))?;
@@ -211,6 +213,7 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             };
             let report = reader::validate_bytes_with_options(&data, opts)
                 .map_err(|e| format!("validation: {e}"))?;
@@ -233,6 +236,7 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                     Some(StorageClass::Inline) => "inline",
                     Some(StorageClass::Payload) => "payload",
                     Some(StorageClass::Redacted) => "redacted",
+                    Some(_) => "future",
                     None => "unknown",
                 };
                 let tag_str = format!("{}", entry.value_tag);
@@ -244,6 +248,7 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             };
             let report = reader::validate_bytes_with_options(&data, opts)
                 .map_err(|e| format!("validation: {e}"))?;
@@ -269,6 +274,7 @@ fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String
                     let n = bytes.len().min(max_bytes);
                     print_hex(&bytes[..n]);
                 }
+                _ => return Err("unsupported future dictionary value kind".into()),
             }
         }
     }

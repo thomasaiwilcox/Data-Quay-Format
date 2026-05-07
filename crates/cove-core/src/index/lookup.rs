@@ -12,6 +12,7 @@ pub const LOOKUP_INDEX_ENTRY_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum LookupKeyKind {
     FileCode = 0,
     NumCode = 1,
@@ -33,6 +34,7 @@ impl LookupKeyKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum LookupIndexKind {
     Hash = 0,
     SparseSorted = 1,
@@ -52,6 +54,7 @@ impl LookupIndexKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum LookupUniqueness {
     Unknown = 0,
     Unique = 1,

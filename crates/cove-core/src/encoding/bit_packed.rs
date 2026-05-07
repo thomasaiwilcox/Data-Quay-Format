@@ -69,15 +69,16 @@ impl BitPackedPayload {
             if v & !mask != 0 {
                 return Err(CoveError::PageCorrupt);
             }
-            for b in 0..bits_per_value {
-                let one = (v >> b) & 1;
-                if one == 1 {
-                    let byte = (bit_pos / 8) as usize;
-                    let off = (bit_pos % 8) as u8;
-                    bits[byte] |= 1u8 << off;
-                }
-                bit_pos += 1;
-            }
+            let byte_off = (bit_pos / 8) as usize;
+            let bit_off = (bit_pos % 8) as usize;
+            let mut buf = [0u8; 16];
+            let avail = bits.len().saturating_sub(byte_off).min(buf.len());
+            buf[..avail].copy_from_slice(&bits[byte_off..byte_off + avail]);
+            let mut word = u128::from_le_bytes(buf);
+            word |= (u128::from(*v) & u128::from(mask)) << bit_off;
+            let encoded = word.to_le_bytes();
+            bits[byte_off..byte_off + avail].copy_from_slice(&encoded[..avail]);
+            bit_pos += u64::from(bits_per_value);
         }
         Ok(Self {
             bits_per_value,
@@ -94,20 +95,21 @@ impl Encoding for BitPacked {
 
     fn canonical_decode(payload: &Self::Payload) -> Result<Vec<i64>, CoveError> {
         let bpv = payload.bits_per_value as usize;
+        let mask: u128 = (1u128 << bpv) - 1;
         let mut out = Vec::with_capacity(payload.row_count as usize);
+        let mut bit_pos: usize = 0;
         for r in 0..payload.row_count as usize {
-            let mut v: u64 = 0;
-            for b in 0..bpv {
-                let bit_pos = r * bpv + b;
-                let byte = bit_pos / 8;
-                let off = (bit_pos % 8) as u8;
-                if byte >= payload.bits.len() {
-                    return Err(CoveError::PageCorrupt);
-                }
-                let one = ((payload.bits[byte] >> off) & 1) as u64;
-                v |= one << b;
+            let byte_off = bit_pos / 8;
+            let bit_off = bit_pos % 8;
+            if byte_off >= payload.bits.len() {
+                return Err(CoveError::PageCorrupt);
             }
-            out.push(v as i64);
+            let mut buf = [0u8; 16];
+            let avail = payload.bits.len().saturating_sub(byte_off).min(buf.len());
+            buf[..avail].copy_from_slice(&payload.bits[byte_off..byte_off + avail]);
+            let word = u128::from_le_bytes(buf);
+            out.push(((word >> bit_off) & mask) as i64);
+            bit_pos = (r + 1).checked_mul(bpv).ok_or(CoveError::ArithOverflow)?;
         }
         Ok(out)
     }

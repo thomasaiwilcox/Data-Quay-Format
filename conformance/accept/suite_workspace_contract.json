@@ -6,6 +6,7 @@
     "crates/cove-dump",
     "crates/cove-convert-parquet",
     "crates/cove-conformance",
+    "crates/cove-map",
     "crates/cove-bench"
   ],
   "op": "workspace_members_present"

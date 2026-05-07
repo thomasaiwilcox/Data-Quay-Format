@@ -21,6 +21,7 @@ use crate::{
 
 /// Source of a pruning decision (Spec §37.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PruningEvidence {
     /// No metadata available; outcome is `Unknown` and decode is required.
     NoMetadata,

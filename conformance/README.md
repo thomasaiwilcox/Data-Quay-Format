@@ -1,7 +1,7 @@
 # COVE Conformance Corpus
 
 This directory contains binary fixtures and a `manifest.jsonl` that maps each
-fixture to the Spec §1–§79 sections it exercises. The corpus includes complete
+fixture to the Spec §1–§81 sections it exercises. The corpus includes complete
 `.cove` files plus parser-focused payload and artifact fixtures for structures
 that are not always meaningful as standalone COVE files. Run the corpus with:
 
@@ -23,16 +23,19 @@ Each manifest line is one JSON object:
     `composite_zone_index`, `topn_summary`, `sort_key`, `clustering_key`,
         `pruning_case`, `error_surface_case`, `cove_e_engine_registry`, `cove_e_execution_code`,
     `cove_e_execution_scope`, `cove_e_code_space`, `cove_e_mount_policy`,
-    `cove_h_mount_hints`, `cove_o_object_catalog`, and
-    `cove_o_temporal_segment_index`
+    `cove_h_mount_hints`, `cove_o_object_catalog`,
+    `cove_o_temporal_segment_index`, `cove_o_temporal_bloom_index`,
+    `extension_registry`, `extension_logical_type`, `extension_index_descriptor`,
+    `durable_publish_case`, `sidecar_freshness_case`, `cove_map_convert_case`, and
+    `cove_map_project_case`
 - `expect`   — `"accept"` or `"reject"`
-- `error_code` — (preferred when `expect=reject`) stable Spec §75 error code
-    Fixtures with `error_code` are automatically tagged as `§75` evidence by `gen-corpus`.
+- `error_code` — (preferred when `expect=reject`) stable Spec §76 error code
+    Fixtures with `error_code` are automatically tagged as `§76` evidence by `gen-corpus`.
 - `error`    — optional fallback substring match for ad hoc cases
 - `sections` — list of `"§N.M"` markers from `Spec.md`
 - `morsel_count` — required only for `row_morsel_directory` fixtures
 
-`suite_contract_case` fixtures are repo-level meta checks used for Spec §78. They
+`suite_contract_case` fixtures are repo-level meta checks used for Spec §§78-79. They
 verify the generated manifest breadth plus the release-gate and workspace binary
 contract that keeps the conformance and benchmark suite executable.
 

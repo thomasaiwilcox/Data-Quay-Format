@@ -1,11 +1,12 @@
 //! Cove Format (COVE) v1.0 — Error types.
 //!
-//! Corresponds to Section 75 of the COVE v1.0 specification.
+//! Corresponds to Section 76 of the COVE v1.0 specification.
 
-use std::fmt;
+use std::{error::Error, fmt};
 
 /// All errors that can occur while reading, writing, or validating a COVE file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
+#[non_exhaustive]
 pub enum CoveError {
     /// Missing or invalid magic bytes (COVE_E_BAD_MAGIC).
     BadMagic,
@@ -75,8 +76,10 @@ pub enum CoveError {
     /// A field that MUST be zero contained a non-zero value.
     ReservedNotZero,
     /// I/O error during file reading or writing.
-    Io(String),
-    /// Encoding kind is not supported by this implementation (COVE_E_UNSUPPORTED_ENCODING).
+    Io(std::io::Error),
+    /// Encoding kind is not supported by this implementation.
+    ///
+    /// This is an implementation capability error, not a Spec §76 error code.
     UnsupportedEncoding(String),
 }
 
@@ -192,14 +195,14 @@ impl fmt::Display for CoveError {
             CoveError::ReservedNotZero => {
                 write!(f, "COVE_E_BAD_SECTION: reserved field is non-zero")
             }
-            CoveError::Io(s) => write!(f, "I/O error: {s}"),
-            CoveError::UnsupportedEncoding(s) => write!(f, "COVE_E_UNSUPPORTED_ENCODING: {s}"),
+            CoveError::Io(error) => write!(f, "I/O error: {error}"),
+            CoveError::UnsupportedEncoding(s) => write!(f, "unsupported encoding: {s}"),
         }
     }
 }
 
 impl CoveError {
-    /// Complete Spec §75 code inventory surfaced by [`Self::spec_code`].
+    /// Complete Spec §76 code inventory surfaced by [`Self::spec_code`].
     pub const ALL_SPEC_CODES: [&'static str; 31] = [
         "COVE_E_BAD_MAGIC",
         "COVE_E_BAD_VERSION",
@@ -234,10 +237,10 @@ impl CoveError {
         "COVE_E_MAP_EVIDENCE_INVALID",
     ];
 
-    /// Return the closest Spec §75 error code for this error.
+    /// Return the closest Spec §76 error code for this error.
     ///
     /// Some implementation-level errors such as [`CoveError::BufferTooShort`] and
-    /// [`CoveError::ReservedNotZero`] are normalized to their Spec §75 structural
+    /// [`CoveError::ReservedNotZero`] are normalized to their Spec §76 structural
     /// category so callers can report stable conformance diagnostics.
     pub fn spec_code(&self) -> Option<&'static str> {
         match self {
@@ -283,7 +286,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn spec_75_errors_expose_stable_codes() {
+    fn spec_76_errors_expose_stable_codes() {
         assert_eq!(CoveError::BadMagic.spec_code(), Some("COVE_E_BAD_MAGIC"));
         assert_eq!(
             CoveError::UnknownRequiredFeature(1).spec_code(),
@@ -301,7 +304,8 @@ mod tests {
             CoveError::MapInvalid.spec_code(),
             Some("COVE_E_MAP_INVALID")
         );
-        assert_eq!(CoveError::Io("disk".into()).spec_code(), None);
+        let io_error: CoveError = std::io::Error::other("disk").into();
+        assert_eq!(io_error.spec_code(), None);
     }
 
     #[test]
@@ -317,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_75_code_inventory_is_unique() {
+    fn spec_76_code_inventory_is_unique() {
         let unique = CoveError::ALL_SPEC_CODES
             .into_iter()
             .collect::<BTreeSet<_>>();
@@ -326,12 +330,82 @@ mod tests {
         assert!(unique.contains("COVE_E_SIDECAR_STALE"));
         assert!(unique.contains("COVE_E_MAP_EVIDENCE_INVALID"));
     }
+
+    #[test]
+    fn io_error_preserves_source() {
+        let source = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied by test",
+        );
+        let error = CoveError::from(source);
+        let source = error.source().expect("io source should be preserved");
+        assert_eq!(source.to_string(), "permission denied by test");
+    }
+
+    #[test]
+    fn unsupported_encoding_is_not_rendered_as_spec_code() {
+        let error = CoveError::UnsupportedEncoding("codec disabled".into());
+        assert_eq!(error.spec_code(), None);
+        assert_eq!(error.to_string(), "unsupported encoding: codec disabled");
+    }
 }
 
-impl std::error::Error for CoveError {}
+impl Error for CoveError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            CoveError::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for CoveError {
     fn from(e: std::io::Error) -> Self {
-        CoveError::Io(e.to_string())
+        CoveError::Io(e)
+    }
+}
+
+#[cfg(test)]
+impl PartialEq for CoveError {
+    fn eq(&self, other: &Self) -> bool {
+        use CoveError::*;
+        match (self, other) {
+            (BadMagic, BadMagic)
+            | (BadVersion, BadVersion)
+            | (ChecksumMismatch, ChecksumMismatch)
+            | (DigestMismatch, DigestMismatch)
+            | (OffsetRange, OffsetRange)
+            | (ArithOverflow, ArithOverflow)
+            | (BadLogicalPhysicalPair, BadLogicalPhysicalPair)
+            | (DictMiss, DictMiss)
+            | (BadFileCode, BadFileCode)
+            | (BadNumCode, BadNumCode)
+            | (BadDomain, BadDomain)
+            | (BadStats, BadStats)
+            | (BadIndex, BadIndex)
+            | (BadExtension, BadExtension)
+            | (BadEngineProfile, BadEngineProfile)
+            | (ExecutionCodeMap, ExecutionCodeMap)
+            | (HarborMountLease, HarborMountLease)
+            | (RefInvalid, RefInvalid)
+            | (NotSelfContained, NotSelfContained)
+            | (SegmentCorrupt, SegmentCorrupt)
+            | (PageCorrupt, PageCorrupt)
+            | (RedactionPolicy, RedactionPolicy)
+            | (SidecarStale, SidecarStale)
+            | (MapInvalid, MapInvalid)
+            | (MapFunctionUndeclared, MapFunctionUndeclared)
+            | (MapIdentityConflict, MapIdentityConflict)
+            | (MapSourceStale, MapSourceStale)
+            | (MapEvidenceInvalid, MapEvidenceInvalid)
+            | (BufferTooShort, BufferTooShort)
+            | (ReservedNotZero, ReservedNotZero) => true,
+            (UnknownRequiredFeature(lhs), UnknownRequiredFeature(rhs)) => lhs == rhs,
+            (BadSection(lhs), BadSection(rhs))
+            | (BadSchema(lhs), BadSchema(rhs))
+            | (UnsupportedEncoding(lhs), UnsupportedEncoding(rhs)) => lhs == rhs,
+            (Io(lhs), Io(rhs)) => lhs.kind() == rhs.kind() && lhs.to_string() == rhs.to_string(),
+            _ => false,
+        }
     }
 }

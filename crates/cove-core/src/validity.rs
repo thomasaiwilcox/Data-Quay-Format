@@ -26,6 +26,7 @@ use crate::CoveError;
 /// assert_eq!(bm.is_null(0).unwrap(), true);
 /// assert_eq!(bm.is_null(1).unwrap(), false);
 /// ```
+#[derive(Debug, Clone, Copy)]
 pub struct ValidityBitmap<'a> {
     bytes: &'a [u8],
     row_count: u64,
@@ -105,18 +106,23 @@ impl<'a> ValidityBitmap<'a> {
         if self.bytes.len() < needed_bytes {
             return Err(CoveError::BufferTooShort);
         }
-        // Count set bits, masking off the tail byte for any unused bits.
-        let mut count: u64 = 0;
-        for (i, &byte) in self.bytes[..needed_bytes].iter().enumerate() {
-            let byte_start_row = (i as u64) * 8;
-            let rows_in_byte = (self.row_count - byte_start_row).min(8);
-            // Mask to include only the rows within this byte.
-            let mask = if rows_in_byte == 8 {
-                0xffu8
-            } else {
-                (1u8 << rows_in_byte) - 1
-            };
-            count += (byte & mask).count_ones() as u64;
+        let full_words = needed_bytes / 8;
+        let mut count = 0u64;
+        for word_bytes in self.bytes[..full_words * 8].chunks_exact(8) {
+            let word = u64::from_le_bytes(word_bytes.try_into().unwrap());
+            count += word.count_ones() as u64;
+        }
+        let tail = &self.bytes[full_words * 8..needed_bytes];
+        if !tail.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..tail.len()].copy_from_slice(tail);
+            let mut word = u64::from_le_bytes(buf);
+            let tail_bits = (self.row_count as usize).saturating_sub(full_words * 64);
+            if tail_bits < 64 {
+                let mask = (1u64 << tail_bits) - 1;
+                word &= mask;
+            }
+            count += word.count_ones() as u64;
         }
         Ok(count)
     }

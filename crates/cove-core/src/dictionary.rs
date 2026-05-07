@@ -9,6 +9,8 @@
 //! - `FILE_DICTIONARY_PAYLOAD` — variable-length value bytes for inline-overflow
 //!   and payload-class values.
 
+use std::borrow::Cow;
+
 use crate::{
     canonical,
     constants::{StorageClass, ValueTag},
@@ -229,11 +231,113 @@ impl FileDictionaryIndexEntryV1 {
 
 /// A resolved dictionary value returned by [`FileDictionary::decode_value`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DictionaryValue {
     /// Raw value bytes copied from inline or payload storage.
     RawBytes(Vec<u8>),
     /// Value is present but access-restricted by the file's redaction policy.
     RedactedPresent,
+}
+
+/// Borrowed or owned view over file dictionary sections.
+///
+/// The view validates the dictionary header and section lengths up front, then
+/// parses individual index entries only when requested. Call [`Self::validate_all`]
+/// before using the view for conformance validation; lazy access must not
+/// weaken Spec §16 dictionary invariants.
+#[derive(Debug, Clone)]
+pub struct FileDictionaryView<'a> {
+    /// Parsed dictionary header.
+    pub header: FileDictionaryHeaderV1,
+    index_section: Cow<'a, [u8]>,
+    payload_section: Cow<'a, [u8]>,
+}
+
+impl<'a> FileDictionaryView<'a> {
+    /// Parses a lazy dictionary view from raw dictionary sections.
+    pub fn parse(
+        index_section: Cow<'a, [u8]>,
+        payload_section: Cow<'a, [u8]>,
+    ) -> Result<Self, CoveError> {
+        if index_section.len() < DICT_HEADER_SIZE {
+            return Err(CoveError::BufferTooShort);
+        }
+        let header = FileDictionaryHeaderV1::parse(&index_section[..DICT_HEADER_SIZE])?;
+        let entries_bytes = usize::try_from(header.entry_count)
+            .map_err(|_| CoveError::ArithOverflow)?
+            .checked_mul(header.index_entry_len as usize)
+            .ok_or(CoveError::ArithOverflow)?;
+        let expected = DICT_HEADER_SIZE
+            .checked_add(entries_bytes)
+            .ok_or(CoveError::ArithOverflow)?;
+        if index_section.len() != expected {
+            return Err(CoveError::BadSection(
+                "dictionary index section length mismatch".into(),
+            ));
+        }
+        if payload_section.len()
+            != usize::try_from(header.payload_length).map_err(|_| CoveError::ArithOverflow)?
+        {
+            return Err(CoveError::BadSection(
+                "dictionary payload section length mismatch".into(),
+            ));
+        }
+        Ok(Self {
+            header,
+            index_section,
+            payload_section,
+        })
+    }
+
+    /// Parses a lazy dictionary view over borrowed dictionary sections.
+    pub fn borrowed(index_section: &'a [u8], payload_section: &'a [u8]) -> Result<Self, CoveError> {
+        Self::parse(Cow::Borrowed(index_section), Cow::Borrowed(payload_section))
+    }
+
+    /// Returns the number of entries in the dictionary.
+    pub fn len(&self) -> u32 {
+        self.header.entry_count
+    }
+
+    /// Returns `true` if the dictionary contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.header.entry_count == 0
+    }
+
+    /// Returns the raw dictionary payload section.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload_section
+    }
+
+    /// Returns the parsed index entry for `file_code`.
+    pub fn get_entry(&self, file_code: u32) -> Result<FileDictionaryIndexEntryV1, CoveError> {
+        if file_code >= self.header.entry_count {
+            return Err(CoveError::BadFileCode);
+        }
+        let i = usize::try_from(file_code).map_err(|_| CoveError::ArithOverflow)?;
+        let off = DICT_HEADER_SIZE
+            .checked_add(
+                i.checked_mul(DICT_INDEX_ENTRY_SIZE)
+                    .ok_or(CoveError::ArithOverflow)?,
+            )
+            .ok_or(CoveError::ArithOverflow)?;
+        FileDictionaryIndexEntryV1::parse(&self.index_section[off..off + DICT_INDEX_ENTRY_SIZE])
+    }
+
+    /// Validates every dictionary entry and payload reference.
+    pub fn validate_all(&self) -> Result<(), CoveError> {
+        for file_code in 0..self.header.entry_count {
+            let entry = self.get_entry(file_code)?;
+            validate_dictionary_entry(&entry, self.payload(), self.header.payload_length)?;
+        }
+        Ok(())
+    }
+
+    /// Resolves the raw value bytes for a given `file_code`.
+    pub fn decode_value(&self, file_code: u32) -> Result<DictionaryValue, CoveError> {
+        let entry = self.get_entry(file_code)?;
+        decode_dictionary_entry(&entry, self.payload())
+    }
 }
 
 /// A fully parsed file dictionary, combining the index section and payload
@@ -261,88 +365,14 @@ impl FileDictionary {
     /// violations, and [`CoveError::ArithOverflow`] or [`CoveError::OffsetRange`]
     /// on arithmetic or bounds failures.
     pub fn parse(index_section: &[u8], payload_section: &[u8]) -> Result<Self, CoveError> {
-        if index_section.len() < DICT_HEADER_SIZE {
-            return Err(CoveError::BufferTooShort);
-        }
-        let header = FileDictionaryHeaderV1::parse(&index_section[..DICT_HEADER_SIZE])?;
-        let entries_bytes = usize::try_from(header.entry_count)
-            .map_err(|_| CoveError::ArithOverflow)?
-            .checked_mul(header.index_entry_len as usize)
-            .ok_or(CoveError::ArithOverflow)?;
-        let expected = DICT_HEADER_SIZE
-            .checked_add(entries_bytes)
-            .ok_or(CoveError::ArithOverflow)?;
-        if index_section.len() != expected {
-            return Err(CoveError::BadSection(
-                "dictionary index section length mismatch".into(),
-            ));
-        }
-        if payload_section.len()
-            != usize::try_from(header.payload_length).map_err(|_| CoveError::ArithOverflow)?
-        {
-            return Err(CoveError::BadSection(
-                "dictionary payload section length mismatch".into(),
-            ));
-        }
-        let mut entries = Vec::with_capacity(header.entry_count as usize);
-        for i in 0..header.entry_count as usize {
-            let off = DICT_HEADER_SIZE
-                .checked_add(
-                    i.checked_mul(DICT_INDEX_ENTRY_SIZE)
-                        .ok_or(CoveError::ArithOverflow)?,
-                )
-                .ok_or(CoveError::ArithOverflow)?;
-            let e = FileDictionaryIndexEntryV1::parse(
-                &index_section[off..off + DICT_INDEX_ENTRY_SIZE],
-            )?;
-            e.validate_payload_bounds(header.payload_length)?;
-            match StorageClass::from_u8(e.storage_class)
-                .ok_or_else(|| CoveError::BadSection("invalid storage class".into()))?
-            {
-                StorageClass::Inline => {
-                    if e.payload_length != 0 {
-                        return Err(CoveError::BadSection(
-                            "inline storage must not use payload bytes".into(),
-                        ));
-                    }
-                    let bytes = &e.inline_data[..e.inline_len as usize];
-                    validate_canonical_value_bytes(
-                        ValueTag::from_u16(e.value_tag)
-                            .ok_or_else(|| CoveError::BadSection("invalid value tag".into()))?,
-                        bytes,
-                    )?;
-                }
-                StorageClass::Payload => {
-                    if e.inline_len != 0 {
-                        return Err(CoveError::BadSection(
-                            "payload storage must not use inline bytes".into(),
-                        ));
-                    }
-                    let start =
-                        usize::try_from(e.payload_offset).map_err(|_| CoveError::ArithOverflow)?;
-                    let bytes = crate::wire::read_range_checked(
-                        payload_section,
-                        start,
-                        e.payload_length as usize,
-                    )?;
-                    validate_canonical_value_bytes(
-                        ValueTag::from_u16(e.value_tag)
-                            .ok_or_else(|| CoveError::BadSection("invalid value tag".into()))?,
-                        bytes,
-                    )?;
-                }
-                StorageClass::Redacted => {
-                    if ValueTag::from_u16(e.value_tag) == Some(ValueTag::Null) {
-                        return Err(CoveError::BadSection(
-                            "redacted value must not be null".into(),
-                        ));
-                    }
-                }
-            }
-            entries.push(e);
+        let view = FileDictionaryView::borrowed(index_section, payload_section)?;
+        view.validate_all()?;
+        let mut entries = Vec::with_capacity(view.header.entry_count as usize);
+        for file_code in 0..view.header.entry_count {
+            entries.push(view.get_entry(file_code)?);
         }
         Ok(Self {
-            header,
+            header: view.header,
             entries,
             payload: payload_section.to_vec(),
         })
@@ -374,23 +404,82 @@ impl FileDictionary {
     /// without exposing any bytes.
     pub fn decode_value(&self, file_code: u32) -> Result<DictionaryValue, CoveError> {
         let entry = self.get_entry(file_code)?;
-        match StorageClass::from_u8(entry.storage_class)
-            .ok_or_else(|| CoveError::BadSection("invalid storage class".into()))?
-        {
-            StorageClass::Redacted => Ok(DictionaryValue::RedactedPresent),
-            StorageClass::Inline => Ok(DictionaryValue::RawBytes(
-                entry.inline_data[..entry.inline_len as usize].to_vec(),
-            )),
-            StorageClass::Payload => {
-                let start =
-                    usize::try_from(entry.payload_offset).map_err(|_| CoveError::ArithOverflow)?;
-                let payload = crate::wire::read_range_checked(
-                    &self.payload,
-                    start,
-                    entry.payload_length as usize,
-                )?;
-                Ok(DictionaryValue::RawBytes(payload.to_vec()))
+        decode_dictionary_entry(entry, &self.payload)
+    }
+}
+
+fn validate_dictionary_entry(
+    entry: &FileDictionaryIndexEntryV1,
+    payload_section: &[u8],
+    payload_total_len: u64,
+) -> Result<(), CoveError> {
+    entry.validate_payload_bounds(payload_total_len)?;
+    match StorageClass::from_u8(entry.storage_class)
+        .ok_or_else(|| CoveError::BadSection("invalid storage class".into()))?
+    {
+        StorageClass::Inline => {
+            if entry.payload_length != 0 {
+                return Err(CoveError::BadSection(
+                    "inline storage must not use payload bytes".into(),
+                ));
             }
+            let bytes = &entry.inline_data[..entry.inline_len as usize];
+            validate_canonical_value_bytes(
+                ValueTag::from_u16(entry.value_tag)
+                    .ok_or_else(|| CoveError::BadSection("invalid value tag".into()))?,
+                bytes,
+            )?;
+        }
+        StorageClass::Payload => {
+            if entry.inline_len != 0 {
+                return Err(CoveError::BadSection(
+                    "payload storage must not use inline bytes".into(),
+                ));
+            }
+            let start =
+                usize::try_from(entry.payload_offset).map_err(|_| CoveError::ArithOverflow)?;
+            let bytes = crate::wire::read_range_checked(
+                payload_section,
+                start,
+                entry.payload_length as usize,
+            )?;
+            validate_canonical_value_bytes(
+                ValueTag::from_u16(entry.value_tag)
+                    .ok_or_else(|| CoveError::BadSection("invalid value tag".into()))?,
+                bytes,
+            )?;
+        }
+        StorageClass::Redacted => {
+            if ValueTag::from_u16(entry.value_tag) == Some(ValueTag::Null) {
+                return Err(CoveError::BadSection(
+                    "redacted value must not be null".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_dictionary_entry(
+    entry: &FileDictionaryIndexEntryV1,
+    payload_section: &[u8],
+) -> Result<DictionaryValue, CoveError> {
+    match StorageClass::from_u8(entry.storage_class)
+        .ok_or_else(|| CoveError::BadSection("invalid storage class".into()))?
+    {
+        StorageClass::Redacted => Ok(DictionaryValue::RedactedPresent),
+        StorageClass::Inline => Ok(DictionaryValue::RawBytes(
+            entry.inline_data[..entry.inline_len as usize].to_vec(),
+        )),
+        StorageClass::Payload => {
+            let start =
+                usize::try_from(entry.payload_offset).map_err(|_| CoveError::ArithOverflow)?;
+            let payload = crate::wire::read_range_checked(
+                payload_section,
+                start,
+                entry.payload_length as usize,
+            )?;
+            Ok(DictionaryValue::RawBytes(payload.to_vec()))
         }
     }
 }
@@ -712,6 +801,55 @@ mod tests {
             dict.decode_value(0).unwrap(),
             DictionaryValue::RedactedPresent
         );
+    }
+
+    #[test]
+    fn file_dictionary_view_decodes_on_demand_but_full_validation_checks_all_entries() {
+        let mut inline_data = [0u8; 16];
+        inline_data[..2].copy_from_slice(b"ok");
+        let good_entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Utf8 as u16,
+            storage_class: StorageClass::Inline as u8,
+            flags: 0,
+            inline_len: 2,
+            reserved0: [0; 3],
+            inline_data,
+            payload_offset: 0,
+            payload_length: 0,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let bad_later_entry = FileDictionaryIndexEntryV1 {
+            value_tag: ValueTag::Utf8 as u16,
+            storage_class: StorageClass::Inline as u8,
+            flags: 0,
+            inline_len: 0,
+            reserved0: [0; 3],
+            inline_data: [0; 16],
+            payload_offset: 0,
+            payload_length: 1,
+            canonical_hash64: 0,
+            reserved1: 0,
+        };
+        let header = FileDictionaryHeaderV1 {
+            entry_count: 2,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        };
+        let mut index = Vec::new();
+        index.extend_from_slice(&header.serialize());
+        index.extend_from_slice(&good_entry.serialize());
+        index.extend_from_slice(&bad_later_entry.serialize());
+
+        let view = FileDictionaryView::borrowed(&index, &[]).unwrap();
+        assert_eq!(
+            view.decode_value(0).unwrap(),
+            DictionaryValue::RawBytes(b"ok".to_vec())
+        );
+        assert!(view.validate_all().is_err());
     }
 
     #[test]

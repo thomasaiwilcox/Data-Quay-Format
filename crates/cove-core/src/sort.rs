@@ -27,6 +27,7 @@ pub const SORT_KEY_ENTRY_LEN: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum SortDirection {
     Ascending = 0,
     Descending = 1,
@@ -45,6 +46,7 @@ impl SortDirection {
 /// Where nulls sort relative to non-null values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum NullOrder {
     NullsFirst = 0,
     NullsLast = 1,

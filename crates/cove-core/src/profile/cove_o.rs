@@ -7,10 +7,18 @@
 //! FileCodes preserves the chain.
 
 use crate::{
-    checksum,
-    constants::{CoveLogicalType, CovePhysicalKind},
+    checksum, compression,
+    constants::{CoveLogicalType, CovePhysicalKind, FEATURE_PAGE_PAYLOAD_ELISION},
+    page::{
+        page_uses_payload_elision, ColumnPageIndex, ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL,
+    },
+    page_payload::ColumnPagePayloadV1,
+    page_validation::{
+        validate_column_page_payload, validate_stats_only_constant_page, PageValidationContext,
+    },
+    segment::{TableColumnDirectoryEntryV1, TABLE_COLUMN_DIRECTORY_ENTRY_LEN},
     trust_chain,
-    types::validate_logical_physical_pair,
+    types::{validate_logical_physical_pair_with_options, LogicalPhysicalOptions},
     CoveError,
 };
 
@@ -22,6 +30,7 @@ pub const TRUST_MANIFEST_ENTRY_LEN: usize = 40;
 
 /// Record kinds (Spec §59.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RecordKind {
     Delta,
     Snapshot,
@@ -125,6 +134,7 @@ pub struct ObjectTypeCatalog {
 pub struct ObjectTypeEntryV1 {
     pub object_type_id: u32,
     pub type_name: String,
+    pub flags: u32,
     pub properties: Vec<PropertyEntryV1>,
 }
 
@@ -139,6 +149,23 @@ pub struct PropertyEntryV1 {
     pub flags: u32,
 }
 
+pub const OBJECT_TYPE_FLAG_ENTITY_OBJECT: u32 = 0x0000_0001;
+pub const OBJECT_TYPE_FLAG_EVENT_OBJECT: u32 = 0x0000_0002;
+pub const OBJECT_TYPE_FLAG_LINK_OBJECT: u32 = 0x0000_0004;
+pub const OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT: u32 = 0x0000_0008;
+pub const OBJECT_TYPE_FLAG_EVIDENCE_OBJECT: u32 = 0x0000_0010;
+pub const OBJECT_TYPE_FLAG_PROJECTION_OBJECT: u32 = 0x0000_0020;
+
+pub const PROPERTY_FLAG_ASSOCIATION_FROM_GOID: u32 = 0x0000_0001;
+pub const PROPERTY_FLAG_ASSOCIATION_TO_GOID: u32 = 0x0000_0002;
+pub const PROPERTY_FLAG_ASSOCIATION_TYPE: u32 = 0x0000_0004;
+pub const PROPERTY_FLAG_ASSOCIATION_VALID_FROM: u32 = 0x0000_0008;
+pub const PROPERTY_FLAG_ASSOCIATION_VALID_TO: u32 = 0x0000_0010;
+pub const PROPERTY_FLAG_ASSOCIATION_OBSERVED_AT: u32 = 0x0000_0020;
+pub const PROPERTY_FLAG_EVIDENCE_REF: u32 = 0x0000_0040;
+pub const PROPERTY_FLAG_MAPPING_RULE_REF: u32 = 0x0000_0080;
+pub const PROPERTY_FLAG_BOOL_DECLARED_NUMERIC: u32 = 0x0000_0100;
+
 impl ObjectTypeCatalog {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
         if bytes.len() < 8 {
@@ -152,6 +179,11 @@ impl ObjectTypeCatalog {
             let (entry, used) = ObjectTypeEntryV1::parse(&bytes[pos..])?;
             pos = pos.checked_add(used).ok_or(CoveError::ArithOverflow)?;
             types.push(entry);
+        }
+        if pos != bytes.len() {
+            return Err(CoveError::BadSchema(
+                "object type catalog has trailing bytes".into(),
+            ));
         }
         let catalog = Self { flags, types };
         catalog.validate()?;
@@ -193,7 +225,16 @@ impl ObjectTypeCatalog {
                         prop.property_id
                     )));
                 }
-                if validate_logical_physical_pair(prop.logical_type, prop.physical_kind).is_err() {
+                if validate_logical_physical_pair_with_options(
+                    prop.logical_type,
+                    prop.physical_kind,
+                    LogicalPhysicalOptions {
+                        bool_declared_numeric: prop.flags & PROPERTY_FLAG_BOOL_DECLARED_NUMERIC
+                            != 0,
+                    },
+                )
+                .is_err()
+                {
                     return Err(CoveError::BadLogicalPhysicalPair);
                 }
             }
@@ -210,9 +251,11 @@ impl ObjectTypeEntryV1 {
         let object_type_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
         let mut pos = 4usize;
         let type_name = read_str(bytes, &mut pos, "object type name")?;
-        if bytes.len() < pos + 2 {
+        if bytes.len() < pos + 4 + 2 {
             return Err(CoveError::BufferTooShort);
         }
+        let flags = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        pos += 4;
         let property_count = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
         let mut properties = Vec::with_capacity(property_count);
@@ -225,6 +268,7 @@ impl ObjectTypeEntryV1 {
             Self {
                 object_type_id,
                 type_name,
+                flags,
                 properties,
             },
             pos,
@@ -237,6 +281,7 @@ impl ObjectTypeEntryV1 {
         let mut out = Vec::new();
         out.extend_from_slice(&self.object_type_id.to_le_bytes());
         write_str(&mut out, &self.type_name, "object type name")?;
+        out.extend_from_slice(&self.flags.to_le_bytes());
         out.extend_from_slice(&property_count.to_le_bytes());
         for prop in &self.properties {
             out.extend_from_slice(&prop.serialize()?);
@@ -682,10 +727,35 @@ impl TemporalRowEntryV1 {
 pub struct TemporalSegmentData {
     pub header: TemporalSegmentHeaderV1,
     pub rows: Vec<TemporalRowEntryV1>,
+    pub property_columns: Vec<TemporalPropertyColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalPropertyColumn {
+    pub directory: TableColumnDirectoryEntryV1,
+    pub page_index: ColumnPageIndex,
+    pub pages: Vec<TemporalPropertyPage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporalPropertyPage {
+    pub index_entry: ColumnPageIndexEntryV1,
+    pub payload: Option<ColumnPagePayloadV1>,
 }
 
 impl TemporalSegmentData {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        Self::parse_inner(bytes, None)
+    }
+
+    pub fn parse_with_required_features(
+        bytes: &[u8],
+        required_features: u64,
+    ) -> Result<Self, CoveError> {
+        Self::parse_inner(bytes, Some(required_features))
+    }
+
+    fn parse_inner(bytes: &[u8], required_features: Option<u64>) -> Result<Self, CoveError> {
         let header = TemporalSegmentHeaderV1::parse(bytes)?;
         if header.row_count == 0 && header.morsel_count != 0 {
             return Err(CoveError::BadSchema(
@@ -726,6 +796,17 @@ impl TemporalSegmentData {
                 "temporal row directory exceeds declared boundary".into(),
             ));
         }
+        let column_dir_len = (header.column_count as usize)
+            .checked_mul(TABLE_COLUMN_DIRECTORY_ENTRY_LEN)
+            .ok_or(CoveError::ArithOverflow)?;
+        let column_dir_end = column_directory_offset
+            .checked_add(column_dir_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        if column_dir_end > page_index_offset {
+            return Err(CoveError::BadSchema(
+                "temporal property column directory exceeds declared boundary".into(),
+            ));
+        }
         let mut rows = Vec::with_capacity(header.row_count as usize);
         let mut pos = row_directory_offset;
         for _ in 0..header.row_count {
@@ -734,7 +815,17 @@ impl TemporalSegmentData {
             )?);
             pos += TEMPORAL_ROW_ENTRY_LEN;
         }
-        let segment = Self { header, rows };
+        let property_columns = parse_temporal_property_columns(
+            bytes,
+            &header,
+            column_directory_offset,
+            required_features,
+        )?;
+        let segment = Self {
+            header,
+            rows,
+            property_columns,
+        };
         segment.validate()?;
         Ok(segment)
     }
@@ -746,6 +837,13 @@ impl TemporalSegmentData {
             .map(TemporalRowEntryV1::row_key)
             .collect::<Vec<_>>();
         validate_temporal_order(&row_keys)?;
+        for pair in self.rows.windows(2) {
+            if pair[1].csn < pair[0].csn {
+                return Err(CoveError::BadSchema(
+                    "temporal segment csn decreases in row order".into(),
+                ));
+            }
+        }
 
         for (row_index, row) in self.rows.iter().enumerate() {
             if let Some(prev_ref) = row.prev_ref {
@@ -779,6 +877,127 @@ impl TemporalSegmentData {
 
         Ok(())
     }
+}
+
+fn parse_temporal_property_columns(
+    bytes: &[u8],
+    header: &TemporalSegmentHeaderV1,
+    column_directory_offset: usize,
+    required_features: Option<u64>,
+) -> Result<Vec<TemporalPropertyColumn>, CoveError> {
+    let page_index_offset =
+        usize::try_from(header.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
+    let data_offset = usize::try_from(header.data_offset).map_err(|_| CoveError::OffsetRange)?;
+    let mut out = Vec::with_capacity(header.column_count as usize);
+    let mut pos = column_directory_offset;
+    for _ in 0..header.column_count {
+        let directory = TableColumnDirectoryEntryV1::parse(
+            &bytes[pos..pos + TABLE_COLUMN_DIRECTORY_ENTRY_LEN],
+        )?;
+        pos += TABLE_COLUMN_DIRECTORY_ENTRY_LEN;
+
+        let page_index_start =
+            usize::try_from(directory.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
+        let page_index_end = usize::try_from(
+            directory
+                .page_index_offset
+                .checked_add(directory.page_index_length)
+                .ok_or(CoveError::ArithOverflow)?,
+        )
+        .map_err(|_| CoveError::OffsetRange)?;
+        if page_index_start < page_index_offset || page_index_end > data_offset {
+            return Err(CoveError::SegmentCorrupt);
+        }
+        let page_index = ColumnPageIndex::parse(&bytes[page_index_start..page_index_end])?;
+
+        let data_start =
+            usize::try_from(directory.data_offset).map_err(|_| CoveError::OffsetRange)?;
+        let data_end = usize::try_from(
+            directory
+                .data_offset
+                .checked_add(directory.data_length)
+                .ok_or(CoveError::ArithOverflow)?,
+        )
+        .map_err(|_| CoveError::OffsetRange)?;
+        if data_start < data_offset || data_end > bytes.len() {
+            return Err(CoveError::SegmentCorrupt);
+        }
+
+        let mut pages = Vec::with_capacity(page_index.entries.len());
+        for page in &page_index.entries {
+            if page.column_id != directory.column_id {
+                return Err(CoveError::PageCorrupt);
+            }
+            validate_temporal_property_page_elision_features(page, required_features)?;
+            let context = PageValidationContext {
+                table_id: None,
+                segment_id: Some(header.segment_id),
+                column_id: directory.column_id,
+                logical_type: directory.logical_type,
+                physical_kind: directory.physical_kind,
+                dictionary: None,
+                zone_stats: None,
+            };
+            if page.page_length == 0 {
+                validate_temporal_property_stats_only_page(&context, page)?;
+                pages.push(TemporalPropertyPage {
+                    index_entry: page.clone(),
+                    payload: None,
+                });
+                continue;
+            }
+            let page_start =
+                usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
+            let page_end = usize::try_from(
+                page.page_offset
+                    .checked_add(page.page_length)
+                    .ok_or(CoveError::ArithOverflow)?,
+            )
+            .map_err(|_| CoveError::OffsetRange)?;
+            if page_start < data_start || page_end > data_end {
+                return Err(CoveError::PageCorrupt);
+            }
+            let decoded = compression::column_page_payload(&bytes[page_start..page_end], page)?;
+            let payload = ColumnPagePayloadV1::parse(decoded.as_ref())?;
+            validate_column_page_payload(&context, page, &payload)?;
+            pages.push(TemporalPropertyPage {
+                index_entry: page.clone(),
+                payload: Some(payload),
+            });
+        }
+        out.push(TemporalPropertyColumn {
+            directory,
+            page_index,
+            pages,
+        });
+    }
+    Ok(out)
+}
+
+pub(crate) fn validate_temporal_property_page_elision_features(
+    page: &ColumnPageIndexEntryV1,
+    required_features: Option<u64>,
+) -> Result<(), CoveError> {
+    if page_uses_payload_elision(page.flags)
+        && required_features.is_some_and(|bits| bits & FEATURE_PAGE_PAYLOAD_ELISION == 0)
+    {
+        return Err(CoveError::BadSection(
+            "COVE-O property page payload-elision flags require FEATURE_PAGE_PAYLOAD_ELISION in required_features"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_temporal_property_stats_only_page(
+    context: &PageValidationContext<'_>,
+    page: &ColumnPageIndexEntryV1,
+) -> Result<(), CoveError> {
+    validate_stats_only_constant_page(context, page)?;
+    if page.flags & PAGE_FLAG_ALL_NON_NULL != 0 {
+        return Err(CoveError::PageCorrupt);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -816,6 +1035,14 @@ impl TemporalBloomIndex {
         let mut entries = Vec::with_capacity(entry_count);
         let mut pos = 8usize;
         for _ in 0..entry_count {
+            let segment_id = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            let time_bucket_start_us =
+                i64::from_le_bytes(bytes[pos + 4..pos + 12].try_into().unwrap());
+            let time_bucket_end_us =
+                i64::from_le_bytes(bytes[pos + 12..pos + 20].try_into().unwrap());
+            if time_bucket_start_us > time_bucket_end_us {
+                return Err(CoveError::BadIndex);
+            }
             let checksum_field = u32::from_le_bytes(bytes[pos + 36..pos + 40].try_into().unwrap());
             let mut for_crc = [0u8; TEMPORAL_BLOOM_ENTRY_LEN];
             for_crc.copy_from_slice(&bytes[pos..pos + TEMPORAL_BLOOM_ENTRY_LEN]);
@@ -832,13 +1059,9 @@ impl TemporalBloomIndex {
                 return Err(CoveError::OffsetRange);
             }
             entries.push(TemporalBloomEntryV1 {
-                segment_id: u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()),
-                time_bucket_start_us: i64::from_le_bytes(
-                    bytes[pos + 4..pos + 12].try_into().unwrap(),
-                ),
-                time_bucket_end_us: i64::from_le_bytes(
-                    bytes[pos + 12..pos + 20].try_into().unwrap(),
-                ),
+                segment_id,
+                time_bucket_start_us,
+                time_bucket_end_us,
                 filter_offset,
                 filter_length,
                 checksum: checksum_field,
@@ -846,6 +1069,54 @@ impl TemporalBloomIndex {
             pos += TEMPORAL_BLOOM_ENTRY_LEN;
         }
         Ok(Self { flags, entries })
+    }
+
+    /// Inverse of [`Self::parse`]; computes filter offsets, lengths, and entry
+    /// checksums canonically from the provided filter payloads.
+    pub fn serialize(&self, filters: &[Vec<u8>]) -> Result<Vec<u8>, CoveError> {
+        if self.entries.len() != filters.len() {
+            return Err(CoveError::BadIndex);
+        }
+        let entry_count = u32::try_from(self.entries.len())
+            .map_err(|_| CoveError::BadSection("too many temporal bloom entries".into()))?;
+        let entries_len = self
+            .entries
+            .len()
+            .checked_mul(TEMPORAL_BLOOM_ENTRY_LEN)
+            .ok_or(CoveError::ArithOverflow)?;
+        let payload_start = 8usize
+            .checked_add(entries_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        let mut out = Vec::with_capacity(
+            payload_start
+                .checked_add(filters.iter().map(Vec::len).sum())
+                .ok_or(CoveError::ArithOverflow)?,
+        );
+        out.extend_from_slice(&entry_count.to_le_bytes());
+        out.extend_from_slice(&self.flags.to_le_bytes());
+        let mut next_filter_offset = payload_start as u64;
+        for (entry, filter) in self.entries.iter().zip(filters) {
+            if entry.time_bucket_start_us > entry.time_bucket_end_us {
+                return Err(CoveError::BadIndex);
+            }
+            let filter_length = u64::try_from(filter.len()).map_err(|_| CoveError::OffsetRange)?;
+            let mut entry_bytes = [0u8; TEMPORAL_BLOOM_ENTRY_LEN];
+            entry_bytes[0..4].copy_from_slice(&entry.segment_id.to_le_bytes());
+            entry_bytes[4..12].copy_from_slice(&entry.time_bucket_start_us.to_le_bytes());
+            entry_bytes[12..20].copy_from_slice(&entry.time_bucket_end_us.to_le_bytes());
+            entry_bytes[20..28].copy_from_slice(&next_filter_offset.to_le_bytes());
+            entry_bytes[28..36].copy_from_slice(&filter_length.to_le_bytes());
+            let crc = checksum::crc32c(&entry_bytes);
+            entry_bytes[36..40].copy_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&entry_bytes);
+            next_filter_offset = next_filter_offset
+                .checked_add(filter_length)
+                .ok_or(CoveError::ArithOverflow)?;
+        }
+        for filter in filters {
+            out.extend_from_slice(filter);
+        }
+        Ok(out)
     }
 }
 
@@ -953,6 +1224,10 @@ fn write_str(out: &mut Vec<u8>, s: &str, what: &str) -> Result<(), CoveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        constants::{FEATURE_OBJECT_PROFILE, FEATURE_PAGE_PAYLOAD_ELISION},
+        page::{PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT},
+    };
 
     fn k(t: i64, csn: u64) -> TemporalRowKey {
         TemporalRowKey {
@@ -1016,11 +1291,13 @@ mod tests {
             types: vec![ObjectTypeEntryV1 {
                 object_type_id: 10,
                 type_name: "Customer".into(),
+                flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
                 properties: vec![property(1)],
             }],
         };
         let parsed = ObjectTypeCatalog::parse(&catalog.serialize().unwrap()).unwrap();
         assert_eq!(parsed.types[0].type_name, "Customer");
+        assert_eq!(parsed.types[0].flags, OBJECT_TYPE_FLAG_ENTITY_OBJECT);
     }
 
     #[test]
@@ -1030,6 +1307,7 @@ mod tests {
             types: vec![ObjectTypeEntryV1 {
                 object_type_id: 10,
                 type_name: "Customer".into(),
+                flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
                 properties: vec![property(1), property(1)],
             }],
         };
@@ -1049,6 +1327,7 @@ mod tests {
             types: vec![ObjectTypeEntryV1 {
                 object_type_id: 10,
                 type_name: "Customer".into(),
+                flags: OBJECT_TYPE_FLAG_ENTITY_OBJECT,
                 properties: vec![p],
             }],
         };
@@ -1160,6 +1439,78 @@ mod tests {
         bytes
     }
 
+    fn temporal_segment_with_stats_only_property_page(
+        rows: &[TemporalRowEntryV1],
+        non_null_count: u32,
+        null_count: u32,
+        flags: u32,
+    ) -> Vec<u8> {
+        let row_directory_offset = TEMPORAL_SEGMENT_HEADER_LEN as u64;
+        let row_bytes = (rows.len() * TEMPORAL_ROW_ENTRY_LEN) as u64;
+        let row_end = row_directory_offset + row_bytes;
+        let column_directory_offset = row_end;
+        let page_index_offset = column_directory_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN as u64;
+        let page_index_length = crate::page::COLUMN_PAGE_INDEX_ENTRY_LEN as u64;
+        let data_offset = page_index_offset + page_index_length;
+        let header = TemporalSegmentHeaderV1 {
+            segment_id: 7,
+            object_type_id: 1,
+            time_range_start_us: rows.first().map(|row| row.timestamp_us).unwrap_or(0),
+            time_range_end_us: rows.last().map(|row| row.timestamp_us).unwrap_or(0),
+            csn_min: rows.first().map(|row| row.csn).unwrap_or(0),
+            csn_max: rows.last().map(|row| row.csn).unwrap_or(0),
+            row_count: rows.len() as u32,
+            morsel_count: u32::from(!rows.is_empty()),
+            morsel_row_count: if rows.is_empty() {
+                0
+            } else {
+                rows.len() as u32
+            },
+            column_count: 1,
+            row_directory_offset,
+            column_directory_offset,
+            page_index_offset,
+            data_offset,
+            flags: 0,
+            checksum: 0,
+        };
+        let directory = TableColumnDirectoryEntryV1 {
+            column_id: 1,
+            logical_type: CoveLogicalType::Bool,
+            physical_kind: CovePhysicalKind::Boolean,
+            flags: 0,
+            page_index_offset,
+            page_index_length,
+            data_offset,
+            data_length: 0,
+            stats_ref: u32::MAX,
+            domain_ref: u32::MAX,
+            checksum: 0,
+        };
+        let page = ColumnPageIndexEntryV1 {
+            column_id: 1,
+            morsel_id: 0,
+            row_count: rows.len() as u32,
+            non_null_count,
+            null_count,
+            encoding_root: u32::MAX,
+            page_offset: 0,
+            page_length: 0,
+            uncompressed_length: 0,
+            stats_ref: 0,
+            flags,
+            checksum: checksum::crc32c(&[]),
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        for row in rows {
+            bytes.extend_from_slice(&row.serialize());
+        }
+        bytes.extend_from_slice(&directory.serialize());
+        bytes.extend_from_slice(&page.serialize());
+        bytes
+    }
+
     #[test]
     fn temporal_segment_data_roundtrip_validates() {
         let bytes = temporal_segment_bytes(&[temporal_row(10, 1), temporal_row(20, 2)]);
@@ -1169,12 +1520,59 @@ mod tests {
     }
 
     #[test]
+    fn temporal_property_all_null_stats_only_requires_elision_feature() {
+        let bytes = temporal_segment_with_stats_only_property_page(
+            &[temporal_row(10, 1)],
+            0,
+            1,
+            PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NULL,
+        );
+        assert!(matches!(
+            TemporalSegmentData::parse_with_required_features(&bytes, FEATURE_OBJECT_PROFILE),
+            Err(CoveError::BadSection(_))
+        ));
+        assert!(TemporalSegmentData::parse_with_required_features(
+            &bytes,
+            FEATURE_OBJECT_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn temporal_property_all_non_null_stats_only_requires_validated_stats() {
+        let bytes = temporal_segment_with_stats_only_property_page(
+            &[temporal_row(10, 1)],
+            1,
+            0,
+            PAGE_FLAG_STATS_ONLY_CONSTANT | PAGE_FLAG_ALL_NON_NULL,
+        );
+        assert_eq!(
+            TemporalSegmentData::parse_with_required_features(
+                &bytes,
+                FEATURE_OBJECT_PROFILE | FEATURE_PAGE_PAYLOAD_ELISION
+            ),
+            Err(CoveError::PageCorrupt)
+        );
+    }
+
+    #[test]
     fn temporal_segment_data_rejects_out_of_order_rows() {
         let bytes = temporal_segment_bytes(&[temporal_row(20, 2), temporal_row(10, 1)]);
         assert!(matches!(
             TemporalSegmentData::parse(&bytes),
             Err(CoveError::BadSchema(_))
         ));
+    }
+
+    #[test]
+    fn temporal_segment_data_rejects_csn_decrease_in_row_order() {
+        let bytes = temporal_segment_bytes(&[temporal_row(10, 100), temporal_row(20, 50)]);
+        assert_eq!(
+            TemporalSegmentData::parse(&bytes),
+            Err(CoveError::BadSchema(
+                "temporal segment csn decreases in row order".into()
+            ))
+        );
     }
 
     #[test]
@@ -1231,6 +1629,7 @@ mod tests {
         assert_eq!(parsed.entries[0].segment_id, 7);
     }
 
+    #[cfg(feature = "digest-sha2")]
     fn trust_manifest_bytes(segment: &TemporalSegmentData) -> Vec<u8> {
         let mut bytes = 2u32.to_le_bytes().to_vec();
         let mut prev = [0u8; 32];
@@ -1243,6 +1642,7 @@ mod tests {
         bytes
     }
 
+    #[cfg(feature = "digest-sha2")]
     #[test]
     fn trust_manifest_verifies_temporal_rows() {
         let segment = TemporalSegmentData::parse(&temporal_segment_bytes(&[
@@ -1254,6 +1654,7 @@ mod tests {
         assert!(manifest.verify_against(&[segment]).is_ok());
     }
 
+    #[cfg(feature = "digest-sha2")]
     #[test]
     fn trust_manifest_rejects_bad_digest() {
         let segment = TemporalSegmentData::parse(&temporal_segment_bytes(&[

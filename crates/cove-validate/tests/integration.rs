@@ -216,6 +216,72 @@ fn temporal_segment_section(
     }
 }
 
+fn object_catalog_section() -> SectionPayload {
+    let catalog = cove_core::profile::cove_o::ObjectTypeCatalog {
+        flags: 0,
+        types: vec![cove_core::profile::cove_o::ObjectTypeEntryV1 {
+            object_type_id: 1,
+            type_name: "TestObject".into(),
+            flags: cove_core::profile::cove_o::OBJECT_TYPE_FLAG_ENTITY_OBJECT,
+            properties: Vec::new(),
+        }],
+    };
+    SectionPayload {
+        section_kind: SectionKind::ObjectTypeCatalog as u16,
+        profile: 1,
+        flags: 0,
+        item_count: 1,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: catalog.serialize().unwrap(),
+    }
+}
+
+fn temporal_segment_index_section(
+    segments: &[(u32, &[cove_core::profile::cove_o::TemporalRowEntryV1])],
+) -> SectionPayload {
+    let entries = segments
+        .iter()
+        .map(|(segment_id, rows)| {
+            let row_count = rows.len() as u32;
+            cove_core::profile::cove_o::TemporalSegmentIndexEntryV1 {
+                segment_id: *segment_id,
+                object_type_id: 1,
+                time_range_start_us: rows.first().map(|row| row.timestamp_us).unwrap_or(0),
+                time_range_end_us: rows.last().map(|row| row.timestamp_us).unwrap_or(0),
+                csn_min: rows.first().map(|row| row.csn).unwrap_or(0),
+                csn_max: rows.last().map(|row| row.csn).unwrap_or(0),
+                row_count,
+                delta_count: row_count,
+                snapshot_count: 0,
+                baseline_count: 0,
+                tombstone_count: 0,
+                min_goid: rows.iter().map(|row| row.goid).min().unwrap_or([0; 16]),
+                max_goid: rows.iter().map(|row| row.goid).max().unwrap_or([0; 16]),
+                offset: 0,
+                length: temporal_segment_data_bytes(*segment_id, rows).len() as u64,
+                checksum: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    let index = cove_core::profile::cove_o::TemporalSegmentIndex { flags: 0, entries };
+    SectionPayload {
+        section_kind: SectionKind::TemporalSegmentIndex as u16,
+        profile: 1,
+        flags: 0,
+        item_count: index.entries.len() as u64,
+        row_count: segments.iter().map(|(_, rows)| rows.len() as u64).sum(),
+        compression: 0,
+        alignment_log2: 0,
+        required_features: FEATURE_OBJECT_PROFILE,
+        optional_features: 0,
+        data: index.serialize().unwrap(),
+    }
+}
+
 fn trust_manifest_bytes(
     segment_id: u32,
     rows: &[cove_core::profile::cove_o::TemporalRowEntryV1],
@@ -233,7 +299,7 @@ fn trust_manifest_bytes(
 
 #[test]
 fn validate_empty_file() {
-    let bytes = MinimalCoveWriter::write_empty_file();
+    let bytes = MinimalCoveWriter::write_empty_file().unwrap();
     let path = write_temp_file("empty", &bytes);
 
     // Run cove-validate on the file.
@@ -252,7 +318,7 @@ fn validate_empty_file() {
 
 #[test]
 fn validate_corrupted_file() {
-    let mut bytes = MinimalCoveWriter::write_empty_file();
+    let mut bytes = MinimalCoveWriter::write_empty_file().unwrap();
     // Corrupt the trailing magic.
     let len = bytes.len();
     bytes[len - 1] = 0xFF;
@@ -297,7 +363,7 @@ fn validate_rejects_corrupt_standalone_covemap_json() {
 
 #[test]
 fn json_cli_surfaces_stable_error_code() {
-    let mut bytes = MinimalCoveWriter::write_empty_file();
+    let mut bytes = MinimalCoveWriter::write_empty_file().unwrap();
     let len = bytes.len();
     bytes.truncate(len - 4);
 
@@ -341,7 +407,7 @@ fn semantic_cli_rejects_cove_t_bad_column_domain() {
         optional_features: 0,
         data,
     });
-    let path = write_temp_file("cove_t_bad_domain", &writer.write());
+    let path = write_temp_file("cove_t_bad_domain", &writer.write().unwrap());
     let output = run_validate(&path, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());
@@ -415,7 +481,7 @@ fn semantic_cli_rejects_required_cove_e_profile_error() {
         optional_features: 0,
         data: invalid_execution_descriptor_payload(),
     });
-    let path = write_temp_file("cove_e_required_bad", &writer.write());
+    let path = write_temp_file("cove_e_required_bad", &writer.write().unwrap());
     let output = run_validate(&path, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());
@@ -441,7 +507,7 @@ fn semantic_cli_ignores_optional_cove_e_profile_error() {
         optional_features: FEATURE_ENGINE_PROFILE,
         data: invalid_execution_descriptor_payload(),
     });
-    let path = write_temp_file("cove_e_optional_bad", &writer.write());
+    let path = write_temp_file("cove_e_optional_bad", &writer.write().unwrap());
     let output = run_validate(&path, true);
     assert!(output.status.success());
     let _ = std::fs::remove_file(&path);
@@ -457,6 +523,7 @@ fn semantic_cli_rejects_required_cove_o_schema_error() {
         types: vec![cove_core::profile::cove_o::ObjectTypeEntryV1 {
             object_type_id: 1,
             type_name: "Thing".into(),
+            flags: cove_core::profile::cove_o::OBJECT_TYPE_FLAG_ENTITY_OBJECT,
             properties: vec![cove_core::profile::cove_o::PropertyEntryV1 {
                 property_id: 1,
                 property_name: "bad".into(),
@@ -480,7 +547,7 @@ fn semantic_cli_rejects_required_cove_o_schema_error() {
         optional_features: 0,
         data: catalog.serialize().unwrap(),
     });
-    let path = write_temp_file("cove_o_required_bad", &writer.write());
+    let path = write_temp_file("cove_o_required_bad", &writer.write().unwrap());
     let output = run_validate(&path, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());
@@ -508,7 +575,7 @@ fn semantic_cli_rejects_required_cove_o_temporal_order_error() {
             &[temporal_row(20, 2, None), temporal_row(10, 1, None)],
         ),
     });
-    let path = write_temp_file("cove_o_bad_temporal_order", &writer.write());
+    let path = write_temp_file("cove_o_bad_temporal_order", &writer.write().unwrap());
     let output = run_validate(&path, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());
@@ -524,6 +591,10 @@ fn semantic_cli_rejects_required_cove_o_bad_trust_manifest() {
     let rows = vec![temporal_row(10, 1, None), temporal_row(20, 2, None)];
     let mut manifest = trust_manifest_bytes(5, &rows);
     *manifest.last_mut().unwrap() ^= 0xFF;
+    writer.sections.push(object_catalog_section());
+    writer
+        .sections
+        .push(temporal_segment_index_section(&[(5, &rows)]));
     writer.sections.push(SectionPayload {
         section_kind: SectionKind::TemporalSegmentData as u16,
         profile: 1,
@@ -548,7 +619,7 @@ fn semantic_cli_rejects_required_cove_o_bad_trust_manifest() {
         optional_features: 0,
         data: manifest,
     });
-    let path = write_temp_file("cove_o_bad_trust_manifest", &writer.write());
+    let path = write_temp_file("cove_o_bad_trust_manifest", &writer.write().unwrap());
     let output = run_validate(&path, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());
@@ -571,6 +642,11 @@ fn semantic_cli_accepts_cross_segment_temporal_prev_ref() {
             target_kind: 0,
         }),
     )];
+    writer.sections.push(object_catalog_section());
+    writer.sections.push(temporal_segment_index_section(&[
+        (4, &earlier_rows),
+        (5, &later_rows),
+    ]));
     writer
         .sections
         .push(temporal_segment_section(4, &earlier_rows));
@@ -578,7 +654,7 @@ fn semantic_cli_accepts_cross_segment_temporal_prev_ref() {
         .sections
         .push(temporal_segment_section(5, &later_rows));
 
-    let path = write_temp_file("cove_o_cross_segment_prev_ref", &writer.write());
+    let path = write_temp_file("cove_o_cross_segment_prev_ref", &writer.write().unwrap());
     let output = run_validate(&path, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
@@ -619,7 +695,7 @@ fn semantic_cli_ignores_optional_harbor_hint_error() {
         optional_features: FEATURE_HARBOR_PROFILE,
         data,
     });
-    let path = write_temp_file("cove_h_optional_bad", &writer.write());
+    let path = write_temp_file("cove_h_optional_bad", &writer.write().unwrap());
     let output = run_validate(&path, true);
     assert!(output.status.success());
     let _ = std::fs::remove_file(&path);
@@ -643,7 +719,7 @@ fn semantic_cli_rejects_redacted_dictionary_without_manifest() {
         data: dictionary_index_bytes(true),
     });
 
-    let path = write_temp_file("redacted_dict_missing_manifest", &writer.write());
+    let path = write_temp_file("redacted_dict_missing_manifest", &writer.write().unwrap());
     let output = run_validate(&path, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());
@@ -681,7 +757,7 @@ fn semantic_cli_rejects_redaction_manifest_for_non_redacted_filecode() {
         data: redaction_manifest_bytes(1, &[0]),
     });
 
-    let path = write_temp_file("manifest_non_redacted_filecode", &writer.write());
+    let path = write_temp_file("manifest_non_redacted_filecode", &writer.write().unwrap());
     let output = run_validate(&path, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());
@@ -719,7 +795,7 @@ fn semantic_cli_accepts_redacted_dictionary_with_manifest() {
         data: redaction_manifest_bytes(1, &[0]),
     });
 
-    let path = write_temp_file("redacted_dict_with_manifest", &writer.write());
+    let path = write_temp_file("redacted_dict_with_manifest", &writer.write().unwrap());
     let output = run_validate(&path, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
@@ -745,7 +821,7 @@ fn semantic_cli_rejects_bad_zone_stats_section() {
         data: zone_stats_entry_bytes(1, 2, 0),
     });
 
-    let path = write_temp_file("bad_zone_stats", &writer.write());
+    let path = write_temp_file("bad_zone_stats", &writer.write().unwrap());
     let output = run_validate(&path, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());
@@ -771,7 +847,7 @@ fn semantic_cli_rejects_bad_table_segment_payload() {
         data: segment_payload_bytes(10, 9),
     });
 
-    let path = write_temp_file("bad_table_segment_payload", &writer.write());
+    let path = write_temp_file("bad_table_segment_payload", &writer.write().unwrap());
     let output = run_validate(&path, true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());

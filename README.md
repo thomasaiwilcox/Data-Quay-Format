@@ -47,6 +47,8 @@ COVE is designed to help engines:
 
 - `Spec.md`: the main Cove Format specification
 - `crates/cove-core`: core format primitives, staged validation, a minimal writer, and an early COVE-T scan-profile writer surface
+- `crates/cove-arrow`: Arrow schema/export/import and Parquet conversion interop layered on top of `cove-core`
+- `crates/cove-datafusion`: DataFusion integration scaffold and version-adapter boundary for future COVE query execution
 - `crates/cove-validate`: validates COVE files (headers, footers, section CRCs, feature consistency, and optional semantic/profile checks)
 - `crates/cove-inspect`: prints a readable layout summary for COVE files
 - `crates/cove-dump`: dumps metadata or section bytes as hex for debugging
@@ -79,6 +81,64 @@ sh scripts/release-gates.sh
 
 The gate checks formatting, the workspace tests, generated-corpus freshness,
 capability-matrix freshness, and the full conformance corpus.
+
+For DataFusion M6 performance work, keep the release gate fast and run the
+Criterion suite separately:
+
+```sh
+cargo bench -p cove-datafusion --bench m6
+```
+
+A short compile-and-smoke profile is useful before full measurement runs:
+
+```sh
+cargo bench -p cove-datafusion --bench m6 -- --sample-size 10 --warm-up-time 0.1 --measurement-time 0.1
+```
+
+For cross-format DataFusion comparisons on matched COVE and Parquet fixtures,
+enable the optional Parquet bench track:
+
+```sh
+cargo bench -p cove-datafusion --features parquet-compare --bench m6 parquet_compare
+```
+
+A short smoke run for that compare track is:
+
+```sh
+cargo bench -p cove-datafusion --features parquet-compare --bench m6 parquet_compare -- --sample-size 10 --warm-up-time 0.1 --measurement-time 0.1
+```
+
+The compare track now includes heavier `scan_heavy` and `cold_context`
+benchmarks on larger matched fixtures. Those are intended for targeted
+regression checks rather than every edit-loop run. To focus on one heavier
+track:
+
+```sh
+cargo bench -p cove-datafusion --features parquet-compare --bench m6 parquet_compare_scan_heavy_full_scan
+cargo bench -p cove-datafusion --features parquet-compare --bench m6 parquet_compare_cold_context_full_scan
+```
+
+For Instruments profiling on macOS, use the repo wrapper instead of profiling
+`cargo` itself. It builds the `m6` bench binary with symbols and can either
+launch a Criterion benchmark directly or run a dedicated attach-based query
+profiler that keeps fixture setup out of the trace window.
+
+Criterion mode:
+
+```sh
+python3 scripts/profile_datafusion_bench.py --track scan-heavy-full-scan --engine cove
+python3 scripts/profile_datafusion_bench.py --track cold-context-full-scan --engine parquet
+```
+
+Attach after setup, then profile only the hot loop:
+
+```sh
+python3 scripts/profile_datafusion_bench.py --runner attached-query --stage execute-only --track scan-heavy-full-scan --engine cove
+python3 scripts/profile_datafusion_bench.py --runner attached-query --stage planning-only --track scan-heavy-full-scan --engine parquet
+```
+
+The script defaults to `Time Profiler` and writes traces under
+`artifacts/instruments/`.
 
 ## Read the spec
 

@@ -2,8 +2,8 @@
 //!
 //! This module is the first piece of the implementation ledger described by the
 //! reference plan: feature bits (Spec §11), section kinds (Spec §14), writer
-//! profiles (Spec §71), recovery behavior (Spec §73), compatibility rules
-//! (Spec §76), and error codes (Spec §75) are available as structured data
+//! profiles (Spec §72), recovery behavior (Spec §74), compatibility rules
+//! (Spec §77), and error codes (Spec §76) are available as structured data
 //! instead of duplicated strings in CLI tools.
 
 use crate::constants::*;
@@ -29,7 +29,7 @@ pub struct SectionInfo {
     pub description: &'static str,
 }
 
-/// A registered v1 error code from Spec §75.
+/// A registered v1 error code from Spec §76.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ErrorCodeInfo {
     pub code: &'static str,
@@ -37,7 +37,7 @@ pub struct ErrorCodeInfo {
     pub meaning: &'static str,
 }
 
-/// A registered writer profile tier from Spec §71.
+/// A registered writer profile tier from Spec §72.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterProfileInfo {
     pub name: &'static str,
@@ -46,7 +46,7 @@ pub struct WriterProfileInfo {
     pub requirements: &'static [&'static str],
 }
 
-/// A recovery/failure behavior row from Spec §73.
+/// A recovery/failure behavior row from Spec §74.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryBehaviorInfo {
     pub condition: &'static str,
@@ -54,7 +54,7 @@ pub struct RecoveryBehaviorInfo {
     pub default_behavior: &'static str,
 }
 
-/// A compatibility rule from Spec §76.
+/// A compatibility rule from Spec §77.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompatibilityRuleInfo {
     pub key: &'static str,
@@ -626,136 +626,136 @@ pub const SECTION_REGISTRY: &[SectionInfo] = &[
     },
 ];
 
-/// All error codes assigned by Spec §75.
+/// All error codes assigned by Spec §76.
 pub const ERROR_CODE_REGISTRY: &[ErrorCodeInfo] = &[
     ErrorCodeInfo {
         code: "COVE_E_BAD_MAGIC",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Missing or invalid magic.",
     },
     ErrorCodeInfo {
         code: "COVE_E_BAD_VERSION",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Unsupported COVE version.",
     },
     ErrorCodeInfo {
         code: "COVE_E_UNKNOWN_REQUIRED_FEATURE",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Unknown required feature bit set.",
     },
     ErrorCodeInfo {
         code: "COVE_E_CHECKSUM_MISMATCH",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "CRC32C mismatch.",
     },
     ErrorCodeInfo {
         code: "COVE_E_DIGEST_MISMATCH",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Cryptographic digest mismatch.",
     },
     ErrorCodeInfo {
         code: "COVE_E_OFFSET_RANGE",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Offset, length, or count exceeds file bounds.",
     },
     ErrorCodeInfo {
         code: "COVE_E_ARITH_OVERFLOW",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Offset/count/size arithmetic overflow.",
     },
     ErrorCodeInfo {
         code: "COVE_E_BAD_SECTION",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Section malformed or invalid.",
     },
     ErrorCodeInfo {
         code: "COVE_E_BAD_SCHEMA",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Catalog/schema malformed.",
     },
     ErrorCodeInfo {
         code: "COVE_E_BAD_LOGICAL_PHYSICAL_PAIR",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Logical type incompatible with physical kind.",
     },
     ErrorCodeInfo {
         code: "COVE_E_DICT_MISS",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "FileCode missing from dictionary.",
     },
     ErrorCodeInfo {
         code: "COVE_E_BAD_FILECODE",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "FileCode outside dictionary range.",
     },
     ErrorCodeInfo {
         code: "COVE_E_BAD_NUMCODE",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "NumCode invalid for declared logical type.",
     },
     ErrorCodeInfo {
         code: "COVE_E_BAD_DOMAIN",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "ColumnDomain invalid.",
     },
     ErrorCodeInfo {
         code: "COVE_E_BAD_STATS",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Statistics invalid or unsafe.",
     },
     ErrorCodeInfo {
         code: "COVE_E_BAD_INDEX",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Optional index invalid or corrupt.",
     },
     ErrorCodeInfo {
         code: "COVE_E_BAD_EXTENSION",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Extension invalid or required extension unsupported.",
     },
     ErrorCodeInfo {
         code: "COVE_E_BAD_ENGINE_PROFILE",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Engine profile invalid or unsupported when required.",
     },
     ErrorCodeInfo {
         code: "COVE_E_EXECUTION_CODE_MAP",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Engine-local code mapping failed.",
     },
     ErrorCodeInfo {
         code: "COVE_E_HARBOR_MOUNT_LEASE",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Harbor code lease resolution failed.",
     },
     ErrorCodeInfo {
         code: "COVE_E_REF_INVALID",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "COVE-O prev_ref invalid.",
     },
     ErrorCodeInfo {
         code: "COVE_E_NOT_SELF_CONTAINED",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "COVE-O chain lacks baseline/snapshot/full chain.",
     },
     ErrorCodeInfo {
         code: "COVE_E_SEGMENT_CORRUPT",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Segment structure invalid.",
     },
     ErrorCodeInfo {
         code: "COVE_E_PAGE_CORRUPT",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Page structure invalid.",
     },
     ErrorCodeInfo {
         code: "COVE_E_REDACTION_POLICY",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "Redacted value cannot be surfaced under current policy.",
     },
     ErrorCodeInfo {
         code: "COVE_E_SIDECAR_STALE",
-        spec_section: "Spec §75",
+        spec_section: "Spec §76",
         meaning: "COVX/COVM sidecar does not match referenced COVE.",
     },
 ];
@@ -841,187 +841,204 @@ const WRITER_PROFILE_OBJECT_CHECKPOINT: &[&str] = &[
     "redaction manifest if redactions are present",
 ];
 
-/// All writer profile tiers from Spec §71.
+const WRITER_PROFILE_MAP_CONVERSION: &[&str] = &[
+    "COVEMAP artifact framing",
+    "deterministic identity join keys",
+    "object and association materialisation",
+    "MAP assertion log",
+    "MAP identity equivalence index",
+    "MAP evidence index",
+    "MAP conversion report",
+    "semantically valid COVE-O output",
+];
+
+/// All writer profile tiers from Spec §72.
 pub const WRITER_PROFILE_REGISTRY: &[WriterProfileInfo] = &[
     WriterProfileInfo {
         name: "COVE-Core Minimal Profile",
-        spec_section: "Spec §71.1",
+        spec_section: "Spec §72.1",
         summary: "Minimum valid COVE-Core writer output.",
         requirements: WRITER_PROFILE_CORE_MINIMAL,
     },
     WriterProfileInfo {
         name: "COVE-T Minimal Table Profile",
-        spec_section: "Spec §71.2",
+        spec_section: "Spec §72.2",
         summary: "Minimum valid table-scan writer output.",
         requirements: WRITER_PROFILE_TABLE_MINIMAL,
     },
     WriterProfileInfo {
         name: "COVE-T Scan Profile",
-        spec_section: "Spec §71.3",
+        spec_section: "Spec §72.3",
         summary: "Recommended default table-scan writer profile.",
         requirements: WRITER_PROFILE_TABLE_SCAN,
     },
     WriterProfileInfo {
         name: "COVE-A Archive Acceleration Profile",
-        spec_section: "Spec §71.4",
+        spec_section: "Spec §72.4",
         summary: "Recommended archive acceleration writer profile.",
         requirements: WRITER_PROFILE_ARCHIVE,
     },
     WriterProfileInfo {
         name: "COVE-E Engine Execution Profile",
-        spec_section: "Spec §71.5",
+        spec_section: "Spec §72.5",
         summary: "Recommended engine execution profile writer output.",
         requirements: WRITER_PROFILE_ENGINE,
     },
     WriterProfileInfo {
         name: "COVE-H Harbor Profile",
-        spec_section: "Spec §71.6",
+        spec_section: "Spec §72.6",
         summary: "Recommended Harbor-oriented writer profile.",
         requirements: WRITER_PROFILE_HARBOR,
     },
     WriterProfileInfo {
         name: "COVE-O Object Checkpoint Profile",
-        spec_section: "Spec §71.7",
+        spec_section: "Spec §72.7",
         summary: "Recommended object state checkpoint writer profile.",
         requirements: WRITER_PROFILE_OBJECT_CHECKPOINT,
     },
+    WriterProfileInfo {
+        name: "COVE-MAP Object Conversion Profile",
+        spec_section: "Spec §72.8",
+        summary: "Recommended deterministic semantic mapping conversion output.",
+        requirements: WRITER_PROFILE_MAP_CONVERSION,
+    },
 ];
 
-/// Recovery and failure behavior rows from Spec §73.
+/// Recovery and failure behavior rows from Spec §74.
 pub const RECOVERY_BEHAVIOR_REGISTRY: &[RecoveryBehaviorInfo] = &[
     RecoveryBehaviorInfo {
         condition: "Bad header magic",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Reject file",
     },
     RecoveryBehaviorInfo {
         condition: "Bad trailing magic",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Reject file",
     },
     RecoveryBehaviorInfo {
         condition: "Unsupported version",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Reject file",
     },
     RecoveryBehaviorInfo {
         condition: "Unknown required feature",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Reject file",
     },
     RecoveryBehaviorInfo {
         condition: "Unknown optional feature",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Ignore if not needed",
     },
     RecoveryBehaviorInfo {
         condition: "Header checksum mismatch",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Reject file",
     },
     RecoveryBehaviorInfo {
         condition: "Postscript checksum mismatch",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Reject file",
     },
     RecoveryBehaviorInfo {
         condition: "Footer CRC mismatch",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Reject file",
     },
     RecoveryBehaviorInfo {
         condition: "Required section CRC mismatch",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Reject file",
     },
     RecoveryBehaviorInfo {
         condition: "Optional index CRC mismatch",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Ignore index and scan",
     },
     RecoveryBehaviorInfo {
         condition: "Bloom corruption",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Ignore bloom and scan",
     },
     RecoveryBehaviorInfo {
         condition: "Exact set corruption",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Ignore exact set and scan",
     },
     RecoveryBehaviorInfo {
         condition: "Inverted index corruption",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Ignore index and scan",
     },
     RecoveryBehaviorInfo {
         condition: "Lookup index corruption",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Ignore index and scan",
     },
     RecoveryBehaviorInfo {
         condition: "Aggregate synopsis corruption",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Ignore synopsis unless required by query-only plan",
     },
     RecoveryBehaviorInfo {
         condition: "Composite zone corruption",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Ignore composite zone and scan",
     },
     RecoveryBehaviorInfo {
         condition: "Top-N summary corruption",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Ignore summary and scan",
     },
     RecoveryBehaviorInfo {
         condition: "COVE-E optional profile corrupt",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Ignore profile",
     },
     RecoveryBehaviorInfo {
         condition: "COVE-E required profile corrupt",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Reject if needed",
     },
     RecoveryBehaviorInfo {
         condition: "COVX stale/corrupt",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Ignore COVX",
     },
     RecoveryBehaviorInfo {
         condition: "COVM stale/corrupt",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Ignore COVM",
     },
     RecoveryBehaviorInfo {
         condition: "Segment checksum mismatch",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Reject segment; fail read unless explicit best-effort mode",
     },
     RecoveryBehaviorInfo {
         condition: "Page checksum mismatch",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Reject page; fail read unless explicit best-effort mode",
     },
     RecoveryBehaviorInfo {
         condition: "Invalid FileCode",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Treat as corruption",
     },
     RecoveryBehaviorInfo {
         condition: "Invalid NumCode/logical type pairing",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Schema error",
     },
     RecoveryBehaviorInfo {
         condition: "Invalid prev_ref",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Reject COVE-O file",
     },
     RecoveryBehaviorInfo {
         condition: "Unsafe min/max",
-        spec_section: "Spec §73",
+        spec_section: "Spec §74",
         default_behavior: "Do not use for skipping",
     },
 ];
@@ -1044,35 +1061,35 @@ const COMPAT_OPTIONAL_FEATURE_EXAMPLES: &[&str] = &[
     "optional engine profile mappings",
 ];
 
-/// Compatibility rules from Spec §76.
+/// Compatibility rules from Spec §77.
 pub const COMPATIBILITY_REGISTRY: &[CompatibilityRuleInfo] = &[
     CompatibilityRuleInfo {
         key: "supported_major_version",
-        spec_section: "Spec §76.1",
+        spec_section: "Spec §77.1",
         rule: "COVE v1 readers support version_major = 1.",
         examples: &[],
     },
     CompatibilityRuleInfo {
         key: "reject_unsupported_major",
-        spec_section: "Spec §76.1",
+        spec_section: "Spec §77.1",
         rule: "Readers MUST reject unsupported major versions.",
         examples: &[],
     },
     CompatibilityRuleInfo {
         key: "accept_safe_newer_minor",
-        spec_section: "Spec §76.1",
+        spec_section: "Spec §77.1",
         rule: "Readers MAY accept newer minor versions if no unknown required features are set.",
         examples: &[],
     },
     CompatibilityRuleInfo {
         key: "required_features",
-        spec_section: "Spec §76.2",
+        spec_section: "Spec §77.2",
         rule: "Required features are needed for correctness.",
         examples: COMPAT_REQUIRED_FEATURE_EXAMPLES,
     },
     CompatibilityRuleInfo {
         key: "optional_features",
-        spec_section: "Spec §76.2",
+        spec_section: "Spec §77.2",
         rule: "Optional features are accelerators or metadata.",
         examples: COMPAT_OPTIONAL_FEATURE_EXAMPLES,
     },
@@ -1097,26 +1114,26 @@ pub fn section_info(kind: SectionKind) -> Option<&'static SectionInfo> {
     SECTION_REGISTRY.iter().find(|info| info.kind == kind)
 }
 
-/// Return metadata for an error code, if it is defined by Spec §75.
+/// Return metadata for an error code, if it is defined by Spec §76.
 pub fn error_code_info(code: &str) -> Option<&'static ErrorCodeInfo> {
     ERROR_CODE_REGISTRY.iter().find(|info| info.code == code)
 }
 
-/// Return metadata for a writer profile tier from Spec §71.
+/// Return metadata for a writer profile tier from Spec §72.
 pub fn writer_profile_info(name: &str) -> Option<&'static WriterProfileInfo> {
     WRITER_PROFILE_REGISTRY
         .iter()
         .find(|info| info.name == name)
 }
 
-/// Return the default recovery behavior for a Spec §73 condition.
+/// Return the default recovery behavior for a Spec §74 condition.
 pub fn recovery_behavior_info(condition: &str) -> Option<&'static RecoveryBehaviorInfo> {
     RECOVERY_BEHAVIOR_REGISTRY
         .iter()
         .find(|info| info.condition == condition)
 }
 
-/// Return a compatibility rule from Spec §76.
+/// Return a compatibility rule from Spec §77.
 pub fn compatibility_rule_info(key: &str) -> Option<&'static CompatibilityRuleInfo> {
     COMPATIBILITY_REGISTRY.iter().find(|info| info.key == key)
 }
@@ -1148,17 +1165,18 @@ mod tests {
     }
 
     #[test]
-    fn spec_75_error_registry_contains_all_v1_codes() {
+    fn spec_76_error_registry_contains_all_v1_codes() {
         assert_eq!(ERROR_CODE_REGISTRY.len(), 26);
         assert!(error_code_info("COVE_E_BAD_MAGIC").is_some());
         assert!(error_code_info("COVE_E_SIDECAR_STALE").is_some());
     }
 
     #[test]
-    fn spec_71_writer_profile_registry_lists_all_v1_tiers() {
-        assert_eq!(WRITER_PROFILE_REGISTRY.len(), 7);
+    fn spec_72_writer_profile_registry_lists_all_v1_tiers() {
+        assert_eq!(WRITER_PROFILE_REGISTRY.len(), 8);
         assert!(writer_profile_info("COVE-Core Minimal Profile").is_some());
         assert!(writer_profile_info("COVE-O Object Checkpoint Profile").is_some());
+        assert!(writer_profile_info("COVE-MAP Object Conversion Profile").is_some());
         assert!(writer_profile_info("COVE-T Scan Profile")
             .unwrap()
             .requirements
@@ -1166,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_73_recovery_registry_covers_recovery_table() {
+    fn spec_74_recovery_registry_covers_recovery_table() {
         assert_eq!(RECOVERY_BEHAVIOR_REGISTRY.len(), 27);
         assert_eq!(
             recovery_behavior_info("Bad header magic")
@@ -1183,7 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_76_compatibility_registry_contains_version_and_feature_rules() {
+    fn spec_77_compatibility_registry_contains_version_and_feature_rules() {
         assert_eq!(COMPATIBILITY_REGISTRY.len(), 5);
         assert_eq!(
             compatibility_rule_info("reject_unsupported_major")

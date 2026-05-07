@@ -19,12 +19,17 @@ pub struct MapSourceEntry {
     pub snapshot_digest: Option<String>,
     pub row_identity_rules: Vec<String>,
     pub replay_claimed: bool,
+    pub source_priority: Option<i64>,
+    pub sensitivity_label: Option<String>,
+    pub sensitivity_rank: Option<i64>,
+    pub access_policy_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapSourceCatalog {
     pub mapping_id: String,
     pub mapping_version: String,
+    pub governance_reconciliation_policy: String,
     pub sources: Vec<MapSourceEntry>,
 }
 
@@ -45,6 +50,8 @@ pub struct MapFunctionRegistry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapJoinKeyComponent {
+    pub role_id: String,
+    pub source_column: String,
     pub logical_type: String,
     pub canonicalization: String,
     pub null_policy: String,
@@ -57,6 +64,7 @@ pub struct MapIdentityRule {
     pub object_type: String,
     pub semantic_role: String,
     pub confidence_class: String,
+    pub auto_merge: Option<bool>,
     pub candidate_only: bool,
     pub property_conflicts_declared: bool,
     pub function_ids: Vec<String>,
@@ -82,9 +90,49 @@ pub struct MapRowSemanticRule {
     pub rule_id: String,
     pub source_id: String,
     pub identity_rule_id: String,
+    pub row_semantics_kind: String,
+    pub assertion_kinds: Vec<String>,
+    pub tombstone_target: Option<String>,
+    pub record_kind: String,
+    pub temporal_policy: String,
+    pub conflict_policy: String,
     pub function_ids: Vec<String>,
     pub output_assertion_ids: Vec<String>,
     pub association_endpoints: Vec<String>,
+    pub property_bindings: Vec<MapPropertyBinding>,
+    pub association_bindings: Vec<MapAssociationBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapPropertyBinding {
+    pub assertion_id: String,
+    pub property_id: String,
+    pub property_name: String,
+    pub source_column: String,
+    pub logical_type: String,
+    pub physical_kind: String,
+    pub value_expression: String,
+    pub nullable: bool,
+    pub missing_policy: String,
+    pub conflict_policy: String,
+    pub source_priority: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapAssociationBinding {
+    pub assertion_id: String,
+    pub association_type: String,
+    pub target_identity_rule_id: String,
+    pub source_identity_rule_id: String,
+    pub source_role: String,
+    pub target_role: String,
+    pub source_endpoint_expression: String,
+    pub target_endpoint_expression: String,
+    pub valid_from_expression: Option<String>,
+    pub valid_to_expression: Option<String>,
+    pub cardinality_policy: String,
+    pub missing_policy: String,
+    pub link_object_materialization: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +204,31 @@ pub struct MapConversionReport {
 pub struct MapProjectionEntry {
     pub projection_id: String,
     pub assertion_ids: Vec<String>,
+    pub output_table: Option<String>,
+    pub row_grain: Option<String>,
+    pub anchor: Option<MapProjectionAnchor>,
+    pub temporal_mode: Option<String>,
+    pub columns: Vec<MapProjectionColumn>,
+    pub multi_value_policy: Option<String>,
+    pub missing_policy: String,
+    pub ordering: Vec<String>,
+    pub evidence_policy: String,
+    pub output_modes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapProjectionAnchor {
+    pub object_type: Option<String>,
+    pub association_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapProjectionColumn {
+    pub name: String,
+    pub value: String,
+    pub logical_type: Option<String>,
+    pub conflict_policy: String,
+    pub missing_policy: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +239,7 @@ pub struct MapProjectionCatalog {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EmbeddedMapSection {
     SourceCatalog(MapSourceCatalog),
     FunctionRegistry(MapFunctionRegistry),
@@ -364,6 +438,7 @@ pub fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Result<(),
         {
             return Err(CoveError::MapInvalid);
         }
+        validate_row_semantic_rule_shape(rule)?;
         if !assertion_ids.is_empty()
             && rule
                 .output_assertion_ids
@@ -377,6 +452,29 @@ pub fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Result<(),
             .iter()
             .any(|identity_id| !identity_rule_ids.contains(identity_id))
         {
+            return Err(CoveError::MapInvalid);
+        }
+        if !assertion_ids.is_empty()
+            && rule
+                .property_bindings
+                .iter()
+                .any(|binding| !assertion_ids.contains(&binding.assertion_id))
+        {
+            return Err(CoveError::MapInvalid);
+        }
+        if !assertion_ids.is_empty()
+            && rule
+                .association_bindings
+                .iter()
+                .any(|binding| !assertion_ids.contains(&binding.assertion_id))
+        {
+            return Err(CoveError::MapInvalid);
+        }
+        if rule.association_bindings.iter().any(|binding| {
+            !identity_rule_ids.contains(&binding.target_identity_rule_id)
+                || (!binding.source_identity_rule_id.is_empty()
+                    && !identity_rule_ids.contains(&binding.source_identity_rule_id))
+        }) {
             return Err(CoveError::MapInvalid);
         }
     }
@@ -440,8 +538,124 @@ pub fn validate_embedded_sections(sections: &[EmbeddedMapSection]) -> Result<(),
         {
             return Err(CoveError::MapEvidenceInvalid);
         }
+        let expanded = projection.output_table.is_some()
+            || projection.row_grain.is_some()
+            || projection.anchor.is_some()
+            || !projection.columns.is_empty()
+            || !projection.output_modes.is_empty();
+        if expanded {
+            if projection.output_table.is_none()
+                || projection.row_grain.is_none()
+                || projection.anchor.is_none()
+                || projection.temporal_mode.is_none()
+                || projection.multi_value_policy.is_none()
+                || projection.columns.is_empty()
+                || projection.output_modes.is_empty()
+            {
+                return Err(CoveError::MapInvalid);
+            }
+            let row_grain = projection
+                .row_grain
+                .as_deref()
+                .ok_or(CoveError::MapInvalid)?;
+            if !is_valid_projection_row_grain(row_grain) {
+                return Err(CoveError::MapInvalid);
+            }
+            if !projection
+                .temporal_mode
+                .as_deref()
+                .is_some_and(is_valid_temporal_mode)
+            {
+                return Err(CoveError::MapInvalid);
+            }
+            if !projection
+                .multi_value_policy
+                .as_deref()
+                .is_some_and(is_valid_multi_value_policy)
+            {
+                return Err(CoveError::MapInvalid);
+            }
+            if projection
+                .output_modes
+                .iter()
+                .any(|mode| !is_valid_projection_output_mode(mode))
+            {
+                return Err(CoveError::MapInvalid);
+            }
+            let anchor = projection.anchor.as_ref().ok_or(CoveError::MapInvalid)?;
+            if anchor.object_type.is_some() == anchor.association_type.is_some() {
+                return Err(CoveError::MapInvalid);
+            }
+            match row_grain {
+                "one_row_per_object"
+                | "one_row_per_property_version"
+                | "one_row_per_event_object"
+                | "one_row_per_object_as_of_time"
+                    if anchor.object_type.is_none() =>
+                {
+                    return Err(CoveError::MapInvalid);
+                }
+                "one_row_per_association" | "one_row_per_link_object"
+                    if anchor.association_type.is_none() =>
+                {
+                    return Err(CoveError::MapInvalid);
+                }
+                _ => {}
+            }
+        }
     }
 
+    Ok(())
+}
+
+fn validate_row_semantic_rule_shape(rule: &MapRowSemanticRule) -> Result<(), CoveError> {
+    let has = |kind: &str| rule.assertion_kinds.iter().any(|value| value == kind);
+    match rule.row_semantics_kind.as_str() {
+        "Object" | "EventObject" | "LinkObject" => {
+            if !has("object") {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+        "AssociationOnly" => {
+            if !has("association") || has("object") {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+        "Composite" | "Dispatched" => {
+            if rule.assertion_kinds.len() < 2 {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+        "ProjectionOnly" => {
+            if rule
+                .assertion_kinds
+                .iter()
+                .any(|kind| !matches!(kind.as_str(), "projection" | "evidence" | "candidate_match"))
+            {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+        "EvidenceOnly" => {
+            if rule
+                .assertion_kinds
+                .iter()
+                .any(|kind| !matches!(kind.as_str(), "evidence" | "candidate_match" | "conflict"))
+            {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+        "Tombstone" => {
+            if !has("tombstone") || rule.tombstone_target.is_none() {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+        "KeyValueFragment" => {
+            if !has("property") {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+        _ => return Err(CoveError::MapInvalid),
+    }
     Ok(())
 }
 
@@ -450,6 +664,15 @@ impl MapSourceCatalog {
         let root = parse_root(bytes)?;
         let object = as_object(&root)?;
         let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
+        let governance_reconciliation_policy =
+            optional_non_empty_str(object, "governance_reconciliation_policy")?
+                .unwrap_or_else(|| "emit_effective_policy".to_string());
+        if !matches!(
+            governance_reconciliation_policy.as_str(),
+            "emit_effective_policy" | "reject_on_mixed_sensitivity"
+        ) {
+            return Err(CoveError::MapInvalid);
+        }
         let mut sources = Vec::new();
         if let Some(values) = optional_array(object, "sources")? {
             for value in values {
@@ -470,12 +693,17 @@ impl MapSourceCatalog {
                     snapshot_digest,
                     row_identity_rules,
                     replay_claimed,
+                    source_priority: optional_i64(entry, "source_priority")?,
+                    sensitivity_label: optional_non_empty_str(entry, "sensitivity_label")?,
+                    sensitivity_rank: optional_i64(entry, "sensitivity_rank")?,
+                    access_policy_ids: optional_string_list(entry, "access_policy_ids")?,
                 });
             }
         }
         Ok(Self {
             mapping_id,
             mapping_version,
+            governance_reconciliation_policy,
             sources,
         })
     }
@@ -520,6 +748,8 @@ impl MapIdentityRuleCatalog {
                 for join_key in required_array(entry, "join_keys")? {
                     let join_key = as_object(join_key)?;
                     join_keys.push(MapJoinKeyComponent {
+                        role_id: required_non_empty_str(join_key, "role_id")?,
+                        source_column: required_non_empty_str(join_key, "source_column")?,
                         logical_type: required_non_empty_str(join_key, "logical_type")?,
                         canonicalization: required_non_empty_str(join_key, "canonicalization")?,
                         null_policy: required_non_empty_str(join_key, "null_policy")?,
@@ -534,6 +764,7 @@ impl MapIdentityRuleCatalog {
                     object_type: required_non_empty_str(entry, "object_type")?,
                     semantic_role: required_non_empty_str(entry, "semantic_role")?,
                     confidence_class: required_non_empty_str(entry, "confidence_class")?,
+                    auto_merge: optional_bool_value(entry, "auto_merge")?,
                     candidate_only: optional_bool(entry, "candidate_only", false)?,
                     property_conflicts_declared: required_bool(
                         entry,
@@ -572,13 +803,48 @@ impl MapRowSemanticsCatalog {
         if let Some(values) = optional_array(object, "rules")? {
             for value in values {
                 let entry = as_object(value)?;
+                let property_bindings =
+                    parse_property_bindings(optional_array(entry, "property_bindings")?)?;
+                let association_bindings =
+                    parse_association_bindings(optional_array(entry, "association_bindings")?)?;
+                let row_semantics_kind = optional_non_empty_str(entry, "row_semantics_kind")?
+                    .or_else(|| optional_non_empty_str(entry, "kind").ok().flatten())
+                    .unwrap_or_else(|| "Object".to_string());
+                validate_row_semantics_kind(&row_semantics_kind)?;
+                let assertion_kinds = string_list(entry, "assertion_kinds")?;
+                if assertion_kinds.is_empty() {
+                    return Err(CoveError::MapInvalid);
+                }
+                for kind in &assertion_kinds {
+                    validate_assertion_kind(kind)?;
+                }
+                let tombstone_target = optional_non_empty_str(entry, "tombstone_target")?;
+                match row_semantics_kind.as_str() {
+                    "Tombstone" => match tombstone_target.as_deref() {
+                        Some(target) if is_valid_tombstone_target(target) => {}
+                        _ => return Err(CoveError::MapInvalid),
+                    },
+                    _ if tombstone_target.is_some() => return Err(CoveError::MapInvalid),
+                    _ => {}
+                }
                 rules.push(MapRowSemanticRule {
                     rule_id: required_non_empty_str(entry, "rule_id")?,
                     source_id: required_non_empty_str(entry, "source_id")?,
                     identity_rule_id: required_non_empty_str(entry, "identity_rule_id")?,
+                    row_semantics_kind,
+                    assertion_kinds,
+                    tombstone_target,
+                    record_kind: optional_non_empty_str(entry, "record_kind")?
+                        .unwrap_or_else(|| "Baseline".to_string()),
+                    temporal_policy: optional_non_empty_str(entry, "temporal_policy")?
+                        .unwrap_or_else(|| "latest_committed".to_string()),
+                    conflict_policy: optional_non_empty_str(entry, "conflict_policy")?
+                        .unwrap_or_else(|| "reject_conflict".to_string()),
                     function_ids: optional_string_list(entry, "function_ids")?,
                     output_assertion_ids: optional_string_list(entry, "output_assertion_ids")?,
                     association_endpoints: optional_string_list(entry, "association_endpoints")?,
+                    property_bindings,
+                    association_bindings,
                 });
             }
         }
@@ -588,6 +854,89 @@ impl MapRowSemanticsCatalog {
             rules,
         })
     }
+}
+
+fn parse_property_bindings(
+    values: Option<&Vec<Value>>,
+) -> Result<Vec<MapPropertyBinding>, CoveError> {
+    let Some(values) = values else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            let entry = as_object(value)?;
+            Ok(MapPropertyBinding {
+                assertion_id: required_non_empty_str(entry, "assertion_id")?,
+                property_id: required_non_empty_str(entry, "property_id")?,
+                property_name: required_non_empty_str(entry, "property_name")?,
+                source_column: required_non_empty_str(entry, "source_column")?,
+                logical_type: required_non_empty_str(entry, "logical_type")?,
+                physical_kind: optional_non_empty_str(entry, "physical_kind")?
+                    .unwrap_or_else(|| "auto".to_string()),
+                value_expression: optional_non_empty_str(entry, "value_expression")?
+                    .unwrap_or_else(|| {
+                        entry
+                            .get("source_column")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string()
+                    }),
+                nullable: optional_bool(entry, "nullable", true)?,
+                missing_policy: optional_non_empty_str(entry, "missing_policy")?
+                    .unwrap_or_else(|| "null".to_string()),
+                conflict_policy: optional_non_empty_str(entry, "conflict_policy")?
+                    .unwrap_or_else(|| "reject_conflict".to_string()),
+                source_priority: optional_i64(entry, "source_priority")?,
+            })
+        })
+        .collect()
+}
+
+fn parse_association_bindings(
+    values: Option<&Vec<Value>>,
+) -> Result<Vec<MapAssociationBinding>, CoveError> {
+    let Some(values) = values else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            let entry = as_object(value)?;
+            Ok(MapAssociationBinding {
+                assertion_id: required_non_empty_str(entry, "assertion_id")?,
+                association_type: required_non_empty_str(entry, "association_type")?,
+                target_identity_rule_id: required_non_empty_str(entry, "target_identity_rule_id")?,
+                source_identity_rule_id: optional_non_empty_str(entry, "source_identity_rule_id")?
+                    .unwrap_or_default(),
+                source_role: optional_non_empty_str(entry, "source_role")?
+                    .unwrap_or_else(|| "source".to_string()),
+                target_role: optional_non_empty_str(entry, "target_role")?
+                    .unwrap_or_else(|| "target".to_string()),
+                source_endpoint_expression: optional_non_empty_str(
+                    entry,
+                    "source_endpoint_expression",
+                )?
+                .unwrap_or_else(|| "source.goid".to_string()),
+                target_endpoint_expression: optional_non_empty_str(
+                    entry,
+                    "target_endpoint_expression",
+                )?
+                .unwrap_or_else(|| "target.goid".to_string()),
+                valid_from_expression: optional_non_empty_str(entry, "valid_from_expression")?,
+                valid_to_expression: optional_non_empty_str(entry, "valid_to_expression")?,
+                cardinality_policy: optional_non_empty_str(entry, "cardinality_policy")?
+                    .unwrap_or_else(|| "one".to_string()),
+                missing_policy: optional_non_empty_str(entry, "missing_policy")?
+                    .unwrap_or_else(|| "reject".to_string()),
+                link_object_materialization: optional_non_empty_str(
+                    entry,
+                    "link_object_materialization",
+                )?
+                .unwrap_or_else(|| "required".to_string()),
+            })
+        })
+        .collect()
 }
 
 impl MapAssertionLog {
@@ -706,6 +1055,54 @@ impl MapProjectionCatalog {
                 projections.push(MapProjectionEntry {
                     projection_id: required_non_empty_str(entry, "projection_id")?,
                     assertion_ids: optional_string_list(entry, "assertion_ids")?,
+                    output_table: optional_non_empty_str(entry, "output_table")?,
+                    row_grain: {
+                        let row_grain = optional_non_empty_str(entry, "row_grain")?;
+                        if row_grain
+                            .as_deref()
+                            .is_some_and(|row_grain| !is_valid_projection_row_grain(row_grain))
+                        {
+                            return Err(CoveError::MapInvalid);
+                        }
+                        row_grain
+                    },
+                    anchor: parse_projection_anchor(entry)?,
+                    temporal_mode: {
+                        let mode = parse_temporal_mode(entry)?;
+                        if mode
+                            .as_deref()
+                            .is_some_and(|mode| !is_valid_temporal_mode(mode))
+                        {
+                            return Err(CoveError::MapInvalid);
+                        }
+                        mode
+                    },
+                    columns: parse_projection_columns(optional_array(entry, "columns")?)?,
+                    multi_value_policy: {
+                        let policy = optional_non_empty_str(entry, "multi_value_policy")?;
+                        if policy
+                            .as_deref()
+                            .is_some_and(|policy| !is_valid_multi_value_policy(policy))
+                        {
+                            return Err(CoveError::MapInvalid);
+                        }
+                        policy
+                    },
+                    missing_policy: optional_non_empty_str(entry, "missing_policy")?
+                        .unwrap_or_else(|| "null".to_string()),
+                    ordering: optional_string_list(entry, "ordering")?,
+                    evidence_policy: optional_non_empty_str(entry, "evidence_policy")?
+                        .unwrap_or_else(|| "omit".to_string()),
+                    output_modes: {
+                        let modes = optional_string_list(entry, "output_modes")?;
+                        if modes
+                            .iter()
+                            .any(|mode| !is_valid_projection_output_mode(mode))
+                        {
+                            return Err(CoveError::MapInvalid);
+                        }
+                        modes
+                    },
                 });
             }
         }
@@ -715,6 +1112,123 @@ impl MapProjectionCatalog {
             projections,
         })
     }
+}
+
+fn parse_projection_anchor(
+    entry: &Map<String, Value>,
+) -> Result<Option<MapProjectionAnchor>, CoveError> {
+    let Some(anchor) = entry.get("anchor") else {
+        return Ok(None);
+    };
+    let anchor = as_object(anchor)?;
+    Ok(Some(MapProjectionAnchor {
+        object_type: optional_non_empty_str(anchor, "object_type")?,
+        association_type: optional_non_empty_str(anchor, "association_type")?,
+    }))
+}
+
+fn parse_temporal_mode(entry: &Map<String, Value>) -> Result<Option<String>, CoveError> {
+    match entry.get("temporal_mode") {
+        None => Ok(None),
+        Some(value) if value.is_string() => value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| Some(value.to_string()))
+            .ok_or(CoveError::MapInvalid),
+        Some(value) => {
+            let mode = as_object(value)?;
+            optional_non_empty_str(mode, "as_of")
+        }
+    }
+}
+
+fn parse_projection_columns(
+    values: Option<&Vec<Value>>,
+) -> Result<Vec<MapProjectionColumn>, CoveError> {
+    let Some(values) = values else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            let entry = as_object(value)?;
+            Ok(MapProjectionColumn {
+                name: required_non_empty_str(entry, "name")?,
+                value: required_non_empty_str(entry, "value")?,
+                logical_type: optional_non_empty_str(entry, "logical_type")?,
+                conflict_policy: optional_non_empty_str(entry, "conflict_policy")?
+                    .unwrap_or_else(|| "canonical_value".to_string()),
+                missing_policy: optional_non_empty_str(entry, "missing_policy")?
+                    .unwrap_or_else(|| "null".to_string()),
+            })
+        })
+        .collect()
+}
+
+fn validate_row_semantics_kind(kind: &str) -> Result<(), CoveError> {
+    match kind {
+        "Object" | "EventObject" | "LinkObject" | "AssociationOnly" | "Composite"
+        | "Dispatched" | "KeyValueFragment" | "ProjectionOnly" | "EvidenceOnly" | "Tombstone" => {
+            Ok(())
+        }
+        _ => Err(CoveError::MapInvalid),
+    }
+}
+
+fn validate_assertion_kind(kind: &str) -> Result<(), CoveError> {
+    match kind {
+        "object"
+        | "property"
+        | "association"
+        | "temporal"
+        | "identity_key"
+        | "identity_equivalence"
+        | "candidate_match"
+        | "tombstone"
+        | "evidence"
+        | "conflict"
+        | "projection" => Ok(()),
+        _ => Err(CoveError::MapInvalid),
+    }
+}
+
+fn is_valid_tombstone_target(target: &str) -> bool {
+    matches!(
+        target,
+        "object" | "property" | "association" | "source_record" | "evidence"
+    )
+}
+
+fn is_valid_temporal_mode(mode: &str) -> bool {
+    matches!(
+        mode,
+        "latest_committed" | "full_history" | "valid_time" | "observed_time" | "commit_order"
+    )
+}
+
+fn is_valid_multi_value_policy(policy: &str) -> bool {
+    matches!(
+        policy,
+        "reject" | "explode" | "aggregate" | "first" | "last" | "list"
+    )
+}
+
+fn is_valid_projection_row_grain(row_grain: &str) -> bool {
+    matches!(
+        row_grain,
+        "one_row_per_object"
+            | "one_row_per_association"
+            | "one_row_per_link_object"
+            | "one_row_per_property_version"
+            | "one_row_per_event_object"
+            | "one_row_per_object_as_of_time"
+            | "one_row_per_evidence_assertion"
+    )
+}
+
+fn is_valid_projection_output_mode(mode: &str) -> bool {
+    matches!(mode, "json" | "cove-o" | "cove-t" | "arrow" | "sql")
 }
 
 fn parse_root(bytes: &[u8]) -> Result<Value, CoveError> {
@@ -777,6 +1291,13 @@ fn optional_non_empty_str(
     }
 }
 
+fn optional_i64(object: &Map<String, Value>, key: &str) -> Result<Option<i64>, CoveError> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(value) => value.as_i64().map(Some).ok_or(CoveError::MapInvalid),
+    }
+}
+
 fn required_bool(object: &Map<String, Value>, key: &str) -> Result<bool, CoveError> {
     object
         .get(key)
@@ -788,6 +1309,13 @@ fn optional_bool(object: &Map<String, Value>, key: &str, default: bool) -> Resul
     match object.get(key) {
         None => Ok(default),
         Some(value) => value.as_bool().ok_or(CoveError::MapInvalid),
+    }
+}
+
+fn optional_bool_value(object: &Map<String, Value>, key: &str) -> Result<Option<bool>, CoveError> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(value) => value.as_bool().map(Some).ok_or(CoveError::MapInvalid),
     }
 }
 
@@ -836,6 +1364,10 @@ mod tests {
         parse_embedded_section(kind, &serde_json::to_vec_pretty(&value).unwrap()).unwrap()
     }
 
+    fn parse_json_result(kind: SectionKind, value: Value) -> Result<EmbeddedMapSection, CoveError> {
+        parse_embedded_section(kind, &serde_json::to_vec_pretty(&value).unwrap())
+    }
+
     fn valid_sections() -> Vec<EmbeddedMapSection> {
         vec![
             parse_json(
@@ -879,6 +1411,8 @@ mod tests {
                         "property_conflicts_declared": true,
                         "function_ids": ["trim_lower"],
                         "join_keys": [{
+                            "role_id": "customer_id",
+                            "source_column": "customer_id",
                             "logical_type": "utf8",
                             "canonicalization": "trim_lower",
                             "null_policy": "reject",
@@ -897,6 +1431,8 @@ mod tests {
                         "rule_id": "upsert_customer",
                         "source_id": "crm.customers",
                         "identity_rule_id": "customer_identity",
+                        "row_semantics_kind": "Object",
+                        "assertion_kinds": ["object", "property", "evidence"],
                         "function_ids": ["trim_lower"],
                         "output_assertion_ids": ["assert_customer_name"],
                         "association_endpoints": []
@@ -943,6 +1479,117 @@ mod tests {
                 }))
                 .unwrap()
             ),
+            Err(CoveError::MapInvalid)
+        );
+    }
+
+    #[test]
+    fn row_semantics_parse_rejects_missing_assertion_kinds() {
+        assert_eq!(
+            parse_json_result(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "customer-map",
+                    "mapping_version": "2026.05",
+                    "rules": [{
+                        "rule_id": "upsert_customer",
+                        "source_id": "crm.customers",
+                        "identity_rule_id": "customer_identity"
+                    }]
+                }),
+            ),
+            Err(CoveError::MapInvalid)
+        );
+    }
+
+    #[test]
+    fn row_semantics_parse_rejects_unknown_row_kind() {
+        assert_eq!(
+            parse_json_result(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "customer-map",
+                    "mapping_version": "2026.05",
+                    "rules": [{
+                        "rule_id": "bad_customer",
+                        "source_id": "crm.customers",
+                        "identity_rule_id": "customer_identity",
+                        "row_semantics_kind": "MaybeObject",
+                        "assertion_kinds": ["object"]
+                    }]
+                }),
+            ),
+            Err(CoveError::MapInvalid)
+        );
+    }
+
+    #[test]
+    fn row_semantics_parse_rejects_invalid_tombstone_target() {
+        assert_eq!(
+            parse_json_result(
+                SectionKind::MapRowSemanticsCatalog,
+                json!({
+                    "mapping_id": "customer-map",
+                    "mapping_version": "2026.05",
+                    "rules": [{
+                        "rule_id": "delete_customer",
+                        "source_id": "crm.customers",
+                        "identity_rule_id": "customer_identity",
+                        "row_semantics_kind": "Tombstone",
+                        "assertion_kinds": ["tombstone", "evidence"],
+                        "tombstone_target": "foreign_key"
+                    }]
+                }),
+            ),
+            Err(CoveError::MapInvalid)
+        );
+    }
+
+    #[test]
+    fn projection_parse_rejects_malformed_policy() {
+        assert_eq!(
+            parse_json_result(
+                SectionKind::MapProjectionCatalog,
+                json!({
+                    "mapping_id": "customer-map",
+                    "mapping_version": "2026.05",
+                    "projections": [{
+                        "projection_id": "customer_projection",
+                        "output_table": "customers",
+                        "row_grain": "one_row_per_object",
+                        "anchor": {"object_type": "Customer"},
+                        "temporal_mode": {"as_of": "latest_committed"},
+                        "multi_value_policy": "maybe",
+                        "columns": [{"name": "goid", "value": "object.goid"}],
+                        "output_modes": ["json"]
+                    }]
+                }),
+            ),
+            Err(CoveError::MapInvalid)
+        );
+    }
+
+    #[test]
+    fn embedded_map_validation_rejects_expanded_projection_without_policy() {
+        let mut sections = valid_sections();
+        sections.push(parse_json(
+            SectionKind::MapProjectionCatalog,
+            json!({
+                "mapping_id": "customer-map",
+                "mapping_version": "2026.05",
+                "projections": [{
+                    "projection_id": "customer_projection",
+                    "output_table": "customers",
+                    "row_grain": "one_row_per_object",
+                    "anchor": {"object_type": "Customer"},
+                    "temporal_mode": {"as_of": "latest_committed"},
+                    "columns": [{"name": "goid", "value": "object.goid"}],
+                    "output_modes": ["json"]
+                }]
+            }),
+        ));
+        assert_eq!(
+            validate_embedded_sections(&sections),
             Err(CoveError::MapInvalid)
         );
     }
@@ -997,6 +1644,8 @@ mod tests {
                     "property_conflicts_declared": true,
                     "function_ids": ["trim_lower"],
                     "join_keys": [{
+                        "role_id": "customer_id",
+                        "source_column": "customer_id",
                         "logical_type": "utf8",
                         "canonicalization": "trim_lower",
                         "null_policy": "reject",

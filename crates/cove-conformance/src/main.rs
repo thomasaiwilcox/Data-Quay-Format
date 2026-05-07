@@ -1,4 +1,4 @@
-//! `cove-conformance` — Cove Format conformance corpus runner (Spec §70, §73, §75, §77).
+//! `cove-conformance` — Cove Format conformance corpus runner (Spec §70, §73, §76, §78-§79).
 //!
 //! Walks a corpus directory of fixtures plus a JSON manifest that
 //! maps each fixture to (a) the spec sections it exercises and (b) the
@@ -19,9 +19,21 @@
 //! {"path":"reject/bad_crc.cove","kind":"cove","expect":"reject","error_code":"COVE_E_CHECKSUM_MISMATCH","sections":["§13"]}
 //! ```
 
-use std::{borrow::Cow, collections::BTreeSet, path::Path, process};
+use std::{
+    borrow::Cow,
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    process,
+};
 
 use arrow_array::{Array, BinaryArray, BooleanArray, Int32Array, StringArray, UInt64Array};
+use cove_arrow::{
+    arrow::{arrow_validity_to_cove_null, cove_null_to_arrow_validity, encoded_array_to_arrow},
+    parquet::{
+        convert_parquet_bytes, decode_materialized_page_values_with_nulls,
+        ParquetConversionOptions, ParquetScalarValue,
+    },
+};
 use serde_json::{json, Value};
 
 use cove_core::{
@@ -36,6 +48,7 @@ use cove_core::{
     dictionary::FileDictionary,
     digest::DigestManifest,
     domain::ColumnDomain,
+    durable,
     encoding::{
         assert_parity,
         bit_packed::{BitPacked, BitPackedPayload},
@@ -51,6 +64,10 @@ use cove_core::{
         sparse::{Sparse, SparsePayload},
         Encoding,
     },
+    extensions::{
+        ExtensionIndexDescriptorV1, ExtensionLogicalTypeV1, ExtensionRegistry,
+        ExtensionValidationContext,
+    },
     index::{
         aggregate::AggregateSynopsis,
         bloom::BloomFilterIndex,
@@ -63,24 +80,29 @@ use cove_core::{
         lookup::LookupIndex,
         topn::TopNSummary,
     },
-    interop::{
-        arrow::{arrow_validity_to_cove_null, cove_null_to_arrow_validity, encoded_array_to_arrow},
-        lakehouse::LakehouseHints,
-        parquet::{
-            convert_parquet_bytes, decode_materialized_page_values, ParquetConversionOptions,
-        },
-    },
+    interop::lakehouse::{LakehouseHints, LakehouseMetadataUse, LakehouseOverlayDecision},
     io_hints::IoHints,
     kernel::KernelCapabilities,
     metadata::MetadataJson,
+    mount::{
+        mount_cove_file, mount_cove_h_file, ExecutionCodeRequest, ExecutionCodeResolver,
+        ExecutionCodeValue, HarborMountOptions, MountOptions, SidecarValidationStatus,
+    },
     page::{ColumnPageIndex, ColumnPageIndexEntryV1, PageIndex},
+    page_payload::{ColumnPagePayloadV1, PageBufferKind},
     profile::{
         cove_e::{
             CodeSpaceDescriptorV1, EngineMountPolicyV1, EngineProfileRegistry,
             ExecutionCodeDescriptorV1, ExecutionScopeDescriptorV1,
         },
         cove_h::HarborMountHintsV1,
-        cove_o::{ObjectTypeCatalog, TemporalSegmentIndex},
+        cove_o::{
+            ObjectTypeCatalog, TemporalBloomIndex, TemporalSegmentIndex,
+            OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT, OBJECT_TYPE_FLAG_LINK_OBJECT,
+            PROPERTY_FLAG_ASSOCIATION_FROM_GOID, PROPERTY_FLAG_ASSOCIATION_TO_GOID,
+            PROPERTY_FLAG_ASSOCIATION_TYPE, PROPERTY_FLAG_EVIDENCE_REF,
+            PROPERTY_FLAG_MAPPING_RULE_REF,
+        },
     },
     pruning::{
         explain_aggregate_synopsis, explain_bloom_membership, explain_composite_zone,
@@ -227,12 +249,17 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
                 semantic: true,
                 verify_digests: false,
                 allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
             },
         )
         .map(|_| ()),
-        "covemap" => CovemapFile::parse(bytes).map(|_| ()),
+        "covemap" => CovemapFile::parse(bytes).and_then(|file| file.validate_map_sections()),
         "covx" => CovxFile::parse(bytes).map(|_| ()),
         "covm" => CovmFile::parse(bytes).map(|_| ()),
+        "extension_registry" => validate_extension_registry_fixture(bytes),
+        "extension_logical_type" => validate_extension_logical_type_fixture(entry, bytes),
+        "extension_index_descriptor" => validate_extension_index_descriptor_fixture(entry, bytes),
+        "durable_publish_case" => validate_durable_publish_fixture(bytes),
         "metadata_json" => MetadataJson::parse(bytes).map(|_| ()),
         "encoding_case" => validate_encoding_fixture(bytes),
         "encoded_array_decode_case" => validate_encoded_array_decode_fixture(bytes),
@@ -248,6 +275,7 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
         "redaction_manifest" => RedactionManifest::parse(bytes).map(|_| ()),
         "io_hints" => IoHints::parse(bytes).map(|_| ()),
         "lakehouse_hints" => LakehouseHints::parse(bytes).map(|_| ()),
+        "lakehouse_overlay_guard_case" => validate_lakehouse_overlay_guard_fixture(bytes),
         "kernel_capabilities" => KernelCapabilities::parse(bytes).map(|_| ()),
         "page_index" => PageIndex::parse(bytes).map(|_| ()),
         "column_domain" => ColumnDomain::parse(bytes).map(|_| ()),
@@ -277,15 +305,414 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
         "cove_e_code_space" => CodeSpaceDescriptorV1::parse(bytes).map(|_| ()),
         "cove_e_mount_policy" => EngineMountPolicyV1::parse(bytes).map(|_| ()),
         "cove_h_mount_hints" => HarborMountHintsV1::parse(bytes).map(|_| ()),
+        "cove_h_mount_case" => validate_harbor_mount_fixture(bytes),
         "cove_o_object_catalog" => ObjectTypeCatalog::parse(bytes).map(|_| ()),
         "cove_o_temporal_segment_index" => TemporalSegmentIndex::parse(bytes).map(|_| ()),
+        "cove_o_temporal_bloom_index" => TemporalBloomIndex::parse(bytes).map(|_| ()),
+        "cove_map_convert_case" => validate_cove_map_convert_fixture(corpus, bytes),
+        "cove_map_project_case" => validate_cove_map_project_fixture(corpus, bytes),
         "pruning_case" => validate_pruning_fixture(bytes),
         "page_codec_case" => validate_page_codec_fixture(bytes),
         "wire_primitive_case" => validate_wire_primitive_fixture(bytes),
+        "sidecar_freshness_case" => validate_sidecar_freshness_fixture(bytes),
         other => Err(CoveError::BadSection(format!(
             "unknown conformance fixture kind {other}"
         ))),
     }
+}
+
+fn validate_extension_registry_fixture(bytes: &[u8]) -> Result<(), CoveError> {
+    let registry = ExtensionRegistry::parse(bytes)?;
+    registry.validate_known(true)
+}
+
+struct HarborFixtureResolver;
+
+impl ExecutionCodeResolver for HarborFixtureResolver {
+    fn resolve(&self, request: ExecutionCodeRequest<'_>) -> Result<ExecutionCodeValue, CoveError> {
+        Ok(ExecutionCodeValue::Unsigned(
+            10_000 + u64::from(request.file_code),
+        ))
+    }
+}
+
+fn validate_harbor_mount_fixture(bytes: &[u8]) -> Result<(), CoveError> {
+    let mounted = mount_cove_h_file(
+        bytes,
+        MountOptions::default(),
+        HarborMountOptions::default(),
+        Some(&HarborFixtureResolver),
+    )?;
+    if mounted.harbor_maps.is_empty() {
+        return Err(CoveError::BadSection(
+            "harbor mount fixture did not build any maps".into(),
+        ));
+    }
+    let reused = mount_cove_h_file(
+        bytes,
+        MountOptions::default(),
+        HarborMountOptions {
+            existing_maps: Some(&mounted.harbor_maps),
+            rebuild_missing_or_stale: false,
+        },
+        None,
+    )?;
+    if reused.harbor_maps != mounted.harbor_maps {
+        return Err(CoveError::BadSection(
+            "harbor mount fixture did not reuse valid maps".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lakehouse_overlay_guard_fixture(bytes: &[u8]) -> Result<(), CoveError> {
+    let hints = LakehouseHints::parse(bytes)?;
+    if hints.visibility_overlay.is_none() {
+        return Err(CoveError::BadSection(
+            "lakehouse overlay guard fixture missing overlay".into(),
+        ));
+    }
+    let expected = [
+        (
+            LakehouseMetadataUse::PhysicalPruning,
+            false,
+            false,
+            LakehouseOverlayDecision::Allow,
+        ),
+        (
+            LakehouseMetadataUse::LookupOrInvertedCandidates,
+            false,
+            false,
+            LakehouseOverlayDecision::RequireOverlayApplication,
+        ),
+        (
+            LakehouseMetadataUse::VisibleExactDomain,
+            false,
+            false,
+            LakehouseOverlayDecision::ForbidVisibleExactness,
+        ),
+        (
+            LakehouseMetadataUse::VisibleAggregateAnswer,
+            false,
+            true,
+            LakehouseOverlayDecision::Allow,
+        ),
+    ];
+    for (metadata_use, overlay_empty, overlay_aware, decision) in expected {
+        if hints.overlay_decision(metadata_use, overlay_empty, overlay_aware) != decision {
+            return Err(CoveError::BadSection(
+                "lakehouse overlay guard decision mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_sidecar_freshness_fixture(bytes: &[u8]) -> Result<(), CoveError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        CoveError::BadSection(format!("invalid sidecar-freshness fixture json: {error}"))
+    })?;
+    let cove = parse_fixture_byte_vector(value.get("cove"), "cove")?;
+    let covx = parse_optional_fixture_byte_vector(&value, "covx")?;
+    let covm = parse_optional_fixture_byte_vector(&value, "covm")?;
+    let expected_covx = parse_sidecar_status(
+        value
+            .get("expect_covx")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoveError::BadSection("sidecar fixture missing expect_covx".into()))?,
+    )?;
+    let expected_covm = parse_sidecar_status(
+        value
+            .get("expect_covm")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoveError::BadSection("sidecar fixture missing expect_covm".into()))?,
+    )?;
+    let mounted = mount_cove_file(
+        &cove,
+        MountOptions {
+            covx: covx.as_deref(),
+            covm: covm.as_deref(),
+            ..MountOptions::default()
+        },
+        None,
+    )?;
+    if mounted.covx_status != expected_covx {
+        return Err(CoveError::BadSection(format!(
+            "expected covx status {}, got {}",
+            sidecar_status_name(expected_covx),
+            sidecar_status_name(mounted.covx_status)
+        )));
+    }
+    if mounted.covm_status != expected_covm {
+        return Err(CoveError::BadSection(format!(
+            "expected covm status {}, got {}",
+            sidecar_status_name(expected_covm),
+            sidecar_status_name(mounted.covm_status)
+        )));
+    }
+    Ok(())
+}
+
+fn parse_sidecar_status(value: &str) -> Result<SidecarValidationStatus, CoveError> {
+    match value {
+        "NotProvided" => Ok(SidecarValidationStatus::NotProvided),
+        "Valid" => Ok(SidecarValidationStatus::Valid),
+        "StaleIgnored" => Ok(SidecarValidationStatus::StaleIgnored),
+        other => Err(CoveError::BadSection(format!(
+            "unknown sidecar status {other}"
+        ))),
+    }
+}
+
+fn sidecar_status_name(status: SidecarValidationStatus) -> &'static str {
+    match status {
+        SidecarValidationStatus::NotProvided => "NotProvided",
+        SidecarValidationStatus::Valid => "Valid",
+        SidecarValidationStatus::StaleIgnored => "StaleIgnored",
+        _ => "Future",
+    }
+}
+
+fn validate_extension_logical_type_fixture(entry: &Entry, bytes: &[u8]) -> Result<(), CoveError> {
+    let descriptor = ExtensionLogicalTypeV1::parse(bytes)?;
+    let collation_count = entry
+        .raw
+        .get("collation_count")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    descriptor.validate(ExtensionValidationContext { collation_count })
+}
+
+fn validate_extension_index_descriptor_fixture(
+    entry: &Entry,
+    bytes: &[u8],
+) -> Result<(), CoveError> {
+    let descriptor = ExtensionIndexDescriptorV1::parse(bytes)?;
+    descriptor.validate()?;
+    if let Some(expected) = entry.raw.get("expect_can_skip").and_then(Value::as_bool) {
+        if descriptor.can_skip_data() != expected {
+            return Err(CoveError::BadExtension);
+        }
+    }
+    Ok(())
+}
+
+fn validate_durable_publish_fixture(bytes: &[u8]) -> Result<(), CoveError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        CoveError::BadSection(format!("invalid durable-publish fixture json: {error}"))
+    })?;
+    let payload = value
+        .get("payload")
+        .and_then(Value::as_str)
+        .unwrap_or("durable-cove-candidate")
+        .as_bytes()
+        .to_vec();
+    let dir = std::env::temp_dir().join(format!(
+        "cove-conformance-durable-{}-{}",
+        std::process::id(),
+        value
+            .get("case_id")
+            .and_then(Value::as_str)
+            .unwrap_or("case")
+    ));
+    std::fs::create_dir_all(&dir).map_err(CoveError::from)?;
+    let path = dir.join("published.cove");
+    std::fs::write(&path, b"old-authoritative").map_err(CoveError::from)?;
+    durable::durable_replace(&path, &payload)?;
+    let actual = std::fs::read(&path).map_err(CoveError::from)?;
+    let _ = std::fs::remove_dir_all(&dir);
+    if actual != payload {
+        return Err(CoveError::BadSection(
+            "durable publish fixture did not replace destination bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cove_map_convert_fixture(corpus: &Path, bytes: &[u8]) -> Result<(), CoveError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        CoveError::BadSection(format!("invalid cove-map convert fixture json: {error}"))
+    })?;
+    let (map, sources) = cove_map_fixture_paths(corpus, &value)?;
+    let summary = cove_map::conversion_summary_from_paths(&map, &sources)
+        .map_err(|_| CoveError::MapInvalid)?;
+    let report = summary
+        .get("report")
+        .ok_or_else(|| CoveError::BadSection("conversion summary missing report".into()))?;
+    if let Some(expected_report) = value.get("expected_conversion") {
+        validate_expected_json_fields(report, expected_report)?;
+    }
+    if let Some(expected_summary) = value.get("expected_conversion_summary") {
+        validate_expected_json_fields(&summary, expected_summary)?;
+    }
+    if value
+        .get("expect_cove_o_valid")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let bytes =
+            cove_map::cove_o_from_paths(&map, &sources).map_err(|_| CoveError::MapInvalid)?;
+        let report = reader::validate_bytes_with_options(
+            &bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .map_err(|err| err)?;
+        if value
+            .get("expect_semantic_map_optional")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let required = report.validated.header.required_features;
+            let optional = report.validated.header.optional_features;
+            if required & cove_core::constants::FEATURE_SEMANTIC_MAP != 0
+                || optional & cove_core::constants::FEATURE_SEMANTIC_MAP == 0
+            {
+                return Err(CoveError::MapInvalid);
+            }
+            if report.validated.footer.sections.iter().any(|entry| {
+                entry.required_features & cove_core::constants::FEATURE_SEMANTIC_MAP != 0
+            }) {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+        if value
+            .get("expect_association_readback_flags")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            validate_association_readback_flags(&bytes, &report.validated)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_association_readback_flags(
+    bytes: &[u8],
+    validated: &reader::ValidatedCoveFile,
+) -> Result<(), CoveError> {
+    let entry = validated
+        .footer
+        .sections
+        .iter()
+        .find(|entry| entry.section_kind == SectionKind::ObjectTypeCatalog as u16)
+        .ok_or_else(|| CoveError::BadSection("missing object type catalog".into()))?;
+    let payload = section_payload(bytes, entry)?;
+    let catalog = ObjectTypeCatalog::parse(&payload)?;
+    let association = catalog
+        .types
+        .iter()
+        .find(|ty| ty.type_name.starts_with("Association:"))
+        .ok_or(CoveError::MapEvidenceInvalid)?;
+    let required_type_flags = OBJECT_TYPE_FLAG_ASSOCIATION_OBJECT | OBJECT_TYPE_FLAG_LINK_OBJECT;
+    if association.flags & required_type_flags != required_type_flags {
+        return Err(CoveError::MapEvidenceInvalid);
+    }
+    let required_property_flags = [
+        ("source_goid", PROPERTY_FLAG_ASSOCIATION_FROM_GOID),
+        ("target_goid", PROPERTY_FLAG_ASSOCIATION_TO_GOID),
+        ("association_type", PROPERTY_FLAG_ASSOCIATION_TYPE),
+        ("mapping_rule_id", PROPERTY_FLAG_MAPPING_RULE_REF),
+        ("source_evidence_id", PROPERTY_FLAG_EVIDENCE_REF),
+    ];
+    for (name, flag) in required_property_flags {
+        let property = association
+            .properties
+            .iter()
+            .find(|property| property.property_name == name)
+            .ok_or(CoveError::MapEvidenceInvalid)?;
+        if property.flags & flag != flag {
+            return Err(CoveError::MapEvidenceInvalid);
+        }
+    }
+    let required_metadata = [
+        ("source_role", CoveLogicalType::Utf8, false),
+        ("target_role", CoveLogicalType::Utf8, false),
+        ("valid_from", CoveLogicalType::Json, true),
+        ("valid_to", CoveLogicalType::Json, true),
+        ("cardinality_policy", CoveLogicalType::Utf8, false),
+    ];
+    for (name, logical_type, nullable) in required_metadata {
+        let property = association
+            .properties
+            .iter()
+            .find(|property| property.property_name == name)
+            .ok_or(CoveError::MapEvidenceInvalid)?;
+        if property.logical_type != logical_type
+            || property.physical_kind != CovePhysicalKind::VarBytes
+            || property.nullable != nullable
+        {
+            return Err(CoveError::MapEvidenceInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn validate_cove_map_project_fixture(corpus: &Path, bytes: &[u8]) -> Result<(), CoveError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        CoveError::BadSection(format!("invalid cove-map project fixture json: {error}"))
+    })?;
+    let (map, sources) = cove_map_fixture_paths(corpus, &value)?;
+    let projected =
+        cove_map::projected_rows_from_paths(&map, &sources).map_err(|_| CoveError::MapInvalid)?;
+    if let Some(expected_rows) = value.get("expected_projected_rows") {
+        if projected.get("rows") != Some(expected_rows) {
+            return Err(CoveError::MapEvidenceInvalid);
+        }
+    }
+    if let Some(expected) = value.get("expected_projection") {
+        validate_expected_json_fields(&projected, expected)?;
+    }
+    Ok(())
+}
+
+fn cove_map_fixture_paths(
+    corpus: &Path,
+    value: &Value,
+) -> Result<(PathBuf, Vec<PathBuf>), CoveError> {
+    let mapping = value
+        .get("mapping")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoveError::BadSection("cove-map fixture missing mapping".into()))?;
+    let sources = value
+        .get("sources")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CoveError::BadSection("cove-map fixture sources must be an array".into()))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .ok_or_else(|| {
+                    CoveError::BadSection("cove-map fixture source is not a string".into())
+                })
+                .map(|path| resolve_corpus_path(corpus, path))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((resolve_corpus_path(corpus, mapping), sources))
+}
+
+fn resolve_corpus_path(corpus: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        corpus.join(path)
+    }
+}
+
+fn validate_expected_json_fields(actual: &Value, expected: &Value) -> Result<(), CoveError> {
+    let expected = expected
+        .as_object()
+        .ok_or_else(|| CoveError::BadSection("expected fixture fields must be an object".into()))?;
+    for (key, expected_value) in expected {
+        if actual.get(key) != Some(expected_value) {
+            return Err(CoveError::MapEvidenceInvalid);
+        }
+    }
+    Ok(())
 }
 
 fn validate_suite_contract_fixture(corpus: &Path, bytes: &[u8]) -> Result<(), CoveError> {
@@ -804,6 +1231,9 @@ fn array_value_to_json(
         CoveArrayValue::DictValue(_) => Err(CoveError::BadSection(
             "array decode conformance fixtures do not use dictionaries".into(),
         )),
+        _ => Err(CoveError::BadSection(
+            "array decode fixture produced a future value kind".into(),
+        )),
     }
 }
 
@@ -998,6 +1428,7 @@ fn validate_parquet_conversion_fixture(entry: &Entry, bytes: &[u8]) -> Result<()
             semantic: true,
             verify_digests: false,
             allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
         },
     )?;
 
@@ -1125,7 +1556,7 @@ fn decode_segment_column_values(
     segment_bytes: &[u8],
     segment: &TableSegmentPayloadV1,
     column: &cove_core::table::ColumnEntry,
-) -> Result<Vec<cove_core::interop::parquet::ParquetScalarValue>, CoveError> {
+) -> Result<Vec<ParquetScalarValue>, CoveError> {
     let column_directory = segment
         .columns
         .iter()
@@ -1145,10 +1576,31 @@ fn decode_segment_column_values(
         let page_wire = &segment_bytes
             [page.page_offset as usize..(page.page_offset + page.page_length) as usize];
         let payload = column_page_payload(page_wire, page)?;
-        out.extend(decode_materialized_page_values(
+        let page_payload = ColumnPagePayloadV1::parse(payload.as_ref())?;
+        let root = page_payload.root_node()?;
+        if root.logical_type != column.logical
+            || root.physical_kind != column.physical
+            || root.logical_len != page.row_count
+        {
+            return Err(CoveError::PageCorrupt);
+        }
+        let values = page_payload
+            .buffer_bytes(PageBufferKind::Values)?
+            .unwrap_or(&[]);
+        let decode_payload = match page_payload.buffer_bytes(PageBufferKind::NullBitmap)? {
+            Some(nulls) => {
+                let mut bytes = Vec::with_capacity(nulls.len() + values.len());
+                bytes.extend_from_slice(nulls);
+                bytes.extend_from_slice(values);
+                Cow::Owned(bytes)
+            }
+            None => Cow::Borrowed(values),
+        };
+        out.extend(decode_materialized_page_values_with_nulls(
             column,
             page.row_count,
-            payload.as_ref(),
+            page.null_count,
+            decode_payload.as_ref(),
         )?);
     }
     Ok(out)
@@ -1170,6 +1622,16 @@ fn parse_fixture_byte_vector(value: Option<&Value>, field: &str) -> Result<Vec<u
                 })
         })
         .collect()
+}
+
+fn parse_optional_fixture_byte_vector(
+    value: &Value,
+    field: &str,
+) -> Result<Option<Vec<u8>>, CoveError> {
+    match value.get(field) {
+        Some(Value::Null) | None => Ok(None),
+        Some(bytes) => parse_fixture_byte_vector(Some(bytes), field).map(Some),
+    }
 }
 
 fn parse_fixture_i64_vector(value: Option<&Value>, field: &str) -> Result<Vec<i64>, CoveError> {
@@ -2024,6 +2486,11 @@ fn parse_pruning_stat_scalar(value: &Value, field: &str) -> Result<StatScalar, C
                 "{field} uses unsupported pruning stat kind {kind_name}"
             )))
         }
+        _ => {
+            return Err(CoveError::BadSection(format!(
+                "{field} uses future pruning stat kind {kind_name}"
+            )))
+        }
     };
 
     Ok(StatScalar {
@@ -2451,5 +2918,6 @@ fn pruning_evidence_name(evidence: PruningEvidence) -> &'static str {
         PruningEvidence::AggregateSynopsis => "AggregateSynopsis",
         PruningEvidence::TopNSummary => "TopNSummary",
         PruningEvidence::FallbackToScan => "FallbackToScan",
+        _ => "Future",
     }
 }

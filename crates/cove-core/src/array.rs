@@ -23,6 +23,7 @@ use crate::{
 
 /// A decoded value from an encoded array row.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum CoveArrayValue<'a> {
     /// The row is null.
     Null,
@@ -44,6 +45,213 @@ pub enum CoveArrayValue<'a> {
     Boolean(bool),
     /// The validity bit for this row (Validity-encoded columns).
     ValidityBit(bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VariableOffsetKind {
+    PlainVarint,
+    VarBytes,
+    CanonicalLengthPrefixed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VariableOffsets {
+    kind: VariableOffsetKind,
+    row_offsets: Vec<usize>,
+}
+
+impl VariableOffsets {
+    fn plain_varint(data: &[u8], row_count: u64) -> Result<Self, CoveError> {
+        let mut row_offsets = Vec::with_capacity(expected_row_count(row_count)?);
+        let mut pos = 0usize;
+        for _ in 0..row_count {
+            if pos >= data.len() {
+                return Err(CoveError::OffsetRange);
+            }
+            row_offsets.push(pos);
+            let (_value, consumed) = wire::decode_u64_leb128(&data[pos..])?;
+            pos = pos.checked_add(consumed).ok_or(CoveError::ArithOverflow)?;
+        }
+        Ok(Self {
+            kind: VariableOffsetKind::PlainVarint,
+            row_offsets,
+        })
+    }
+
+    fn varbytes(data: &[u8], row_count: u64) -> Result<Self, CoveError> {
+        let mut row_offsets = Vec::with_capacity(expected_row_count(row_count)?);
+        let mut pos = 0usize;
+        for _ in 0..row_count {
+            row_offsets.push(pos);
+            let len = read_u32_le(data, pos)? as usize;
+            pos = pos
+                .checked_add(4)
+                .and_then(|offset| offset.checked_add(len))
+                .ok_or(CoveError::ArithOverflow)?;
+            if pos > data.len() {
+                return Err(CoveError::OffsetRange);
+            }
+        }
+        Ok(Self {
+            kind: VariableOffsetKind::VarBytes,
+            row_offsets,
+        })
+    }
+
+    fn canonical_length_prefixed(data: &[u8], row_count: u64) -> Result<Self, CoveError> {
+        let mut row_offsets = Vec::with_capacity(expected_row_count(row_count)?);
+        let mut pos = 0usize;
+        for _ in 0..row_count {
+            row_offsets.push(pos);
+            let (len, consumed) = wire::decode_u64_leb128(&data[pos..])?;
+            let len = usize::try_from(len).map_err(|_| CoveError::ArithOverflow)?;
+            pos = pos
+                .checked_add(consumed)
+                .and_then(|offset| offset.checked_add(len))
+                .ok_or(CoveError::ArithOverflow)?;
+            if pos > data.len() {
+                return Err(CoveError::OffsetRange);
+            }
+        }
+        Ok(Self {
+            kind: VariableOffsetKind::CanonicalLengthPrefixed,
+            row_offsets,
+        })
+    }
+
+    fn offset_for_row(&self, row: u64) -> Result<usize, CoveError> {
+        self.row_offsets
+            .get(row as usize)
+            .copied()
+            .ok_or(CoveError::OffsetRange)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PreparedArrayRepr<'a> {
+    Direct,
+    VariableOffsets(VariableOffsets),
+    DecodedValues(Vec<CoveArrayValue<'a>>),
+}
+
+/// Page-scoped prepared access for repeated row reads.
+///
+/// `EncodedArray::decode_row()` remains the one-off scalar API. Hot consumers
+/// that touch many rows from the same page should prepare once and then read
+/// through this wrapper so variable-width and transform encodings are decoded
+/// at page scope instead of per row.
+#[derive(Clone)]
+pub struct PreparedEncodedArray<'a> {
+    array: &'a EncodedArray<'a>,
+    repr: PreparedArrayRepr<'a>,
+}
+
+impl<'a> PreparedEncodedArray<'a> {
+    pub fn new(array: &'a EncodedArray<'a>) -> Result<Self, CoveError> {
+        let repr = match array.encoding {
+            CoveEncodingKind::PlainVarint => PreparedArrayRepr::VariableOffsets(
+                VariableOffsets::plain_varint(array.data, array.row_count)?,
+            ),
+            CoveEncodingKind::VarBytes => PreparedArrayRepr::VariableOffsets(
+                VariableOffsets::varbytes(array.data, array.row_count)?,
+            ),
+            CoveEncodingKind::Canonical
+                if matches!(
+                    array.logical,
+                    CoveLogicalType::Utf8 | CoveLogicalType::Binary | CoveLogicalType::Json
+                ) =>
+            {
+                PreparedArrayRepr::VariableOffsets(VariableOffsets::canonical_length_prefixed(
+                    array.data,
+                    array.row_count,
+                )?)
+            }
+            CoveEncodingKind::LocalCodebook
+            | CoveEncodingKind::Rle
+            | CoveEncodingKind::RunEnd
+            | CoveEncodingKind::BitPacked
+            | CoveEncodingKind::Delta
+            | CoveEncodingKind::FrameOfReference
+            | CoveEncodingKind::PatchedBase
+            | CoveEncodingKind::Sparse => {
+                PreparedArrayRepr::DecodedValues(array.decode_all_rows()?)
+            }
+            _ => PreparedArrayRepr::Direct,
+        };
+        Ok(Self { array, repr })
+    }
+
+    pub fn array(&self) -> &'a EncodedArray<'a> {
+        self.array
+    }
+
+    pub fn decode_row(&self, row: u64) -> Result<CoveArrayValue<'a>, CoveError> {
+        if row >= self.array.row_count {
+            return Err(CoveError::OffsetRange);
+        }
+        match &self.repr {
+            PreparedArrayRepr::Direct => self.array.decode_row(row),
+            PreparedArrayRepr::DecodedValues(values) => values
+                .get(row as usize)
+                .cloned()
+                .ok_or(CoveError::OffsetRange),
+            PreparedArrayRepr::VariableOffsets(offsets) => {
+                if self.array.is_null(row)? {
+                    return Ok(CoveArrayValue::Null);
+                }
+                let offset = offsets.offset_for_row(row)?;
+                match offsets.kind {
+                    VariableOffsetKind::PlainVarint => {
+                        if offset >= self.array.data.len() {
+                            return Err(CoveError::OffsetRange);
+                        }
+                        let (value, _consumed) =
+                            wire::decode_u64_leb128(&self.array.data[offset..])?;
+                        Ok(CoveArrayValue::Varint(value))
+                    }
+                    VariableOffsetKind::VarBytes => {
+                        let len = read_u32_le(self.array.data, offset)? as usize;
+                        let data_start = offset.checked_add(4).ok_or(CoveError::ArithOverflow)?;
+                        let slice = wire::read_range_checked(self.array.data, data_start, len)?;
+                        Ok(CoveArrayValue::Bytes(slice))
+                    }
+                    VariableOffsetKind::CanonicalLengthPrefixed => {
+                        let (len, consumed) = wire::decode_u64_leb128(&self.array.data[offset..])?;
+                        let len = usize::try_from(len).map_err(|_| CoveError::ArithOverflow)?;
+                        let data_start = offset
+                            .checked_add(consumed)
+                            .ok_or(CoveError::ArithOverflow)?;
+                        let slice = wire::read_range_checked(self.array.data, data_start, len)?;
+                        Ok(CoveArrayValue::Bytes(slice))
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn decode_selected_rows(
+        &self,
+        selected_rows: &[u32],
+    ) -> Result<Vec<CoveArrayValue<'a>>, CoveError> {
+        let mut out = Vec::with_capacity(selected_rows.len());
+        for row in selected_rows {
+            out.push(self.decode_row(u64::from(*row))?);
+        }
+        Ok(out)
+    }
+
+    pub fn decode_all_rows(&self) -> Result<Vec<CoveArrayValue<'a>>, CoveError> {
+        match &self.repr {
+            PreparedArrayRepr::DecodedValues(values) => Ok(values.clone()),
+            _ => {
+                let mut out = Vec::with_capacity(expected_row_count(self.array.row_count)?);
+                for row in 0..self.array.row_count {
+                    out.push(self.decode_row(row)?);
+                }
+                Ok(out)
+            }
+        }
+    }
 }
 
 /// A view over an encoded column array.
@@ -105,6 +313,10 @@ impl<'a> EncodedArray<'a> {
 
     /// Decodes the value at `row`.
     ///
+    /// This is the one-off scalar access path. Repeated row reads from the
+    /// same page should call [`EncodedArray::prepare`] once and then read
+    /// through [`PreparedEncodedArray`].
+    ///
     /// Returns [`CoveArrayValue::Null`] if the row is null.
     /// Returns [`CoveError::OffsetRange`] if `row >= row_count`.
     /// Returns [`CoveError::UnsupportedEncoding`] for transform/container encodings
@@ -117,6 +329,11 @@ impl<'a> EncodedArray<'a> {
             return Ok(CoveArrayValue::Null);
         }
         self.decode_present_row(row)
+    }
+
+    /// Prepares page-scoped access for repeated row reads.
+    pub fn prepare(&'a self) -> Result<PreparedEncodedArray<'a>, CoveError> {
+        PreparedEncodedArray::new(self)
     }
 
     /// Decodes the full logical row set in row order.
@@ -932,6 +1149,141 @@ mod tests {
                 CoveArrayValue::OwnedBytes(b"blue".to_vec()),
                 CoveArrayValue::OwnedBytes(b"blue".to_vec()),
             ]
+        );
+    }
+
+    #[test]
+    fn prepared_access_matches_scalar_and_bulk_varint_varbytes_and_canonical() {
+        let varint_bytes = [
+            wire::encode_u64_leb128(3),
+            wire::encode_u64_leb128(17),
+            wire::encode_u64_leb128(255),
+        ]
+        .concat();
+        let varint = make_array(
+            CoveLogicalType::UInt64,
+            CoveEncodingKind::PlainVarint,
+            3,
+            &varint_bytes,
+            None,
+        );
+        let prepared = varint.prepare().unwrap();
+        assert_eq!(
+            prepared.decode_row(2).unwrap(),
+            varint.decode_row(2).unwrap()
+        );
+        assert_eq!(
+            prepared.decode_selected_rows(&[2, 0]).unwrap(),
+            vec![CoveArrayValue::Varint(255), CoveArrayValue::Varint(3)]
+        );
+        assert_eq!(
+            prepared.decode_all_rows().unwrap(),
+            varint.decode_all_rows().unwrap()
+        );
+
+        let mut varbytes_bytes = Vec::new();
+        varbytes_bytes.extend_from_slice(&2u32.to_le_bytes());
+        varbytes_bytes.extend_from_slice(b"hi");
+        varbytes_bytes.extend_from_slice(&5u32.to_le_bytes());
+        varbytes_bytes.extend_from_slice(b"there");
+        varbytes_bytes.extend_from_slice(&3u32.to_le_bytes());
+        varbytes_bytes.extend_from_slice(b"bye");
+        let varbytes = make_array(
+            CoveLogicalType::Utf8,
+            CoveEncodingKind::VarBytes,
+            3,
+            &varbytes_bytes,
+            None,
+        );
+        let prepared = varbytes.prepare().unwrap();
+        assert_eq!(
+            prepared.decode_row(1).unwrap(),
+            varbytes.decode_row(1).unwrap()
+        );
+        assert_eq!(
+            prepared.decode_selected_rows(&[1, 2]).unwrap(),
+            vec![
+                CoveArrayValue::Bytes(b"there"),
+                CoveArrayValue::Bytes(b"bye")
+            ]
+        );
+        assert_eq!(
+            prepared.decode_all_rows().unwrap(),
+            varbytes.decode_all_rows().unwrap()
+        );
+
+        let mut canonical_bytes = Vec::new();
+        canonical_bytes.extend_from_slice(&wire::encode_u64_leb128(2));
+        canonical_bytes.extend_from_slice(b"hi");
+        canonical_bytes.extend_from_slice(&wire::encode_u64_leb128(5));
+        canonical_bytes.extend_from_slice(b"there");
+        let canonical = make_array(
+            CoveLogicalType::Utf8,
+            CoveEncodingKind::Canonical,
+            2,
+            &canonical_bytes,
+            None,
+        );
+        let prepared = canonical.prepare().unwrap();
+        assert_eq!(
+            prepared.decode_row(1).unwrap(),
+            canonical.decode_row(1).unwrap()
+        );
+        assert_eq!(
+            prepared.decode_selected_rows(&[1]).unwrap(),
+            vec![CoveArrayValue::Bytes(b"there")]
+        );
+        assert_eq!(
+            prepared.decode_all_rows().unwrap(),
+            canonical.decode_all_rows().unwrap()
+        );
+    }
+
+    #[test]
+    fn prepared_access_matches_bulk_transform_decodes() {
+        let rle_payload = RlePayload {
+            runs: vec![(-2, 2), (9, 1)],
+        };
+        let rle_bytes = rle_payload.encode();
+        let rle = make_array(
+            CoveLogicalType::Int64,
+            CoveEncodingKind::Rle,
+            3,
+            &rle_bytes,
+            None,
+        );
+        let prepared = rle.prepare().unwrap();
+        assert_eq!(prepared.decode_row(2).unwrap(), CoveArrayValue::Int64(9));
+        assert_eq!(
+            prepared.decode_all_rows().unwrap(),
+            rle.decode_all_rows().unwrap()
+        );
+
+        let payload = LocalCodebookPayload {
+            values: LocalCodebookValues::VarBytes(vec![b"red".to_vec(), b"blue".to_vec()]),
+            indexes: LocalIndexPayload::Rle(RlePayload {
+                runs: vec![(0, 1), (1, 2)],
+            }),
+        };
+        let data = payload.encode();
+        let local_codebook = make_physical_array(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            CoveEncodingKind::LocalCodebook,
+            3,
+            &data,
+        );
+        let prepared = local_codebook.prepare().unwrap();
+        assert_eq!(
+            prepared.decode_selected_rows(&[2, 0]).unwrap(),
+            vec![
+                CoveArrayValue::OwnedBytes(b"blue".to_vec()),
+                CoveArrayValue::OwnedBytes(b"red".to_vec())
+            ]
+        );
+        assert_eq!(
+            prepared.decode_all_rows().unwrap(),
+            local_codebook.decode_all_rows().unwrap()
         );
     }
 
