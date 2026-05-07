@@ -34,7 +34,7 @@ use cove_core::{
 
 use crate::{
     execution_code::{self, ExecutionCodePlanStats},
-    options::ExecutionCodePolicy,
+    options::{ExecutionCodePolicy, LocalFileReadPolicy, PagePayloadValidationPolicy},
     overlay::RowVisibility,
     planner::{CovePredicate, ScanPlan},
     range_reader::RangeCoalescingOptions,
@@ -187,6 +187,8 @@ pub struct DatasetState {
     segments: Arc<Vec<TableSegmentIndexEntryV1>>,
     arrow_export_options: ArrowExportOptions,
     execution_code_policy: ExecutionCodePolicy,
+    page_payload_validation_policy: PagePayloadValidationPolicy,
+    local_file_read_policy: LocalFileReadPolicy,
     target_morsels_per_partition: usize,
     range_coalescing: RangeCoalescingOptions,
     dynamic_filters_enabled: bool,
@@ -205,6 +207,8 @@ impl DatasetState {
             bytes,
             ArrowExportOptions::default(),
             ExecutionCodePolicy::Opportunistic,
+            PagePayloadValidationPolicy::Trusted,
+            LocalFileReadPolicy::PositionedReads,
             128,
             RangeCoalescingOptions::default(),
             false,
@@ -218,6 +222,8 @@ impl DatasetState {
         bytes: Vec<u8>,
         arrow_export_options: ArrowExportOptions,
         execution_code_policy: ExecutionCodePolicy,
+        page_payload_validation_policy: PagePayloadValidationPolicy,
+        local_file_read_policy: LocalFileReadPolicy,
         target_morsels_per_partition: usize,
         range_coalescing: RangeCoalescingOptions,
         dynamic_filters_enabled: bool,
@@ -300,6 +306,8 @@ impl DatasetState {
             segments,
             arrow_export_options,
             execution_code_policy,
+            page_payload_validation_policy,
+            local_file_read_policy,
             target_morsels_per_partition: target_morsels_per_partition.max(1),
             range_coalescing,
             dynamic_filters_enabled,
@@ -328,6 +336,8 @@ impl DatasetState {
         pruning: PruningMetadata,
         arrow_export_options: ArrowExportOptions,
         execution_code_policy: ExecutionCodePolicy,
+        page_payload_validation_policy: PagePayloadValidationPolicy,
+        local_file_read_policy: LocalFileReadPolicy,
         target_morsels_per_partition: usize,
         range_coalescing: RangeCoalescingOptions,
         dynamic_filters_enabled: bool,
@@ -377,6 +387,8 @@ impl DatasetState {
             segments,
             arrow_export_options,
             execution_code_policy,
+            page_payload_validation_policy,
+            local_file_read_policy,
             target_morsels_per_partition: target_morsels_per_partition.max(1),
             range_coalescing,
             dynamic_filters_enabled,
@@ -398,6 +410,8 @@ impl DatasetState {
         mut bootstrap_stats: DatasetBootstrapStats,
         arrow_export_options: ArrowExportOptions,
         execution_code_policy: ExecutionCodePolicy,
+        page_payload_validation_policy: PagePayloadValidationPolicy,
+        local_file_read_policy: LocalFileReadPolicy,
         target_morsels_per_partition: usize,
         range_coalescing: RangeCoalescingOptions,
         dynamic_filters_enabled: bool,
@@ -442,6 +456,8 @@ impl DatasetState {
             segments: Arc::clone(&primary.segments),
             arrow_export_options,
             execution_code_policy,
+            page_payload_validation_policy,
+            local_file_read_policy,
             target_morsels_per_partition: target_morsels_per_partition.max(1),
             range_coalescing,
             dynamic_filters_enabled,
@@ -571,6 +587,8 @@ impl DatasetState {
             segments: Arc::clone(&file.segments),
             arrow_export_options: self.arrow_export_options,
             execution_code_policy: self.execution_code_policy,
+            page_payload_validation_policy: self.page_payload_validation_policy,
+            local_file_read_policy: self.local_file_read_policy,
             target_morsels_per_partition: self.target_morsels_per_partition,
             range_coalescing: self.range_coalescing,
             dynamic_filters_enabled: self.dynamic_filters_enabled,
@@ -643,6 +661,14 @@ impl DatasetState {
 
     pub fn execution_code_policy(&self) -> ExecutionCodePolicy {
         self.execution_code_policy
+    }
+
+    pub fn page_payload_validation_policy(&self) -> PagePayloadValidationPolicy {
+        self.page_payload_validation_policy
+    }
+
+    pub fn local_file_read_policy(&self) -> LocalFileReadPolicy {
+        self.local_file_read_policy
     }
 
     pub fn target_morsels_per_partition(&self) -> usize {

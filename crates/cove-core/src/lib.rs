@@ -100,6 +100,7 @@ pub mod pruning;
 pub mod reader;
 pub mod redaction;
 pub mod registry;
+pub mod retained_bytes;
 pub mod row_ref;
 pub mod segment;
 pub mod sort;

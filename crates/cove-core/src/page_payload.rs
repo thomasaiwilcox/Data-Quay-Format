@@ -7,6 +7,7 @@
 use crate::{
     checksum,
     constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
+    retained_bytes::RetainedBytes,
     CoveError,
 };
 
@@ -14,6 +15,12 @@ pub const COLUMN_PAGE_PAYLOAD_MAGIC: [u8; 4] = *b"CPG1";
 pub const COLUMN_PAGE_PAYLOAD_HEADER_LEN: usize = 36;
 pub const COVE_ENCODING_NODE_LEN: usize = 30;
 pub const PAGE_BUFFER_DESCRIPTOR_LEN: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferChecksumValidation {
+    Verify,
+    Trusted,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -252,106 +259,42 @@ pub struct ColumnPagePayloadV1 {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedColumnPagePayloadV1 {
+    pub header: ColumnPagePayloadHeaderV1,
+    pub nodes: Vec<CoveEncodingNodeV1>,
+    pub buffers: Vec<PageBufferDescriptorV1>,
+    pub data: RetainedBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedColumnPagePayloadParts {
+    header: ColumnPagePayloadHeaderV1,
+    nodes: Vec<CoveEncodingNodeV1>,
+    buffers: Vec<PageBufferDescriptorV1>,
+}
+
 impl ColumnPagePayloadV1 {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        let header = ColumnPagePayloadHeaderV1::parse(bytes)?;
-        let nodes_offset =
-            usize::try_from(header.nodes_offset).map_err(|_| CoveError::OffsetRange)?;
-        let buffer_directory_offset =
-            usize::try_from(header.buffer_directory_offset).map_err(|_| CoveError::OffsetRange)?;
-        let buffers_offset =
-            usize::try_from(header.buffers_offset).map_err(|_| CoveError::OffsetRange)?;
-        if nodes_offset != COLUMN_PAGE_PAYLOAD_HEADER_LEN
-            || buffer_directory_offset < nodes_offset
-            || buffers_offset < buffer_directory_offset
-            || buffers_offset > bytes.len()
-        {
-            return Err(CoveError::PageCorrupt);
-        }
-        let node_region_len = (header.node_count as usize)
-            .checked_mul(COVE_ENCODING_NODE_LEN)
-            .ok_or(CoveError::ArithOverflow)?;
-        let expected_buffer_directory_offset = nodes_offset
-            .checked_add(node_region_len)
-            .ok_or(CoveError::ArithOverflow)?;
-        if buffer_directory_offset != expected_buffer_directory_offset {
-            return Err(CoveError::PageCorrupt);
-        }
-        let buffer_region_len = (header.buffer_count as usize)
-            .checked_mul(PAGE_BUFFER_DESCRIPTOR_LEN)
-            .ok_or(CoveError::ArithOverflow)?;
-        let expected_buffers_offset = buffer_directory_offset
-            .checked_add(buffer_region_len)
-            .ok_or(CoveError::ArithOverflow)?;
-        if buffers_offset != expected_buffers_offset {
-            return Err(CoveError::PageCorrupt);
-        }
-        if header.node_count == 0 {
-            return Err(CoveError::PageCorrupt);
-        }
+        Self::parse_with_buffer_checksum_validation(bytes, BufferChecksumValidation::Verify)
+    }
 
-        let mut nodes = Vec::with_capacity(header.node_count as usize);
-        let mut pos = nodes_offset;
-        for _ in 0..header.node_count {
-            nodes.push(CoveEncodingNodeV1::parse(
-                &bytes[pos..pos + COVE_ENCODING_NODE_LEN],
-            )?);
-            pos += COVE_ENCODING_NODE_LEN;
-        }
-        let mut seen_node_ids = std::collections::BTreeSet::new();
-        for node in &nodes {
-            if !seen_node_ids.insert(node.node_id) {
-                return Err(CoveError::PageCorrupt);
-            }
-        }
-
-        let mut roots = nodes
-            .iter()
-            .filter(|node| node.node_id == header.root_node_id);
-        let root = roots.next().ok_or(CoveError::PageCorrupt)?;
-        if roots.next().is_some() {
-            return Err(CoveError::PageCorrupt);
-        }
-        if root.logical_len != header.row_count {
-            return Err(CoveError::PageCorrupt);
-        }
-
-        let mut buffers = Vec::with_capacity(header.buffer_count as usize);
-        let mut pos = buffer_directory_offset;
-        let mut previous_end = buffers_offset as u64;
-        for expected_id in 0..header.buffer_count {
-            let descriptor =
-                PageBufferDescriptorV1::parse(&bytes[pos..pos + PAGE_BUFFER_DESCRIPTOR_LEN])?;
-            if descriptor.buffer_id != expected_id {
-                return Err(CoveError::PageCorrupt);
-            }
-            if descriptor.offset < buffers_offset as u64 || descriptor.offset < previous_end {
-                return Err(CoveError::PageCorrupt);
-            }
-            let end = descriptor
-                .offset
-                .checked_add(descriptor.length)
-                .ok_or(CoveError::ArithOverflow)?;
-            let end_usize = usize::try_from(end).map_err(|_| CoveError::OffsetRange)?;
-            if end_usize > bytes.len() {
-                return Err(CoveError::OffsetRange);
-            }
-            let start = usize::try_from(descriptor.offset).map_err(|_| CoveError::OffsetRange)?;
-            if checksum::crc32c(&bytes[start..end_usize]) != descriptor.checksum {
-                return Err(CoveError::ChecksumMismatch);
-            }
-            previous_end = end;
-            buffers.push(descriptor);
-            pos += PAGE_BUFFER_DESCRIPTOR_LEN;
-        }
-        if previous_end != bytes.len() as u64 {
-            return Err(CoveError::PageCorrupt);
-        }
+    /// Parse a column page payload with caller-selected physical buffer checksum
+    /// handling.
+    ///
+    /// INVARIANT: `Trusted` skips only descriptor buffer CRC checks. The page
+    /// header, node layout, descriptor order, descriptor bounds, and contiguous
+    /// data coverage are still validated before the payload is accepted.
+    pub fn parse_with_buffer_checksum_validation(
+        bytes: &[u8],
+        checksum_validation: BufferChecksumValidation,
+    ) -> Result<Self, CoveError> {
+        let parts = parse_column_page_payload_parts(bytes, checksum_validation)?;
 
         Ok(Self {
-            header,
-            nodes,
-            buffers,
+            header: parts.header,
+            nodes: parts.nodes,
+            buffers: parts.buffers,
             data: bytes.to_vec(),
         })
     }
@@ -500,13 +443,172 @@ impl ColumnPagePayloadV1 {
                 .ok_or(CoveError::ArithOverflow)?,
         )
         .map_err(|_| CoveError::OffsetRange)?;
-        Ok(Some(&self.data[start..end]))
+        Ok(Some(&self.data.as_slice()[start..end]))
     }
+}
+
+impl RetainedColumnPagePayloadV1 {
+    pub fn parse(data: impl Into<RetainedBytes>) -> Result<Self, CoveError> {
+        Self::parse_with_buffer_checksum_validation(data, BufferChecksumValidation::Verify)
+    }
+
+    /// Parse a retained column page payload without copying the payload bytes.
+    ///
+    /// INVARIANT: `Trusted` skips only descriptor buffer CRC checks. The page
+    /// header, node layout, descriptor order, descriptor bounds, and contiguous
+    /// data coverage are still validated before the payload is accepted.
+    pub fn parse_with_buffer_checksum_validation(
+        data: impl Into<RetainedBytes>,
+        checksum_validation: BufferChecksumValidation,
+    ) -> Result<Self, CoveError> {
+        let data = data.into();
+        let parts = parse_column_page_payload_parts(data.as_slice(), checksum_validation)?;
+        Ok(Self {
+            header: parts.header,
+            nodes: parts.nodes,
+            buffers: parts.buffers,
+            data,
+        })
+    }
+
+    pub fn root_node(&self) -> Result<&CoveEncodingNodeV1, CoveError> {
+        let mut roots = self
+            .nodes
+            .iter()
+            .filter(|node| node.node_id == self.header.root_node_id);
+        let root = roots.next().ok_or(CoveError::PageCorrupt)?;
+        if roots.next().is_some() {
+            return Err(CoveError::PageCorrupt);
+        }
+        Ok(root)
+    }
+
+    pub fn buffer_bytes(&self, kind: PageBufferKind) -> Result<Option<&[u8]>, CoveError> {
+        let Some(buffer) = self.buffers.iter().find(|buffer| buffer.kind == kind) else {
+            return Ok(None);
+        };
+        let start = usize::try_from(buffer.offset).map_err(|_| CoveError::OffsetRange)?;
+        let end = usize::try_from(
+            buffer
+                .offset
+                .checked_add(buffer.length)
+                .ok_or(CoveError::ArithOverflow)?,
+        )
+        .map_err(|_| CoveError::OffsetRange)?;
+        Ok(Some(&self.data.as_slice()[start..end]))
+    }
+}
+
+fn parse_column_page_payload_parts(
+    bytes: &[u8],
+    checksum_validation: BufferChecksumValidation,
+) -> Result<ParsedColumnPagePayloadParts, CoveError> {
+    let header = ColumnPagePayloadHeaderV1::parse(bytes)?;
+    let nodes_offset = usize::try_from(header.nodes_offset).map_err(|_| CoveError::OffsetRange)?;
+    let buffer_directory_offset =
+        usize::try_from(header.buffer_directory_offset).map_err(|_| CoveError::OffsetRange)?;
+    let buffers_offset =
+        usize::try_from(header.buffers_offset).map_err(|_| CoveError::OffsetRange)?;
+    if nodes_offset != COLUMN_PAGE_PAYLOAD_HEADER_LEN
+        || buffer_directory_offset < nodes_offset
+        || buffers_offset < buffer_directory_offset
+        || buffers_offset > bytes.len()
+    {
+        return Err(CoveError::PageCorrupt);
+    }
+    let node_region_len = (header.node_count as usize)
+        .checked_mul(COVE_ENCODING_NODE_LEN)
+        .ok_or(CoveError::ArithOverflow)?;
+    let expected_buffer_directory_offset = nodes_offset
+        .checked_add(node_region_len)
+        .ok_or(CoveError::ArithOverflow)?;
+    if buffer_directory_offset != expected_buffer_directory_offset {
+        return Err(CoveError::PageCorrupt);
+    }
+    let buffer_region_len = (header.buffer_count as usize)
+        .checked_mul(PAGE_BUFFER_DESCRIPTOR_LEN)
+        .ok_or(CoveError::ArithOverflow)?;
+    let expected_buffers_offset = buffer_directory_offset
+        .checked_add(buffer_region_len)
+        .ok_or(CoveError::ArithOverflow)?;
+    if buffers_offset != expected_buffers_offset {
+        return Err(CoveError::PageCorrupt);
+    }
+    if header.node_count == 0 {
+        return Err(CoveError::PageCorrupt);
+    }
+
+    let mut nodes = Vec::with_capacity(header.node_count as usize);
+    let mut pos = nodes_offset;
+    for _ in 0..header.node_count {
+        nodes.push(CoveEncodingNodeV1::parse(
+            &bytes[pos..pos + COVE_ENCODING_NODE_LEN],
+        )?);
+        pos += COVE_ENCODING_NODE_LEN;
+    }
+    let mut seen_node_ids = std::collections::BTreeSet::new();
+    for node in &nodes {
+        if !seen_node_ids.insert(node.node_id) {
+            return Err(CoveError::PageCorrupt);
+        }
+    }
+
+    let mut roots = nodes
+        .iter()
+        .filter(|node| node.node_id == header.root_node_id);
+    let root = roots.next().ok_or(CoveError::PageCorrupt)?;
+    if roots.next().is_some() {
+        return Err(CoveError::PageCorrupt);
+    }
+    if root.logical_len != header.row_count {
+        return Err(CoveError::PageCorrupt);
+    }
+
+    let mut buffers = Vec::with_capacity(header.buffer_count as usize);
+    let mut pos = buffer_directory_offset;
+    let mut previous_end = buffers_offset as u64;
+    for expected_id in 0..header.buffer_count {
+        let descriptor =
+            PageBufferDescriptorV1::parse(&bytes[pos..pos + PAGE_BUFFER_DESCRIPTOR_LEN])?;
+        if descriptor.buffer_id != expected_id {
+            return Err(CoveError::PageCorrupt);
+        }
+        if descriptor.offset < buffers_offset as u64 || descriptor.offset < previous_end {
+            return Err(CoveError::PageCorrupt);
+        }
+        let end = descriptor
+            .offset
+            .checked_add(descriptor.length)
+            .ok_or(CoveError::ArithOverflow)?;
+        let end_usize = usize::try_from(end).map_err(|_| CoveError::OffsetRange)?;
+        if end_usize > bytes.len() {
+            return Err(CoveError::OffsetRange);
+        }
+        let start = usize::try_from(descriptor.offset).map_err(|_| CoveError::OffsetRange)?;
+        if checksum_validation == BufferChecksumValidation::Verify
+            && checksum::crc32c(&bytes[start..end_usize]) != descriptor.checksum
+        {
+            return Err(CoveError::ChecksumMismatch);
+        }
+        previous_end = end;
+        buffers.push(descriptor);
+        pos += PAGE_BUFFER_DESCRIPTOR_LEN;
+    }
+    if previous_end != bytes.len() as u64 {
+        return Err(CoveError::PageCorrupt);
+    }
+
+    Ok(ParsedColumnPagePayloadParts {
+        header,
+        nodes,
+        buffers,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn single_node_payload_round_trips() {
@@ -528,6 +630,56 @@ mod tests {
         assert_eq!(
             parsed.buffer_bytes(PageBufferKind::Values).unwrap(),
             Some(&[1, 2, 3, 4][..])
+        );
+    }
+
+    #[test]
+    fn retained_payload_parser_matches_owned_parser() {
+        let bytes = ColumnPagePayloadV1::build_single_node(
+            2,
+            CoveEncodingKind::VarBytes,
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            None,
+            b"\x02\0\0\0hi\x03\0\0\0bye".to_vec(),
+        )
+        .unwrap();
+        let owned = ColumnPagePayloadV1::parse(&bytes).unwrap();
+        let retained = RetainedColumnPagePayloadV1::parse(bytes).unwrap();
+        assert_eq!(retained.header, owned.header);
+        assert_eq!(retained.nodes, owned.nodes);
+        assert_eq!(retained.buffers, owned.buffers);
+        assert_eq!(retained.data.as_slice(), owned.data.as_slice());
+        assert_eq!(
+            retained.buffer_bytes(PageBufferKind::Values).unwrap(),
+            owned.buffer_bytes(PageBufferKind::Values).unwrap()
+        );
+    }
+
+    #[test]
+    fn retained_payload_parser_accepts_slice_owner() {
+        let payload = ColumnPagePayloadV1::build_single_node(
+            2,
+            CoveEncodingKind::VarBytes,
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            None,
+            b"\x02\0\0\0hi\x03\0\0\0bye".to_vec(),
+        )
+        .unwrap();
+        let mut owner = b"prefix".to_vec();
+        let offset = owner.len();
+        owner.extend_from_slice(&payload);
+        owner.extend_from_slice(b"suffix");
+
+        let retained = RetainedColumnPagePayloadV1::parse(
+            RetainedBytes::from_arc_slice(Arc::new(owner), offset, payload.len()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retained.data.as_slice(), payload.as_slice());
+        assert_eq!(
+            retained.buffer_bytes(PageBufferKind::Values).unwrap(),
+            Some(&b"\x02\0\0\0hi\x03\0\0\0bye"[..])
         );
     }
 

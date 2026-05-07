@@ -29,6 +29,7 @@ use crate::{
         stream::{CoveRecordBatchStream, CoveStreamMetrics},
     },
     dataset_state::DatasetState,
+    decode::ScanExecutionCache,
     planner::ScanPlan,
     task_graph::{build_task_graph, TaskGraph},
 };
@@ -41,6 +42,7 @@ pub struct CoveExec {
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+    scan_cache: Arc<ScanExecutionCache>,
     #[cfg(feature = "dynamic-filters")]
     dynamic_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
@@ -65,6 +67,7 @@ impl CoveExec {
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            scan_cache: Arc::new(ScanExecutionCache::default()),
             #[cfg(feature = "dynamic-filters")]
             dynamic_filters: Vec::new(),
         })
@@ -140,6 +143,7 @@ impl ExecutionPlan for CoveExec {
         Ok(Box::pin(CoveRecordBatchStream::new(
             Arc::clone(&self.schema),
             Arc::clone(&self.state),
+            Arc::clone(&self.scan_cache),
             self.plan.clone(),
             tasks,
             partition,

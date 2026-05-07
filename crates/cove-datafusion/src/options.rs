@@ -1,6 +1,9 @@
 //! Public options for COVE-backed DataFusion table registration.
 
-use cove_arrow::arrow::{ArrowDictionaryPolicy, ArrowExportOptions};
+use cove_arrow::arrow::{
+    ArrowDictionaryPolicy, ArrowExportOptions, ArrowStringValidationPolicy,
+    ArrowVarBytesExportPolicy,
+};
 
 use crate::range_reader::RangeCoalescingOptions;
 
@@ -11,6 +14,8 @@ pub struct CoveTableOptions {
     sidecar_digest_policy: SidecarDigestPolicy,
     covx_discovery: CovxDiscovery,
     execution_code_policy: ExecutionCodePolicy,
+    page_payload_validation_policy: PagePayloadValidationPolicy,
+    local_file_read_policy: LocalFileReadPolicy,
     target_morsels_per_partition: usize,
     range_coalescing: RangeCoalescingOptions,
     #[cfg(feature = "dynamic-filters")]
@@ -43,6 +48,18 @@ pub enum ExecutionCodePolicy {
     RequireSupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagePayloadValidationPolicy {
+    Trusted,
+    Strict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LocalFileReadPolicy {
+    PositionedReads,
+    Mmap,
+}
+
 impl Default for CoveTableOptions {
     fn default() -> Self {
         Self {
@@ -51,6 +68,8 @@ impl Default for CoveTableOptions {
             sidecar_digest_policy: SidecarDigestPolicy::RequireFreshFingerprint,
             covx_discovery: default_covx_discovery(),
             execution_code_policy: ExecutionCodePolicy::Opportunistic,
+            page_payload_validation_policy: PagePayloadValidationPolicy::Trusted,
+            local_file_read_policy: LocalFileReadPolicy::PositionedReads,
             target_morsels_per_partition: 128,
             range_coalescing: RangeCoalescingOptions::default(),
             #[cfg(feature = "dynamic-filters")]
@@ -71,6 +90,27 @@ impl CoveTableOptions {
 
     pub fn with_arrow_dictionary_output(mut self) -> Self {
         self.arrow_export_options.dictionary_policy = ArrowDictionaryPolicy::DictionaryKeys;
+        self
+    }
+
+    pub fn with_arrow_view_output(mut self) -> Self {
+        self.arrow_export_options.varbytes_policy = ArrowVarBytesExportPolicy::View;
+        self
+    }
+
+    pub fn with_standard_arrow_varbytes_output(mut self) -> Self {
+        self.arrow_export_options.varbytes_policy = ArrowVarBytesExportPolicy::Standard;
+        self
+    }
+
+    pub fn with_trusted_arrow_string_validation(mut self) -> Self {
+        self.arrow_export_options.string_validation_policy =
+            ArrowStringValidationPolicy::TrustedPageProof;
+        self
+    }
+
+    pub fn with_strict_arrow_string_validation(mut self) -> Self {
+        self.arrow_export_options.string_validation_policy = ArrowStringValidationPolicy::Strict;
         self
     }
 
@@ -107,6 +147,34 @@ impl CoveTableOptions {
 
     pub fn with_execution_code_policy(mut self, policy: ExecutionCodePolicy) -> Self {
         self.execution_code_policy = policy;
+        self
+    }
+
+    pub fn page_payload_validation_policy(self) -> PagePayloadValidationPolicy {
+        self.page_payload_validation_policy
+    }
+
+    pub fn with_trusted_page_payload_validation(mut self) -> Self {
+        self.page_payload_validation_policy = PagePayloadValidationPolicy::Trusted;
+        self
+    }
+
+    pub fn with_strict_page_payload_validation(mut self) -> Self {
+        self.page_payload_validation_policy = PagePayloadValidationPolicy::Strict;
+        self
+    }
+
+    pub fn local_file_read_policy(self) -> LocalFileReadPolicy {
+        self.local_file_read_policy
+    }
+
+    pub fn with_local_file_mmap_reads(mut self) -> Self {
+        self.local_file_read_policy = LocalFileReadPolicy::Mmap;
+        self
+    }
+
+    pub fn with_positioned_local_file_reads(mut self) -> Self {
+        self.local_file_read_policy = LocalFileReadPolicy::PositionedReads;
         self
     }
 

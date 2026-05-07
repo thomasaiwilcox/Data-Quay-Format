@@ -19,7 +19,9 @@ use futures::Stream;
 use crate::{
     adapter_v53::cove_to_datafusion,
     dataset_state::DatasetState,
-    decode::{decode_local_dataset_scan_tasks, DecodeStats, DecodedScan},
+    decode::{
+        decode_local_dataset_scan_tasks_with_cache, DecodeStats, DecodedScan, ScanExecutionCache,
+    },
     planner::ScanPlan,
     task_graph::ScanTask,
 };
@@ -250,6 +252,7 @@ impl CoveStreamMetrics {
 pub(crate) struct CoveRecordBatchStream {
     schema: SchemaRef,
     state: Option<Arc<DatasetState>>,
+    scan_cache: Arc<ScanExecutionCache>,
     plan: ScanPlan,
     tasks: Vec<ScanTask>,
     partition_index: usize,
@@ -267,6 +270,7 @@ impl CoveRecordBatchStream {
     pub(crate) fn new(
         schema: SchemaRef,
         state: Arc<DatasetState>,
+        scan_cache: Arc<ScanExecutionCache>,
         plan: ScanPlan,
         tasks: Vec<ScanTask>,
         partition_index: usize,
@@ -277,6 +281,7 @@ impl CoveRecordBatchStream {
         Self {
             schema,
             state: Some(state),
+            scan_cache,
             plan,
             tasks,
             partition_index,
@@ -332,13 +337,15 @@ impl Stream for CoveRecordBatchStream {
             let tasks = this.tasks.clone();
             let partition_index = this.partition_index;
             let partition_count = this.partition_count;
+            let scan_cache = Arc::clone(&this.scan_cache);
             this.decode_task = Some(tokio::task::spawn_blocking(move || {
-                let mut decoded = decode_local_dataset_scan_tasks(
+                let mut decoded = decode_local_dataset_scan_tasks_with_cache(
                     &state,
                     &plan,
                     &tasks,
                     partition_index,
                     partition_count,
+                    scan_cache,
                 )?;
                 decoded.stats.add_decode(dynamic_stats);
                 Ok(decoded)

@@ -76,7 +76,11 @@ use datafusion::object_store::{
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use datafusion::{
-    arrow::{array::DictionaryArray, datatypes::UInt32Type, util::pretty::pretty_format_batches},
+    arrow::{
+        array::{Array, BinaryViewArray, DictionaryArray, StringViewArray},
+        datatypes::UInt32Type,
+        util::pretty::pretty_format_batches,
+    },
     assert_batches_eq,
     catalog::TableProvider,
     common::{stats::Precision, Column, ScalarValue},
@@ -564,6 +568,142 @@ async fn select_projected_column_returns_only_projection() {
     ];
     assert_batches_eq!(expected, &batches);
     assert!(batches.iter().all(|batch| batch.num_columns() == 1));
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn arrow_view_output_returns_view_arrays_and_preserves_values() {
+    let path = write_temp_cove("arrow_view_output", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file_with_options(
+        &ctx,
+        "events",
+        &path,
+        CoveTableOptions::default().with_arrow_view_output(),
+    )
+    .unwrap();
+
+    let batches = ctx
+        .sql("SELECT name FROM events WHERE name >= 'beta'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches[0].schema().field(0).data_type(),
+        &datafusion::arrow::datatypes::DataType::Utf8View
+    );
+    let names = batches
+        .iter()
+        .flat_map(|batch| {
+            let array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap();
+            (0..array.len())
+                .map(|row| array.value(row).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["beta", "gamma"]);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn arrow_view_output_returns_binary_view_arrays() {
+    let path = write_temp_cove("arrow_binary_view_output", binary_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file_with_options(
+        &ctx,
+        "events",
+        &path,
+        CoveTableOptions::default().with_arrow_view_output(),
+    )
+    .unwrap();
+
+    let batches = ctx
+        .sql("SELECT payload FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches[0].schema().field(0).data_type(),
+        &datafusion::arrow::datatypes::DataType::BinaryView
+    );
+    let payloads = batches
+        .iter()
+        .flat_map(|batch| {
+            let array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .unwrap();
+            (0..array.len())
+                .map(|row| array.value(row).to_vec())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payloads,
+        vec![b"short".to_vec(), b"long-binary-payload".to_vec()]
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn arrow_view_output_supports_sort_group_and_topn() {
+    let path = write_temp_cove("arrow_view_sort_group", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file_with_options(
+        &ctx,
+        "events",
+        &path,
+        CoveTableOptions::default().with_arrow_view_output(),
+    )
+    .unwrap();
+
+    let sorted = ctx
+        .sql("SELECT name FROM events ORDER BY name DESC LIMIT 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        sorted[0].schema().field(0).data_type(),
+        &datafusion::arrow::datatypes::DataType::Utf8View
+    );
+    let expected_sorted = [
+        "+-------+",
+        "| name  |",
+        "+-------+",
+        "| gamma |",
+        "| beta  |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected_sorted, &sorted);
+
+    let grouped = ctx
+        .sql("SELECT name, COUNT(*) AS n FROM events GROUP BY name ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected_grouped = [
+        "+-------+---+",
+        "| name  | n |",
+        "+-------+---+",
+        "| alpha | 1 |",
+        "| beta  | 1 |",
+        "| gamma | 1 |",
+        "+-------+---+",
+    ];
+    assert_batches_eq!(expected_grouped, &grouped);
     fs::remove_file(path).unwrap();
 }
 
@@ -1934,6 +2074,39 @@ fn primitive_events_file() -> Vec<u8> {
     writer.write().unwrap()
 }
 
+fn binary_events_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 41,
+            namespace: "public".into(),
+            name: "events".into(),
+            row_count: 2,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![column(
+                1,
+                "payload",
+                CoveLogicalType::Binary,
+                CovePhysicalKind::VarBytes,
+                false,
+            )],
+        }],
+    };
+    let mut segment = ScanSegment::new(41, 0, 0, 2, 1);
+    segment.set_column_pages(
+        1,
+        vec![varbytes_page(
+            2,
+            varbinary(&[b"short", b"long-binary-payload"]),
+        )],
+    );
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
 fn nullable_events_file() -> Vec<u8> {
     let catalog = TableCatalog {
         flags: 0,
@@ -2714,6 +2887,15 @@ fn varbytes(values: &[&str]) -> Vec<u8> {
     for value in values {
         out.extend_from_slice(&(value.len() as u32).to_le_bytes());
         out.extend_from_slice(value.as_bytes());
+    }
+    out
+}
+
+fn varbinary(values: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for value in values {
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(value);
     }
     out
 }

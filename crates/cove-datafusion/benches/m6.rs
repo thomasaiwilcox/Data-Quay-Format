@@ -46,7 +46,9 @@ use cove_datafusion::{
     options::CoveTableOptions,
     overlay::{CoveOverlaySnapshot, OverlayFile, OverlayFileIdentity, RowRange, RowVisibility},
     planner::{plan_scan, FilterPlan, NumericPredicateOp, PredicateLiteral, TopNScanHint},
-    register::{register_cove_file, register_cove_overlay_snapshot},
+    register::{
+        register_cove_file, register_cove_file_with_options, register_cove_overlay_snapshot,
+    },
 };
 use criterion::{black_box, criterion_group, Criterion};
 #[cfg(feature = "parquet-compare")]
@@ -341,6 +343,76 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
         &large_projection_cove,
         &large_projection_parquet,
     );
+
+    let view_fixture = ParquetCompareFixture::new_with_cove_options(
+        &runtime,
+        CoveTableOptions::default().with_arrow_view_output(),
+    );
+    let trusted_fixture = ParquetCompareFixture::new_with_cove_options(
+        &runtime,
+        CoveTableOptions::default().with_trusted_arrow_string_validation(),
+    );
+    let mmap_fixture = ParquetCompareFixture::new_with_cove_options(
+        &runtime,
+        CoveTableOptions::default().with_local_file_mmap_reads(),
+    );
+    let large_projection_view = view_fixture.prepare_query(
+        &runtime,
+        "SELECT payload FROM large_events_cove",
+        PARQUET_COMPARE_SCAN_HEAVY_ROWS,
+        1,
+    );
+    let large_projection_trusted = trusted_fixture.prepare_query(
+        &runtime,
+        "SELECT payload FROM large_events_cove",
+        PARQUET_COMPARE_SCAN_HEAVY_ROWS,
+        1,
+    );
+    let large_projection_mmap = mmap_fixture.prepare_query(
+        &runtime,
+        "SELECT payload FROM large_events_cove",
+        PARQUET_COMPARE_SCAN_HEAVY_ROWS,
+        1,
+    );
+    let mut arrow_output_group =
+        c.benchmark_group("cove_arrow_varbytes_output_scan_heavy_projection");
+    arrow_output_group.bench_function("standard-strict", |b| {
+        b.iter(|| {
+            black_box(execute_prepared_query(
+                &runtime,
+                &fixture.ctx,
+                &large_projection_cove,
+            ))
+        })
+    });
+    arrow_output_group.bench_function("standard-trusted", |b| {
+        b.iter(|| {
+            black_box(execute_prepared_query(
+                &runtime,
+                &trusted_fixture.ctx,
+                &large_projection_trusted,
+            ))
+        })
+    });
+    arrow_output_group.bench_function("standard-strict-mmap", |b| {
+        b.iter(|| {
+            black_box(execute_prepared_query(
+                &runtime,
+                &mmap_fixture.ctx,
+                &large_projection_mmap,
+            ))
+        })
+    });
+    arrow_output_group.bench_function("view", |b| {
+        b.iter(|| {
+            black_box(execute_prepared_query(
+                &runtime,
+                &view_fixture.ctx,
+                &large_projection_view,
+            ))
+        })
+    });
+    arrow_output_group.finish();
 
     let large_low_cardinality_cove = fixture.prepare_query(
         &runtime,
@@ -645,6 +717,10 @@ struct ParquetCompareFixture {
 #[cfg(feature = "parquet-compare")]
 impl ParquetCompareFixture {
     fn new(runtime: &Runtime) -> Self {
+        Self::new_with_cove_options(runtime, CoveTableOptions::default())
+    }
+
+    fn new_with_cove_options(runtime: &Runtime, cove_options: CoveTableOptions) -> Self {
         let dir = TempFixtureDir::new("m6-parquet-compare");
 
         let events_cove = dir.path.join("events.cove");
@@ -699,14 +775,26 @@ impl ParquetCompareFixture {
         );
 
         let ctx = SessionContext::new();
-        register_cove_file(&ctx, "events_cove", &events_cove).expect("register events_cove");
-        register_cove_file(&ctx, "items_cove", &items_cove).expect("register items_cove");
-        register_cove_file(&ctx, "wide_events_cove", &wide_cove)
+        register_cove_file_with_options(&ctx, "events_cove", &events_cove, cove_options)
+            .expect("register events_cove");
+        register_cove_file_with_options(&ctx, "items_cove", &items_cove, cove_options)
+            .expect("register items_cove");
+        register_cove_file_with_options(&ctx, "wide_events_cove", &wide_cove, cove_options)
             .expect("register wide_events_cove");
-        register_cove_file(&ctx, "large_events_cove", &large_events.cove)
-            .expect("register large_events_cove");
-        register_cove_file(&ctx, "large_wide_events_cove", &large_wide_events.cove)
-            .expect("register large_wide_events_cove");
+        register_cove_file_with_options(
+            &ctx,
+            "large_events_cove",
+            &large_events.cove,
+            cove_options,
+        )
+        .expect("register large_events_cove");
+        register_cove_file_with_options(
+            &ctx,
+            "large_wide_events_cove",
+            &large_wide_events.cove,
+            cove_options,
+        )
+        .expect("register large_wide_events_cove");
 
         runtime.block_on(async {
             ctx.register_parquet(
@@ -1427,6 +1515,9 @@ struct QueryProfileCommand {
     engine: CompareSource,
     stage: QueryProfileStage,
     run_seconds: u64,
+    cove_arrow_view_output: bool,
+    cove_trusted_arrow_string_validation: bool,
+    cove_local_file_mmap_reads: bool,
 }
 
 #[cfg(feature = "parquet-compare")]
@@ -1455,6 +1546,9 @@ fn parse_query_profile_command(
     let mut engine = None;
     let mut stage = QueryProfileStage::ExecuteOnly;
     let mut run_seconds = None;
+    let mut cove_arrow_view_output = false;
+    let mut cove_trusted_arrow_string_validation = false;
+    let mut cove_local_file_mmap_reads = false;
 
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -1481,6 +1575,15 @@ fn parse_query_profile_command(
                         format!("invalid --run-seconds value '{value}': {error}")
                     })?);
             }
+            "--cove-arrow-view-output" => {
+                cove_arrow_view_output = true;
+            }
+            "--cove-trusted-arrow-string-validation" => {
+                cove_trusted_arrow_string_validation = true;
+            }
+            "--cove-local-file-mmap-reads" => {
+                cove_local_file_mmap_reads = true;
+            }
             "--help" | "-h" => {
                 return Err(query_profile_usage());
             }
@@ -1498,6 +1601,9 @@ fn parse_query_profile_command(
         engine: engine.ok_or_else(query_profile_usage)?,
         stage,
         run_seconds: run_seconds.unwrap_or(20),
+        cove_arrow_view_output,
+        cove_trusted_arrow_string_validation,
+        cove_local_file_mmap_reads,
     })
 }
 
@@ -1512,7 +1618,7 @@ fn next_profile_arg(
 
 #[cfg(feature = "parquet-compare")]
 fn query_profile_usage() -> String {
-    "usage: m6 profile-query --track <track> --engine <cove|parquet> [--stage <full-query|planning-only|execute-only>] [--run-seconds <seconds>]"
+    "usage: m6 profile-query --track <track> --engine <cove|parquet> [--stage <full-query|planning-only|execute-only>] [--run-seconds <seconds>] [--cove-arrow-view-output] [--cove-trusted-arrow-string-validation] [--cove-local-file-mmap-reads]"
         .into()
 }
 
@@ -1530,7 +1636,17 @@ fn parse_compare_source(value: &str) -> Result<CompareSource, String> {
 #[cfg(feature = "parquet-compare")]
 fn run_query_profile_command(command: QueryProfileCommand) {
     let runtime = Runtime::new().expect("query profile runtime");
-    let fixture = ParquetCompareFixture::new(&runtime);
+    let mut cove_options = CoveTableOptions::default();
+    if command.cove_arrow_view_output {
+        cove_options = cove_options.with_arrow_view_output();
+    }
+    if command.cove_trusted_arrow_string_validation {
+        cove_options = cove_options.with_trusted_arrow_string_validation();
+    }
+    if command.cove_local_file_mmap_reads {
+        cove_options = cove_options.with_local_file_mmap_reads();
+    }
+    let fixture = ParquetCompareFixture::new_with_cove_options(&runtime, cove_options);
     let query = profile_query_spec(&command.track, command.engine).unwrap_or_else(|message| {
         panic!("{message}");
     });
@@ -1545,11 +1661,14 @@ fn run_query_profile_command(command: QueryProfileCommand) {
     };
 
     println!(
-        "PROFILE_READY pid={} stage={} track={} engine={}",
+        "PROFILE_READY pid={} stage={} track={} engine={} cove_arrow_view_output={} cove_trusted_arrow_string_validation={} cove_local_file_mmap_reads={}",
         process::id(),
         command.stage.as_str(),
         command.track,
         compare_source_name(command.engine),
+        command.cove_arrow_view_output,
+        command.cove_trusted_arrow_string_validation,
+        command.cove_local_file_mmap_reads,
     );
     io::stdout().flush().expect("flush profile ready line");
     wait_for_profile_start_signal();

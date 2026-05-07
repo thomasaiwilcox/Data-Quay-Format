@@ -2,14 +2,18 @@
 
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    mem::MaybeUninit,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
-use cove_core::CoveError;
+use cove_core::{
+    retained_bytes::{RetainedByteOwner, RetainedByteSource, RetainedBytes},
+    CoveError,
+};
+use memmap2::Mmap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RangeCoalescingOptions {
@@ -70,7 +74,7 @@ impl RangeReadPlan {
 }
 
 #[async_trait]
-pub trait CoveRangeReader: Send + Sync {
+pub trait CoveRangeReader: std::fmt::Debug + Send + Sync {
     async fn read_ranges(
         &self,
         ranges: &[Range<u64>],
@@ -78,6 +82,19 @@ pub trait CoveRangeReader: Send + Sync {
     ) -> Result<Vec<Vec<u8>>, CoveError>;
 
     fn record_coalescing(&self, _original_ranges: usize, _coalesced_ranges: usize) {}
+
+    async fn read_range_buffers(
+        &self,
+        ranges: &[Range<u64>],
+        kind: RangeReadKind,
+    ) -> Result<Vec<RetainedBytes>, CoveError> {
+        Ok(self
+            .read_ranges(ranges, kind)
+            .await?
+            .into_iter()
+            .map(RetainedBytes::from_vec)
+            .collect())
+    }
 
     async fn read_range(
         &self,
@@ -87,12 +104,21 @@ pub trait CoveRangeReader: Send + Sync {
         let mut ranges = self.read_ranges(&[range], kind).await?;
         ranges.pop().ok_or(CoveError::BufferTooShort)
     }
+
+    async fn read_range_buffer(
+        &self,
+        range: Range<u64>,
+        kind: RangeReadKind,
+    ) -> Result<RetainedBytes, CoveError> {
+        let mut ranges = self.read_range_buffers(&[range], kind).await?;
+        ranges.pop().ok_or(CoveError::BufferTooShort)
+    }
 }
 
 #[derive(Debug)]
 pub struct LocalFileRangeReader {
     path: PathBuf,
-    file: Mutex<Option<File>>,
+    file: Mutex<Option<Arc<File>>>,
 }
 
 impl LocalFileRangeReader {
@@ -102,6 +128,17 @@ impl LocalFileRangeReader {
             file: Mutex::new(None),
         }
     }
+
+    fn file(&self) -> Result<Arc<File>, CoveError> {
+        let mut guard = self
+            .file
+            .lock()
+            .map_err(|_| CoveError::BadSection("local range reader file lock poisoned".into()))?;
+        if guard.is_none() {
+            *guard = Some(Arc::new(File::open(&self.path)?));
+        }
+        guard.as_ref().cloned().ok_or(CoveError::BufferTooShort)
+    }
 }
 
 #[async_trait]
@@ -109,24 +146,120 @@ impl CoveRangeReader for LocalFileRangeReader {
     async fn read_ranges(
         &self,
         ranges: &[Range<u64>],
-        _kind: RangeReadKind,
+        kind: RangeReadKind,
     ) -> Result<Vec<Vec<u8>>, CoveError> {
+        Ok(self
+            .read_range_buffers(ranges, kind)
+            .await?
+            .into_iter()
+            .map(|bytes| bytes.to_vec())
+            .collect())
+    }
+
+    async fn read_range_buffers(
+        &self,
+        ranges: &[Range<u64>],
+        _kind: RangeReadKind,
+    ) -> Result<Vec<RetainedBytes>, CoveError> {
         // INVARIANT: a LocalFileRangeReader is bound to one immutable COVE file
-        // snapshot. Reusing the descriptor avoids repeated open/close overhead
-        // while preserving checked seek/read bounds for every requested range.
-        let mut guard = self
-            .file
-            .lock()
-            .map_err(|_| CoveError::BadSection("local range reader file lock poisoned".into()))?;
-        if guard.is_none() {
-            *guard = Some(File::open(&self.path)?);
-        }
-        let file = guard.as_mut().ok_or(CoveError::BufferTooShort)?;
+        // snapshot. Reusing the descriptor avoids repeated open/close overhead;
+        // positioned reads avoid mutating shared file cursor state.
+        let file = self.file()?;
         let mut out = Vec::with_capacity(ranges.len());
         for range in ranges {
-            out.push(read_file_range(file, range)?);
+            out.push(RetainedBytes::from_vec(read_file_range(&file, range)?));
         }
         Ok(out)
+    }
+}
+
+#[derive(Debug)]
+struct MmapByteSource {
+    mmap: Mmap,
+}
+
+impl RetainedByteSource for MmapByteSource {
+    fn as_slice(&self) -> &[u8] {
+        self.mmap.as_ref()
+    }
+}
+
+/// Read-only mmap-backed local range reader.
+///
+/// INVARIANT: this reader is only selected by the explicit mmap read policy.
+/// Callers must use it for immutable local COVE files; if a file may be
+/// concurrently replaced, truncated, or modified, use `LocalFileRangeReader`.
+#[derive(Debug)]
+pub struct MmapFileRangeReader {
+    path: PathBuf,
+    owner: Mutex<Option<Arc<RetainedByteOwner>>>,
+}
+
+impl MmapFileRangeReader {
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            owner: Mutex::new(None),
+        }
+    }
+
+    fn owner(&self) -> Result<Arc<RetainedByteOwner>, CoveError> {
+        let mut guard = self
+            .owner
+            .lock()
+            .map_err(|_| CoveError::BadSection("local mmap reader lock poisoned".into()))?;
+        if let Some(owner) = guard.as_ref() {
+            return Ok(Arc::clone(owner));
+        }
+
+        let file = File::open(&self.path)?;
+        let len = file.metadata()?.len();
+        let owner = if len == 0 {
+            Arc::new(RetainedByteOwner::from_vec(Vec::new()))
+        } else {
+            // SAFETY: mmap mode is an explicit scan policy for immutable local
+            // COVE files. The returned read-only map is retained by the owner
+            // for every slice built from it, and positioned reads remain the
+            // default for files that may be concurrently modified/truncated.
+            let mmap = unsafe { Mmap::map(&file)? };
+            Arc::new(RetainedByteOwner::from_external(Arc::new(MmapByteSource {
+                mmap,
+            })))
+        };
+        *guard = Some(Arc::clone(&owner));
+        Ok(owner)
+    }
+}
+
+#[async_trait]
+impl CoveRangeReader for MmapFileRangeReader {
+    async fn read_ranges(
+        &self,
+        ranges: &[Range<u64>],
+        kind: RangeReadKind,
+    ) -> Result<Vec<Vec<u8>>, CoveError> {
+        Ok(self
+            .read_range_buffers(ranges, kind)
+            .await?
+            .into_iter()
+            .map(|bytes| bytes.to_vec())
+            .collect())
+    }
+
+    async fn read_range_buffers(
+        &self,
+        ranges: &[Range<u64>],
+        _kind: RangeReadKind,
+    ) -> Result<Vec<RetainedBytes>, CoveError> {
+        let owner = self.owner()?;
+        ranges
+            .iter()
+            .map(|range| {
+                let start = usize::try_from(range.start).map_err(|_| CoveError::OffsetRange)?;
+                let len = range_len(range)?;
+                RetainedBytes::from_owner_slice(Arc::clone(&owner), start, len)
+            })
+            .collect()
     }
 }
 
@@ -152,8 +285,21 @@ impl CoveRangeReader for MemoryRangeReader {
     async fn read_ranges(
         &self,
         ranges: &[Range<u64>],
-        _kind: RangeReadKind,
+        kind: RangeReadKind,
     ) -> Result<Vec<Vec<u8>>, CoveError> {
+        Ok(self
+            .read_range_buffers(ranges, kind)
+            .await?
+            .into_iter()
+            .map(|bytes| bytes.to_vec())
+            .collect())
+    }
+
+    async fn read_range_buffers(
+        &self,
+        ranges: &[Range<u64>],
+        _kind: RangeReadKind,
+    ) -> Result<Vec<RetainedBytes>, CoveError> {
         ranges
             .iter()
             .map(|range| {
@@ -163,7 +309,7 @@ impl CoveRangeReader for MemoryRangeReader {
                 if end > self.bytes.len() {
                     return Err(CoveError::OffsetRange);
                 }
-                Ok(self.bytes[start..end].to_vec())
+                RetainedBytes::from_arc_slice(Arc::clone(&self.bytes), start, len)
             })
             .collect()
     }
@@ -198,6 +344,21 @@ pub async fn read_coalesced_ranges_with_options<R: CoveRangeReader + ?Sized>(
     kind: RangeReadKind,
     options: RangeCoalescingOptions,
 ) -> Result<Vec<Vec<u8>>, CoveError> {
+    Ok(
+        read_coalesced_range_buffers_with_options(reader, ranges, kind, options)
+            .await?
+            .into_iter()
+            .map(|bytes| bytes.to_vec())
+            .collect(),
+    )
+}
+
+pub async fn read_coalesced_range_buffers_with_options<R: CoveRangeReader + ?Sized>(
+    reader: &R,
+    ranges: &[Range<u64>],
+    kind: RangeReadKind,
+    options: RangeCoalescingOptions,
+) -> Result<Vec<RetainedBytes>, CoveError> {
     if ranges.is_empty() {
         return Ok(Vec::new());
     }
@@ -207,12 +368,12 @@ pub async fn read_coalesced_ranges_with_options<R: CoveRangeReader + ?Sized>(
         .iter()
         .map(|range| range.start..range.end)
         .collect::<Vec<_>>();
-    let coalesced_bytes = reader.read_ranges(&reads, kind).await?;
+    let coalesced_bytes = reader.read_range_buffers(&reads, kind).await?;
     if coalesced_bytes.len() != coalesced.len() {
         return Err(CoveError::BufferTooShort);
     }
 
-    let mut out = vec![Vec::new(); ranges.len()];
+    let mut out = vec![None; ranges.len()];
     for (group, bytes) in coalesced.iter().zip(coalesced_bytes.iter()) {
         for original in &group.originals {
             let offset = usize::try_from(
@@ -229,14 +390,12 @@ pub async fn read_coalesced_ranges_with_options<R: CoveRangeReader + ?Sized>(
                     .ok_or(CoveError::OffsetRange)?,
             )
             .map_err(|_| CoveError::OffsetRange)?;
-            let end = offset.checked_add(len).ok_or(CoveError::ArithOverflow)?;
-            if end > bytes.len() {
-                return Err(CoveError::OffsetRange);
-            }
-            out[original.index] = bytes[offset..end].to_vec();
+            out[original.index] = Some(bytes.slice(offset, len)?);
         }
     }
-    Ok(out)
+    out.into_iter()
+        .map(|bytes| bytes.ok_or(CoveError::BufferTooShort))
+        .collect()
 }
 
 pub fn coalesced_range_count(
@@ -296,12 +455,67 @@ fn coalesce_ranges(
     Ok(groups)
 }
 
-fn read_file_range(file: &mut File, range: &Range<u64>) -> Result<Vec<u8>, CoveError> {
+fn read_file_range(file: &File, range: &Range<u64>) -> Result<Vec<u8>, CoveError> {
     let len = range_len(range)?;
-    let mut bytes = vec![0u8; len];
-    file.seek(SeekFrom::Start(range.start))?;
-    file.read_exact(&mut bytes)?;
+    let mut bytes = Vec::<u8>::with_capacity(len);
+    read_file_exact_at_uninit(file, range.start, &mut bytes.spare_capacity_mut()[..len])?;
+    // INVARIANT: `read_file_exact_at_uninit` returns `Ok(())` only after every
+    // byte in the spare range has been initialized by the positioned read loop.
+    // SAFETY: `bytes` has capacity `len`, and all elements in `0..len` have
+    // been initialized before publishing the vector length.
+    unsafe {
+        bytes.set_len(len);
+    }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn read_file_exact_at_uninit(
+    file: &File,
+    mut offset: u64,
+    mut bytes: &mut [MaybeUninit<u8>],
+) -> Result<(), CoveError> {
+    use std::os::unix::fs::FileExt;
+
+    while !bytes.is_empty() {
+        // INVARIANT: the OS positioned read initializes at most `bytes.len()`
+        // bytes in the supplied memory and never reads from the destination.
+        // SAFETY: `MaybeUninit<u8>` and `u8` have compatible layout, and the
+        // returned byte count is used to advance the uninitialized tail before
+        // the caller publishes the vector length.
+        let initialized =
+            unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u8>(), bytes.len()) };
+        let read = file.read_at(initialized, offset)?;
+        if read == 0 {
+            return Err(CoveError::BufferTooShort);
+        }
+        offset = offset
+            .checked_add(u64::try_from(read).map_err(|_| CoveError::ArithOverflow)?)
+            .ok_or(CoveError::ArithOverflow)?;
+        let tmp = bytes;
+        bytes = &mut tmp[read..];
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_file_exact_at_uninit(
+    file: &File,
+    offset: u64,
+    bytes: &mut [MaybeUninit<u8>],
+) -> Result<(), CoveError> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(offset))?;
+    // INVARIANT: `read_exact` returns `Ok(())` only after filling the whole
+    // destination slice.
+    // SAFETY: `MaybeUninit<u8>` and `u8` have compatible layout, and `read`
+    // implementations must not read from the destination buffer.
+    let initialized =
+        unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u8>(), bytes.len()) };
+    file.read_exact(initialized)?;
+    Ok(())
 }
 
 fn range_len(range: &Range<u64>) -> Result<usize, CoveError> {
@@ -310,4 +524,106 @@ fn range_len(range: &Range<u64>) -> Result<usize, CoveError> {
         .checked_sub(range.start)
         .ok_or(CoveError::OffsetRange)?;
     usize::try_from(len).map_err(|_| CoveError::OffsetRange)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, process, time::SystemTime};
+
+    #[test]
+    fn coalesced_range_buffers_split_without_copying() {
+        let reader = MemoryRangeReader::new((0u8..64).collect());
+        let ranges = vec![10..14, 16..20];
+        let out = futures::executor::block_on(read_coalesced_range_buffers_with_options(
+            &reader,
+            &ranges,
+            RangeReadKind::Data,
+            RangeCoalescingOptions {
+                max_gap: 4,
+                max_span: 16,
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].as_slice(), &[10, 11, 12, 13]);
+        assert_eq!(out[1].as_slice(), &[16, 17, 18, 19]);
+        assert!(out[0].shares_owner(&out[1]));
+        assert_eq!(out[0].owner_offset(), 10);
+        assert_eq!(out[1].owner_offset(), 16);
+    }
+
+    #[test]
+    fn local_file_range_reader_reads_exact_positioned_ranges() {
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("cove-range-reader-{}-{stamp}.bin", process::id()));
+        fs::write(&path, b"abcdefghijklmnopqrstuvwxyz").unwrap();
+        let reader = LocalFileRangeReader::new(&path);
+
+        let first =
+            futures::executor::block_on(reader.read_range_buffer(5..10, RangeReadKind::Data))
+                .unwrap();
+        let second =
+            futures::executor::block_on(reader.read_range_buffer(0..3, RangeReadKind::Data))
+                .unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(first.as_slice(), b"fghij");
+        assert_eq!(second.as_slice(), b"abc");
+    }
+
+    #[test]
+    fn mmap_file_range_reader_returns_shared_retained_slices() {
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cove-mmap-range-reader-{}-{stamp}.bin",
+            process::id()
+        ));
+        fs::write(&path, b"abcdefghijklmnopqrstuvwxyz").unwrap();
+        let reader = MmapFileRangeReader::new(&path);
+
+        let ranges = vec![2..7, 10..15];
+        let out =
+            futures::executor::block_on(reader.read_range_buffers(&ranges, RangeReadKind::Data))
+                .unwrap();
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(out[0].as_slice(), b"cdefg");
+        assert_eq!(out[1].as_slice(), b"klmno");
+        assert!(out[0].shares_owner(&out[1]));
+        assert_eq!(out[0].owner_offset(), 2);
+        assert_eq!(out[1].owner_offset(), 10);
+    }
+
+    #[test]
+    fn local_file_range_reader_handles_empty_and_short_reads() {
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cove-range-reader-empty-short-{}-{stamp}.bin",
+            process::id()
+        ));
+        fs::write(&path, b"abc").unwrap();
+        let reader = LocalFileRangeReader::new(&path);
+
+        let empty =
+            futures::executor::block_on(reader.read_range_buffer(1..1, RangeReadKind::Data))
+                .unwrap();
+        let short =
+            futures::executor::block_on(reader.read_range_buffer(0..10, RangeReadKind::Data));
+        fs::remove_file(&path).unwrap();
+
+        assert!(empty.is_empty());
+        assert!(matches!(short, Err(CoveError::BufferTooShort)));
+    }
 }

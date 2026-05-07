@@ -1,11 +1,17 @@
 //! Decode and materialization kernels shared by execution modes.
 
-use std::path::Path;
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
 use cove_arrow::arrow::{
-    encoded_columns_to_arrow_arrays_with_options, ArrowExportOptions, ArrowRowSelection,
+    arrow_buffer_owner, encoded_columns_to_arrow_arrays_with_owners_options, ArrowEncodedColumn,
+    ArrowExportOptions, ArrowRowSelection, ArrowVarBytesExportPolicy,
 };
 use cove_core::{
     array::{CoveArrayValue, EncodedArray, PreparedEncodedArray},
@@ -16,7 +22,8 @@ use cove_core::{
         page_uses_payload_elision, ColumnPageIndex, ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL,
         PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT,
     },
-    page_payload::{ColumnPagePayloadV1, PageBufferKind},
+    page_payload::{ColumnPagePayloadV1, PageBufferKind, RetainedColumnPagePayloadV1},
+    retained_bytes::RetainedBytes,
     segment::{
         RowMorselDirectory, RowMorselEntryV1, TableColumnDirectoryEntryV1, TableSegmentHeaderV1,
         TableSegmentIndexEntryV1, TableSegmentPayloadV1, TABLE_COLUMN_DIRECTORY_ENTRY_LEN,
@@ -29,14 +36,16 @@ use cove_core::{
 
 use crate::{
     dataset_state::{DatasetBootstrapStats, DatasetState},
+    options::{LocalFileReadPolicy, PagePayloadValidationPolicy},
     planner::{
         CoveFilterUse, CovePredicate, NullPredicateKind, NumericPredicateOp, PredicateLiteral,
         ScanPlan,
     },
     prune,
     range_reader::{
-        coalesced_range_count, read_coalesced_ranges_with_options, CoveRangeReader,
-        LocalFileRangeReader, MemoryRangeReader, RangeReadKind, RangeReadMode, RangeReadPlan,
+        coalesced_range_count, read_coalesced_range_buffers_with_options, CoveRangeReader,
+        LocalFileRangeReader, MemoryRangeReader, MmapFileRangeReader, RangeReadKind, RangeReadMode,
+        RangeReadPlan,
     },
     task_graph::ScanTask,
 };
@@ -164,6 +173,86 @@ impl DecodeStats {
 pub struct DecodedScan {
     pub batches: Vec<RecordBatch>,
     pub stats: DecodeStats,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ScanExecutionCache {
+    local_readers: Mutex<HashMap<LocalReaderCacheKey, Arc<dyn CoveRangeReader>>>,
+    segment_metadata: Mutex<HashMap<SegmentMetadataCacheKey, Arc<SegmentMetadata>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LocalReaderCacheKey {
+    file_ordinal: usize,
+    policy: LocalFileReadPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SegmentMetadataCacheKey {
+    file_ordinal: usize,
+    table_id: u32,
+    segment_id: u32,
+    row_start: u64,
+    offset: u64,
+    length: u64,
+}
+
+impl SegmentMetadataCacheKey {
+    fn new(file_ordinal: usize, segment_ref: &TableSegmentIndexEntryV1) -> Self {
+        Self {
+            file_ordinal,
+            table_id: segment_ref.table_id,
+            segment_id: segment_ref.segment_id,
+            row_start: u64::from(segment_ref.row_start),
+            offset: segment_ref.offset,
+            length: segment_ref.length,
+        }
+    }
+}
+
+impl ScanExecutionCache {
+    fn local_reader(
+        &self,
+        file_ordinal: usize,
+        policy: LocalFileReadPolicy,
+        path: impl AsRef<Path>,
+    ) -> Result<Arc<dyn CoveRangeReader>, CoveError> {
+        let path = path.as_ref().to_path_buf();
+        let mut readers = self.local_readers.lock().map_err(|_| {
+            CoveError::BadSection("scan execution local-reader cache lock poisoned".into())
+        })?;
+        let key = LocalReaderCacheKey {
+            file_ordinal,
+            policy,
+        };
+        Ok(Arc::clone(readers.entry(key).or_insert_with(
+            || match policy {
+                LocalFileReadPolicy::PositionedReads => Arc::new(LocalFileRangeReader::new(&path)),
+                LocalFileReadPolicy::Mmap => Arc::new(MmapFileRangeReader::new(&path)),
+            },
+        )))
+    }
+
+    fn get_segment_metadata(
+        &self,
+        key: SegmentMetadataCacheKey,
+    ) -> Result<Option<Arc<SegmentMetadata>>, CoveError> {
+        let metadata = self.segment_metadata.lock().map_err(|_| {
+            CoveError::BadSection("scan execution segment-metadata cache lock poisoned".into())
+        })?;
+        Ok(metadata.get(&key).cloned())
+    }
+
+    fn insert_segment_metadata(
+        &self,
+        key: SegmentMetadataCacheKey,
+        segment: Arc<SegmentMetadata>,
+    ) -> Result<Arc<SegmentMetadata>, CoveError> {
+        let mut metadata = self.segment_metadata.lock().map_err(|_| {
+            CoveError::BadSection("scan execution segment-metadata cache lock poisoned".into())
+        })?;
+        Ok(Arc::clone(metadata.entry(key).or_insert(segment)))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -355,6 +444,15 @@ pub fn decode_local_dataset_scan(
     state: &DatasetState,
     plan: &ScanPlan,
 ) -> Result<DecodedScan, CoveError> {
+    let cache = Arc::new(ScanExecutionCache::default());
+    decode_local_dataset_scan_with_cache(state, plan, cache)
+}
+
+fn decode_local_dataset_scan_with_cache(
+    state: &DatasetState,
+    plan: &ScanPlan,
+    cache: Arc<ScanExecutionCache>,
+) -> Result<DecodedScan, CoveError> {
     let mut decoded = DecodedScan {
         batches: Vec::new(),
         stats: DecodeStats::default(),
@@ -375,8 +473,18 @@ pub fn decode_local_dataset_scan(
         let file_decoded = if file_state.has_full_file_bytes() {
             decode_scan(&file_state, &file_plan)?
         } else if Path::new(file_state.source()).is_file() {
-            let reader = LocalFileRangeReader::new(file_state.source());
-            futures::executor::block_on(decode_scan_with_reader(&file_state, &file_plan, &reader))?
+            let reader = cache.local_reader(
+                file_ordinal,
+                file_state.local_file_read_policy(),
+                file_state.source(),
+            )?;
+            futures::executor::block_on(decode_scan_with_reader_cached(
+                &file_state,
+                &file_plan,
+                reader.as_ref(),
+                Some(cache.as_ref()),
+                file_ordinal,
+            ))?
         } else {
             decode_scan(&file_state, &file_plan)?
         };
@@ -392,6 +500,25 @@ pub fn decode_local_dataset_scan_tasks(
     tasks: &[ScanTask],
     partition_index: usize,
     partition_count: usize,
+) -> Result<DecodedScan, CoveError> {
+    let cache = Arc::new(ScanExecutionCache::default());
+    decode_local_dataset_scan_tasks_with_cache(
+        state,
+        plan,
+        tasks,
+        partition_index,
+        partition_count,
+        cache,
+    )
+}
+
+pub(crate) fn decode_local_dataset_scan_tasks_with_cache(
+    state: &DatasetState,
+    plan: &ScanPlan,
+    tasks: &[ScanTask],
+    partition_index: usize,
+    partition_count: usize,
+    cache: Arc<ScanExecutionCache>,
 ) -> Result<DecodedScan, CoveError> {
     let mut decoded = DecodedScan {
         batches: Vec::new(),
@@ -431,19 +558,27 @@ pub fn decode_local_dataset_scan_tasks(
             .and_then(|file| file.full_file_bytes_arc())
         {
             let reader = MemoryRangeReader::from_arc(bytes);
-            futures::executor::block_on(decode_scan_with_reader_tasks(
+            futures::executor::block_on(decode_scan_with_reader_tasks_cached(
                 &file_state,
                 &file_plan,
                 &reader,
                 file_tasks,
+                Some(cache.as_ref()),
+                file_ordinal,
             ))?
         } else if Path::new(file_state.source()).is_file() {
-            let reader = LocalFileRangeReader::new(file_state.source());
-            futures::executor::block_on(decode_scan_with_reader_tasks(
+            let reader = cache.local_reader(
+                file_ordinal,
+                file_state.local_file_read_policy(),
+                file_state.source(),
+            )?;
+            futures::executor::block_on(decode_scan_with_reader_tasks_cached(
                 &file_state,
                 &file_plan,
-                &reader,
+                reader.as_ref(),
                 file_tasks,
+                Some(cache.as_ref()),
+                file_ordinal,
             ))?
         } else {
             decode_scan(&file_state, &file_plan)?
@@ -562,7 +697,12 @@ pub fn decode_scan(state: &DatasetState, plan: &ScanPlan) -> Result<DecodedScan,
                 let column = &state.table().columns[*projection_index];
                 let segment_column = prepared_segment.column(column.column_id)?;
                 let page = prepared_segment.page_for_morsel(segment_column, morsel.morsel_id)?;
-                let payload = materialize_page_payload(segment_bytes, column, &page)?;
+                let payload = materialize_page_payload(
+                    segment_bytes,
+                    column,
+                    &page,
+                    state.page_payload_validation_policy(),
+                )?;
                 stats.pages_decoded += usize::from(page.page_length != 0);
                 stats.data_bytes_read = stats
                     .data_bytes_read
@@ -586,15 +726,14 @@ pub fn decode_scan(state: &DatasetState, plan: &ScanPlan) -> Result<DecodedScan,
                     encoded_array_for_page(payload, page, state.mounted().dictionary.as_ref())?,
                 ));
             }
-            let column_refs = encoded_columns
-                .iter()
-                .map(|(name, array)| (*name, array))
-                .collect::<Vec<_>>();
+            let arrow_options = state.arrow_export_options();
+            let column_refs =
+                arrow_encoded_columns_for_payloads(&encoded_columns, &page_payloads, arrow_options);
             let batch = record_batch_for_selection(
                 &column_refs,
                 &scratch.selection,
                 plan.output_schema.clone(),
-                state.arrow_export_options(),
+                arrow_options,
             )?
             .value;
             stats.rows_materialized += batch.num_rows();
@@ -669,8 +808,30 @@ fn apply_overlay_to_selection(
     Ok(())
 }
 
+fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
+    encoded_columns: &'array [(&'name str, EncodedArray<'data>)],
+    page_payloads: &[RetainedColumnPagePayloadV1],
+    options: ArrowExportOptions,
+) -> Vec<ArrowEncodedColumn<'name, 'array, 'data>> {
+    debug_assert_eq!(encoded_columns.len(), page_payloads.len());
+    encoded_columns
+        .iter()
+        .zip(page_payloads.iter())
+        .map(|((name, array), payload)| {
+            let data_owner = if options.varbytes_policy == ArrowVarBytesExportPolicy::View
+                && array.physical == CovePhysicalKind::VarBytes
+            {
+                Some(arrow_buffer_owner(payload.data.owner()))
+            } else {
+                None
+            };
+            ArrowEncodedColumn::with_data_owner(*name, array, data_owner)
+        })
+        .collect()
+}
+
 fn record_batch_for_selection(
-    columns: &[(&str, &EncodedArray<'_>)],
+    columns: &[ArrowEncodedColumn<'_, '_, '_>],
     selection: &Selection,
     schema: SchemaRef,
     options: ArrowExportOptions,
@@ -684,7 +845,8 @@ fn record_batch_for_selection(
             len: mask.len,
         },
     };
-    let result = encoded_columns_to_arrow_arrays_with_options(columns, arrow_selection, options)?;
+    let result =
+        encoded_columns_to_arrow_arrays_with_owners_options(columns, arrow_selection, options)?;
     let batch = RecordBatch::try_new(schema, result.value)
         .map_err(|err| CoveError::BadSection(format!("Arrow RecordBatch: {err}")))?;
     Ok(cove_arrow::arrow::ArrowExportResult {
@@ -747,6 +909,16 @@ pub async fn decode_scan_with_reader<R: CoveRangeReader + ?Sized>(
     plan: &ScanPlan,
     reader: &R,
 ) -> Result<DecodedScan, CoveError> {
+    decode_scan_with_reader_cached(state, plan, reader, None, 0).await
+}
+
+async fn decode_scan_with_reader_cached<R: CoveRangeReader + ?Sized>(
+    state: &DatasetState,
+    plan: &ScanPlan,
+    reader: &R,
+    cache: Option<&ScanExecutionCache>,
+    file_ordinal: usize,
+) -> Result<DecodedScan, CoveError> {
     let plan = state.resolved_plan_for_current_state(plan)?;
     validate_scan_plan(state, &plan)?;
     let mut batches = Vec::new();
@@ -755,7 +927,9 @@ pub async fn decode_scan_with_reader<R: CoveRangeReader + ?Sized>(
     let mut scratch = DecodeScratch::default();
 
     for segment_ref in state.segments() {
-        let segment = read_segment_metadata(reader, state, segment_ref, &mut stats).await?;
+        let segment =
+            read_segment_metadata(reader, state, segment_ref, &mut stats, cache, file_ordinal)
+                .await?;
 
         for morsel in ordered_morsels(
             state,
@@ -871,7 +1045,7 @@ pub async fn decode_scan_with_reader<R: CoveRangeReader + ?Sized>(
             if coalesced < ranges.len() {
                 stats.coalesced_range_requests += coalesced;
             }
-            let wires = read_coalesced_ranges_with_options(
+            let wires = read_coalesced_range_buffers_with_options(
                 reader,
                 &ranges,
                 RangeReadKind::Data,
@@ -880,12 +1054,18 @@ pub async fn decode_scan_with_reader<R: CoveRangeReader + ?Sized>(
             .await?;
             stats.data_bytes_read = stats
                 .data_bytes_read
-                .checked_add(wires.iter().map(Vec::len).sum::<usize>())
+                .checked_add(wires.iter().map(RetainedBytes::len).sum::<usize>())
                 .ok_or(CoveError::ArithOverflow)?;
+            let mut wire_slots = wires.into_iter().map(Some).collect::<Vec<_>>();
             let mut page_payloads = Vec::with_capacity(page_indexes.len());
             for ((column, page), slot) in columns.iter().zip(page_indexes.iter()).zip(range_slots) {
-                let wire = slot.map(|index| wires[index].as_slice());
-                page_payloads.push(materialize_page_payload_from_wire(column, page, wire)?);
+                let wire = slot.and_then(|index| wire_slots[index].take());
+                page_payloads.push(materialize_page_payload_from_wire(
+                    column,
+                    page,
+                    wire,
+                    state.page_payload_validation_policy(),
+                )?);
             }
 
             let mut encoded_columns = Vec::with_capacity(columns.len());
@@ -899,15 +1079,14 @@ pub async fn decode_scan_with_reader<R: CoveRangeReader + ?Sized>(
                     encoded_array_for_page(payload, page, state.mounted().dictionary.as_ref())?,
                 ));
             }
-            let column_refs = encoded_columns
-                .iter()
-                .map(|(name, array)| (*name, array))
-                .collect::<Vec<_>>();
+            let arrow_options = state.arrow_export_options();
+            let column_refs =
+                arrow_encoded_columns_for_payloads(&encoded_columns, &page_payloads, arrow_options);
             let batch = record_batch_for_selection(
                 &column_refs,
                 &scratch.selection,
                 plan.output_schema.clone(),
-                state.arrow_export_options(),
+                arrow_options,
             )?
             .value;
             stats.rows_materialized += batch.num_rows();
@@ -924,6 +1103,17 @@ pub async fn decode_scan_with_reader_tasks<R: CoveRangeReader + ?Sized>(
     reader: &R,
     tasks: &[ScanTask],
 ) -> Result<DecodedScan, CoveError> {
+    decode_scan_with_reader_tasks_cached(state, plan, reader, tasks, None, 0).await
+}
+
+async fn decode_scan_with_reader_tasks_cached<R: CoveRangeReader + ?Sized>(
+    state: &DatasetState,
+    plan: &ScanPlan,
+    reader: &R,
+    tasks: &[ScanTask],
+    cache: Option<&ScanExecutionCache>,
+    file_ordinal: usize,
+) -> Result<DecodedScan, CoveError> {
     let plan = state.resolved_plan_for_current_state(plan)?;
     validate_scan_plan(state, &plan)?;
     let mut batches = Vec::new();
@@ -938,7 +1128,9 @@ pub async fn decode_scan_with_reader_tasks<R: CoveRangeReader + ?Sized>(
             .segments()
             .get(segment_index)
             .ok_or(CoveError::SegmentCorrupt)?;
-        let segment = read_segment_metadata(reader, state, segment_ref, &mut stats).await?;
+        let segment =
+            read_segment_metadata(reader, state, segment_ref, &mut stats, cache, file_ordinal)
+                .await?;
         let task_end = tasks[task_start..]
             .iter()
             .position(|task| task.segment_index != segment_index)
@@ -1061,7 +1253,7 @@ pub async fn decode_scan_with_reader_tasks<R: CoveRangeReader + ?Sized>(
             if coalesced < ranges.len() {
                 stats.coalesced_range_requests += coalesced;
             }
-            let wires = read_coalesced_ranges_with_options(
+            let wires = read_coalesced_range_buffers_with_options(
                 reader,
                 &ranges,
                 RangeReadKind::Data,
@@ -1070,12 +1262,18 @@ pub async fn decode_scan_with_reader_tasks<R: CoveRangeReader + ?Sized>(
             .await?;
             stats.data_bytes_read = stats
                 .data_bytes_read
-                .checked_add(wires.iter().map(Vec::len).sum::<usize>())
+                .checked_add(wires.iter().map(RetainedBytes::len).sum::<usize>())
                 .ok_or(CoveError::ArithOverflow)?;
+            let mut wire_slots = wires.into_iter().map(Some).collect::<Vec<_>>();
             let mut page_payloads = Vec::with_capacity(page_indexes.len());
             for ((column, page), slot) in columns.iter().zip(page_indexes.iter()).zip(range_slots) {
-                let wire = slot.map(|index| wires[index].as_slice());
-                page_payloads.push(materialize_page_payload_from_wire(column, page, wire)?);
+                let wire = slot.and_then(|index| wire_slots[index].take());
+                page_payloads.push(materialize_page_payload_from_wire(
+                    column,
+                    page,
+                    wire,
+                    state.page_payload_validation_policy(),
+                )?);
             }
 
             let mut encoded_columns = Vec::with_capacity(columns.len());
@@ -1089,15 +1287,14 @@ pub async fn decode_scan_with_reader_tasks<R: CoveRangeReader + ?Sized>(
                     encoded_array_for_page(payload, page, state.mounted().dictionary.as_ref())?,
                 ));
             }
-            let column_refs = encoded_columns
-                .iter()
-                .map(|(name, array)| (*name, array))
-                .collect::<Vec<_>>();
+            let arrow_options = state.arrow_export_options();
+            let column_refs =
+                arrow_encoded_columns_for_payloads(&encoded_columns, &page_payloads, arrow_options);
             let batch = record_batch_for_selection(
                 &column_refs,
                 &scratch.selection,
                 plan.output_schema.clone(),
-                state.arrow_export_options(),
+                arrow_options,
             )?
             .value;
             stats.rows_materialized += batch.num_rows();
@@ -1250,7 +1447,16 @@ async fn read_segment_metadata<R: CoveRangeReader + ?Sized>(
     state: &DatasetState,
     segment_ref: &TableSegmentIndexEntryV1,
     stats: &mut DecodeStats,
-) -> Result<SegmentMetadata, CoveError> {
+    cache: Option<&ScanExecutionCache>,
+    file_ordinal: usize,
+) -> Result<Arc<SegmentMetadata>, CoveError> {
+    let key = SegmentMetadataCacheKey::new(file_ordinal, segment_ref);
+    if let Some(cache) = cache {
+        if let Some(segment) = cache.get_segment_metadata(key)? {
+            return Ok(segment);
+        }
+    }
+
     let header_end = segment_ref
         .offset
         .checked_add(TABLE_SEGMENT_HEADER_LEN as u64)
@@ -1285,11 +1491,16 @@ async fn read_segment_metadata<R: CoveRangeReader + ?Sized>(
         .metadata_bytes_read
         .checked_add(metadata.len())
         .ok_or(CoveError::ArithOverflow)?;
-    parse_segment_metadata(
+    let segment = Arc::new(parse_segment_metadata(
         &metadata,
         segment_ref.length,
         state.mounted().header.required_features,
-    )
+    )?);
+    if let Some(cache) = cache {
+        cache.insert_segment_metadata(key, segment)
+    } else {
+        Ok(segment)
+    }
 }
 
 fn parse_segment_metadata(
@@ -1483,7 +1694,12 @@ fn selected_rows_for_morsel(
         let column = &state.table().columns[column_index];
         let segment_column = segment.column(column.column_id)?;
         let page = segment.page_for_morsel(segment_column, morsel_id)?;
-        let payload = match materialize_page_payload(segment_bytes, column, &page) {
+        let payload = match materialize_page_payload(
+            segment_bytes,
+            column,
+            &page,
+            state.page_payload_validation_policy(),
+        ) {
             Ok(payload) => payload,
             Err(CoveError::UnsupportedEncoding(_)) => {
                 if filter.use_kind == CoveFilterUse::FullRowPredicateExact {
@@ -1607,7 +1823,9 @@ async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Sized>(
             let end = start
                 .checked_add(page.page_length)
                 .ok_or(CoveError::ArithOverflow)?;
-            let bytes = reader.read_range(start..end, RangeReadKind::Data).await?;
+            let bytes = reader
+                .read_range_buffer(start..end, RangeReadKind::Data)
+                .await?;
             stats.data_bytes_read = stats
                 .data_bytes_read
                 .checked_add(bytes.len())
@@ -1615,8 +1833,12 @@ async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Sized>(
             Some(bytes)
         };
         stats.pages_decoded += usize::from(page.page_length != 0);
-        let payload = match materialize_page_payload_from_wire(column, &page, page_wire.as_deref())
-        {
+        let payload = match materialize_page_payload_from_wire(
+            column,
+            &page,
+            page_wire,
+            state.page_payload_validation_policy(),
+        ) {
             Ok(payload) => payload,
             Err(CoveError::UnsupportedEncoding(_)) => {
                 if filter.use_kind == CoveFilterUse::FullRowPredicateExact {
@@ -2123,7 +2345,8 @@ fn materialize_page_payload(
     segment_bytes: &[u8],
     column: &ColumnEntry,
     page: &ColumnPageIndexEntryV1,
-) -> Result<ColumnPagePayloadV1, CoveError> {
+    validation_policy: PagePayloadValidationPolicy,
+) -> Result<RetainedColumnPagePayloadV1, CoveError> {
     if page.flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0 {
         return materialize_stats_only_page(column, page);
     }
@@ -2131,29 +2354,70 @@ fn materialize_page_payload(
     let start = usize::try_from(page.page_offset).map_err(|_| CoveError::OffsetRange)?;
     let len = usize::try_from(page.page_length).map_err(|_| CoveError::OffsetRange)?;
     let page_wire = wire::read_range_checked(segment_bytes, start, len)?;
-    let decoded = compression::column_page_payload(page_wire, page)?;
-    ColumnPagePayloadV1::parse(decoded.as_ref())
+    let decoded = compression::column_page_payload_with_checksum_validation(
+        page_wire,
+        page,
+        page_checksum_validation(validation_policy),
+    )?;
+    let decoded = match decoded {
+        Cow::Borrowed(bytes) => bytes.to_vec(),
+        Cow::Owned(bytes) => bytes,
+    };
+    RetainedColumnPagePayloadV1::parse_with_buffer_checksum_validation(
+        RetainedBytes::from_vec(decoded),
+        buffer_checksum_validation(validation_policy),
+    )
 }
 
 fn materialize_page_payload_from_wire(
     column: &ColumnEntry,
     page: &ColumnPageIndexEntryV1,
-    page_wire: Option<&[u8]>,
-) -> Result<ColumnPagePayloadV1, CoveError> {
+    page_wire: Option<RetainedBytes>,
+    validation_policy: PagePayloadValidationPolicy,
+) -> Result<RetainedColumnPagePayloadV1, CoveError> {
     if page.flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0 {
         return materialize_stats_only_page(column, page);
     }
     let Some(page_wire) = page_wire else {
         return Err(CoveError::PageCorrupt);
     };
-    let decoded = compression::column_page_payload(page_wire, page)?;
-    ColumnPagePayloadV1::parse(decoded.as_ref())
+    let decoded = compression::column_page_payload_retained_with_checksum_validation(
+        page_wire,
+        page,
+        page_checksum_validation(validation_policy),
+    )?;
+    RetainedColumnPagePayloadV1::parse_with_buffer_checksum_validation(
+        decoded,
+        buffer_checksum_validation(validation_policy),
+    )
+}
+
+fn page_checksum_validation(
+    validation_policy: PagePayloadValidationPolicy,
+) -> compression::PageChecksumValidation {
+    match validation_policy {
+        PagePayloadValidationPolicy::Trusted => compression::PageChecksumValidation::Trusted,
+        PagePayloadValidationPolicy::Strict => compression::PageChecksumValidation::Verify,
+    }
+}
+
+fn buffer_checksum_validation(
+    validation_policy: PagePayloadValidationPolicy,
+) -> cove_core::page_payload::BufferChecksumValidation {
+    match validation_policy {
+        PagePayloadValidationPolicy::Trusted => {
+            cove_core::page_payload::BufferChecksumValidation::Trusted
+        }
+        PagePayloadValidationPolicy::Strict => {
+            cove_core::page_payload::BufferChecksumValidation::Verify
+        }
+    }
 }
 
 fn materialize_stats_only_page(
     column: &ColumnEntry,
     page: &ColumnPageIndexEntryV1,
-) -> Result<ColumnPagePayloadV1, CoveError> {
+) -> Result<RetainedColumnPagePayloadV1, CoveError> {
     if page.flags & PAGE_FLAG_ALL_NULL != 0 {
         let bitmap_len = (page.row_count as usize)
             .checked_add(7)
@@ -2172,7 +2436,7 @@ fn materialize_stats_only_page(
             Some(bitmap),
             Vec::new(),
         )?;
-        return ColumnPagePayloadV1::parse(&payload);
+        return RetainedColumnPagePayloadV1::parse(RetainedBytes::from_vec(payload));
     }
     if page.flags & PAGE_FLAG_ALL_NON_NULL != 0 {
         return Err(CoveError::UnsupportedEncoding(
@@ -2184,7 +2448,7 @@ fn materialize_stats_only_page(
 }
 
 fn encoded_array_for_page<'a>(
-    payload: &'a ColumnPagePayloadV1,
+    payload: &'a RetainedColumnPagePayloadV1,
     page: &ColumnPageIndexEntryV1,
     dictionary: Option<&'a cove_core::dictionary::FileDictionary>,
 ) -> Result<EncodedArray<'a>, CoveError> {
@@ -2208,7 +2472,7 @@ fn encoded_array_for_page<'a>(
 }
 
 fn buffer_slice(
-    payload: &ColumnPagePayloadV1,
+    payload: &RetainedColumnPagePayloadV1,
     kind: PageBufferKind,
 ) -> Result<Option<&[u8]>, CoveError> {
     let mut matches = payload.buffers.iter().filter(|buffer| buffer.kind == kind);
@@ -2220,7 +2484,7 @@ fn buffer_slice(
     }
     let start = usize::try_from(buffer.offset).map_err(|_| CoveError::OffsetRange)?;
     let len = usize::try_from(buffer.length).map_err(|_| CoveError::OffsetRange)?;
-    wire::read_range_checked(&payload.data, start, len).map(Some)
+    wire::read_range_checked(payload.data.as_slice(), start, len).map(Some)
 }
 
 fn default_encoding_kind(physical: CovePhysicalKind) -> CoveEncodingKind {
@@ -2239,13 +2503,207 @@ fn default_encoding_kind(physical: CovePhysicalKind) -> CoveEncodingKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::options::CoveTableOptions;
     use arrow_array::Array;
+    use cove_arrow::arrow::ArrowStringValidationPolicy;
     use cove_core::{
         array::EncodedArray,
-        constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
+        checksum,
+        constants::{CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
+        page_payload::{COLUMN_PAGE_PAYLOAD_HEADER_LEN, COVE_ENCODING_NODE_LEN},
         wire,
     };
     use std::sync::Arc;
+
+    fn bool_test_column() -> ColumnEntry {
+        ColumnEntry {
+            column_id: 0,
+            name: "flag".to_string(),
+            logical: CoveLogicalType::Bool,
+            physical: CovePhysicalKind::Boolean,
+            nullable: false,
+            sort_order: 0,
+            collation_id: 0,
+            precision: 0,
+            scale: 0,
+            flags: 0,
+        }
+    }
+
+    fn bool_test_page(payload: &[u8], checksum: u32) -> ColumnPageIndexEntryV1 {
+        ColumnPageIndexEntryV1 {
+            column_id: 0,
+            morsel_id: 0,
+            row_count: 3,
+            non_null_count: 3,
+            null_count: 0,
+            encoding_root: 0,
+            page_offset: 0,
+            page_length: payload.len() as u64,
+            uncompressed_length: payload.len() as u64,
+            stats_ref: 0,
+            flags: CompressionCodec::None as u32,
+            checksum,
+        }
+    }
+
+    fn bool_test_payload() -> Vec<u8> {
+        ColumnPagePayloadV1::build_single_node(
+            3,
+            CoveEncodingKind::PlainFixed,
+            CoveLogicalType::Bool,
+            CovePhysicalKind::Boolean,
+            None,
+            vec![0, 1, 0],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cove_table_options_default_to_trusted_page_payload_validation() {
+        assert_eq!(
+            CoveTableOptions::default().page_payload_validation_policy(),
+            PagePayloadValidationPolicy::Trusted
+        );
+        assert_eq!(
+            CoveTableOptions::default()
+                .with_strict_page_payload_validation()
+                .page_payload_validation_policy(),
+            PagePayloadValidationPolicy::Strict
+        );
+    }
+
+    #[test]
+    fn cove_table_options_default_to_strict_arrow_string_validation() {
+        assert_eq!(
+            CoveTableOptions::default()
+                .arrow_export_options()
+                .string_validation_policy,
+            ArrowStringValidationPolicy::Strict
+        );
+        assert_eq!(
+            CoveTableOptions::default()
+                .with_trusted_arrow_string_validation()
+                .arrow_export_options()
+                .string_validation_policy,
+            ArrowStringValidationPolicy::TrustedPageProof
+        );
+        assert_eq!(
+            CoveTableOptions::default()
+                .with_trusted_arrow_string_validation()
+                .with_strict_arrow_string_validation()
+                .arrow_export_options()
+                .string_validation_policy,
+            ArrowStringValidationPolicy::Strict
+        );
+    }
+
+    #[test]
+    fn cove_table_options_default_to_positioned_local_file_reads() {
+        assert_eq!(
+            CoveTableOptions::default().local_file_read_policy(),
+            LocalFileReadPolicy::PositionedReads
+        );
+        assert_eq!(
+            CoveTableOptions::default()
+                .with_local_file_mmap_reads()
+                .local_file_read_policy(),
+            LocalFileReadPolicy::Mmap
+        );
+        assert_eq!(
+            CoveTableOptions::default()
+                .with_local_file_mmap_reads()
+                .with_positioned_local_file_reads()
+                .local_file_read_policy(),
+            LocalFileReadPolicy::PositionedReads
+        );
+    }
+
+    #[test]
+    fn scan_execution_cache_reuses_local_reader_by_file_ordinal() {
+        let cache = ScanExecutionCache::default();
+        let first = cache
+            .local_reader(
+                4,
+                LocalFileReadPolicy::PositionedReads,
+                "/tmp/cove-cache-a.cove",
+            )
+            .unwrap();
+        let second = cache
+            .local_reader(
+                4,
+                LocalFileReadPolicy::PositionedReads,
+                "/tmp/cove-cache-a.cove",
+            )
+            .unwrap();
+        let mmap = cache
+            .local_reader(4, LocalFileReadPolicy::Mmap, "/tmp/cove-cache-a.cove")
+            .unwrap();
+        let other = cache
+            .local_reader(
+                5,
+                LocalFileReadPolicy::PositionedReads,
+                "/tmp/cove-cache-a.cove",
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &mmap));
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[test]
+    fn trusted_page_payload_validation_skips_page_wire_crc_only() {
+        let column = bool_test_column();
+        let payload = bool_test_payload();
+        let wrong_checksum = checksum::crc32c(&payload) ^ 1;
+        let page = bool_test_page(&payload, wrong_checksum);
+
+        assert!(materialize_page_payload_from_wire(
+            &column,
+            &page,
+            Some(RetainedBytes::from_vec(payload.clone())),
+            PagePayloadValidationPolicy::Trusted,
+        )
+        .is_ok());
+        assert!(matches!(
+            materialize_page_payload_from_wire(
+                &column,
+                &page,
+                Some(RetainedBytes::from_vec(payload)),
+                PagePayloadValidationPolicy::Strict,
+            )
+            .unwrap_err(),
+            CoveError::ChecksumMismatch
+        ));
+    }
+
+    #[test]
+    fn trusted_page_payload_validation_skips_buffer_crc_only() {
+        let column = bool_test_column();
+        let mut payload = bool_test_payload();
+        let checksum_offset = COLUMN_PAGE_PAYLOAD_HEADER_LEN + COVE_ENCODING_NODE_LEN + 24;
+        payload[checksum_offset..checksum_offset + 4].copy_from_slice(&0u32.to_le_bytes());
+        let page = bool_test_page(&payload, checksum::crc32c(&payload));
+
+        assert!(materialize_page_payload_from_wire(
+            &column,
+            &page,
+            Some(RetainedBytes::from_vec(payload.clone())),
+            PagePayloadValidationPolicy::Trusted,
+        )
+        .is_ok());
+        assert!(matches!(
+            materialize_page_payload_from_wire(
+                &column,
+                &page,
+                Some(RetainedBytes::from_vec(payload)),
+                PagePayloadValidationPolicy::Strict,
+            )
+            .unwrap_err(),
+            CoveError::ChecksumMismatch
+        ));
+    }
 
     #[test]
     fn selection_mask_and_row_extraction() {
@@ -2362,7 +2820,7 @@ mod tests {
         )]));
 
         let result = record_batch_for_selection(
-            &[("word", &array)],
+            &[ArrowEncodedColumn::borrowed("word", &array)],
             &selection,
             schema,
             ArrowExportOptions::default(),

@@ -4,18 +4,28 @@
 //! a *validity* bitmap (bit set ⇒ valid). This module owns the bit inversion
 //! and byte-aligned conversion required to bridge the two.
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    panic::RefUnwindSafe,
+    ptr::{self, NonNull},
+    sync::Arc,
+};
 
 use arrow_array::{
-    builder::{BinaryBuilder, StringBuilder},
+    builder::{BinaryBuilder, BinaryViewBuilder, StringBuilder, StringViewBuilder},
     types::{GenericBinaryType, GenericStringType, UInt32Type},
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
-    FixedSizeBinaryArray, Float32Array, Float64Array, GenericByteArray, Int16Array, Int32Array,
-    Int64Array, Int8Array, ListArray, MapArray, RecordBatch, StructArray,
-    TimestampMicrosecondArray, TimestampNanosecondArray, UInt16Array, UInt32Array, UInt64Array,
-    UInt8Array,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array,
+    DictionaryArray, FixedSizeBinaryArray, Float32Array, Float64Array, GenericByteArray,
+    Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, RecordBatch,
+    StringViewArray, StructArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt16Array,
+    UInt32Array, UInt64Array, UInt8Array,
 };
-use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{
+    alloc::Allocation, ArrowNativeType, BooleanBuffer, Buffer, NullBuffer, OffsetBuffer,
+    ScalarBuffer,
+};
+use arrow_data::{ByteView, MAX_INLINE_VIEW_LEN};
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 
 use crate::{
@@ -83,6 +93,41 @@ pub enum ArrowDictionaryPolicy {
 impl Default for ArrowDictionaryPolicy {
     fn default() -> Self {
         Self::DictionaryKeys
+    }
+}
+
+/// Policy for exporting COVE variable byte payloads to Arrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ArrowVarBytesExportPolicy {
+    /// Materialise COVE length-prefixed bytes into standard Arrow Utf8/Binary
+    /// offset/value buffers.
+    Standard,
+    /// Export COVE length-prefixed bytes as legal Arrow Utf8View/BinaryView
+    /// arrays. The backing buffer must own or retain the COVE values bytes.
+    View,
+}
+
+impl Default for ArrowVarBytesExportPolicy {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
+/// Policy for validating COVE byte payloads before constructing Arrow Utf8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ArrowStringValidationPolicy {
+    /// Validate all materialized non-null rows while exporting.
+    Strict,
+    /// Trust a caller-supplied page-level proof that every non-null row slice is
+    /// valid UTF-8.
+    TrustedPageProof,
+}
+
+impl Default for ArrowStringValidationPolicy {
+    fn default() -> Self {
+        Self::Strict
     }
 }
 
@@ -156,6 +201,8 @@ pub struct ArrowExportResult<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArrowExportOptions {
     pub dictionary_policy: ArrowDictionaryPolicy,
+    pub varbytes_policy: ArrowVarBytesExportPolicy,
+    pub string_validation_policy: ArrowStringValidationPolicy,
     pub decimal: Option<ArrowDecimalContext>,
     pub emit_uuid_extension_metadata: bool,
     pub emit_json_extension_metadata: bool,
@@ -165,9 +212,52 @@ impl Default for ArrowExportOptions {
     fn default() -> Self {
         Self {
             dictionary_policy: ArrowDictionaryPolicy::DecodeValues,
+            varbytes_policy: ArrowVarBytesExportPolicy::Standard,
+            string_validation_policy: ArrowStringValidationPolicy::Strict,
             decimal: None,
             emit_uuid_extension_metadata: false,
             emit_json_extension_metadata: false,
+        }
+    }
+}
+
+/// Owner for an Arrow buffer that points into an externally retained COVE byte
+/// allocation.
+pub type ArrowBufferOwner = Arc<dyn Allocation>;
+
+/// Convert an owned COVE allocation into an Arrow buffer owner.
+pub fn arrow_buffer_owner<T>(owner: Arc<T>) -> ArrowBufferOwner
+where
+    T: RefUnwindSafe + Send + Sync + 'static,
+{
+    owner
+}
+
+#[derive(Clone)]
+pub struct ArrowEncodedColumn<'name, 'array, 'data> {
+    pub name: &'name str,
+    pub array: &'array EncodedArray<'data>,
+    pub data_owner: Option<ArrowBufferOwner>,
+}
+
+impl<'name, 'array, 'data> ArrowEncodedColumn<'name, 'array, 'data> {
+    pub fn borrowed(name: &'name str, array: &'array EncodedArray<'data>) -> Self {
+        Self {
+            name,
+            array,
+            data_owner: None,
+        }
+    }
+
+    pub fn with_data_owner(
+        name: &'name str,
+        array: &'array EncodedArray<'data>,
+        data_owner: Option<ArrowBufferOwner>,
+    ) -> Self {
+        Self {
+            name,
+            array,
+            data_owner,
         }
     }
 }
@@ -550,9 +640,17 @@ pub fn encoded_array_to_arrow_with_options(
     array: &EncodedArray<'_>,
     options: ArrowExportOptions,
 ) -> Result<ArrowExportResult<ArrayRef>, CoveError> {
+    encoded_array_to_arrow_with_options_and_owner(array, options, None)
+}
+
+fn encoded_array_to_arrow_with_options_and_owner(
+    array: &EncodedArray<'_>,
+    options: ArrowExportOptions,
+    data_owner: Option<&ArrowBufferOwner>,
+) -> Result<ArrowExportResult<ArrayRef>, CoveError> {
     let mut report = ArrowExportReport::default();
     if options.dictionary_policy == ArrowDictionaryPolicy::DictionaryKeys {
-        if let Some(dictionary_array) = try_filecode_dictionary_array(array)? {
+        if let Some(dictionary_array) = try_filecode_dictionary_array(array, options)? {
             report.push(
                 None,
                 array.logical,
@@ -566,84 +664,25 @@ pub fn encoded_array_to_arrow_with_options(
         }
     }
     let arrow_type = arrow_data_type_with_report(array.logical, &options, &mut report)?;
-    if let Some(array_ref) = try_direct_byte_array(array, &arrow_type)? {
+    if let Some(array_ref) = try_direct_byte_array(
+        array,
+        &arrow_type,
+        data_owner,
+        options.string_validation_policy,
+    )? {
         return Ok(ArrowExportResult {
             value: array_ref,
             report,
         });
     }
-    if let Some(array_ref) = try_direct_primitive_array(array, &arrow_type)? {
+    if let Some(array_ref) = try_direct_primitive_array(array, &arrow_type, data_owner)? {
         return Ok(ArrowExportResult {
             value: array_ref,
             report,
         });
     }
     let values = array.decode_all_rows()?;
-    let array_ref = match arrow_type {
-        DataType::Boolean => Arc::new(BooleanArray::from(collect_bool(&values)?)) as ArrayRef,
-        DataType::Int8 => Arc::new(Int8Array::from(collect_i64(array.logical, &values, |v| {
-            i8::try_from(v).map_err(|_| CoveError::PageCorrupt)
-        })?)) as ArrayRef,
-        DataType::Int16 => Arc::new(Int16Array::from(collect_i64(
-            array.logical,
-            &values,
-            |v| i16::try_from(v).map_err(|_| CoveError::PageCorrupt),
-        )?)) as ArrayRef,
-        DataType::Int32 => Arc::new(Int32Array::from(collect_i64(
-            array.logical,
-            &values,
-            |v| i32::try_from(v).map_err(|_| CoveError::PageCorrupt),
-        )?)) as ArrayRef,
-        DataType::Int64 => {
-            Arc::new(Int64Array::from(collect_i64(array.logical, &values, Ok)?)) as ArrayRef
-        }
-        DataType::UInt8 => Arc::new(UInt8Array::from(collect_u64(
-            array.logical,
-            &values,
-            |v| u8::try_from(v).map_err(|_| CoveError::PageCorrupt),
-        )?)) as ArrayRef,
-        DataType::UInt16 => Arc::new(UInt16Array::from(collect_u64(
-            array.logical,
-            &values,
-            |v| u16::try_from(v).map_err(|_| CoveError::PageCorrupt),
-        )?)) as ArrayRef,
-        DataType::UInt32 => Arc::new(UInt32Array::from(collect_u64(
-            array.logical,
-            &values,
-            |v| u32::try_from(v).map_err(|_| CoveError::PageCorrupt),
-        )?)) as ArrayRef,
-        DataType::UInt64 => {
-            Arc::new(UInt64Array::from(collect_u64(array.logical, &values, Ok)?)) as ArrayRef
-        }
-        DataType::Float32 => Arc::new(Float32Array::from(collect_f32(&values)?)) as ArrayRef,
-        DataType::Float64 => Arc::new(Float64Array::from(collect_f64(&values)?)) as ArrayRef,
-        DataType::Date32 => Arc::new(Date32Array::from(collect_i64(
-            array.logical,
-            &values,
-            |v| i32::try_from(v).map_err(|_| CoveError::PageCorrupt),
-        )?)) as ArrayRef,
-        DataType::Timestamp(TimeUnit::Microsecond, None) => Arc::new(
-            TimestampMicrosecondArray::from(collect_i64(array.logical, &values, Ok)?),
-        ) as ArrayRef,
-        DataType::Timestamp(TimeUnit::Nanosecond, None) => Arc::new(TimestampNanosecondArray::from(
-            collect_i64(array.logical, &values, Ok)?,
-        )) as ArrayRef,
-        DataType::Utf8 => Arc::new(collect_utf8(array.logical, &values)?) as ArrayRef,
-        DataType::Binary => Arc::new(collect_binary(array.logical, &values)?) as ArrayRef,
-        DataType::FixedSizeBinary(size) => {
-            Arc::new(collect_fixed_size_binary(array.logical, &values, size)?) as ArrayRef
-        }
-        DataType::Decimal128(precision, scale) => Arc::new(
-            Decimal128Array::from(collect_i128(array.logical, &values)?)
-                .with_precision_and_scale(precision, scale)
-                .map_err(|err| CoveError::BadSection(format!("Arrow Decimal128: {err}")))?,
-        ) as ArrayRef,
-        other => {
-            return Err(CoveError::UnsupportedEncoding(format!(
-                "Arrow export for {other:?}"
-            )));
-        }
-    };
+    let array_ref = values_to_arrow_array_with_data_type(array.logical, &values, arrow_type)?;
     Ok(ArrowExportResult {
         value: array_ref,
         report,
@@ -673,13 +712,22 @@ pub fn encoded_array_to_arrow_with_row_selection_options(
     selection: ArrowRowSelection<'_>,
     options: ArrowExportOptions,
 ) -> Result<ArrowExportResult<ArrayRef>, CoveError> {
+    encoded_array_to_arrow_with_row_selection_options_and_owner(array, selection, options, None)
+}
+
+fn encoded_array_to_arrow_with_row_selection_options_and_owner(
+    array: &EncodedArray<'_>,
+    selection: ArrowRowSelection<'_>,
+    options: ArrowExportOptions,
+    data_owner: Option<&ArrowBufferOwner>,
+) -> Result<ArrowExportResult<ArrayRef>, CoveError> {
     if selection.is_all_rows(array.row_count)? {
-        return encoded_array_to_arrow_with_options(array, options);
+        return encoded_array_to_arrow_with_options_and_owner(array, options, data_owner);
     }
     let mut report = ArrowExportReport::default();
     if options.dictionary_policy == ArrowDictionaryPolicy::DictionaryKeys {
         if let Some(dictionary_array) =
-            try_filecode_dictionary_array_for_selection(array, selection)?
+            try_filecode_dictionary_array_for_selection(array, selection, options)?
         {
             report.push(
                 None,
@@ -694,7 +742,13 @@ pub fn encoded_array_to_arrow_with_row_selection_options(
         }
     }
     let arrow_type = arrow_data_type_with_report(array.logical, &options, &mut report)?;
-    if let Some(array_ref) = try_direct_byte_array_for_selection(array, selection, &arrow_type)? {
+    if let Some(array_ref) = try_direct_byte_array_for_selection(
+        array,
+        selection,
+        &arrow_type,
+        data_owner,
+        options.string_validation_policy,
+    )? {
         return Ok(ArrowExportResult {
             value: array_ref,
             report,
@@ -740,11 +794,30 @@ pub fn encoded_columns_to_arrow_arrays_with_options(
     selection: ArrowRowSelection<'_>,
     options: ArrowExportOptions,
 ) -> Result<ArrowExportResult<Vec<ArrayRef>>, CoveError> {
+    let owned_columns = columns
+        .iter()
+        .map(|(name, array)| ArrowEncodedColumn::borrowed(*name, *array))
+        .collect::<Vec<_>>();
+    encoded_columns_to_arrow_arrays_with_owners_options(&owned_columns, selection, options)
+}
+
+/// Export named COVE array views as Arrow arrays, retaining optional backing
+/// owners for direct Arrow View buffers.
+pub fn encoded_columns_to_arrow_arrays_with_owners_options(
+    columns: &[ArrowEncodedColumn<'_, '_, '_>],
+    selection: ArrowRowSelection<'_>,
+    options: ArrowExportOptions,
+) -> Result<ArrowExportResult<Vec<ArrayRef>>, CoveError> {
     let mut arrays = Vec::with_capacity(columns.len());
     let mut report = ArrowExportReport::default();
-    for (name, array) in columns {
-        let result = encoded_array_to_arrow_with_row_selection_options(array, selection, options)?;
-        report.extend_with_field(name, result.report);
+    for column in columns {
+        let result = encoded_array_to_arrow_with_row_selection_options_and_owner(
+            column.array,
+            selection,
+            options,
+            column.data_owner.as_ref(),
+        )?;
+        report.extend_with_field(column.name, result.report);
         arrays.push(result.value);
     }
     Ok(ArrowExportResult {
@@ -857,10 +930,12 @@ fn arrow_extension_metadata(
         }
         CoveLogicalType::Json if options.emit_json_extension_metadata => {
             metadata.insert("ARROW:extension:name".into(), "cove.json".into());
-            metadata.insert(
-                "ARROW:extension:metadata".into(),
-                r#"{"storage":"utf8"}"#.into(),
-            );
+            let storage = if options.varbytes_policy == ArrowVarBytesExportPolicy::View {
+                r#"{"storage":"utf8_view"}"#
+            } else {
+                r#"{"storage":"utf8"}"#
+            };
+            metadata.insert("ARROW:extension:metadata".into(), storage.into());
         }
         _ => {}
     }
@@ -880,6 +955,101 @@ fn arrow_i32_offsets(offsets: &[u32]) -> Result<OffsetBuffer<i32>, CoveError> {
     Ok(OffsetBuffer::new(ScalarBuffer::from(converted)))
 }
 
+#[inline]
+fn bitpacked_len(len: usize) -> Result<usize, CoveError> {
+    len.checked_add(7)
+        .ok_or(CoveError::ArithOverflow)
+        .map(|len| len / 8)
+}
+
+#[inline]
+fn set_packed_bit(bytes: &mut [u8], index: usize) {
+    bytes[index / 8] |= 1u8 << (index % 8);
+}
+
+struct ArrowValidityBuilder {
+    bytes: Vec<u8>,
+    len: usize,
+    pos: usize,
+    null_count: usize,
+}
+
+impl ArrowValidityBuilder {
+    fn new(len: usize) -> Result<Self, CoveError> {
+        Ok(Self {
+            bytes: vec![0u8; bitpacked_len(len)?],
+            len,
+            pos: 0,
+            null_count: 0,
+        })
+    }
+
+    fn append(&mut self, is_valid: bool) {
+        debug_assert!(self.pos < self.len);
+        if is_valid {
+            set_packed_bit(&mut self.bytes, self.pos);
+        } else {
+            self.null_count += 1;
+        }
+        self.pos += 1;
+    }
+
+    fn finish(self) -> Option<NullBuffer> {
+        debug_assert_eq!(self.pos, self.len);
+        if self.null_count == 0 {
+            return None;
+        }
+        let buffer = BooleanBuffer::new(Buffer::from_vec(self.bytes), 0, self.len);
+        // INVARIANT: `append` writes exactly one validity bit per logical row,
+        // setting true only for valid rows and incrementing `null_count` for
+        // every false bit.
+        // SAFETY: the packed BooleanBuffer therefore contains exactly
+        // `null_count` zero bits over its declared logical length.
+        Some(unsafe { NullBuffer::new_unchecked(buffer, self.null_count) })
+    }
+}
+
+fn trusted_i32_offset_buffer(offsets: Vec<i32>) -> OffsetBuffer<i32> {
+    debug_assert!(!offsets.is_empty());
+    debug_assert_eq!(offsets[0], 0);
+    debug_assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+    // INVARIANT: callers append offsets from checked cumulative byte lengths.
+    // They start at zero, never decrease, and each value has already fit in
+    // i32 before being pushed.
+    // SAFETY: these are exactly Arrow's OffsetBuffer invariants for i32
+    // offsets.
+    unsafe { OffsetBuffer::new_unchecked(ScalarBuffer::from(offsets)) }
+}
+
+fn trusted_binary_array(
+    offsets: OffsetBuffer<i32>,
+    values: Buffer,
+    nulls: Option<NullBuffer>,
+) -> BinaryArray {
+    debug_assert!(offsets.last().copied().unwrap_or_default() as usize <= values.len());
+    // INVARIANT: `BytePayloadPlan::materialize*` builds monotonic offsets with
+    // the final offset equal to the values buffer length, and any null buffer is
+    // produced for the same logical row count.
+    // SAFETY: Binary arrays do not require UTF-8 validation; with the proven
+    // offset/value/null invariants, `try_new` would not fail.
+    unsafe { GenericByteArray::<GenericBinaryType<i32>>::new_unchecked(offsets, values, nulls) }
+}
+
+fn trusted_string_array(
+    offsets: OffsetBuffer<i32>,
+    values: Buffer,
+    nulls: Option<NullBuffer>,
+) -> GenericByteArray<GenericStringType<i32>> {
+    debug_assert!(offsets.last().copied().unwrap_or_default() as usize <= values.len());
+    // INVARIANT: callers either validate every non-null string row against the
+    // same offset/value/null buffers immediately before construction or carry
+    // an explicit page-level proof that every non-null row slice is UTF-8.
+    // SAFETY: with monotonic i32 offsets, final offset within `values`, null
+    // buffer length matching the offset count, and proven UTF-8 row slices,
+    // `try_new` would not fail.
+    unsafe { GenericByteArray::<GenericStringType<i32>>::new_unchecked(offsets, values, nulls) }
+}
+
 fn arrow_null_buffer(
     validity: Option<ValidityBitmap<'_>>,
     row_count: usize,
@@ -889,28 +1059,25 @@ fn arrow_null_buffer(
     };
     let row_count_u64 = u64::try_from(row_count).map_err(|_| CoveError::ArithOverflow)?;
     validity.validate_len(row_count_u64)?;
-    let mut any_null = false;
-    let mut bits = Vec::with_capacity(row_count);
+    let mut validity_builder = ArrowValidityBuilder::new(row_count)?;
     for row in 0..row_count_u64 {
         let valid = validity.is_valid(row)?;
-        any_null |= !valid;
-        bits.push(valid);
+        validity_builder.append(valid);
     }
-    if any_null {
-        Ok(Some(NullBuffer::from(bits)))
-    } else {
-        Ok(None)
-    }
+    Ok(validity_builder.finish())
 }
 
-fn try_filecode_dictionary_array(array: &EncodedArray<'_>) -> Result<Option<ArrayRef>, CoveError> {
+fn try_filecode_dictionary_array(
+    array: &EncodedArray<'_>,
+    options: ArrowExportOptions,
+) -> Result<Option<ArrayRef>, CoveError> {
     if array.encoding != crate::constants::CoveEncodingKind::FileCode {
         return Ok(None);
     }
     let Some(dictionary) = array.dictionary else {
         return Ok(None);
     };
-    let values = file_dictionary_values_to_arrow(array.logical, dictionary)?;
+    let values = file_dictionary_values_to_arrow(array.logical, dictionary, options)?;
     let mut keys = Vec::with_capacity(usize::try_from(array.row_count).map_err(|_| {
         CoveError::UnsupportedEncoding("Arrow export row count exceeds usize".into())
     })?);
@@ -934,6 +1101,7 @@ fn try_filecode_dictionary_array(array: &EncodedArray<'_>) -> Result<Option<Arra
 fn try_filecode_dictionary_array_for_selection(
     array: &EncodedArray<'_>,
     selection: ArrowRowSelection<'_>,
+    options: ArrowExportOptions,
 ) -> Result<Option<ArrayRef>, CoveError> {
     if array.encoding != crate::constants::CoveEncodingKind::FileCode {
         return Ok(None);
@@ -941,7 +1109,7 @@ fn try_filecode_dictionary_array_for_selection(
     let Some(dictionary) = array.dictionary else {
         return Ok(None);
     };
-    let values = file_dictionary_values_to_arrow(array.logical, dictionary)?;
+    let values = file_dictionary_values_to_arrow(array.logical, dictionary, options)?;
     let mut keys = Vec::with_capacity(selection.selected_len(array.row_count)?);
     selection.for_each_row(array.row_count, |row| {
         let row_u64 = u64::try_from(row).map_err(|_| CoveError::ArithOverflow)?;
@@ -962,12 +1130,14 @@ fn try_filecode_dictionary_array_for_selection(
 fn file_dictionary_values_to_arrow(
     logical: CoveLogicalType,
     dictionary: &crate::dictionary::FileDictionary,
+    options: ArrowExportOptions,
 ) -> Result<ArrayRef, CoveError> {
     let mut values = Vec::with_capacity(dictionary.entries.len());
     for code in 0..dictionary.len() {
         values.push(CoveArrayValue::DictValue(dictionary.decode_value(code)?));
     }
-    match arrow_data_type(logical)? {
+    let mut report = ArrowExportReport::default();
+    match arrow_data_type_with_report(logical, &options, &mut report)? {
         DataType::Boolean => Ok(Arc::new(BooleanArray::from(collect_bool(&values)?))),
         DataType::Int8 => Ok(Arc::new(Int8Array::from(collect_i64(
             logical,
@@ -1019,7 +1189,9 @@ fn file_dictionary_values_to_arrow(
             TimestampNanosecondArray::from(collect_i64(logical, &values, Ok)?),
         )),
         DataType::Utf8 => Ok(Arc::new(collect_utf8(logical, &values)?)),
+        DataType::Utf8View => Ok(Arc::new(collect_utf8_view(logical, &values)?)),
         DataType::Binary => Ok(Arc::new(collect_binary(logical, &values)?)),
+        DataType::BinaryView => Ok(Arc::new(collect_binary_view(logical, &values)?)),
         DataType::FixedSizeBinary(size) => {
             Ok(Arc::new(collect_fixed_size_binary(logical, &values, size)?))
         }
@@ -1032,11 +1204,6 @@ fn file_dictionary_values_to_arrow(
 fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, CoveError> {
     let slice = wire::read_range_checked(bytes, offset, 4)?;
     Ok(u32::from_le_bytes(slice.try_into().unwrap()))
-}
-
-fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, CoveError> {
-    let slice = wire::read_range_checked(bytes, offset, 8)?;
-    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
 }
 
 #[inline]
@@ -1093,6 +1260,8 @@ enum BytePayloadLayout {
 fn try_direct_byte_array(
     array: &EncodedArray<'_>,
     data_type: &DataType,
+    data_owner: Option<&ArrowBufferOwner>,
+    string_validation_policy: ArrowStringValidationPolicy,
 ) -> Result<Option<ArrayRef>, CoveError> {
     if array.physical != CovePhysicalKind::VarBytes {
         return Ok(None);
@@ -1109,13 +1278,22 @@ fn try_direct_byte_array(
         }
         _ => return Ok(None),
     };
-    byte_array_from_payload_plan(array, ArrowRowSelection::All, layout, data_type)
+    byte_array_from_payload_plan(
+        array,
+        ArrowRowSelection::All,
+        layout,
+        data_type,
+        data_owner,
+        string_validation_policy,
+    )
 }
 
 fn try_direct_byte_array_for_selection(
     array: &EncodedArray<'_>,
     selection: ArrowRowSelection<'_>,
     data_type: &DataType,
+    data_owner: Option<&ArrowBufferOwner>,
+    string_validation_policy: ArrowStringValidationPolicy,
 ) -> Result<Option<ArrayRef>, CoveError> {
     if array.physical != CovePhysicalKind::VarBytes {
         return Ok(None);
@@ -1132,7 +1310,14 @@ fn try_direct_byte_array_for_selection(
         }
         _ => return Ok(None),
     };
-    byte_array_from_payload_plan(array, selection, layout, data_type)
+    byte_array_from_payload_plan(
+        array,
+        selection,
+        layout,
+        data_type,
+        data_owner,
+        string_validation_policy,
+    )
 }
 
 fn byte_array_from_payload_plan(
@@ -1140,24 +1325,311 @@ fn byte_array_from_payload_plan(
     selection: ArrowRowSelection<'_>,
     layout: BytePayloadLayout,
     data_type: &DataType,
+    data_owner: Option<&ArrowBufferOwner>,
+    string_validation_policy: ArrowStringValidationPolicy,
 ) -> Result<Option<ArrayRef>, CoveError> {
-    if !matches!(data_type, DataType::Utf8 | DataType::Binary) {
+    if !matches!(
+        data_type,
+        DataType::Utf8 | DataType::Binary | DataType::Utf8View | DataType::BinaryView
+    ) {
         return Ok(None);
     }
     let plan = BytePayloadPlan { layout };
-    let (offsets, values, nulls) = plan.materialize(array, selection)?;
     let array_ref = match data_type {
-        DataType::Utf8 => Arc::new(
-            GenericByteArray::<GenericStringType<i32>>::try_new(offsets, values, nulls)
-                .map_err(|err| CoveError::BadSection(format!("Arrow Utf8 export: {err}")))?,
-        ) as ArrayRef,
-        DataType::Binary => Arc::new(
-            GenericByteArray::<GenericBinaryType<i32>>::try_new(offsets, values, nulls)
-                .map_err(|err| CoveError::BadSection(format!("Arrow Binary export: {err}")))?,
-        ) as ArrayRef,
+        DataType::Utf8 => {
+            let (offsets, values, nulls) =
+                plan.materialize_utf8(array, selection, string_validation_policy)?;
+            // INVARIANT: Strict mode validates all materialized values before
+            // construction. TrustedPageProof is an explicit caller contract
+            // that every non-null source row slice is valid UTF-8 at the same
+            // row boundaries used to build `offsets`.
+            Arc::new(trusted_string_array(offsets, values, nulls)) as ArrayRef
+        }
+        DataType::Binary => {
+            let (offsets, values, nulls) = plan.materialize(array, selection)?;
+            Arc::new(trusted_binary_array(offsets, values, nulls)) as ArrayRef
+        }
+        DataType::Utf8View => {
+            let (views, buffers, nulls) = plan.materialize_view(array, selection, data_owner)?;
+            Arc::new(
+                StringViewArray::try_new(views, buffers, nulls).map_err(|err| {
+                    CoveError::BadSection(format!("Arrow Utf8View export: {err}"))
+                })?,
+            ) as ArrayRef
+        }
+        DataType::BinaryView => {
+            let (views, buffers, nulls) = plan.materialize_view(array, selection, data_owner)?;
+            Arc::new(
+                BinaryViewArray::try_new(views, buffers, nulls).map_err(|err| {
+                    CoveError::BadSection(format!("Arrow BinaryView export: {err}"))
+                })?,
+            ) as ArrayRef
+        }
         _ => unreachable!(),
     };
     Ok(Some(array_ref))
+}
+
+fn byte_view_backing_buffer(
+    array: &EncodedArray<'_>,
+    data_owner: Option<&ArrowBufferOwner>,
+) -> Result<Buffer, CoveError> {
+    if array.data.is_empty() {
+        return Ok(Buffer::from_vec(Vec::<u8>::new()));
+    }
+    let Some(owner) = data_owner else {
+        return Ok(Buffer::from_vec(array.data.to_vec()));
+    };
+    let ptr = NonNull::new(array.data.as_ptr() as *mut u8).ok_or(CoveError::BufferTooShort)?;
+    // SAFETY: `data_owner` is supplied by the caller for the allocation that
+    // contains `array.data`, and the Arrow Buffer retains that owner for at
+    // least as long as any view array referencing this byte range.
+    Ok(unsafe { Buffer::from_custom_allocation(ptr, array.data.len(), Arc::clone(owner)) })
+}
+
+fn inline_byte_view(bytes: &[u8]) -> Result<u128, CoveError> {
+    let len = u32::try_from(bytes.len()).map_err(|_| CoveError::ArithOverflow)?;
+    if len > MAX_INLINE_VIEW_LEN {
+        return Err(CoveError::ArithOverflow);
+    }
+    let mut raw = [0u8; 16];
+    raw[..4].copy_from_slice(&len.to_le_bytes());
+    raw[4..4 + bytes.len()].copy_from_slice(bytes);
+    Ok(u128::from_le_bytes(raw))
+}
+
+fn buffered_byte_view(data: &[u8], start: usize, end: usize) -> Result<u128, CoveError> {
+    let len = end.checked_sub(start).ok_or(CoveError::PageCorrupt)?;
+    let len = u32::try_from(len).map_err(|_| CoveError::ArithOverflow)?;
+    let offset = u32::try_from(start).map_err(|_| CoveError::ArithOverflow)?;
+    let prefix_end = start.checked_add(4).ok_or(CoveError::ArithOverflow)?;
+    if prefix_end > end {
+        return Err(CoveError::PageCorrupt);
+    }
+    Ok(ByteView::new(len, &data[start..prefix_end])
+        .with_buffer_index(0)
+        .with_offset(offset)
+        .as_u128())
+}
+
+fn byte_view_for_range(data: &[u8], start: usize, end: usize) -> Result<u128, CoveError> {
+    let len = end.checked_sub(start).ok_or(CoveError::PageCorrupt)?;
+    if u32::try_from(len).map_err(|_| CoveError::ArithOverflow)? <= MAX_INLINE_VIEW_LEN {
+        inline_byte_view(&data[start..end])
+    } else {
+        buffered_byte_view(data, start, end)
+    }
+}
+
+fn validate_utf8_offsets_values(
+    offsets: &OffsetBuffer<i32>,
+    values: &Buffer,
+) -> Result<(), CoveError> {
+    let values = values.as_slice();
+    for pair in offsets.windows(2) {
+        let start = usize::try_from(pair[0]).map_err(|_| CoveError::OffsetRange)?;
+        let end = usize::try_from(pair[1]).map_err(|_| CoveError::OffsetRange)?;
+        if start > end || end > values.len() {
+            return Err(CoveError::OffsetRange);
+        }
+        validate_arrow_utf8_row(&values[start..end])?;
+    }
+    Ok(())
+}
+
+const ASCII_HIGH_BIT_MASK_U64: u64 = 0x8080_8080_8080_8080;
+
+#[inline(always)]
+fn validate_arrow_utf8(bytes: &[u8]) -> Result<(), CoveError> {
+    simdutf8::basic::from_utf8(bytes)
+        .map(|_| ())
+        .map_err(|err| CoveError::BadSection(format!("Arrow Utf8 export: {err}")))
+}
+
+#[inline(always)]
+fn validate_arrow_utf8_row(bytes: &[u8]) -> Result<(), CoveError> {
+    if bytes.is_ascii() {
+        return Ok(());
+    }
+    validate_arrow_utf8(bytes)
+}
+
+#[inline(always)]
+unsafe fn read_u32_le_unaligned(src: *const u8) -> u32 {
+    // SAFETY: callers prove that `src..src + 4` is in bounds for the backing
+    // byte slice before invoking this helper. `read_unaligned` handles any byte
+    // alignment accepted by COVE wire payloads.
+    u32::from_le(unsafe { ptr::read_unaligned(src.cast::<u32>()) })
+}
+
+#[inline(always)]
+unsafe fn copy_varbytes_value(src: *const u8, dst: *mut u8, len: usize) {
+    if len <= 16 {
+        // SAFETY: the caller proves both ranges are valid for `len` bytes and
+        // non-overlapping. The small-copy helper only reads and writes within
+        // those same ranges.
+        unsafe {
+            copy_small_varbytes_value(src, dst, len);
+        }
+    } else {
+        // SAFETY: forwarded caller invariant.
+        unsafe {
+            ptr::copy_nonoverlapping(src, dst, len);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn copy_varbytes_value_ascii_mask(src: *const u8, dst: *mut u8, len: usize) -> u64 {
+    if len <= 16 {
+        // SAFETY: forwarded caller invariant.
+        return unsafe { copy_small_varbytes_value_ascii_mask(src, dst, len) };
+    }
+    if len <= 64 {
+        let mut mask = 0u64;
+        let mut offset = 0usize;
+        while offset + 8 <= len {
+            // SAFETY: `offset + 8 <= len`, and callers prove both ranges are
+            // valid for `len` bytes.
+            let word = unsafe { ptr::read_unaligned(src.add(offset).cast::<u64>()) };
+            // SAFETY: destination range is valid for the same initialized word.
+            unsafe {
+                ptr::write_unaligned(dst.add(offset).cast::<u64>(), word);
+            }
+            mask |= word & ASCII_HIGH_BIT_MASK_U64;
+            offset += 8;
+        }
+        if offset < len {
+            // SAFETY: tail lies inside the proven source/destination ranges.
+            mask |= unsafe {
+                copy_small_varbytes_value_ascii_mask(src.add(offset), dst.add(offset), len - offset)
+            };
+        }
+        return mask;
+    }
+
+    // SAFETY: forwarded caller invariant. Large rows use the platform memcpy
+    // for throughput, then scan the source with raw loads only on the strict
+    // validation path.
+    unsafe {
+        ptr::copy_nonoverlapping(src, dst, len);
+    }
+    // SAFETY: source is valid for `len` bytes by caller invariant.
+    unsafe { ascii_high_bit_mask(src, len) }
+}
+
+#[inline(always)]
+unsafe fn ascii_high_bit_mask(src: *const u8, len: usize) -> u64 {
+    let mut mask = 0u64;
+    let mut offset = 0usize;
+    while offset + 8 <= len {
+        // SAFETY: `offset + 8 <= len`, and callers prove source validity.
+        let word = unsafe { ptr::read_unaligned(src.add(offset).cast::<u64>()) };
+        mask |= word & ASCII_HIGH_BIT_MASK_U64;
+        offset += 8;
+    }
+    while offset < len {
+        // SAFETY: tail byte lies inside the proven source range.
+        mask |= (unsafe { src.add(offset).read() } as u64) & 0x80;
+        offset += 1;
+    }
+    mask
+}
+
+#[inline(always)]
+unsafe fn copy_small_varbytes_value(src: *const u8, dst: *mut u8, len: usize) {
+    match len {
+        0 => {}
+        1 => {
+            // SAFETY: caller proved one byte is readable and writable.
+            unsafe {
+                dst.write(src.read());
+            }
+        }
+        2 => unsafe {
+            ptr::write_unaligned(dst.cast::<u16>(), ptr::read_unaligned(src.cast::<u16>()));
+        },
+        3 => unsafe {
+            ptr::write_unaligned(dst.cast::<u16>(), ptr::read_unaligned(src.cast::<u16>()));
+            dst.add(2).write(src.add(2).read());
+        },
+        4 => unsafe {
+            ptr::write_unaligned(dst.cast::<u32>(), ptr::read_unaligned(src.cast::<u32>()));
+        },
+        5..=7 => unsafe {
+            ptr::write_unaligned(dst.cast::<u32>(), ptr::read_unaligned(src.cast::<u32>()));
+            ptr::write_unaligned(
+                dst.add(len - 4).cast::<u32>(),
+                ptr::read_unaligned(src.add(len - 4).cast::<u32>()),
+            );
+        },
+        8 => unsafe {
+            ptr::write_unaligned(dst.cast::<u64>(), ptr::read_unaligned(src.cast::<u64>()));
+        },
+        9..=16 => unsafe {
+            ptr::write_unaligned(dst.cast::<u64>(), ptr::read_unaligned(src.cast::<u64>()));
+            ptr::write_unaligned(
+                dst.add(len - 8).cast::<u64>(),
+                ptr::read_unaligned(src.add(len - 8).cast::<u64>()),
+            );
+        },
+        _ => unsafe {
+            ptr::copy_nonoverlapping(src, dst, len);
+        },
+    }
+}
+
+#[inline(always)]
+unsafe fn copy_small_varbytes_value_ascii_mask(src: *const u8, dst: *mut u8, len: usize) -> u64 {
+    match len {
+        0 => 0,
+        1 => {
+            // SAFETY: caller proved one byte is readable and writable.
+            let byte = unsafe { src.read() };
+            // SAFETY: destination byte is valid.
+            unsafe {
+                dst.write(byte);
+            }
+            (byte as u64) & 0x80
+        }
+        2 => unsafe {
+            let word = ptr::read_unaligned(src.cast::<u16>());
+            ptr::write_unaligned(dst.cast::<u16>(), word);
+            (word as u64) & 0x8080
+        },
+        3 => unsafe {
+            let first = ptr::read_unaligned(src.cast::<u16>());
+            let last = src.add(2).read();
+            ptr::write_unaligned(dst.cast::<u16>(), first);
+            dst.add(2).write(last);
+            ((first as u64) & 0x8080) | ((last as u64) & 0x80)
+        },
+        4 => unsafe {
+            let word = ptr::read_unaligned(src.cast::<u32>());
+            ptr::write_unaligned(dst.cast::<u32>(), word);
+            (word as u64) & 0x8080_8080
+        },
+        5..=7 => unsafe {
+            let first = ptr::read_unaligned(src.cast::<u32>());
+            let last = ptr::read_unaligned(src.add(len - 4).cast::<u32>());
+            ptr::write_unaligned(dst.cast::<u32>(), first);
+            ptr::write_unaligned(dst.add(len - 4).cast::<u32>(), last);
+            ((first as u64) | (last as u64)) & 0x8080_8080
+        },
+        8 => unsafe {
+            let word = ptr::read_unaligned(src.cast::<u64>());
+            ptr::write_unaligned(dst.cast::<u64>(), word);
+            word & ASCII_HIGH_BIT_MASK_U64
+        },
+        9..=16 => unsafe {
+            let first = ptr::read_unaligned(src.cast::<u64>());
+            let last = ptr::read_unaligned(src.add(len - 8).cast::<u64>());
+            ptr::write_unaligned(dst.cast::<u64>(), first);
+            ptr::write_unaligned(dst.add(len - 8).cast::<u64>(), last);
+            (first | last) & ASCII_HIGH_BIT_MASK_U64
+        },
+        _ => unsafe { copy_varbytes_value_ascii_mask(src, dst, len) },
+    }
 }
 
 struct BytePayloadPlan {
@@ -1198,6 +1670,127 @@ impl BytePayloadPlan {
         self.materialize_selected(array, selection, &ranges)
     }
 
+    fn materialize_utf8(
+        &self,
+        array: &EncodedArray<'_>,
+        selection: ArrowRowSelection<'_>,
+        string_validation_policy: ArrowStringValidationPolicy,
+    ) -> Result<(OffsetBuffer<i32>, Buffer, Option<NullBuffer>), CoveError> {
+        let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
+        let has_nulls = match array.validity {
+            Some(validity) => validity.null_count()? > 0,
+            None => false,
+        };
+        if matches!(selection, ArrowRowSelection::All)
+            && !has_nulls
+            && matches!(self.layout, BytePayloadLayout::U32LengthPrefixed)
+        {
+            return match string_validation_policy {
+                ArrowStringValidationPolicy::Strict => {
+                    self.materialize_all_u32_no_nulls_utf8_strict(array, row_count)
+                }
+                ArrowStringValidationPolicy::TrustedPageProof => {
+                    self.materialize_all_u32_no_nulls(array, row_count)
+                }
+            };
+        }
+        let (offsets, values, nulls) = self.materialize(array, selection)?;
+        if string_validation_policy == ArrowStringValidationPolicy::Strict {
+            validate_utf8_offsets_values(&offsets, &values)?;
+        }
+        Ok((offsets, values, nulls))
+    }
+
+    fn materialize_view(
+        &self,
+        array: &EncodedArray<'_>,
+        selection: ArrowRowSelection<'_>,
+        data_owner: Option<&ArrowBufferOwner>,
+    ) -> Result<(ScalarBuffer<u128>, Vec<Buffer>, Option<NullBuffer>), CoveError> {
+        if matches!(selection, ArrowRowSelection::All) {
+            return self.materialize_view_all_rows(array, data_owner);
+        }
+        let ranges = self.parse_ranges(array)?;
+        let selected_len = selection.selected_len(array.row_count)?;
+        let has_nulls = match array.validity {
+            Some(validity) => validity.null_count()? > 0,
+            None => false,
+        };
+        let mut views = Vec::with_capacity(selected_len);
+        let mut validity_builder = has_nulls
+            .then(|| ArrowValidityBuilder::new(selected_len))
+            .transpose()?;
+        selection.for_each_row(array.row_count, |row| {
+            let row_u64 = u64::try_from(row).map_err(|_| CoveError::ArithOverflow)?;
+            let is_null = has_nulls && array.is_null(row_u64)?;
+            if let Some(builder) = &mut validity_builder {
+                builder.append(!is_null);
+            }
+            if is_null {
+                views.push(0u128);
+                return Ok(());
+            }
+            let (start, end) = ranges[row];
+            views.push(byte_view_for_range(array.data, start, end)?);
+            Ok(())
+        })?;
+
+        let buffers = vec![byte_view_backing_buffer(array, data_owner)?];
+        Ok((
+            ScalarBuffer::from(views),
+            buffers,
+            validity_builder.and_then(ArrowValidityBuilder::finish),
+        ))
+    }
+
+    fn materialize_view_all_rows(
+        &self,
+        array: &EncodedArray<'_>,
+        data_owner: Option<&ArrowBufferOwner>,
+    ) -> Result<(ScalarBuffer<u128>, Vec<Buffer>, Option<NullBuffer>), CoveError> {
+        let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
+        let has_nulls = match array.validity {
+            Some(validity) => validity.null_count()? > 0,
+            None => false,
+        };
+        let mut views = Vec::with_capacity(row_count);
+        let mut validity_builder = has_nulls
+            .then(|| ArrowValidityBuilder::new(row_count))
+            .transpose()?;
+
+        let data = array.data;
+        let mut pos = 0usize;
+        for row in 0..array.row_count {
+            let (data_start, data_end) = match self.layout {
+                BytePayloadLayout::U32LengthPrefixed => read_u32_len_prefixed_range(data, pos)?,
+                BytePayloadLayout::Leb128LengthPrefixed => {
+                    read_leb128_len_prefixed_range(data, pos)?
+                }
+            };
+            pos = data_end;
+
+            let is_null = has_nulls && array.is_null(row)?;
+            if let Some(builder) = &mut validity_builder {
+                builder.append(!is_null);
+            }
+            if is_null {
+                views.push(0u128);
+            } else {
+                views.push(byte_view_for_range(data, data_start, data_end)?);
+            }
+        }
+        if pos != data.len() {
+            return Err(CoveError::PageCorrupt);
+        }
+
+        let buffers = vec![byte_view_backing_buffer(array, data_owner)?];
+        Ok((
+            ScalarBuffer::from(views),
+            buffers,
+            validity_builder.and_then(ArrowValidityBuilder::finish),
+        ))
+    }
+
     fn materialize_all_rows(
         &self,
         array: &EncodedArray<'_>,
@@ -1207,12 +1800,17 @@ impl BytePayloadPlan {
             Some(validity) => validity.null_count()? > 0,
             None => false,
         };
+        if !has_nulls && matches!(self.layout, BytePayloadLayout::U32LengthPrefixed) {
+            return self.materialize_all_u32_no_nulls(array, row_count);
+        }
         let Some(offset_capacity) = row_count.checked_add(1) else {
             return Err(CoveError::ArithOverflow);
         };
-        let mut offsets = Vec::with_capacity(offset_capacity);
+        let mut offsets = Vec::<i32>::with_capacity(offset_capacity);
         let mut values = Vec::with_capacity(array.data.len());
-        let mut valid_bits = has_nulls.then(|| Vec::with_capacity(row_count));
+        let mut validity_builder = has_nulls
+            .then(|| ArrowValidityBuilder::new(row_count))
+            .transpose()?;
         offsets.push(0i32);
 
         let data = array.data;
@@ -1227,8 +1825,8 @@ impl BytePayloadPlan {
             pos = data_end;
 
             let is_null = has_nulls && array.is_null(row)?;
-            if let Some(bits) = &mut valid_bits {
-                bits.push(!is_null);
+            if let Some(builder) = &mut validity_builder {
+                builder.append(!is_null);
             }
             if !is_null {
                 values.extend_from_slice(&data[data_start..data_end]);
@@ -1239,9 +1837,129 @@ impl BytePayloadPlan {
             return Err(CoveError::PageCorrupt);
         }
 
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
-        let nulls = valid_bits.map(NullBuffer::from);
+        let offsets = trusted_i32_offset_buffer(offsets);
+        let nulls = validity_builder.and_then(ArrowValidityBuilder::finish);
         Ok((offsets, Buffer::from_vec(values), nulls))
+    }
+
+    fn materialize_all_u32_no_nulls(
+        &self,
+        array: &EncodedArray<'_>,
+        row_count: usize,
+    ) -> Result<(OffsetBuffer<i32>, Buffer, Option<NullBuffer>), CoveError> {
+        self.materialize_all_u32_no_nulls_impl::<false>(array, row_count)
+    }
+
+    fn materialize_all_u32_no_nulls_utf8_strict(
+        &self,
+        array: &EncodedArray<'_>,
+        row_count: usize,
+    ) -> Result<(OffsetBuffer<i32>, Buffer, Option<NullBuffer>), CoveError> {
+        self.materialize_all_u32_no_nulls_impl::<true>(array, row_count)
+    }
+
+    fn materialize_all_u32_no_nulls_impl<const VALIDATE_UTF8: bool>(
+        &self,
+        array: &EncodedArray<'_>,
+        row_count: usize,
+    ) -> Result<(OffsetBuffer<i32>, Buffer, Option<NullBuffer>), CoveError> {
+        let data = array.data;
+        let Some(prefix_bytes) = row_count.checked_mul(4) else {
+            return Err(CoveError::ArithOverflow);
+        };
+        if prefix_bytes > data.len() {
+            return Err(CoveError::OffsetRange);
+        }
+        let value_len = data.len() - prefix_bytes;
+        if value_len > i32::MAX as usize {
+            return Err(CoveError::ArithOverflow);
+        }
+
+        let Some(offset_capacity) = row_count.checked_add(1) else {
+            return Err(CoveError::ArithOverflow);
+        };
+        let mut offsets = Vec::<i32>::with_capacity(offset_capacity);
+        let mut values = Vec::<u8>::with_capacity(value_len);
+        let mut pos = 0usize;
+        let mut write = 0usize;
+        let offsets_ptr = offsets.as_mut_ptr();
+        // INVARIANT: offset 0 is always initialized, and the vector length is
+        // published only after all row offsets have been written.
+        // SAFETY: `offsets` has capacity `row_count + 1`, so slot 0 is valid.
+        unsafe {
+            offsets_ptr.write(0i32);
+        }
+        for row in 0..row_count {
+            if pos > data.len().saturating_sub(4) {
+                return Err(CoveError::OffsetRange);
+            }
+            // INVARIANT: the branch above proves that `pos..pos + 4` is
+            // in-bounds for `data`.
+            // SAFETY: the length prefix pointer is valid for four bytes.
+            let len = unsafe { read_u32_le_unaligned(data.as_ptr().add(pos)) } as usize;
+            pos += 4;
+            if len > data.len() - pos {
+                return Err(CoveError::OffsetRange);
+            }
+            if len > value_len - write {
+                return Err(CoveError::PageCorrupt);
+            }
+            let data_end = pos + len;
+            let next_write = write + len;
+            let src = data.as_ptr().wrapping_add(pos);
+            let dst = values.as_mut_ptr().wrapping_add(write);
+            // INVARIANT: bounds above prove source and destination ranges are
+            // in-bounds and non-overlapping; destination length is published
+            // only after every row has validated.
+            // SAFETY: `values` has at least `value_len` capacity, source points
+            // into immutable `data`, and both pointers are valid for `len`
+            // bytes.
+            if VALIDATE_UTF8 {
+                let high_bits = unsafe { copy_varbytes_value_ascii_mask(src, dst, len) };
+                if high_bits != 0 {
+                    // INVARIANT: `len <= data.len() - pos` was proven above.
+                    // SAFETY: the row slice points at the same source bytes
+                    // just copied into the values buffer and is valid for
+                    // exactly `len` bytes.
+                    let row = unsafe { std::slice::from_raw_parts(src, len) };
+                    validate_arrow_utf8(row)?;
+                }
+            } else {
+                unsafe {
+                    copy_varbytes_value(src, dst, len);
+                }
+            }
+            pos = data_end;
+            write = next_write;
+            // INVARIANT: `value_len <= i32::MAX` was pre-proven and
+            // `write <= value_len` is maintained by the checked length branch.
+            // SAFETY: `row + 1 < offset_capacity`, so this raw write targets a
+            // reserved offset slot.
+            unsafe {
+                offsets_ptr.add(row + 1).write(write as i32);
+            }
+        }
+        if pos != data.len() || write != value_len {
+            return Err(CoveError::PageCorrupt);
+        }
+        // INVARIANT: every byte in 0..value_len was initialized exactly once by
+        // the checked copy loop above.
+        // SAFETY: the vector has capacity `value_len`, and all elements in the
+        // new initialized length have been written.
+        unsafe {
+            values.set_len(value_len);
+        }
+        // INVARIANT: slot 0 and one offset per row were initialized in order.
+        // SAFETY: all elements in 0..offset_capacity have been written.
+        unsafe {
+            offsets.set_len(offset_capacity);
+        }
+
+        Ok((
+            trusted_i32_offset_buffer(offsets),
+            Buffer::from_vec(values),
+            None,
+        ))
     }
 
     fn materialize_selected(
@@ -1275,30 +1993,56 @@ impl BytePayloadPlan {
             return Err(CoveError::ArithOverflow);
         };
         let mut offsets = Vec::with_capacity(offset_capacity);
-        let mut values = vec![0u8; value_len];
-        let mut valid_bits = any_null.then(|| Vec::with_capacity(selected_len));
+        let mut values = Vec::<u8>::with_capacity(value_len);
+        let mut validity_builder = any_null
+            .then(|| ArrowValidityBuilder::new(selected_len))
+            .transpose()?;
         let mut write = 0usize;
         offsets.push(0i32);
         selection.for_each_row(array.row_count, |row| {
             let row_u64 = u64::try_from(row).map_err(|_| CoveError::ArithOverflow)?;
             let is_null = has_nulls && array.is_null(row_u64)?;
-            if let Some(bits) = &mut valid_bits {
-                bits.push(!is_null);
+            if let Some(builder) = &mut validity_builder {
+                builder.append(!is_null);
             }
             if !is_null {
                 let (start, end) = ranges[row];
                 let len = end.checked_sub(start).ok_or(CoveError::PageCorrupt)?;
                 let next = write.checked_add(len).ok_or(CoveError::ArithOverflow)?;
-                values[write..next].copy_from_slice(&array.data[start..end]);
+                if next > value_len {
+                    return Err(CoveError::PageCorrupt);
+                }
+                // INVARIANT: the prepass computed `value_len` from the same
+                // selected non-null ranges, and every source range was parsed
+                // and bounds-checked before this copy pass.
+                // SAFETY: `values` has capacity `value_len`, source and
+                // destination ranges are in-bounds and non-overlapping, and the
+                // initialized length is set only after all copies finish.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        array.data.as_ptr().add(start),
+                        values.as_mut_ptr().add(write),
+                        len,
+                    );
+                }
                 write = next;
             }
             offsets.push(i32::try_from(write).map_err(|_| CoveError::ArithOverflow)?);
             Ok(())
         })?;
-        debug_assert_eq!(write, value_len);
+        if write != value_len {
+            return Err(CoveError::PageCorrupt);
+        }
+        // INVARIANT: selected copy loop initialized exactly the `write` prefix,
+        // and `write == value_len` was proven by the prepass/debug assertion.
+        // SAFETY: the vector capacity is `value_len` and all bytes in that
+        // range have been written.
+        unsafe {
+            values.set_len(value_len);
+        }
 
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
-        let nulls = valid_bits.map(NullBuffer::from);
+        let offsets = trusted_i32_offset_buffer(offsets);
+        let nulls = validity_builder.and_then(ArrowValidityBuilder::finish);
         Ok((offsets, Buffer::from_vec(values), nulls))
     }
 }
@@ -1306,34 +2050,49 @@ impl BytePayloadPlan {
 fn try_direct_primitive_array(
     array: &EncodedArray<'_>,
     data_type: &DataType,
+    data_owner: Option<&ArrowBufferOwner>,
 ) -> Result<Option<ArrayRef>, CoveError> {
-    if array.validity.is_some() {
-        return Ok(None);
-    }
-
     match array.encoding {
         CoveEncodingKind::NumCode if array.physical == CovePhysicalKind::NumCode => match data_type
         {
-            DataType::Int64 => Ok(Some(
-                Arc::new(Int64Array::from(collect_numcode_i64(array)?)) as ArrayRef,
-            )),
-            DataType::UInt64 => Ok(Some(
-                Arc::new(UInt64Array::from(collect_numcode_u64(array)?)) as ArrayRef,
-            )),
-            DataType::Timestamp(TimeUnit::Microsecond, None) => Ok(Some(Arc::new(
-                TimestampMicrosecondArray::from(collect_numcode_i64(array)?),
-            ) as ArrayRef)),
-            DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(Some(Arc::new(
-                TimestampNanosecondArray::from(collect_numcode_i64(array)?),
-            ) as ArrayRef)),
+            DataType::Int64 => {
+                if let Some(values) = retained_numcode_i64_values(array, data_owner)? {
+                    return Ok(Some(Arc::new(Int64Array::new(values, None)) as ArrayRef));
+                }
+                Ok(Some(Arc::new(numcode_i64_array(array)?) as ArrayRef))
+            }
+            DataType::UInt64 => {
+                if let Some(values) = retained_numcode_u64_values(array, data_owner)? {
+                    return Ok(Some(Arc::new(UInt64Array::new(values, None)) as ArrayRef));
+                }
+                Ok(Some(Arc::new(numcode_u64_array(array)?) as ArrayRef))
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, None) => {
+                if let Some(values) = retained_numcode_i64_values(array, data_owner)? {
+                    return Ok(Some(
+                        Arc::new(TimestampMicrosecondArray::new(values, None)) as ArrayRef
+                    ));
+                }
+                Ok(Some(
+                    Arc::new(timestamp_micros_array(array, ArrowRowSelection::All)?) as ArrayRef,
+                ))
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+                if let Some(values) = retained_numcode_i64_values(array, data_owner)? {
+                    return Ok(Some(
+                        Arc::new(TimestampNanosecondArray::new(values, None)) as ArrayRef
+                    ));
+                }
+                Ok(Some(
+                    Arc::new(timestamp_nanos_array(array, ArrowRowSelection::All)?) as ArrayRef,
+                ))
+            }
             _ => Ok(None),
         },
         CoveEncodingKind::PlainFixed
             if array.logical == CoveLogicalType::Bool && *data_type == DataType::Boolean =>
         {
-            Ok(Some(
-                Arc::new(BooleanArray::from(collect_plain_bool(array)?)) as ArrayRef,
-            ))
+            Ok(Some(Arc::new(plain_bool_array(array)?) as ArrayRef))
         }
         _ => Ok(None),
     }
@@ -1348,20 +2107,16 @@ fn try_direct_primitive_array_for_selection(
         CoveEncodingKind::NumCode if array.physical == CovePhysicalKind::NumCode => match data_type
         {
             DataType::Int64 => Ok(Some(
-                Arc::new(Int64Array::from(collect_numcode_i64_selected(
-                    array, selection,
-                )?)) as ArrayRef,
+                Arc::new(numcode_i64_array_for_selection(array, selection)?) as ArrayRef,
             )),
             DataType::UInt64 => Ok(Some(
-                Arc::new(UInt64Array::from(collect_numcode_u64_selected(
-                    array, selection,
-                )?)) as ArrayRef,
+                Arc::new(numcode_u64_array_for_selection(array, selection)?) as ArrayRef,
             )),
             DataType::Timestamp(TimeUnit::Microsecond, None) => Ok(Some(Arc::new(
-                TimestampMicrosecondArray::from(collect_numcode_i64_selected(array, selection)?),
+                timestamp_micros_array(array, selection)?,
             ) as ArrayRef)),
             DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(Some(Arc::new(
-                TimestampNanosecondArray::from(collect_numcode_i64_selected(array, selection)?),
+                timestamp_nanos_array(array, selection)?,
             ) as ArrayRef)),
             _ => Ok(None),
         },
@@ -1369,9 +2124,7 @@ fn try_direct_primitive_array_for_selection(
             if array.logical == CoveLogicalType::Bool && *data_type == DataType::Boolean =>
         {
             Ok(Some(
-                Arc::new(BooleanArray::from(collect_plain_bool_selected(
-                    array, selection,
-                )?)) as ArrayRef,
+                Arc::new(plain_bool_array_for_selection(array, selection)?) as ArrayRef,
             ))
         }
         _ => Ok(None),
@@ -1392,100 +2145,537 @@ fn fixed_width_payload_prefix<'a>(
     Ok(&data[..required_len])
 }
 
-fn collect_numcode_u64(array: &EncodedArray<'_>) -> Result<Vec<u64>, CoveError> {
+fn array_has_nulls(array: &EncodedArray<'_>) -> Result<bool, CoveError> {
+    Ok(match array.validity {
+        Some(validity) => validity.null_count()? > 0,
+        None => false,
+    })
+}
+
+#[inline]
+fn read_numcode_u64(data: &[u8], row: usize) -> u64 {
+    let offset = row * 8;
+    // INVARIANT: callers validate `data` as an 8-byte fixed-width prefix for
+    // the full row count and validate every selected row before reading.
+    // SAFETY: `offset..offset + 8` is therefore in-bounds; unaligned loads are
+    // explicitly allowed by `read_unaligned`.
+    unsafe { u64::from_le(ptr::read_unaligned(data.as_ptr().add(offset) as *const u64)) }
+}
+
+fn retained_numcode_u64_values(
+    array: &EncodedArray<'_>,
+    data_owner: Option<&ArrowBufferOwner>,
+) -> Result<Option<ScalarBuffer<u64>>, CoveError> {
+    let Some(owner) = data_owner else {
+        return Ok(None);
+    };
+    if !cfg!(target_endian = "little") || array_has_nulls(array)? {
+        return Ok(None);
+    }
     let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
     let data = fixed_width_payload_prefix(array.data, row_count, 8)?;
-    let mut out = Vec::with_capacity(row_count);
-    for bytes in data.chunks_exact(8) {
-        out.push(u64::from_le_bytes(bytes.try_into().unwrap()));
-    }
-    Ok(out)
+    retained_numcode_scalar_buffer::<u64>(data, row_count, owner)
 }
 
-fn collect_numcode_u64_selected(
+fn retained_numcode_i64_values(
     array: &EncodedArray<'_>,
-    selection: ArrowRowSelection<'_>,
-) -> Result<Vec<Option<u64>>, CoveError> {
-    let mut out = Vec::with_capacity(selection.selected_len(array.row_count)?);
-    selection.for_each_row(array.row_count, |row| {
-        let row_u64 = u64::try_from(row).map_err(|_| CoveError::ArithOverflow)?;
-        if array.is_null(row_u64)? {
-            out.push(None);
-            return Ok(());
-        }
-        let offset = row.checked_mul(8).ok_or(CoveError::ArithOverflow)?;
-        out.push(Some(read_u64_le(array.data, offset)?));
-        Ok(())
-    })?;
-    Ok(out)
-}
-
-fn collect_numcode_i64(array: &EncodedArray<'_>) -> Result<Vec<i64>, CoveError> {
+    data_owner: Option<&ArrowBufferOwner>,
+) -> Result<Option<ScalarBuffer<i64>>, CoveError> {
+    let Some(owner) = data_owner else {
+        return Ok(None);
+    };
+    if !cfg!(target_endian = "little") || array_has_nulls(array)? {
+        return Ok(None);
+    }
     let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
     let data = fixed_width_payload_prefix(array.data, row_count, 8)?;
-    let mut out = Vec::with_capacity(row_count);
-    for bytes in data.chunks_exact(8) {
-        let value = u64::from_le_bytes(bytes.try_into().unwrap());
-        out.push(i64::try_from(value).map_err(|_| CoveError::PageCorrupt)?);
+    for row in 0..row_count {
+        checked_numcode_i64(read_numcode_u64(data, row))?;
     }
-    Ok(out)
+    retained_numcode_scalar_buffer::<i64>(data, row_count, owner)
 }
 
-fn collect_numcode_i64_selected(
+fn retained_numcode_scalar_buffer<T: ArrowNativeType>(
+    data: &[u8],
+    row_count: usize,
+    owner: &ArrowBufferOwner,
+) -> Result<Option<ScalarBuffer<T>>, CoveError> {
+    let Some(byte_len) = row_count.checked_mul(std::mem::size_of::<T>()) else {
+        return Err(CoveError::ArithOverflow);
+    };
+    if byte_len == 0 {
+        return Ok(Some(ScalarBuffer::from(Vec::<T>::new())));
+    }
+    if data.len() < byte_len {
+        return Err(CoveError::OffsetRange);
+    }
+    let align = std::mem::align_of::<T>();
+    if (data.as_ptr() as usize) % align != 0 {
+        return Ok(None);
+    }
+    let Some(ptr) = NonNull::new(data.as_ptr() as *mut u8) else {
+        return Err(CoveError::BufferTooShort);
+    };
+    // INVARIANT: the returned Arrow buffer points into immutable retained COVE
+    // page data. The `owner` is cloned into Arrow's custom allocation so the
+    // backing bytes outlive every array using this buffer.
+    // SAFETY: `data` was proven valid for `byte_len` bytes, the pointer is
+    // non-null and aligned for `T`, and only little-endian no-null NumCode
+    // payloads reach this helper.
+    let buffer = unsafe { Buffer::from_custom_allocation(ptr, byte_len, Arc::clone(owner)) };
+    Ok(Some(ScalarBuffer::new(buffer, 0, row_count)))
+}
+
+fn numcode_u64_array(array: &EncodedArray<'_>) -> Result<UInt64Array, CoveError> {
+    let (values, nulls) = collect_numcode_u64_buffers(array, ArrowRowSelection::All)?;
+    Ok(UInt64Array::new(ScalarBuffer::from(values), nulls))
+}
+
+fn numcode_u64_array_for_selection(
     array: &EncodedArray<'_>,
     selection: ArrowRowSelection<'_>,
-) -> Result<Vec<Option<i64>>, CoveError> {
-    let mut out = Vec::with_capacity(selection.selected_len(array.row_count)?);
-    selection.for_each_row(array.row_count, |row| {
-        let row_u64 = u64::try_from(row).map_err(|_| CoveError::ArithOverflow)?;
-        if array.is_null(row_u64)? {
-            out.push(None);
-            return Ok(());
-        }
-        let offset = row.checked_mul(8).ok_or(CoveError::ArithOverflow)?;
-        let value = read_u64_le(array.data, offset)?;
-        out.push(Some(
-            i64::try_from(value).map_err(|_| CoveError::PageCorrupt)?,
-        ));
-        Ok(())
-    })?;
-    Ok(out)
+) -> Result<UInt64Array, CoveError> {
+    let (values, nulls) = collect_numcode_u64_buffers(array, selection)?;
+    Ok(UInt64Array::new(ScalarBuffer::from(values), nulls))
 }
 
-fn collect_plain_bool(array: &EncodedArray<'_>) -> Result<Vec<bool>, CoveError> {
+fn numcode_i64_array(array: &EncodedArray<'_>) -> Result<Int64Array, CoveError> {
+    let (values, nulls) = collect_numcode_i64_buffers(array, ArrowRowSelection::All)?;
+    Ok(Int64Array::new(ScalarBuffer::from(values), nulls))
+}
+
+fn numcode_i64_array_for_selection(
+    array: &EncodedArray<'_>,
+    selection: ArrowRowSelection<'_>,
+) -> Result<Int64Array, CoveError> {
+    let (values, nulls) = collect_numcode_i64_buffers(array, selection)?;
+    Ok(Int64Array::new(ScalarBuffer::from(values), nulls))
+}
+
+fn timestamp_micros_array(
+    array: &EncodedArray<'_>,
+    selection: ArrowRowSelection<'_>,
+) -> Result<TimestampMicrosecondArray, CoveError> {
+    let (values, nulls) = collect_numcode_i64_buffers(array, selection)?;
+    Ok(TimestampMicrosecondArray::new(
+        ScalarBuffer::from(values),
+        nulls,
+    ))
+}
+
+fn timestamp_nanos_array(
+    array: &EncodedArray<'_>,
+    selection: ArrowRowSelection<'_>,
+) -> Result<TimestampNanosecondArray, CoveError> {
+    let (values, nulls) = collect_numcode_i64_buffers(array, selection)?;
+    Ok(TimestampNanosecondArray::new(
+        ScalarBuffer::from(values),
+        nulls,
+    ))
+}
+
+fn collect_numcode_u64_buffers(
+    array: &EncodedArray<'_>,
+    selection: ArrowRowSelection<'_>,
+) -> Result<(Vec<u64>, Option<NullBuffer>), CoveError> {
     let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
-    let data = fixed_width_payload_prefix(array.data, row_count, 1)?;
-    let mut out = Vec::with_capacity(row_count);
-    for byte in data {
-        out.push(match *byte {
-            0 => false,
-            1 => true,
-            _ => return Err(CoveError::PageCorrupt),
+    let data = fixed_width_payload_prefix(array.data, row_count, 8)?;
+    let has_nulls = array_has_nulls(array)?;
+    match selection {
+        ArrowRowSelection::All => collect_numcode_u64_all(array, data, row_count, has_nulls),
+        ArrowRowSelection::Rows(rows) => {
+            selection.validate_for_row_count(array.row_count)?;
+            collect_numcode_u64_rows(array, data, rows, has_nulls)
+        }
+        ArrowRowSelection::Bitset { words, len } => {
+            selection.validate_for_row_count(array.row_count)?;
+            let selected_len = count_bitset_rows(words, len)?;
+            collect_numcode_u64_bitset(array, data, words, len, selected_len, has_nulls)
+        }
+    }
+}
+
+fn collect_numcode_i64_buffers(
+    array: &EncodedArray<'_>,
+    selection: ArrowRowSelection<'_>,
+) -> Result<(Vec<i64>, Option<NullBuffer>), CoveError> {
+    let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
+    let data = fixed_width_payload_prefix(array.data, row_count, 8)?;
+    let has_nulls = array_has_nulls(array)?;
+    match selection {
+        ArrowRowSelection::All => collect_numcode_i64_all(array, data, row_count, has_nulls),
+        ArrowRowSelection::Rows(rows) => {
+            selection.validate_for_row_count(array.row_count)?;
+            collect_numcode_i64_rows(array, data, rows, has_nulls)
+        }
+        ArrowRowSelection::Bitset { words, len } => {
+            selection.validate_for_row_count(array.row_count)?;
+            let selected_len = count_bitset_rows(words, len)?;
+            collect_numcode_i64_bitset(array, data, words, len, selected_len, has_nulls)
+        }
+    }
+}
+
+fn collect_numcode_u64_all(
+    array: &EncodedArray<'_>,
+    data: &[u8],
+    row_count: usize,
+    has_nulls: bool,
+) -> Result<(Vec<u64>, Option<NullBuffer>), CoveError> {
+    let mut out = Vec::<u64>::with_capacity(row_count);
+    if !has_nulls {
+        let out_ptr = out.as_mut_ptr();
+        for row in 0..row_count {
+            // INVARIANT: output capacity is exactly `row_count`, and every row
+            // slot is written once before `set_len`.
+            // SAFETY: `row < row_count`, so the reserved destination slot is
+            // valid and initialized exactly once.
+            unsafe {
+                out_ptr.add(row).write(read_numcode_u64(data, row));
+            }
+        }
+        // SAFETY: the loop above initialized every element in 0..row_count.
+        unsafe {
+            out.set_len(row_count);
+        }
+        return Ok((out, None));
+    }
+
+    let mut validity_builder = ArrowValidityBuilder::new(row_count)?;
+    for row in 0..row_count {
+        let is_null = array.is_null(row as u64)?;
+        validity_builder.append(!is_null);
+        out.push(if is_null {
+            0
+        } else {
+            read_numcode_u64(data, row)
         });
     }
-    Ok(out)
+    Ok((out, validity_builder.finish()))
 }
 
-fn collect_plain_bool_selected(
+fn collect_numcode_u64_rows(
+    array: &EncodedArray<'_>,
+    data: &[u8],
+    rows: &[u32],
+    has_nulls: bool,
+) -> Result<(Vec<u64>, Option<NullBuffer>), CoveError> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut validity_builder = has_nulls
+        .then(|| ArrowValidityBuilder::new(rows.len()))
+        .transpose()?;
+    for row in rows {
+        let row = *row as usize;
+        let is_null = has_nulls && array.is_null(row as u64)?;
+        if let Some(builder) = &mut validity_builder {
+            builder.append(!is_null);
+        }
+        out.push(if is_null {
+            0
+        } else {
+            read_numcode_u64(data, row)
+        });
+    }
+    Ok((out, validity_builder.and_then(ArrowValidityBuilder::finish)))
+}
+
+fn collect_numcode_u64_bitset(
+    array: &EncodedArray<'_>,
+    data: &[u8],
+    words: &[u64],
+    len: usize,
+    selected_len: usize,
+    has_nulls: bool,
+) -> Result<(Vec<u64>, Option<NullBuffer>), CoveError> {
+    let mut out = Vec::with_capacity(selected_len);
+    let mut validity_builder = has_nulls
+        .then(|| ArrowValidityBuilder::new(selected_len))
+        .transpose()?;
+    let word_len = len.div_ceil(64);
+    for (word_index, raw_word) in words.iter().take(word_len).copied().enumerate() {
+        let mut word = if word_index + 1 == word_len {
+            mask_selection_tail(raw_word, len)
+        } else {
+            raw_word
+        };
+        while word != 0 {
+            let row = word_index * 64 + word.trailing_zeros() as usize;
+            let is_null = has_nulls && array.is_null(row as u64)?;
+            if let Some(builder) = &mut validity_builder {
+                builder.append(!is_null);
+            }
+            out.push(if is_null {
+                0
+            } else {
+                read_numcode_u64(data, row)
+            });
+            word &= word - 1;
+        }
+    }
+    Ok((out, validity_builder.and_then(ArrowValidityBuilder::finish)))
+}
+
+#[inline]
+fn checked_numcode_i64(value: u64) -> Result<i64, CoveError> {
+    if value > i64::MAX as u64 {
+        return Err(CoveError::PageCorrupt);
+    }
+    Ok(value as i64)
+}
+
+fn collect_numcode_i64_all(
+    array: &EncodedArray<'_>,
+    data: &[u8],
+    row_count: usize,
+    has_nulls: bool,
+) -> Result<(Vec<i64>, Option<NullBuffer>), CoveError> {
+    let mut out = Vec::<i64>::with_capacity(row_count);
+    if !has_nulls {
+        let out_ptr = out.as_mut_ptr();
+        for row in 0..row_count {
+            let value = checked_numcode_i64(read_numcode_u64(data, row))?;
+            // INVARIANT: output capacity is exactly `row_count`, and every row
+            // slot is written once before `set_len`.
+            // SAFETY: `row < row_count`, so the reserved destination slot is
+            // valid and initialized exactly once.
+            unsafe {
+                out_ptr.add(row).write(value);
+            }
+        }
+        // SAFETY: the loop above initialized every element in 0..row_count.
+        unsafe {
+            out.set_len(row_count);
+        }
+        return Ok((out, None));
+    }
+
+    let mut validity_builder = ArrowValidityBuilder::new(row_count)?;
+    for row in 0..row_count {
+        let is_null = array.is_null(row as u64)?;
+        validity_builder.append(!is_null);
+        out.push(if is_null {
+            0
+        } else {
+            checked_numcode_i64(read_numcode_u64(data, row))?
+        });
+    }
+    Ok((out, validity_builder.finish()))
+}
+
+fn collect_numcode_i64_rows(
+    array: &EncodedArray<'_>,
+    data: &[u8],
+    rows: &[u32],
+    has_nulls: bool,
+) -> Result<(Vec<i64>, Option<NullBuffer>), CoveError> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut validity_builder = has_nulls
+        .then(|| ArrowValidityBuilder::new(rows.len()))
+        .transpose()?;
+    for row in rows {
+        let row = *row as usize;
+        let is_null = has_nulls && array.is_null(row as u64)?;
+        if let Some(builder) = &mut validity_builder {
+            builder.append(!is_null);
+        }
+        out.push(if is_null {
+            0
+        } else {
+            checked_numcode_i64(read_numcode_u64(data, row))?
+        });
+    }
+    Ok((out, validity_builder.and_then(ArrowValidityBuilder::finish)))
+}
+
+fn collect_numcode_i64_bitset(
+    array: &EncodedArray<'_>,
+    data: &[u8],
+    words: &[u64],
+    len: usize,
+    selected_len: usize,
+    has_nulls: bool,
+) -> Result<(Vec<i64>, Option<NullBuffer>), CoveError> {
+    let mut out = Vec::with_capacity(selected_len);
+    let mut validity_builder = has_nulls
+        .then(|| ArrowValidityBuilder::new(selected_len))
+        .transpose()?;
+    let word_len = len.div_ceil(64);
+    for (word_index, raw_word) in words.iter().take(word_len).copied().enumerate() {
+        let mut word = if word_index + 1 == word_len {
+            mask_selection_tail(raw_word, len)
+        } else {
+            raw_word
+        };
+        while word != 0 {
+            let row = word_index * 64 + word.trailing_zeros() as usize;
+            let is_null = has_nulls && array.is_null(row as u64)?;
+            if let Some(builder) = &mut validity_builder {
+                builder.append(!is_null);
+            }
+            out.push(if is_null {
+                0
+            } else {
+                checked_numcode_i64(read_numcode_u64(data, row))?
+            });
+            word &= word - 1;
+        }
+    }
+    Ok((out, validity_builder.and_then(ArrowValidityBuilder::finish)))
+}
+
+fn plain_bool_array(array: &EncodedArray<'_>) -> Result<BooleanArray, CoveError> {
+    plain_bool_array_for_selection(array, ArrowRowSelection::All)
+}
+
+fn plain_bool_array_for_selection(
     array: &EncodedArray<'_>,
     selection: ArrowRowSelection<'_>,
-) -> Result<Vec<Option<bool>>, CoveError> {
-    let mut out = Vec::with_capacity(selection.selected_len(array.row_count)?);
-    selection.for_each_row(array.row_count, |row| {
-        let row_u64 = u64::try_from(row).map_err(|_| CoveError::ArithOverflow)?;
-        if array.is_null(row_u64)? {
-            out.push(None);
-            return Ok(());
+) -> Result<BooleanArray, CoveError> {
+    let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
+    let data = fixed_width_payload_prefix(array.data, row_count, 1)?;
+    let has_nulls = array_has_nulls(array)?;
+    let (values, selected_len, nulls) = match selection {
+        ArrowRowSelection::All => collect_bool_all(array, data, row_count, has_nulls)?,
+        ArrowRowSelection::Rows(rows) => {
+            selection.validate_for_row_count(array.row_count)?;
+            collect_bool_rows(array, data, rows, has_nulls)?
         }
-        let byte = *array.data.get(row).ok_or(CoveError::OffsetRange)?;
-        out.push(Some(match byte {
-            0 => false,
-            1 => true,
-            _ => return Err(CoveError::PageCorrupt),
-        }));
-        Ok(())
-    })?;
-    Ok(out)
+        ArrowRowSelection::Bitset { words, len } => {
+            selection.validate_for_row_count(array.row_count)?;
+            let selected_len = count_bitset_rows(words, len)?;
+            collect_bool_bitset(array, data, words, len, selected_len, has_nulls)?
+        }
+    };
+    let values = BooleanBuffer::new(Buffer::from_vec(values), 0, selected_len);
+    Ok(BooleanArray::new(values, nulls))
+}
+
+#[inline(always)]
+fn checked_bool_byte(byte: u8) -> Result<bool, CoveError> {
+    match byte {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(CoveError::PageCorrupt),
+    }
+}
+
+#[inline(always)]
+fn pack_bool_chunk_8(chunk: &[u8]) -> Result<u8, CoveError> {
+    debug_assert_eq!(chunk.len(), 8);
+    let b0 = chunk[0];
+    let b1 = chunk[1];
+    let b2 = chunk[2];
+    let b3 = chunk[3];
+    let b4 = chunk[4];
+    let b5 = chunk[5];
+    let b6 = chunk[6];
+    let b7 = chunk[7];
+    if (b0 | b1 | b2 | b3 | b4 | b5 | b6 | b7) > 1 {
+        return Err(CoveError::PageCorrupt);
+    }
+    Ok(b0 | (b1 << 1) | (b2 << 2) | (b3 << 3) | (b4 << 4) | (b5 << 5) | (b6 << 6) | (b7 << 7))
+}
+
+fn collect_bool_all(
+    array: &EncodedArray<'_>,
+    data: &[u8],
+    row_count: usize,
+    has_nulls: bool,
+) -> Result<(Vec<u8>, usize, Option<NullBuffer>), CoveError> {
+    let mut values = vec![0u8; bitpacked_len(row_count)?];
+    if !has_nulls {
+        let mut chunks = data.chunks_exact(8);
+        for (byte_index, chunk) in chunks.by_ref().enumerate() {
+            values[byte_index] = pack_bool_chunk_8(chunk)?;
+        }
+        let tail_start = row_count - chunks.remainder().len();
+        for (bit, byte) in chunks.remainder().iter().copied().enumerate() {
+            if checked_bool_byte(byte)? {
+                set_packed_bit(&mut values, tail_start + bit);
+            }
+        }
+        return Ok((values, row_count, None));
+    }
+
+    let mut validity_builder = ArrowValidityBuilder::new(row_count)?;
+    for (row, byte) in data.iter().copied().enumerate() {
+        let bit = checked_bool_byte(byte)?;
+        let is_null = array.is_null(row as u64)?;
+        validity_builder.append(!is_null);
+        if !is_null && bit {
+            set_packed_bit(&mut values, row);
+        }
+    }
+    Ok((values, row_count, validity_builder.finish()))
+}
+
+fn collect_bool_rows(
+    array: &EncodedArray<'_>,
+    data: &[u8],
+    rows: &[u32],
+    has_nulls: bool,
+) -> Result<(Vec<u8>, usize, Option<NullBuffer>), CoveError> {
+    let mut values = vec![0u8; bitpacked_len(rows.len())?];
+    let mut validity_builder = has_nulls
+        .then(|| ArrowValidityBuilder::new(rows.len()))
+        .transpose()?;
+    for (out_row, row) in rows.iter().copied().enumerate() {
+        let row = row as usize;
+        let bit = checked_bool_byte(data[row])?;
+        let is_null = has_nulls && array.is_null(row as u64)?;
+        if let Some(builder) = &mut validity_builder {
+            builder.append(!is_null);
+        }
+        if !is_null && bit {
+            set_packed_bit(&mut values, out_row);
+        }
+    }
+    Ok((
+        values,
+        rows.len(),
+        validity_builder.and_then(ArrowValidityBuilder::finish),
+    ))
+}
+
+fn collect_bool_bitset(
+    array: &EncodedArray<'_>,
+    data: &[u8],
+    words: &[u64],
+    len: usize,
+    selected_len: usize,
+    has_nulls: bool,
+) -> Result<(Vec<u8>, usize, Option<NullBuffer>), CoveError> {
+    let mut values = vec![0u8; bitpacked_len(selected_len)?];
+    let mut validity_builder = has_nulls
+        .then(|| ArrowValidityBuilder::new(selected_len))
+        .transpose()?;
+    let mut out_row = 0usize;
+    let word_len = len.div_ceil(64);
+    for (word_index, raw_word) in words.iter().take(word_len).copied().enumerate() {
+        let mut word = if word_index + 1 == word_len {
+            mask_selection_tail(raw_word, len)
+        } else {
+            raw_word
+        };
+        while word != 0 {
+            let row = word_index * 64 + word.trailing_zeros() as usize;
+            let bit = checked_bool_byte(data[row])?;
+            let is_null = has_nulls && array.is_null(row as u64)?;
+            if let Some(builder) = &mut validity_builder {
+                builder.append(!is_null);
+            }
+            if !is_null && bit {
+                set_packed_bit(&mut values, out_row);
+            }
+            out_row += 1;
+            word &= word - 1;
+        }
+    }
+    Ok((
+        values,
+        selected_len,
+        validity_builder.and_then(ArrowValidityBuilder::finish),
+    ))
 }
 
 fn values_to_arrow_array_with_data_type(
@@ -1531,7 +2721,9 @@ fn values_to_arrow_array_with_data_type(
             collect_i64(logical, values, Ok)?,
         )) as ArrayRef,
         DataType::Utf8 => Arc::new(collect_utf8(logical, values)?) as ArrayRef,
+        DataType::Utf8View => Arc::new(collect_utf8_view(logical, values)?) as ArrayRef,
         DataType::Binary => Arc::new(collect_binary(logical, values)?) as ArrayRef,
+        DataType::BinaryView => Arc::new(collect_binary_view(logical, values)?) as ArrayRef,
         DataType::FixedSizeBinary(size) => {
             Arc::new(collect_fixed_size_binary(logical, values, size)?) as ArrayRef
         }
@@ -1667,14 +2859,29 @@ fn arrow_data_type_with_report(
         }
         CoveLogicalType::Json => {
             if !options.emit_json_extension_metadata {
+                let storage = if options.varbytes_policy == ArrowVarBytesExportPolicy::View {
+                    "Utf8View"
+                } else {
+                    "Utf8"
+                };
                 report.push(
                     None,
                     logical,
                     ArrowFidelitySeverity::Lossy,
-                    "Json exported as Utf8 without Arrow extension metadata",
+                    format!("Json exported as {storage} without Arrow extension metadata"),
                 );
             }
-            Ok(DataType::Utf8)
+            if options.varbytes_policy == ArrowVarBytesExportPolicy::View {
+                Ok(DataType::Utf8View)
+            } else {
+                Ok(DataType::Utf8)
+            }
+        }
+        CoveLogicalType::Utf8 if options.varbytes_policy == ArrowVarBytesExportPolicy::View => {
+            Ok(DataType::Utf8View)
+        }
+        CoveLogicalType::Binary if options.varbytes_policy == ArrowVarBytesExportPolicy::View => {
+            Ok(DataType::BinaryView)
         }
         other => arrow_data_type(other),
     }
@@ -1780,6 +2987,43 @@ fn collect_binary(
     values: &[CoveArrayValue<'_>],
 ) -> Result<BinaryArray, CoveError> {
     let mut builder = BinaryBuilder::new();
+    for value in values {
+        match value {
+            CoveArrayValue::Null => builder.append_null(),
+            _ => {
+                let bytes = value_to_bytes(logical, value)?;
+                builder.append_value(bytes.as_ref());
+            }
+        }
+    }
+    Ok(builder.finish())
+}
+
+fn collect_utf8_view(
+    logical: CoveLogicalType,
+    values: &[CoveArrayValue<'_>],
+) -> Result<StringViewArray, CoveError> {
+    let mut builder = StringViewBuilder::new();
+    for value in values {
+        match value {
+            CoveArrayValue::Null => builder.append_null(),
+            _ => {
+                let bytes = value_to_bytes(logical, value)?;
+                let text = std::str::from_utf8(bytes.as_ref()).map_err(|_| {
+                    CoveError::BadSection("Arrow Utf8View export requires valid UTF-8".into())
+                })?;
+                builder.append_value(text);
+            }
+        }
+    }
+    Ok(builder.finish())
+}
+
+fn collect_binary_view(
+    logical: CoveLogicalType,
+    values: &[CoveArrayValue<'_>],
+) -> Result<BinaryViewArray, CoveError> {
+    let mut builder = BinaryViewBuilder::new();
     for value in values {
         match value {
             CoveArrayValue::Null => builder.append_null(),
@@ -2000,6 +3244,13 @@ mod tests {
         validity::ValidityBitmapBuilder,
     };
 
+    fn view_options() -> ArrowExportOptions {
+        ArrowExportOptions {
+            varbytes_policy: ArrowVarBytesExportPolicy::View,
+            ..ArrowExportOptions::default()
+        }
+    }
+
     #[test]
     fn round_trip_inversion_preserves_payload() {
         let cove = vec![0b0000_1010u8]; // rows 1 and 3 are null
@@ -2082,6 +3333,63 @@ mod tests {
     }
 
     #[test]
+    fn retained_numcode_uint64_array_can_use_backing_owner() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&10u64.to_le_bytes());
+        values.extend_from_slice(&20u64.to_le_bytes());
+        let owner = Arc::new(values);
+        let cove = EncodedArray::new(
+            CoveLogicalType::UInt64,
+            CovePhysicalKind::NumCode,
+            2,
+            CoveEncodingKind::NumCode,
+            None,
+            owner.as_slice(),
+            None,
+        );
+        let buffer_owner = arrow_buffer_owner(Arc::clone(&owner));
+
+        let result = encoded_array_to_arrow_with_options_and_owner(
+            &cove,
+            ArrowExportOptions::default(),
+            Some(&buffer_owner),
+        )
+        .unwrap();
+        let uints = result.value.as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(uints.values(), &[10, 20]);
+        if (owner.as_ptr() as usize) % std::mem::align_of::<u64>() == 0 {
+            assert_eq!(uints.to_data().buffers()[0].as_ptr(), owner.as_ptr());
+        }
+    }
+
+    #[test]
+    fn exports_numcode_int64_array_with_nulls() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&10u64.to_le_bytes());
+        values.extend_from_slice(&99u64.to_le_bytes());
+        values.extend_from_slice(&30u64.to_le_bytes());
+        let mut validity = ValidityBitmapBuilder::new(3).unwrap();
+        validity.set_null(1).unwrap();
+        let validity_bytes = validity.into_bytes();
+        let bitmap = crate::validity::ValidityBitmap::new(&validity_bytes, 3);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            Some(bitmap),
+            &values,
+            None,
+        );
+
+        let arrow = encoded_array_to_arrow(&cove).unwrap();
+        let ints = arrow.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ints.value(0), 10);
+        assert!(ints.is_null(1));
+        assert_eq!(ints.value(2), 30);
+    }
+
+    #[test]
     fn rejects_invalid_plain_bool_array() {
         let values = [1u8, 2u8];
         let cove = EncodedArray::new(
@@ -2098,6 +3406,76 @@ mod tests {
             encoded_array_to_arrow(&cove),
             Err(CoveError::PageCorrupt)
         ));
+    }
+
+    #[test]
+    fn exports_plain_bool_array_with_nulls() {
+        let values = [1u8, 0u8, 1u8];
+        let mut validity = ValidityBitmapBuilder::new(3).unwrap();
+        validity.set_null(1).unwrap();
+        let validity_bytes = validity.into_bytes();
+        let bitmap = crate::validity::ValidityBitmap::new(&validity_bytes, 3);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Bool,
+            CovePhysicalKind::Boolean,
+            3,
+            CoveEncodingKind::PlainFixed,
+            Some(bitmap),
+            &values,
+            None,
+        );
+
+        let arrow = encoded_array_to_arrow(&cove).unwrap();
+        let bools = arrow.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(bools.value(0));
+        assert!(bools.is_null(1));
+        assert!(bools.value(2));
+    }
+
+    #[test]
+    fn rejects_invalid_plain_bool_array_even_for_null_row() {
+        let values = [1u8, 2u8];
+        let mut validity = ValidityBitmapBuilder::new(2).unwrap();
+        validity.set_null(1).unwrap();
+        let validity_bytes = validity.into_bytes();
+        let bitmap = crate::validity::ValidityBitmap::new(&validity_bytes, 2);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Bool,
+            CovePhysicalKind::Boolean,
+            2,
+            CoveEncodingKind::PlainFixed,
+            Some(bitmap),
+            &values,
+            None,
+        );
+
+        assert!(matches!(
+            encoded_array_to_arrow(&cove),
+            Err(CoveError::PageCorrupt)
+        ));
+    }
+
+    #[test]
+    fn bool_chunk_packer_matches_scalar_bits_and_rejects_invalid_bytes() {
+        for pattern in 0u16..=255 {
+            let mut chunk = [0u8; 8];
+            let mut expected = 0u8;
+            for bit in 0..8 {
+                let value = ((pattern >> bit) & 1) as u8;
+                chunk[bit] = value;
+                expected |= value << bit;
+            }
+            assert_eq!(pack_bool_chunk_8(&chunk).unwrap(), expected);
+        }
+
+        for pos in 0..8 {
+            let mut chunk = [0u8; 8];
+            chunk[pos] = 2;
+            assert!(matches!(
+                pack_bool_chunk_8(&chunk),
+                Err(CoveError::PageCorrupt)
+            ));
+        }
     }
 
     #[test]
@@ -2124,6 +3502,178 @@ mod tests {
             .unwrap();
         assert_eq!(strings.value(0), "hi");
         assert_eq!(strings.value(1), "there");
+    }
+
+    #[test]
+    fn trusted_utf8_validation_policy_preserves_valid_standard_output() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&2u32.to_le_bytes());
+        values.extend_from_slice(b"hi");
+        values.extend_from_slice(&5u32.to_le_bytes());
+        values.extend_from_slice(b"there");
+        let cove = EncodedArray::new(
+            CoveLogicalType::Json,
+            CovePhysicalKind::VarBytes,
+            2,
+            CoveEncodingKind::VarBytes,
+            None,
+            &values,
+            None,
+        );
+
+        let strict = encoded_array_to_arrow_with_options(&cove, ArrowExportOptions::default())
+            .unwrap()
+            .value;
+        let trusted = encoded_array_to_arrow_with_options(
+            &cove,
+            ArrowExportOptions {
+                string_validation_policy: ArrowStringValidationPolicy::TrustedPageProof,
+                ..ArrowExportOptions::default()
+            },
+        )
+        .unwrap()
+        .value;
+        assert_eq!(trusted.data_type(), &DataType::Utf8);
+        let strict = strict
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let trusted = trusted
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(trusted.value(0), strict.value(0));
+        assert_eq!(trusted.value(1), strict.value(1));
+    }
+
+    #[test]
+    fn exports_binary_varbytes_array_with_nulls() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&2u32.to_le_bytes());
+        values.extend_from_slice(&[0, 1]);
+        values.extend_from_slice(&3u32.to_le_bytes());
+        values.extend_from_slice(&[2, 3, 4]);
+        values.extend_from_slice(&1u32.to_le_bytes());
+        values.extend_from_slice(&[5]);
+        let mut validity = ValidityBitmapBuilder::new(3).unwrap();
+        validity.set_null(1).unwrap();
+        let validity_bytes = validity.into_bytes();
+        let bitmap = crate::validity::ValidityBitmap::new(&validity_bytes, 3);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Binary,
+            CovePhysicalKind::VarBytes,
+            3,
+            CoveEncodingKind::VarBytes,
+            Some(bitmap),
+            &values,
+            None,
+        );
+
+        let arrow = encoded_array_to_arrow(&cove).unwrap();
+        let binary = arrow.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(binary.value(0), &[0, 1]);
+        assert!(binary.is_null(1));
+        assert_eq!(binary.value(2), &[5]);
+    }
+
+    #[test]
+    fn view_export_maps_varbytes_to_arrow_view_arrays() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&2u32.to_le_bytes());
+        values.extend_from_slice(b"hi");
+        values.extend_from_slice(&19u32.to_le_bytes());
+        values.extend_from_slice(b"long-string-payload");
+        let cove = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            2,
+            CoveEncodingKind::VarBytes,
+            None,
+            &values,
+            None,
+        );
+
+        let standard = encoded_array_to_arrow_with_options(&cove, ArrowExportOptions::default())
+            .unwrap()
+            .value;
+        let view = encoded_array_to_arrow_with_options(&cove, view_options())
+            .unwrap()
+            .value;
+        assert_eq!(view.data_type(), &DataType::Utf8View);
+        let standard = standard
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let view = view.as_any().downcast_ref::<StringViewArray>().unwrap();
+        assert_eq!(view.value(0), standard.value(0));
+        assert_eq!(view.value(1), standard.value(1));
+    }
+
+    #[test]
+    fn view_export_handles_binary_and_selected_rows() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&1u32.to_le_bytes());
+        values.extend_from_slice(&[0xaa]);
+        values.extend_from_slice(&14u32.to_le_bytes());
+        values.extend_from_slice(b"binary-payload");
+        values.extend_from_slice(&2u32.to_le_bytes());
+        values.extend_from_slice(&[0xbb, 0xcc]);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Binary,
+            CovePhysicalKind::VarBytes,
+            3,
+            CoveEncodingKind::VarBytes,
+            None,
+            &values,
+            None,
+        );
+
+        let result = encoded_array_to_arrow_with_row_selection_options(
+            &cove,
+            ArrowRowSelection::Rows(&[2, 1, 2]),
+            view_options(),
+        )
+        .unwrap();
+        assert_eq!(result.value.data_type(), &DataType::BinaryView);
+        let binary = result
+            .value
+            .as_any()
+            .downcast_ref::<BinaryViewArray>()
+            .unwrap();
+        assert_eq!(binary.value(0), &[0xbb, 0xcc]);
+        assert_eq!(binary.value(1), b"binary-payload");
+        assert_eq!(binary.value(2), &[0xbb, 0xcc]);
+    }
+
+    #[test]
+    fn view_export_schema_policy_is_opt_in() {
+        assert_eq!(
+            arrow_data_type_for_export_options(
+                CoveLogicalType::Utf8,
+                ArrowExportOptions::default()
+            )
+            .unwrap()
+            .value,
+            DataType::Utf8
+        );
+        assert_eq!(
+            arrow_data_type_for_export_options(CoveLogicalType::Utf8, view_options())
+                .unwrap()
+                .value,
+            DataType::Utf8View
+        );
+        assert_eq!(
+            arrow_data_type_for_export_options(CoveLogicalType::Json, view_options())
+                .unwrap()
+                .value,
+            DataType::Utf8View
+        );
+        assert_eq!(
+            arrow_data_type_for_export_options(CoveLogicalType::Binary, view_options())
+                .unwrap()
+                .value,
+            DataType::BinaryView
+        );
     }
 
     #[test]
@@ -2157,6 +3707,14 @@ mod tests {
         assert_eq!(strings.value(0), "hi");
         assert!(strings.is_null(1));
         assert_eq!(strings.value(2), "there");
+
+        let view = encoded_array_to_arrow_with_options(&cove, view_options())
+            .unwrap()
+            .value;
+        let strings = view.as_any().downcast_ref::<StringViewArray>().unwrap();
+        assert_eq!(strings.value(0), "hi");
+        assert!(strings.is_null(1));
+        assert_eq!(strings.value(2), "there");
     }
 
     #[test]
@@ -2168,6 +3726,27 @@ mod tests {
             CoveLogicalType::Utf8,
             CovePhysicalKind::VarBytes,
             1,
+            CoveEncodingKind::VarBytes,
+            None,
+            &values,
+            None,
+        );
+
+        assert!(encoded_array_to_arrow(&cove).is_err());
+        assert!(encoded_array_to_arrow_with_options(&cove, view_options()).is_err());
+    }
+
+    #[test]
+    fn strict_utf8_rejects_invalid_row_boundaries_even_if_concat_valid() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&1u32.to_le_bytes());
+        values.push(0xc2);
+        values.extend_from_slice(&1u32.to_le_bytes());
+        values.push(0xa2);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            2,
             CoveEncodingKind::VarBytes,
             None,
             &values,
@@ -2218,6 +3797,46 @@ mod tests {
             encoded_array_to_arrow(&cove),
             Err(CoveError::PageCorrupt)
         ));
+    }
+
+    #[test]
+    fn small_varbytes_copy_matches_slice_copy_for_short_and_large_values() {
+        for len in 0usize..=128 {
+            let src = (0..len).map(|i| i as u8).collect::<Vec<_>>();
+            let mut dst = vec![0xaa; len];
+            // SAFETY: source and destination are separate allocations and both
+            // are valid for `len` bytes.
+            unsafe {
+                copy_varbytes_value(src.as_ptr(), dst.as_mut_ptr(), len);
+            }
+            assert_eq!(dst, src);
+        }
+    }
+
+    #[test]
+    fn fused_varbytes_copy_reports_ascii_high_bits() {
+        for len in 0usize..=128 {
+            let src = vec![b'a'; len];
+            let mut dst = vec![0xaa; len];
+            // SAFETY: source and destination are separate allocations and both
+            // are valid for `len` bytes.
+            let mask =
+                unsafe { copy_varbytes_value_ascii_mask(src.as_ptr(), dst.as_mut_ptr(), len) };
+            assert_eq!(dst, src);
+            assert_eq!(mask, 0, "len={len}");
+        }
+
+        for len in 1usize..=128 {
+            let mut src = vec![b'a'; len];
+            src[len - 1] = 0xc2;
+            let mut dst = vec![0xaa; len];
+            // SAFETY: source and destination are separate allocations and both
+            // are valid for `len` bytes.
+            let mask =
+                unsafe { copy_varbytes_value_ascii_mask(src.as_ptr(), dst.as_mut_ptr(), len) };
+            assert_eq!(dst, src);
+            assert_ne!(mask, 0, "len={len}");
+        }
     }
 
     #[test]
@@ -2310,6 +3929,95 @@ mod tests {
         .unwrap();
         let ints = result.value.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(ints.values(), &[30, 10]);
+    }
+
+    #[test]
+    fn selected_export_reads_numcode_rows_directly_with_nulls() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&10u64.to_le_bytes());
+        values.extend_from_slice(&20u64.to_le_bytes());
+        values.extend_from_slice(&30u64.to_le_bytes());
+        let mut validity = ValidityBitmapBuilder::new(3).unwrap();
+        validity.set_null(1).unwrap();
+        let validity_bytes = validity.into_bytes();
+        let bitmap = crate::validity::ValidityBitmap::new(&validity_bytes, 3);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
+            3,
+            CoveEncodingKind::NumCode,
+            Some(bitmap),
+            &values,
+            None,
+        );
+
+        let result = encoded_array_to_arrow_selected_with_options(
+            &cove,
+            &[2, 1, 0],
+            ArrowExportOptions::default(),
+        )
+        .unwrap();
+        let ints = result.value.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ints.value(0), 30);
+        assert!(ints.is_null(1));
+        assert_eq!(ints.value(2), 10);
+    }
+
+    #[test]
+    fn bitset_export_reads_numcode_rows_directly_with_nulls() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&10u64.to_le_bytes());
+        values.extend_from_slice(&20u64.to_le_bytes());
+        values.extend_from_slice(&30u64.to_le_bytes());
+        values.extend_from_slice(&40u64.to_le_bytes());
+        let mut validity = ValidityBitmapBuilder::new(4).unwrap();
+        validity.set_null(2).unwrap();
+        let validity_bytes = validity.into_bytes();
+        let bitmap = crate::validity::ValidityBitmap::new(&validity_bytes, 4);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
+            4,
+            CoveEncodingKind::NumCode,
+            Some(bitmap),
+            &values,
+            None,
+        );
+
+        let result = encoded_array_to_arrow_with_row_selection_options(
+            &cove,
+            ArrowRowSelection::Bitset {
+                words: &[0b1101],
+                len: 4,
+            },
+            ArrowExportOptions::default(),
+        )
+        .unwrap();
+        let ints = result.value.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ints.value(0), 10);
+        assert!(ints.is_null(1));
+        assert_eq!(ints.value(2), 40);
+    }
+
+    #[test]
+    fn rejects_numcode_int64_overflow_all_rows() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&10u64.to_le_bytes());
+        values.extend_from_slice(&(i64::MAX as u64 + 1).to_le_bytes());
+        let cove = EncodedArray::new(
+            CoveLogicalType::Int64,
+            CovePhysicalKind::NumCode,
+            2,
+            CoveEncodingKind::NumCode,
+            None,
+            &values,
+            None,
+        );
+
+        assert!(matches!(
+            encoded_array_to_arrow(&cove),
+            Err(CoveError::PageCorrupt)
+        ));
     }
 
     #[test]
@@ -2540,6 +4248,42 @@ mod tests {
         let result = encoded_array_to_arrow_selected_with_options(
             &cove,
             &[2, 1, 0],
+            ArrowExportOptions::default(),
+        )
+        .unwrap();
+        let bools = result
+            .value
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(bools.value(0));
+        assert!(bools.is_null(1));
+        assert!(bools.value(2));
+    }
+
+    #[test]
+    fn bitset_export_reads_bool_rows_directly_with_nulls() {
+        let values = [1u8, 0u8, 1u8, 1u8];
+        let mut validity = ValidityBitmapBuilder::new(4).unwrap();
+        validity.set_null(2).unwrap();
+        let validity_bytes = validity.into_bytes();
+        let bitmap = crate::validity::ValidityBitmap::new(&validity_bytes, 4);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Bool,
+            CovePhysicalKind::Boolean,
+            4,
+            CoveEncodingKind::PlainFixed,
+            Some(bitmap),
+            &values,
+            None,
+        );
+
+        let result = encoded_array_to_arrow_with_row_selection_options(
+            &cove,
+            ArrowRowSelection::Bitset {
+                words: &[0b1101],
+                len: 4,
+            },
             ArrowExportOptions::default(),
         )
         .unwrap();

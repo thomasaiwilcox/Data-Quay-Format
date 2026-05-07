@@ -107,6 +107,30 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cove-arrow-view-output",
+        action="store_true",
+        help=(
+            "For --runner attached-query with --engine cove: request Arrow "
+            "Utf8View/BinaryView output from the COVE table registration."
+        ),
+    )
+    parser.add_argument(
+        "--cove-trusted-arrow-string-validation",
+        action="store_true",
+        help=(
+            "For --runner attached-query with --engine cove: request trusted "
+            "page-proof Arrow string validation from the COVE table registration."
+        ),
+    )
+    parser.add_argument(
+        "--cove-local-file-mmap-reads",
+        action="store_true",
+        help=(
+            "For --runner attached-query with --engine cove: use the opt-in "
+            "mmap-backed local file range reader."
+        ),
+    )
+    parser.add_argument(
         "--run-seconds",
         type=int,
         help=(
@@ -211,6 +235,12 @@ def main() -> int:
             f"{sanitize_name(args.engine)}-"
             f"{sanitize_name(args.stage)}"
         )
+        if args.cove_arrow_view_output:
+            default_name += "-arrow-view"
+        if args.cove_trusted_arrow_string_validation:
+            default_name += "-trusted-strings"
+        if args.cove_local_file_mmap_reads:
+            default_name += "-mmap"
     base_name = args.name or default_name
     trace_path = output_dir / f"{base_name}.trace"
     stdout_path = output_dir / f"{base_name}.stdout.log"
@@ -255,6 +285,11 @@ def main() -> int:
             engine=args.engine,
             stage=args.stage,
             run_seconds=run_seconds,
+            cove_arrow_view_output=args.cove_arrow_view_output,
+            cove_trusted_arrow_string_validation=(
+                args.cove_trusted_arrow_string_validation
+            ),
+            cove_local_file_mmap_reads=args.cove_local_file_mmap_reads,
         )
         print("Profile target command:")
         print("  " + " ".join(shlex.quote(part) for part in target_cmd))
@@ -423,8 +458,11 @@ def build_profile_query_command(
     engine: str,
     stage: str,
     run_seconds: int,
+    cove_arrow_view_output: bool,
+    cove_trusted_arrow_string_validation: bool,
+    cove_local_file_mmap_reads: bool,
 ) -> list[str]:
-    return [
+    cmd = [
         str(bench_executable),
         "profile-query",
         "--track",
@@ -436,6 +474,13 @@ def build_profile_query_command(
         "--run-seconds",
         str(run_seconds),
     ]
+    if cove_arrow_view_output:
+        cmd.append("--cove-arrow-view-output")
+    if cove_trusted_arrow_string_validation:
+        cmd.append("--cove-trusted-arrow-string-validation")
+    if cove_local_file_mmap_reads:
+        cmd.append("--cove-local-file-mmap-reads")
+    return cmd
 
 
 def build_attach_xctrace_command(

@@ -13,8 +13,15 @@ use crate::{
     footer::CoveSectionEntryV1,
     page::{page_flag_codec, ColumnPageIndexEntryV1},
     postscript::CoveSectionSpecV1,
+    retained_bytes::RetainedBytes,
     CoveError,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageChecksumValidation {
+    Verify,
+    Trusted,
+}
 
 /// Returns the on-disk payload bytes for a writer-side section payload.
 ///
@@ -156,6 +163,20 @@ pub fn column_page_payload<'a>(
     page_bytes: &'a [u8],
     entry: &ColumnPageIndexEntryV1,
 ) -> Result<Cow<'a, [u8]>, CoveError> {
+    column_page_payload_with_checksum_validation(page_bytes, entry, PageChecksumValidation::Verify)
+}
+
+/// Returns the decompressed payload bytes for a column page with caller-selected
+/// page-wire checksum handling.
+///
+/// INVARIANT: `Trusted` skips only the page-wire CRC check. Length, codec, and
+/// uncompressed-length framing remain validated before decoded bytes are
+/// returned.
+pub fn column_page_payload_with_checksum_validation<'a>(
+    page_bytes: &'a [u8],
+    entry: &ColumnPageIndexEntryV1,
+    checksum_validation: PageChecksumValidation,
+) -> Result<Cow<'a, [u8]>, CoveError> {
     if page_bytes.len() as u64 != entry.page_length {
         return Err(CoveError::BadSection(format!(
             "page payload length {} does not match page_length {}",
@@ -163,7 +184,9 @@ pub fn column_page_payload<'a>(
             entry.page_length
         )));
     }
-    if checksum::crc32c(page_bytes) != entry.checksum {
+    if checksum_validation == PageChecksumValidation::Verify
+        && checksum::crc32c(page_bytes) != entry.checksum
+    {
         return Err(CoveError::ChecksumMismatch);
     }
     let codec = page_flag_codec(entry.flags)?;
@@ -184,6 +207,64 @@ pub fn column_page_payload<'a>(
         CompressionCodec::Zstd => {
             zstd_decompress(page_bytes, entry.uncompressed_length).map(Cow::Owned)
         }
+    }
+}
+
+/// Returns owned decompressed payload bytes for a column page.
+///
+/// This is scan-path plumbing for range readers that already own the page wire
+/// buffer. For uncompressed pages it validates the same framing as
+/// [`column_page_payload_with_checksum_validation`] and then returns the input
+/// buffer without an additional copy.
+pub fn column_page_payload_vec_with_checksum_validation(
+    page_bytes: Vec<u8>,
+    entry: &ColumnPageIndexEntryV1,
+    checksum_validation: PageChecksumValidation,
+) -> Result<Vec<u8>, CoveError> {
+    Ok(column_page_payload_retained_with_checksum_validation(
+        RetainedBytes::from_vec(page_bytes),
+        entry,
+        checksum_validation,
+    )?
+    .to_vec())
+}
+
+/// Returns retained decompressed payload bytes for a column page.
+///
+/// INVARIANT: for uncompressed pages, the returned value is the caller-owned
+/// page slice without copying. For compressed pages, the returned owner is the
+/// single decompressed allocation.
+pub fn column_page_payload_retained_with_checksum_validation(
+    page_bytes: RetainedBytes,
+    entry: &ColumnPageIndexEntryV1,
+    checksum_validation: PageChecksumValidation,
+) -> Result<RetainedBytes, CoveError> {
+    if page_bytes.len() as u64 != entry.page_length {
+        return Err(CoveError::BadSection(format!(
+            "page payload length {} does not match page_length {}",
+            page_bytes.len(),
+            entry.page_length
+        )));
+    }
+    if checksum_validation == PageChecksumValidation::Verify
+        && checksum::crc32c(page_bytes.as_slice()) != entry.checksum
+    {
+        return Err(CoveError::ChecksumMismatch);
+    }
+    let codec = page_flag_codec(entry.flags)?;
+    match codec {
+        CompressionCodec::None => {
+            if entry.uncompressed_length != entry.page_length {
+                return Err(CoveError::BadSection(
+                    "uncompressed_length must equal page_length when page codec=None".into(),
+                ));
+            }
+            Ok(page_bytes)
+        }
+        CompressionCodec::Lz4 => lz4_decompress(page_bytes.as_slice(), entry.uncompressed_length)
+            .map(RetainedBytes::from_vec),
+        CompressionCodec::Zstd => zstd_decompress(page_bytes.as_slice(), entry.uncompressed_length)
+            .map(RetainedBytes::from_vec),
     }
 }
 
@@ -452,6 +533,34 @@ mod tests {
         );
         let decoded = column_page_payload(payload, &entry).unwrap();
         assert_eq!(&*decoded, payload);
+    }
+
+    #[test]
+    fn retained_page_payload_none_returns_input_owner_slice() {
+        let payload = b"raw page bytes";
+        let mut owner = b"prefix".to_vec();
+        let offset = owner.len();
+        owner.extend_from_slice(payload);
+        owner.extend_from_slice(b"suffix");
+        let retained =
+            RetainedBytes::from_arc_slice(std::sync::Arc::new(owner), offset, payload.len())
+                .unwrap();
+        let entry = page_entry(
+            payload.len() as u64,
+            payload.len() as u64,
+            CompressionCodec::None,
+            checksum::crc32c(payload),
+        );
+
+        let decoded = column_page_payload_retained_with_checksum_validation(
+            retained.clone(),
+            &entry,
+            PageChecksumValidation::Verify,
+        )
+        .unwrap();
+        assert!(decoded.shares_owner(&retained));
+        assert_eq!(decoded.owner_offset(), retained.owner_offset());
+        assert_eq!(decoded.as_slice(), payload);
     }
 
     #[test]
