@@ -6,17 +6,17 @@ mod stats;
 
 use std::{borrow::Cow, path::Path, sync::Arc};
 
-use arrow_array::{RecordBatch, RecordBatchOptions};
+use arrow_array::{Array, RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
 use cove_arrow::arrow::{
     arrow_buffer_owner, encoded_array_to_arrow_with_row_selection_options_and_owner,
-    ArrowBufferOwner, ArrowExportOptions, ArrowRowSelection, ArrowStringValidationPolicy,
-    ArrowVarBytesExportPolicy,
+    ArrowBufferOwner, ArrowDictionaryPolicy, ArrowExportOptions, ArrowRowSelection,
+    ArrowStringValidationPolicy, ArrowVarBytesExportPolicy,
 };
 use cove_core::{
     array::{CoveArrayValue, EncodedArray, PreparedEncodedArray},
     compression,
-    constants::{CoveEncodingKind, CovePhysicalKind},
+    constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
     index::{lookup::LookupKeyKind, topn::TopNDirection},
     page::{
         page_uses_payload_elision, ColumnPageIndex, ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL,
@@ -691,12 +691,14 @@ fn record_batch_for_selection(
                 }
             }
         }
+        let export_path = classify_arrow_export(column.array, column_options);
         let result = encoded_array_to_arrow_with_row_selection_options_and_owner(
             column.array,
             arrow_selection,
             column_options,
             column.data_owner.as_ref(),
         )?;
+        record_arrow_export_stats(stats, export_path, result.value.as_ref());
         if let Some(key) = record_utf8_proof {
             if state.utf8_proof_cache().insert(key)? {
                 stats.utf8_proofs_earned += 1;
@@ -724,6 +726,84 @@ fn merge_export_report(
         }
     }
     report.issues.extend(other.issues);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrowExportPath {
+    DirectVarBytes,
+    DirectNumCode,
+    DirectPlainFixed,
+    DirectFileCodeDictionary,
+    DirectTransform,
+    DirectConstantPlainVarint,
+    Fallback,
+}
+
+fn classify_arrow_export(array: &EncodedArray<'_>, options: ArrowExportOptions) -> ArrowExportPath {
+    if options.dictionary_policy == ArrowDictionaryPolicy::DictionaryKeys
+        && array.encoding == CoveEncodingKind::FileCode
+        && array.dictionary.is_some()
+    {
+        return ArrowExportPath::DirectFileCodeDictionary;
+    }
+    if array.physical == CovePhysicalKind::VarBytes
+        && matches!(
+            array.encoding,
+            CoveEncodingKind::VarBytes | CoveEncodingKind::Canonical
+        )
+        && matches!(
+            array.logical,
+            CoveLogicalType::Utf8 | CoveLogicalType::Binary | CoveLogicalType::Json
+        )
+    {
+        return ArrowExportPath::DirectVarBytes;
+    }
+    if array.encoding == CoveEncodingKind::NumCode && array.physical == CovePhysicalKind::NumCode {
+        return ArrowExportPath::DirectNumCode;
+    }
+    if array.encoding == CoveEncodingKind::PlainFixed {
+        return ArrowExportPath::DirectPlainFixed;
+    }
+    if matches!(
+        array.encoding,
+        CoveEncodingKind::Constant | CoveEncodingKind::PlainVarint
+    ) {
+        return ArrowExportPath::DirectConstantPlainVarint;
+    }
+    if matches!(
+        array.encoding,
+        CoveEncodingKind::Rle
+            | CoveEncodingKind::RunEnd
+            | CoveEncodingKind::BitPacked
+            | CoveEncodingKind::Delta
+            | CoveEncodingKind::FrameOfReference
+            | CoveEncodingKind::PatchedBase
+            | CoveEncodingKind::Sparse
+            | CoveEncodingKind::LocalCodebook
+    ) {
+        return ArrowExportPath::DirectTransform;
+    }
+    ArrowExportPath::Fallback
+}
+
+fn record_arrow_export_stats(stats: &mut DecodeStats, path: ArrowExportPath, array: &dyn Array) {
+    let rows = array.len();
+    match path {
+        ArrowExportPath::DirectVarBytes => {
+            stats.arrow_export_direct_varbytes_rows += rows;
+            stats.arrow_export_direct_varbytes_bytes += array.get_buffer_memory_size();
+        }
+        ArrowExportPath::DirectNumCode => stats.arrow_export_direct_numcode_rows += rows,
+        ArrowExportPath::DirectPlainFixed => stats.arrow_export_direct_plainfixed_rows += rows,
+        ArrowExportPath::DirectFileCodeDictionary => {
+            stats.arrow_export_direct_filecode_dictionary_rows += rows;
+        }
+        ArrowExportPath::DirectTransform => stats.arrow_export_direct_transform_rows += rows,
+        ArrowExportPath::DirectConstantPlainVarint => {
+            stats.arrow_export_direct_constant_plainvarint_rows += rows;
+        }
+        ArrowExportPath::Fallback => stats.arrow_export_fallback_rows += rows,
+    }
 }
 
 fn ordered_morsels<'a>(
@@ -1684,13 +1764,24 @@ fn selected_rows_for_morsel(
             state.mounted().dictionary.as_ref()
         };
         let array = encoded_array_for_page(&payload, &page, dictionary)?;
-        let prepared = array.prepare()?;
-        if !try_apply_predicate_to_selection(
+        let applied = match try_apply_raw_predicate_to_selection(
             predicate,
-            &prepared,
+            &array,
             &mut scratch.selected_mask,
             &mut scratch.filter_mask,
         )? {
+            Some(()) => true,
+            None => {
+                let prepared = array.prepare()?;
+                try_apply_predicate_to_selection(
+                    predicate,
+                    &prepared,
+                    &mut scratch.selected_mask,
+                    &mut scratch.filter_mask,
+                )?
+            }
+        };
+        if !applied {
             if filter.use_kind == CoveFilterUse::FullRowPredicateExact {
                 stats.exactness_fallbacks += 1;
                 return Err(CoveError::UnsupportedEncoding(format!(
@@ -1806,13 +1897,24 @@ async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Sized>(
             state.mounted().dictionary.as_ref()
         };
         let array = encoded_array_for_page(&payload, page, dictionary)?;
-        let prepared = array.prepare()?;
-        if !try_apply_predicate_to_selection(
+        let applied = match try_apply_raw_predicate_to_selection(
             predicate,
-            &prepared,
+            &array,
             &mut scratch.selected_mask,
             &mut scratch.filter_mask,
         )? {
+            Some(()) => true,
+            None => {
+                let prepared = array.prepare()?;
+                try_apply_predicate_to_selection(
+                    predicate,
+                    &prepared,
+                    &mut scratch.selected_mask,
+                    &mut scratch.filter_mask,
+                )?
+            }
+        };
+        if !applied {
             if filter.use_kind == CoveFilterUse::FullRowPredicateExact {
                 stats.exactness_fallbacks += 1;
                 return Err(CoveError::UnsupportedEncoding(format!(
@@ -1881,7 +1983,11 @@ fn plan_has_row_predicate(plan: &ScanPlan) -> bool {
     plan.filters.iter().any(|filter| {
         matches!(
             filter.predicate,
-            Some(CovePredicate::Numeric { .. } | CovePredicate::FileCodeIn { .. })
+            Some(
+                CovePredicate::Numeric { .. }
+                    | CovePredicate::FileCodeIn { .. }
+                    | CovePredicate::VarBytesEq { .. }
+            )
         )
     })
 }
@@ -1891,7 +1997,11 @@ fn plan_has_exact_row_predicate(plan: &ScanPlan) -> bool {
         filter.use_kind == CoveFilterUse::FullRowPredicateExact
             && matches!(
                 filter.predicate,
-                Some(CovePredicate::Numeric { .. } | CovePredicate::FileCodeIn { .. })
+                Some(
+                    CovePredicate::Numeric { .. }
+                        | CovePredicate::FileCodeIn { .. }
+                        | CovePredicate::VarBytesEq { .. }
+                )
             )
     })
 }
@@ -2033,7 +2143,8 @@ fn predicate_column_index(predicate: &CovePredicate) -> Option<usize> {
     match predicate {
         CovePredicate::Null { column_index, .. }
         | CovePredicate::Numeric { column_index, .. }
-        | CovePredicate::FileCodeIn { column_index, .. } => Some(*column_index),
+        | CovePredicate::FileCodeIn { column_index, .. }
+        | CovePredicate::VarBytesEq { column_index, .. } => Some(*column_index),
     }
 }
 
@@ -2046,6 +2157,14 @@ fn apply_predicate_to_selection(
     if let Some(()) =
         try_apply_numcode_predicate_to_selection(predicate, prepared.array(), selected, scratch)?
     {
+        return Ok(true);
+    }
+    if let Some(()) = try_apply_varbytes_eq_predicate_to_selection(
+        predicate,
+        prepared.array(),
+        selected,
+        scratch,
+    )? {
         return Ok(true);
     }
     for word_index in 0..selected.words.len() {
@@ -2093,6 +2212,19 @@ fn apply_predicate_to_selection(
                         }
                     }
                 }
+                CovePredicate::VarBytesEq { literal, .. } => {
+                    if array.is_null(row)? {
+                        false
+                    } else {
+                        match prepared.decode_row(row)? {
+                            CoveArrayValue::Bytes(bytes) => bytes == literal.as_slice(),
+                            CoveArrayValue::OwnedBytes(bytes) => {
+                                bytes.as_slice() == literal.as_slice()
+                            }
+                            _ => return Ok(false),
+                        }
+                    }
+                }
             };
             if !keep {
                 selected.clear_bit(index);
@@ -2101,6 +2233,24 @@ fn apply_predicate_to_selection(
         }
     }
     Ok(true)
+}
+
+fn try_apply_raw_predicate_to_selection(
+    predicate: &CovePredicate,
+    array: &EncodedArray<'_>,
+    selected: &mut SelectionMask,
+    scratch: &mut SelectionMask,
+) -> Result<Option<()>, CoveError> {
+    if let Some(()) = try_apply_numcode_predicate_to_selection(predicate, array, selected, scratch)?
+    {
+        return Ok(Some(()));
+    }
+    if let Some(()) =
+        try_apply_varbytes_eq_predicate_to_selection(predicate, array, selected, scratch)?
+    {
+        return Ok(Some(()));
+    }
+    Ok(None)
 }
 
 fn try_apply_numcode_predicate_to_selection(
@@ -2144,6 +2294,72 @@ fn try_apply_numcode_predicate_to_selection(
             }
             remaining &= remaining - 1;
         }
+    }
+    std::mem::swap(selected, scratch);
+    Ok(Some(()))
+}
+
+fn try_apply_varbytes_eq_predicate_to_selection(
+    predicate: &CovePredicate,
+    array: &EncodedArray<'_>,
+    selected: &mut SelectionMask,
+    scratch: &mut SelectionMask,
+) -> Result<Option<()>, CoveError> {
+    let CovePredicate::VarBytesEq { literal, .. } = predicate else {
+        return Ok(None);
+    };
+    if array.encoding != CoveEncodingKind::VarBytes || array.physical != CovePhysicalKind::VarBytes
+    {
+        return Ok(None);
+    }
+    let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
+    if selected.len != row_count {
+        return Err(CoveError::BadSection(format!(
+            "selection length {} does not match VarBytes row count {row_count}",
+            selected.len
+        )));
+    }
+
+    scratch.clone_from_mask(selected);
+    let all_non_null = array.validity.is_none();
+    let all_selected = selected.count_ones() == row_count;
+    let data = array.data;
+    let mut offset = 0usize;
+    for row in 0..row_count {
+        let header_end = offset.checked_add(4).ok_or(CoveError::ArithOverflow)?;
+        if header_end > data.len() {
+            return Err(CoveError::OffsetRange);
+        }
+        let len = u32::from_le_bytes(data[offset..header_end].try_into().unwrap()) as usize;
+        offset = header_end;
+        let end = offset.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+        if end > data.len() {
+            return Err(CoveError::OffsetRange);
+        }
+        let value = &data[offset..end];
+
+        let is_selected = if all_selected {
+            true
+        } else {
+            let word = selected.words.get(row / 64).copied().unwrap_or(0);
+            (word & (1u64 << (row % 64))) != 0
+        };
+        if is_selected {
+            let is_non_null = if all_non_null {
+                true
+            } else {
+                let row_u64 = u64::try_from(row).map_err(|_| CoveError::ArithOverflow)?;
+                !array.is_null(row_u64)?
+            };
+            let keep = is_non_null && value.len() == literal.len() && value == literal.as_slice();
+            if !keep {
+                scratch.clear_bit(row);
+            }
+        }
+        offset = end;
+    }
+    if offset != array.data.len() {
+        return Err(CoveError::PageCorrupt);
     }
     std::mem::swap(selected, scratch);
     Ok(Some(()))

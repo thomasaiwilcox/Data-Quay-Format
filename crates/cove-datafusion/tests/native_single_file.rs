@@ -189,6 +189,44 @@ async fn native_limit_pushdown_materializes_only_requested_rows() {
 }
 
 #[tokio::test]
+async fn native_arrow_export_path_metrics_are_recorded() {
+    let path = write_temp_cove("events_export_metrics", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (_, numcode_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id, name, active FROM events",
+        "cove_arrow_export_direct_numcode_rows",
+    )
+    .await;
+    let (_, varbytes_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id, name, active FROM events",
+        "cove_arrow_export_direct_varbytes_rows",
+    )
+    .await;
+    let (_, plainfixed_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id, name, active FROM events",
+        "cove_arrow_export_direct_plainfixed_rows",
+    )
+    .await;
+    let (_, fallback_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id, name, active FROM events",
+        "cove_arrow_export_fallback_rows",
+    )
+    .await;
+
+    assert_eq!(numcode_rows, 3);
+    assert_eq!(varbytes_rows, 3);
+    assert_eq!(plainfixed_rows, 3);
+    assert_eq!(fallback_rows, 0);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
 async fn native_materialization_mode_selection_is_explained() {
     let path = write_temp_cove("materialization_modes", topn_events_file());
     let ctx = SessionContext::new();
@@ -984,6 +1022,35 @@ fn filter_pushdown_classifies_supported_numeric_exact_and_null_inexact() {
 }
 
 #[test]
+fn filter_pushdown_classifies_varbytes_equality_exact() {
+    let path = write_temp_cove("varbytes_classification", primitive_events_file());
+    let provider = cove_table_from_path(&path).unwrap();
+    let varbytes_equality = Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(Expr::Column(Column::from_name("name"))),
+        Operator::Eq,
+        Box::new(Expr::Literal(ScalarValue::Utf8(Some("beta".into())), None)),
+    ));
+    let varbytes_range = Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(Expr::Column(Column::from_name("name"))),
+        Operator::GtEq,
+        Box::new(Expr::Literal(ScalarValue::Utf8(Some("beta".into())), None)),
+    ));
+
+    let support = provider
+        .supports_filters_pushdown(&[&varbytes_equality, &varbytes_range])
+        .unwrap();
+
+    assert_eq!(
+        support,
+        vec![
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Unsupported
+        ]
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn null_pruning_uses_page_indexes_without_materializing_predicate_columns() {
     let state = bootstrap_bytes("nullable", nullable_events_file()).unwrap();
     let projection = vec![0];
@@ -1024,6 +1091,67 @@ fn numeric_row_selection_late_materializes_projected_columns() {
     assert_eq!(decoded.stats.rows_selected, 1);
     assert_eq!(decoded.stats.rows_materialized, 1);
     assert!(decoded.stats.pages_decoded < full.stats.pages_decoded);
+}
+
+#[test]
+fn varbytes_equality_late_materializes_projected_columns() {
+    let state = bootstrap_bytes("events", primitive_events_file()).unwrap();
+    let full = decode_scan(&state, &plan_scan(&state, None, Vec::new()).unwrap()).unwrap();
+    let projection = vec![0];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Binary {
+            left: Box::new(LowerExpr::Column("name".into())),
+            op: LowerOperator::Eq,
+            right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("beta".into()))),
+        },
+        "name = 'beta'",
+    );
+    assert!(matches!(
+        filter.predicate,
+        Some(CovePredicate::VarBytesEq { .. })
+    ));
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = ["+----+", "| id |", "+----+", "| 2  |", "+----+"];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 1);
+    assert_eq!(decoded.stats.rows_materialized, 1);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+    assert!(decoded.stats.pages_decoded < full.stats.pages_decoded);
+}
+
+#[tokio::test]
+async fn varbytes_equality_filter_is_pushed_down_exactly() {
+    let path = write_temp_cove("events_varbytes_filter", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT id FROM events WHERE name = 'beta'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = ["+----+", "| id |", "+----+", "| 2  |", "+----+"];
+    assert_batches_eq!(expected, &batches);
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events WHERE name = 'beta'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("FilterExec"), "{explain_text}");
+    assert!(explain_text.contains("exact_filters=1"), "{explain_text}");
+    fs::remove_file(path).unwrap();
 }
 
 #[test]

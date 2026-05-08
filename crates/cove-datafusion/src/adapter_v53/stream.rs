@@ -137,6 +137,14 @@ pub(crate) struct CoveStreamMetrics {
     range_plan_mixed: Count,
     range_plan_dense: Count,
     kernel_fallbacks: Count,
+    arrow_export_direct_varbytes_rows: Count,
+    arrow_export_direct_varbytes_bytes: Count,
+    arrow_export_direct_numcode_rows: Count,
+    arrow_export_direct_plainfixed_rows: Count,
+    arrow_export_direct_filecode_dictionary_rows: Count,
+    arrow_export_direct_transform_rows: Count,
+    arrow_export_direct_constant_plainvarint_rows: Count,
+    arrow_export_fallback_rows: Count,
 }
 
 impl CoveStreamMetrics {
@@ -235,6 +243,26 @@ impl CoveStreamMetrics {
                 .counter("cove_range_plan_dense", partition),
             kernel_fallbacks: MetricBuilder::new(metrics)
                 .counter("cove_kernel_fallbacks", partition),
+            arrow_export_direct_varbytes_rows: MetricBuilder::new(metrics)
+                .counter("cove_arrow_export_direct_varbytes_rows", partition),
+            arrow_export_direct_varbytes_bytes: MetricBuilder::new(metrics)
+                .counter("cove_arrow_export_direct_varbytes_bytes", partition),
+            arrow_export_direct_numcode_rows: MetricBuilder::new(metrics)
+                .counter("cove_arrow_export_direct_numcode_rows", partition),
+            arrow_export_direct_plainfixed_rows: MetricBuilder::new(metrics)
+                .counter("cove_arrow_export_direct_plainfixed_rows", partition),
+            arrow_export_direct_filecode_dictionary_rows: MetricBuilder::new(metrics).counter(
+                "cove_arrow_export_direct_filecode_dictionary_rows",
+                partition,
+            ),
+            arrow_export_direct_transform_rows: MetricBuilder::new(metrics)
+                .counter("cove_arrow_export_direct_transform_rows", partition),
+            arrow_export_direct_constant_plainvarint_rows: MetricBuilder::new(metrics).counter(
+                "cove_arrow_export_direct_constant_plainvarint_rows",
+                partition,
+            ),
+            arrow_export_fallback_rows: MetricBuilder::new(metrics)
+                .counter("cove_arrow_export_fallback_rows", partition),
         }
     }
 
@@ -297,6 +325,22 @@ impl CoveStreamMetrics {
         self.range_plan_mixed.add(stats.range_plan_mixed);
         self.range_plan_dense.add(stats.range_plan_dense);
         self.kernel_fallbacks.add(stats.kernel_fallbacks);
+        self.arrow_export_direct_varbytes_rows
+            .add(stats.arrow_export_direct_varbytes_rows);
+        self.arrow_export_direct_varbytes_bytes
+            .add(stats.arrow_export_direct_varbytes_bytes);
+        self.arrow_export_direct_numcode_rows
+            .add(stats.arrow_export_direct_numcode_rows);
+        self.arrow_export_direct_plainfixed_rows
+            .add(stats.arrow_export_direct_plainfixed_rows);
+        self.arrow_export_direct_filecode_dictionary_rows
+            .add(stats.arrow_export_direct_filecode_dictionary_rows);
+        self.arrow_export_direct_transform_rows
+            .add(stats.arrow_export_direct_transform_rows);
+        self.arrow_export_direct_constant_plainvarint_rows
+            .add(stats.arrow_export_direct_constant_plainvarint_rows);
+        self.arrow_export_fallback_rows
+            .add(stats.arrow_export_fallback_rows);
     }
 
     fn record_batch(&self, rows: usize) {

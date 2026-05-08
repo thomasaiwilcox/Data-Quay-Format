@@ -4,7 +4,10 @@
 //! shape Cove has promised to evaluate and the conservative exactness contract
 //! used by DataFusion pushdown classification.
 
-use cove_core::{constants::CovePhysicalKind, index::lookup::LookupKeyKind};
+use cove_core::{
+    constants::{CoveLogicalType, CovePhysicalKind},
+    index::lookup::LookupKeyKind,
+};
 
 use crate::{
     dataset_state::DatasetState,
@@ -23,6 +26,7 @@ pub enum DecodeKernel {
     DirectFileCode,
     PreparedFileCode,
     PreparedNumCode,
+    PreparedVarBytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -30,6 +34,7 @@ pub enum PredicateCost {
     NullBitmap,
     NumericCode,
     FileCode,
+    VarBytes,
     ResidualOrUnsupported,
 }
 
@@ -53,6 +58,13 @@ pub enum ScanOp {
         exactness: PredicateExactness,
         kernel: DecodeKernel,
         literal_count: usize,
+    },
+    VarBytesEq {
+        column_index: usize,
+        column_id: u32,
+        exactness: PredicateExactness,
+        kernel: DecodeKernel,
+        literal_len: usize,
     },
 }
 
@@ -139,6 +151,13 @@ pub fn compile_scan_program(state: &DatasetState, filters: &[FilterPlan]) -> Cov
                 kernel,
                 literal_count: file_codes.len().max(canonical_values.len()),
             },
+            CovePredicate::VarBytesEq { literal, .. } => ScanOp::VarBytesEq {
+                column_index,
+                column_id: column.column_id,
+                exactness,
+                kernel,
+                literal_len: literal.len(),
+            },
         };
         program.ops.push(op);
     }
@@ -160,6 +179,7 @@ pub fn predicate_cost(filter: &FilterPlan) -> PredicateCost {
         Some(CovePredicate::Null { .. }) => PredicateCost::NullBitmap,
         Some(CovePredicate::Numeric { .. }) => PredicateCost::NumericCode,
         Some(CovePredicate::FileCodeIn { .. }) => PredicateCost::FileCode,
+        Some(CovePredicate::VarBytesEq { .. }) => PredicateCost::VarBytes,
         None => PredicateCost::ResidualOrUnsupported,
     }
 }
@@ -212,6 +232,18 @@ fn filter_exactness(state: &DatasetState, filter: &FilterPlan) -> PredicateExact
             }
             PredicateExactness::FullRowPredicateExact
         }
+        CovePredicate::VarBytesEq { column_index, .. } => {
+            let Some(column) = state.table().columns.get(*column_index) else {
+                return PredicateExactness::PruningOnly;
+            };
+            if column.physical == CovePhysicalKind::VarBytes
+                && column.logical == CoveLogicalType::Utf8
+            {
+                PredicateExactness::FullRowPredicateExact
+            } else {
+                PredicateExactness::PruningOnly
+            }
+        }
     }
 }
 
@@ -263,6 +295,7 @@ fn predicate_kernel(predicate: &CovePredicate) -> DecodeKernel {
         CovePredicate::Null { .. } => DecodeKernel::NullBitmap,
         CovePredicate::Numeric { .. } => DecodeKernel::PreparedNumCode,
         CovePredicate::FileCodeIn { .. } => DecodeKernel::PreparedFileCode,
+        CovePredicate::VarBytesEq { .. } => DecodeKernel::PreparedVarBytes,
     }
 }
 
@@ -270,7 +303,8 @@ fn predicate_column_index(predicate: &CovePredicate) -> Option<usize> {
     match predicate {
         CovePredicate::Null { column_index, .. }
         | CovePredicate::Numeric { column_index, .. }
-        | CovePredicate::FileCodeIn { column_index, .. } => Some(*column_index),
+        | CovePredicate::FileCodeIn { column_index, .. }
+        | CovePredicate::VarBytesEq { column_index, .. } => Some(*column_index),
     }
 }
 

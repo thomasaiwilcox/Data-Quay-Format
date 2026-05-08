@@ -14,9 +14,12 @@ use std::{
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
 #[cfg(feature = "parquet-compare")]
 use cove_core::{
-    constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
+    constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind},
     table::{ColumnEntry, TableCatalog, TableEntry},
-    writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment},
+    writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload},
+    zone_stats::{
+        StatKind, StatScalar, ZoneScope, ZoneStatFlags, ZoneStats, ZoneStatsEntry, ZoneStatsSection,
+    },
 };
 #[cfg(feature = "parquet-compare")]
 use cove_datafusion::{options::CoveTableOptions, register::register_cove_file_with_options};
@@ -574,7 +577,81 @@ fn orders_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
         );
         writer.push_segment(segment);
     }
+    writer.push_extra_section(order_id_zone_stats_section(&rows.order_id, segment_rows));
     writer.write().expect("write orders fixture")
+}
+
+#[cfg(feature = "parquet-compare")]
+fn order_id_zone_stats_section(order_ids: &[i64], segment_rows: usize) -> SectionPayload {
+    let mut entries = Vec::new();
+    for (segment_idx, row_start) in (0..order_ids.len()).step_by(segment_rows).enumerate() {
+        let row_end = order_ids.len().min(row_start + segment_rows);
+        if row_start == row_end {
+            continue;
+        }
+        entries.push(order_id_zone_stats_entry(
+            segment_idx as u32,
+            (row_end - row_start) as u32,
+            order_ids[row_start],
+            order_ids[row_end - 1],
+        ));
+    }
+    let item_count = entries.len() as u64;
+    let row_count = order_ids.len() as u64;
+    let section = ZoneStatsSection { entries };
+    SectionPayload {
+        section_kind: SectionKind::ZoneStats as u16,
+        profile: PrimaryProfile::TableScan as u8,
+        flags: 0,
+        item_count,
+        row_count,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: 0,
+        data: section.serialize().expect("serialize order_id zone stats"),
+    }
+}
+
+#[cfg(feature = "parquet-compare")]
+fn order_id_zone_stats_entry(
+    segment_id: u32,
+    row_count: u32,
+    min: i64,
+    max: i64,
+) -> ZoneStatsEntry {
+    ZoneStatsEntry {
+        table_id: 71,
+        segment_id,
+        morsel_id: 0,
+        column_id: 1,
+        non_null_count: row_count,
+        distinct_count: row_count,
+        run_count: row_count,
+        stats: ZoneStats {
+            scope: ZoneScope::Morsel,
+            row_count: u64::from(row_count),
+            null_count: 0,
+            min: Some(int64_stat(min)),
+            max: Some(int64_stat(max)),
+            flags: ZoneStatFlags::HAS_MIN_MAX
+                | ZoneStatFlags::DISTINCT_EXACT
+                | ZoneStatFlags::SORTED_ASC,
+        },
+        min_domain_rank: u32::MAX,
+        max_domain_rank: u32::MAX,
+        exact_set_ref: u32::MAX,
+        bloom_ref: u32::MAX,
+    }
+}
+
+#[cfg(feature = "parquet-compare")]
+fn int64_stat(value: i64) -> StatScalar {
+    StatScalar {
+        kind: StatKind::Int64,
+        bytes: value.to_le_bytes().to_vec(),
+        truncated: false,
+    }
 }
 
 #[cfg(feature = "parquet-compare")]

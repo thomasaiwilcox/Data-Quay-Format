@@ -59,6 +59,14 @@ pub struct DecodeStats {
     pub range_plan_mixed: usize,
     pub range_plan_dense: usize,
     pub kernel_fallbacks: usize,
+    pub arrow_export_direct_varbytes_rows: usize,
+    pub arrow_export_direct_varbytes_bytes: usize,
+    pub arrow_export_direct_numcode_rows: usize,
+    pub arrow_export_direct_plainfixed_rows: usize,
+    pub arrow_export_direct_filecode_dictionary_rows: usize,
+    pub arrow_export_direct_transform_rows: usize,
+    pub arrow_export_direct_constant_plainvarint_rows: usize,
+    pub arrow_export_fallback_rows: usize,
     pub utf8_proof_hits: usize,
     pub utf8_proof_misses: usize,
     pub utf8_proofs_earned: usize,
@@ -135,6 +143,16 @@ impl DecodeStats {
         self.range_plan_mixed += other.range_plan_mixed;
         self.range_plan_dense += other.range_plan_dense;
         self.kernel_fallbacks += other.kernel_fallbacks;
+        self.arrow_export_direct_varbytes_rows += other.arrow_export_direct_varbytes_rows;
+        self.arrow_export_direct_varbytes_bytes += other.arrow_export_direct_varbytes_bytes;
+        self.arrow_export_direct_numcode_rows += other.arrow_export_direct_numcode_rows;
+        self.arrow_export_direct_plainfixed_rows += other.arrow_export_direct_plainfixed_rows;
+        self.arrow_export_direct_filecode_dictionary_rows +=
+            other.arrow_export_direct_filecode_dictionary_rows;
+        self.arrow_export_direct_transform_rows += other.arrow_export_direct_transform_rows;
+        self.arrow_export_direct_constant_plainvarint_rows +=
+            other.arrow_export_direct_constant_plainvarint_rows;
+        self.arrow_export_fallback_rows += other.arrow_export_fallback_rows;
         self.utf8_proof_hits += other.utf8_proof_hits;
         self.utf8_proof_misses += other.utf8_proof_misses;
         self.utf8_proofs_earned += other.utf8_proofs_earned;

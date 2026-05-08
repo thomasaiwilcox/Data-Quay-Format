@@ -112,6 +112,10 @@ pub enum CovePredicate {
         /// resolved against each concrete file before pruning or execution.
         canonical_values: Vec<Vec<u8>>,
     },
+    VarBytesEq {
+        column_index: usize,
+        literal: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +195,22 @@ impl FilterPlan {
                 column_index,
                 file_codes,
                 canonical_values,
+            }),
+        }
+    }
+
+    pub fn pruning_varbytes_eq(
+        column_index: usize,
+        literal: Vec<u8>,
+        display: impl Into<String>,
+    ) -> Self {
+        Self {
+            use_kind: CoveFilterUse::PruningOnly,
+            predicate_columns: vec![column_index],
+            display: display.into(),
+            predicate: Some(CovePredicate::VarBytesEq {
+                column_index,
+                literal,
             }),
         }
     }
@@ -302,6 +322,15 @@ fn validate_filter_shapes(state: &DatasetState, filters: &[FilterPlan]) -> Resul
                 if column.physical != CovePhysicalKind::NumCode {
                     return Err(CoveError::BadSchema(format!(
                         "numeric predicate planned for non-NumCode column {}",
+                        column.name
+                    )));
+                }
+            }
+            Some(CovePredicate::VarBytesEq { column_index, .. }) => {
+                let column = &state.table().columns[*column_index];
+                if column.physical != CovePhysicalKind::VarBytes {
+                    return Err(CoveError::BadSchema(format!(
+                        "VarBytes predicate planned for non-VarBytes column {}",
                         column.name
                     )));
                 }
