@@ -454,12 +454,10 @@ impl CoveRecordBatchStream {
         let (sender, receiver) = mpsc::channel(DECODE_BATCH_CHANNEL_CAPACITY);
         let decode_metrics = metrics.clone();
         let decode_task = tokio::task::spawn_blocking(move || {
-            let (plan, dynamic_stats) = prepare_plan_for_decode(
-                &state,
-                plan,
-                #[cfg(feature = "dynamic-filters")]
-                dynamic_filters,
-            );
+            #[cfg(feature = "dynamic-filters")]
+            let (plan, dynamic_stats) = prepare_plan_for_decode(&state, plan, dynamic_filters);
+            #[cfg(not(feature = "dynamic-filters"))]
+            let (plan, dynamic_stats) = prepare_plan_for_decode(&state, plan);
             let batch_sink = ChannelDecodeSink::new(sender.clone());
             let mut sink = FetchLimitedDecodeSink::new(batch_sink, fetch);
             let result = decode_local_dataset_scan_tasks_with_sink(
@@ -506,12 +504,10 @@ impl CoveRecordBatchStream {
         metrics.record_buffered_partition();
         let decode_metrics = metrics.clone();
         let decode_task = tokio::task::spawn_blocking(move || {
-            let (plan, dynamic_stats) = prepare_plan_for_decode(
-                &state,
-                plan,
-                #[cfg(feature = "dynamic-filters")]
-                Vec::new(),
-            );
+            #[cfg(feature = "dynamic-filters")]
+            let (plan, dynamic_stats) = prepare_plan_for_decode(&state, plan, Vec::new());
+            #[cfg(not(feature = "dynamic-filters"))]
+            let (plan, dynamic_stats) = prepare_plan_for_decode(&state, plan);
             let mut decoded = decode_local_dataset_scan_tasks_with_cache(
                 &state,
                 &plan,

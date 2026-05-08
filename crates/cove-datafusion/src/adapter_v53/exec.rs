@@ -138,17 +138,20 @@ impl CoveExec {
     fn selected_materialization_mode(
         &self,
         fetch: Option<usize>,
-        #[cfg(feature = "dynamic-filters")] dynamic_filters: &[Arc<dyn PhysicalExpr>],
+        has_dynamic_filters: bool,
     ) -> CoveMaterializationMode {
-        CoveMaterializationMode::choose(
-            &self.plan,
-            &self.task_graph,
-            fetch,
-            #[cfg(feature = "dynamic-filters")]
-            !dynamic_filters.is_empty(),
-            #[cfg(not(feature = "dynamic-filters"))]
-            false,
-        )
+        CoveMaterializationMode::choose(&self.plan, &self.task_graph, fetch, has_dynamic_filters)
+    }
+
+    fn has_dynamic_filters(&self) -> bool {
+        #[cfg(feature = "dynamic-filters")]
+        {
+            !self.dynamic_filters.is_empty()
+        }
+        #[cfg(not(feature = "dynamic-filters"))]
+        {
+            false
+        }
     }
 
     fn properties_for_mode(&self, mode: CoveMaterializationMode) -> Arc<PlanProperties> {
@@ -289,11 +292,8 @@ impl ExecutionPlan for CoveExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        let materialization_mode = self.selected_materialization_mode(
-            limit,
-            #[cfg(feature = "dynamic-filters")]
-            &self.dynamic_filters,
-        );
+        let materialization_mode =
+            self.selected_materialization_mode(limit, self.has_dynamic_filters());
         Some(Arc::new(Self {
             state: Arc::clone(&self.state),
             plan: self.plan.clone(),
@@ -334,7 +334,8 @@ impl ExecutionPlan for CoveExec {
 
         let mut dynamic_filters = self.dynamic_filters.clone();
         dynamic_filters.extend(parent_filters);
-        let materialization_mode = self.selected_materialization_mode(self.fetch, &dynamic_filters);
+        let materialization_mode =
+            self.selected_materialization_mode(self.fetch, !dynamic_filters.is_empty());
         let updated = Arc::new(Self {
             state: Arc::clone(&self.state),
             plan: self.plan.clone(),

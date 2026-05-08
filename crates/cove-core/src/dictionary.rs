@@ -510,6 +510,11 @@ pub fn file_dictionary_candidate_len(
     unique: &BTreeSet<FileDictionaryKey>,
     row_count: usize,
 ) -> Result<usize, CoveError> {
+    let index_len = unique
+        .len()
+        .checked_mul(DICT_INDEX_ENTRY_SIZE)
+        .ok_or(CoveError::ArithOverflow)?;
+    let key_len = row_count.checked_mul(4).ok_or(CoveError::ArithOverflow)?;
     let payload_len = unique.iter().try_fold(0usize, |total, key| {
         if key.canonical.len() <= 16 {
             Ok(total)
@@ -520,14 +525,9 @@ pub fn file_dictionary_candidate_len(
         }
     })?;
     DICT_HEADER_SIZE
-        .checked_add(
-            unique
-                .len()
-                .checked_mul(DICT_INDEX_ENTRY_SIZE)
-                .ok_or(CoveError::ArithOverflow)?,
-        )
+        .checked_add(index_len)
         .and_then(|total| total.checked_add(payload_len))
-        .and_then(|total| total.checked_add(row_count.checked_mul(4)?))
+        .and_then(|total| total.checked_add(key_len))
         .ok_or(CoveError::ArithOverflow)
 }
 

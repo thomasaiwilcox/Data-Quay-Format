@@ -167,7 +167,11 @@ pub fn compile_scan_program(state: &DatasetState, filters: &[FilterPlan]) -> Cov
 
 pub fn order_filters_by_cost(filters: &mut [FilterPlan]) -> bool {
     let before = filters.iter().map(filter_order_key).collect::<Vec<_>>();
-    filters.sort_by_key(filter_order_key);
+    let mut indexed = filters.iter().cloned().enumerate().collect::<Vec<_>>();
+    indexed.sort_by_key(|(index, filter)| (filter_order_key(filter), *index));
+    for (slot, (_, filter)) in filters.iter_mut().zip(indexed) {
+        *slot = filter;
+    }
     filters.iter().map(filter_order_key).ne(before)
 }
 
