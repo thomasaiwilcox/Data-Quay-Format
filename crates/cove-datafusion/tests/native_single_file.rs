@@ -159,6 +159,13 @@ async fn native_limit_pushdown_materializes_only_requested_rows() {
     ];
     assert_batches_eq!(full_expected, &full_batches);
     assert_eq!(full_materialized, 3);
+    let (_, full_buffered_partitions) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id FROM events",
+        "cove_materialization_buffered_partitions",
+    )
+    .await;
+    assert_eq!(full_buffered_partitions, 1);
 
     let (limit_batches, limit_materialized) = collect_sql_with_cove_metric(
         &ctx,
@@ -170,6 +177,62 @@ async fn native_limit_pushdown_materializes_only_requested_rows() {
     assert_batches_eq!(limit_expected, &limit_batches);
     assert_eq!(limit_materialized, 1);
     assert!(limit_materialized < full_materialized);
+    let (_, limit_streaming_partitions) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id FROM events LIMIT 1",
+        "cove_materialization_streaming_partitions",
+    )
+    .await;
+    assert_eq!(limit_streaming_partitions, 1);
+
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn native_materialization_mode_selection_is_explained() {
+    let path = write_temp_cove("materialization_modes", topn_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("materialization_mode=buffered"),
+        "{explain_text}"
+    );
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events LIMIT 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("materialization_mode=streaming"),
+        "{explain_text}"
+    );
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events ORDER BY id DESC LIMIT 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(explain_text.contains("topn_hint=Some"), "{explain_text}");
+    assert!(
+        explain_text.contains("materialization_mode=streaming"),
+        "{explain_text}"
+    );
 
     fs::remove_file(path).unwrap();
 }
@@ -1527,6 +1590,10 @@ async fn m4d_topn_optimizer_adds_read_order_hint_without_removing_sort() {
         .unwrap();
     let explain_text = pretty_format_batches(&explain).unwrap().to_string();
     assert!(explain_text.contains("topn_hint=Some"), "{explain_text}");
+    assert!(
+        explain_text.contains("materialization_mode=streaming"),
+        "{explain_text}"
+    );
     assert!(
         explain_text.contains("SortExec") || explain_text.contains("Sort"),
         "{explain_text}"

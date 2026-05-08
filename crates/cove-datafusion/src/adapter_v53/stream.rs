@@ -1,6 +1,7 @@
 //! DataFusion 53.x stream glue.
 
 use std::{
+    collections::VecDeque,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -21,8 +22,8 @@ use crate::{
     adapter_v53::cove_to_datafusion,
     dataset_state::DatasetState,
     decode::{
-        decode_local_dataset_scan_tasks_with_sink, DecodeControl, DecodeSink, DecodeStats,
-        FetchLimitedDecodeSink, ScanExecutionCache,
+        decode_local_dataset_scan_tasks_with_cache, decode_local_dataset_scan_tasks_with_sink,
+        DecodeControl, DecodeSink, DecodeStats, FetchLimitedDecodeSink, ScanExecutionCache,
     },
     planner::ScanPlan,
     task_graph::ScanTask,
@@ -86,6 +87,8 @@ impl DecodeSink for ChannelDecodeSink {
 pub(crate) struct CoveStreamMetrics {
     output_batches: Count,
     output_rows: Count,
+    materialization_streaming_partitions: Count,
+    materialization_buffered_partitions: Count,
     files_considered: Count,
     files_pruned: Count,
     files_validated: Count,
@@ -144,6 +147,10 @@ impl CoveStreamMetrics {
         Self {
             output_batches: MetricBuilder::new(metrics).output_batches(partition),
             output_rows: MetricBuilder::new(metrics).output_rows(partition),
+            materialization_streaming_partitions: MetricBuilder::new(metrics)
+                .counter("cove_materialization_streaming_partitions", partition),
+            materialization_buffered_partitions: MetricBuilder::new(metrics)
+                .counter("cove_materialization_buffered_partitions", partition),
             files_considered: MetricBuilder::new(metrics)
                 .counter("cove_files_considered", partition),
             files_pruned: MetricBuilder::new(metrics).counter("cove_files_pruned", partition),
@@ -296,19 +303,68 @@ impl CoveStreamMetrics {
         self.output_batches.add(1);
         self.output_rows.add(rows);
     }
+
+    fn record_streaming_partition(&self) {
+        self.materialization_streaming_partitions.add(1);
+    }
+
+    fn record_buffered_partition(&self) {
+        self.materialization_buffered_partitions.add(1);
+    }
 }
+
+#[cfg(feature = "dynamic-filters")]
+fn prepare_plan_for_decode(
+    state: &DatasetState,
+    mut plan: ScanPlan,
+    dynamic_filters: Vec<Arc<dyn PhysicalExpr>>,
+) -> (ScanPlan, DecodeStats) {
+    let mut dynamic_stats = DecodeStats::default();
+    if !dynamic_filters.is_empty() {
+        match snapshot_dynamic_filters(state, &dynamic_filters) {
+            Ok(snapshot) => {
+                dynamic_stats.dynamic_filter_snapshots += snapshot.snapshots;
+                dynamic_stats.dynamic_filter_fallbacks += snapshot.fallbacks;
+                plan.filters.extend(snapshot.filters);
+            }
+            Err(_) => {
+                dynamic_stats.dynamic_filter_fallbacks += dynamic_filters.len();
+            }
+        }
+    }
+    (plan, dynamic_stats)
+}
+
+#[cfg(not(feature = "dynamic-filters"))]
+fn prepare_plan_for_decode(_state: &DatasetState, plan: ScanPlan) -> (ScanPlan, DecodeStats) {
+    (plan, DecodeStats::default())
+}
+
+type BufferedDecodeResult = std::result::Result<Vec<RecordBatch>, cove_core::CoveError>;
 
 #[derive(Debug)]
 pub(crate) struct CoveRecordBatchStream {
     schema: SchemaRef,
-    receiver: mpsc::Receiver<DecodeStreamEvent>,
-    decode_task: Option<tokio::task::JoinHandle<()>>,
     metrics: CoveStreamMetrics,
-    done: bool,
+    inner: CoveRecordBatchStreamInner,
+}
+
+#[derive(Debug)]
+enum CoveRecordBatchStreamInner {
+    Streaming {
+        receiver: mpsc::Receiver<DecodeStreamEvent>,
+        decode_task: Option<tokio::task::JoinHandle<()>>,
+        done: bool,
+    },
+    Buffered {
+        batches: VecDeque<RecordBatch>,
+        decode_task: Option<tokio::task::JoinHandle<BufferedDecodeResult>>,
+        done: bool,
+    },
 }
 
 impl CoveRecordBatchStream {
-    pub(crate) fn new(
+    pub(crate) fn new_streaming(
         schema: SchemaRef,
         state: Arc<DatasetState>,
         scan_cache: Arc<ScanExecutionCache>,
@@ -320,30 +376,16 @@ impl CoveRecordBatchStream {
         #[cfg(feature = "dynamic-filters")] dynamic_filters: Vec<Arc<dyn PhysicalExpr>>,
         metrics: CoveStreamMetrics,
     ) -> Self {
+        metrics.record_streaming_partition();
         let (sender, receiver) = mpsc::channel(DECODE_BATCH_CHANNEL_CAPACITY);
         let decode_metrics = metrics.clone();
         let decode_task = tokio::task::spawn_blocking(move || {
-            #[cfg(feature = "dynamic-filters")]
-            let mut plan = plan;
-            #[cfg(not(feature = "dynamic-filters"))]
-            let plan = plan;
-            #[cfg(feature = "dynamic-filters")]
-            let mut dynamic_stats = DecodeStats::default();
-            #[cfg(not(feature = "dynamic-filters"))]
-            let dynamic_stats = DecodeStats::default();
-            #[cfg(feature = "dynamic-filters")]
-            if !dynamic_filters.is_empty() {
-                match snapshot_dynamic_filters(&state, &dynamic_filters) {
-                    Ok(snapshot) => {
-                        dynamic_stats.dynamic_filter_snapshots += snapshot.snapshots;
-                        dynamic_stats.dynamic_filter_fallbacks += snapshot.fallbacks;
-                        plan.filters.extend(snapshot.filters);
-                    }
-                    Err(_) => {
-                        dynamic_stats.dynamic_filter_fallbacks += dynamic_filters.len();
-                    }
-                }
-            }
+            let (plan, dynamic_stats) = prepare_plan_for_decode(
+                &state,
+                plan,
+                #[cfg(feature = "dynamic-filters")]
+                dynamic_filters,
+            );
             let batch_sink = ChannelDecodeSink::new(sender.clone());
             let mut sink = FetchLimitedDecodeSink::new(batch_sink, fetch);
             let result = decode_local_dataset_scan_tasks_with_sink(
@@ -368,10 +410,54 @@ impl CoveRecordBatchStream {
         });
         Self {
             schema,
-            receiver,
-            decode_task: Some(decode_task),
             metrics,
-            done: false,
+            inner: CoveRecordBatchStreamInner::Streaming {
+                receiver,
+                decode_task: Some(decode_task),
+                done: false,
+            },
+        }
+    }
+
+    pub(crate) fn new_buffered(
+        schema: SchemaRef,
+        state: Arc<DatasetState>,
+        scan_cache: Arc<ScanExecutionCache>,
+        plan: ScanPlan,
+        tasks: Vec<ScanTask>,
+        partition_index: usize,
+        partition_count: usize,
+        metrics: CoveStreamMetrics,
+    ) -> Self {
+        metrics.record_buffered_partition();
+        let decode_metrics = metrics.clone();
+        let decode_task = tokio::task::spawn_blocking(move || {
+            let (plan, dynamic_stats) = prepare_plan_for_decode(
+                &state,
+                plan,
+                #[cfg(feature = "dynamic-filters")]
+                Vec::new(),
+            );
+            let mut decoded = decode_local_dataset_scan_tasks_with_cache(
+                &state,
+                &plan,
+                &tasks,
+                partition_index,
+                partition_count,
+                scan_cache,
+            )?;
+            decoded.stats.add_decode(dynamic_stats);
+            decode_metrics.record_decode(decoded.stats);
+            Ok(decoded.batches)
+        });
+        Self {
+            schema,
+            metrics,
+            inner: CoveRecordBatchStreamInner::Buffered {
+                batches: VecDeque::new(),
+                decode_task: Some(decode_task),
+                done: false,
+            },
         }
     }
 }
@@ -381,45 +467,98 @@ impl Stream for CoveRecordBatchStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.done {
-            return Poll::Ready(None);
-        }
+        let metrics = this.metrics.clone();
 
-        match Pin::new(&mut this.receiver).poll_recv(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(DecodeStreamEvent::Batch(batch))) => {
-                this.metrics.record_batch(batch.num_rows());
-                Poll::Ready(Some(Ok(batch)))
-            }
-            Poll::Ready(Some(DecodeStreamEvent::Finished)) => {
-                this.done = true;
-                this.decode_task = None;
-                Poll::Ready(None)
-            }
-            Poll::Ready(Some(DecodeStreamEvent::Failed(error))) => {
-                this.done = true;
-                this.decode_task = None;
-                Poll::Ready(Some(Err(cove_to_datafusion(error))))
-            }
-            Poll::Ready(None) => {
-                if let Some(task) = this.decode_task.as_mut() {
-                    match Pin::new(task).poll(cx) {
-                        Poll::Pending => Poll::Pending,
-                        Poll::Ready(Ok(())) => {
-                            this.decode_task = None;
-                            this.done = true;
+        match &mut this.inner {
+            CoveRecordBatchStreamInner::Streaming {
+                receiver,
+                decode_task,
+                done,
+            } => {
+                if *done {
+                    return Poll::Ready(None);
+                }
+                match Pin::new(receiver).poll_recv(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Some(DecodeStreamEvent::Batch(batch))) => {
+                        metrics.record_batch(batch.num_rows());
+                        Poll::Ready(Some(Ok(batch)))
+                    }
+                    Poll::Ready(Some(DecodeStreamEvent::Finished)) => {
+                        *done = true;
+                        *decode_task = None;
+                        Poll::Ready(None)
+                    }
+                    Poll::Ready(Some(DecodeStreamEvent::Failed(error))) => {
+                        *done = true;
+                        *decode_task = None;
+                        Poll::Ready(Some(Err(cove_to_datafusion(error))))
+                    }
+                    Poll::Ready(None) => {
+                        if let Some(task) = decode_task.as_mut() {
+                            match Pin::new(task).poll(cx) {
+                                Poll::Pending => Poll::Pending,
+                                Poll::Ready(Ok(())) => {
+                                    *decode_task = None;
+                                    *done = true;
+                                    Poll::Ready(None)
+                                }
+                                Poll::Ready(Err(error)) => {
+                                    *decode_task = None;
+                                    *done = true;
+                                    Poll::Ready(Some(Err(DataFusionError::Execution(format!(
+                                        "CoveRecordBatchStream decode task failed: {error}"
+                                    )))))
+                                }
+                            }
+                        } else {
+                            *done = true;
                             Poll::Ready(None)
                         }
+                    }
+                }
+            }
+            CoveRecordBatchStreamInner::Buffered {
+                batches,
+                decode_task,
+                done,
+            } => {
+                if *done {
+                    return Poll::Ready(None);
+                }
+                if let Some(batch) = batches.pop_front() {
+                    metrics.record_batch(batch.num_rows());
+                    return Poll::Ready(Some(Ok(batch)));
+                }
+                if let Some(task) = decode_task.as_mut() {
+                    match Pin::new(task).poll(cx) {
+                        Poll::Pending => Poll::Pending,
+                        Poll::Ready(Ok(Ok(decoded_batches))) => {
+                            *decode_task = None;
+                            *batches = VecDeque::from(decoded_batches);
+                            if let Some(batch) = batches.pop_front() {
+                                metrics.record_batch(batch.num_rows());
+                                Poll::Ready(Some(Ok(batch)))
+                            } else {
+                                *done = true;
+                                Poll::Ready(None)
+                            }
+                        }
+                        Poll::Ready(Ok(Err(error))) => {
+                            *decode_task = None;
+                            *done = true;
+                            Poll::Ready(Some(Err(cove_to_datafusion(error))))
+                        }
                         Poll::Ready(Err(error)) => {
-                            this.decode_task = None;
-                            this.done = true;
+                            *decode_task = None;
+                            *done = true;
                             Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                                "CoveRecordBatchStream decode task failed: {error}"
+                                "CoveRecordBatchStream buffered decode task failed: {error}"
                             )))))
                         }
                     }
                 } else {
-                    this.done = true;
+                    *done = true;
                     Poll::Ready(None)
                 }
             }
