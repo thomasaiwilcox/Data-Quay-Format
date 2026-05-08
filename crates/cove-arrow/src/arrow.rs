@@ -59,7 +59,7 @@ use selection_utils::{count_bitset_rows, mask_selection_tail, selected_rows_are_
 pub use validity::{arrow_validity_to_cove_null, cove_null_to_arrow_validity};
 
 /// Policy for exporting FileCode-backed scalar columns to Arrow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ArrowDictionaryPolicy {
     /// Decode FileCodes to their logical values before building the Arrow array.
@@ -75,7 +75,7 @@ impl Default for ArrowDictionaryPolicy {
 }
 
 /// Policy for exporting COVE variable byte payloads to Arrow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ArrowVarBytesExportPolicy {
     /// Materialise COVE length-prefixed bytes into standard Arrow Utf8/Binary
@@ -93,7 +93,7 @@ impl Default for ArrowVarBytesExportPolicy {
 }
 
 /// Policy for validating COVE byte payloads before constructing Arrow Utf8.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ArrowStringValidationPolicy {
     /// Validate all materialized non-null rows while exporting.
@@ -114,7 +114,7 @@ impl Default for ArrowStringValidationPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArrowDecimalContext {
     pub precision: u8,
     pub scale: i8,
@@ -181,7 +181,7 @@ pub struct ArrowExportResult<T> {
     pub report: ArrowExportReport,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArrowExportOptions {
     pub dictionary_policy: ArrowDictionaryPolicy,
     pub varbytes_policy: ArrowVarBytesExportPolicy,
@@ -1037,10 +1037,8 @@ fn try_filecode_dictionary_array(
         return Ok(None);
     };
     let values = file_dictionary_values_to_arrow(array.logical, dictionary, options)?;
-    let keys = filecode_key_array(array, ArrowRowSelection::All)?;
-    DictionaryArray::<UInt32Type>::try_new(keys, values)
-        .map(|array| Some(Arc::new(array) as ArrayRef))
-        .map_err(|err| CoveError::BadSection(format!("Arrow DictionaryArray: {err}")))
+    encoded_filecode_array_to_arrow_dictionary_with_values(array, ArrowRowSelection::All, values)
+        .map(Some)
 }
 
 fn try_filecode_dictionary_array_for_selection(
@@ -1055,9 +1053,27 @@ fn try_filecode_dictionary_array_for_selection(
         return Ok(None);
     };
     let values = file_dictionary_values_to_arrow(array.logical, dictionary, options)?;
+    encoded_filecode_array_to_arrow_dictionary_with_values(array, selection, values).map(Some)
+}
+
+/// Build an Arrow dictionary array for a FileCode page using prebuilt
+/// dictionary values.
+///
+/// This lets query engines cache the dictionary values for an immutable file
+/// and materialise only the per-page key buffer on repeated scans.
+pub fn encoded_filecode_array_to_arrow_dictionary_with_values(
+    array: &EncodedArray<'_>,
+    selection: ArrowRowSelection<'_>,
+    values: ArrayRef,
+) -> Result<ArrayRef, CoveError> {
+    if array.encoding != crate::constants::CoveEncodingKind::FileCode {
+        return Err(CoveError::UnsupportedEncoding(
+            "Arrow dictionary export requires FileCode encoding".into(),
+        ));
+    }
     let keys = filecode_key_array(array, selection)?;
     DictionaryArray::<UInt32Type>::try_new(keys, values)
-        .map(|array| Some(Arc::new(array) as ArrayRef))
+        .map(|array| Arc::new(array) as ArrayRef)
         .map_err(|err| CoveError::BadSection(format!("Arrow DictionaryArray: {err}")))
 }
 
@@ -1094,7 +1110,8 @@ fn filecode_key_array(
     ))
 }
 
-fn file_dictionary_values_to_arrow(
+/// Decode COVE file dictionary entries into the Arrow dictionary values array.
+pub fn file_dictionary_values_to_arrow(
     logical: CoveLogicalType,
     dictionary: &crate::dictionary::FileDictionary,
     options: ArrowExportOptions,

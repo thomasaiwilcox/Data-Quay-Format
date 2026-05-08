@@ -145,6 +145,11 @@ pub(crate) struct CoveStreamMetrics {
     arrow_export_direct_transform_rows: Count,
     arrow_export_direct_constant_plainvarint_rows: Count,
     arrow_export_fallback_rows: Count,
+    filecode_dictionary_keys_rows: Count,
+    filecode_dictionary_values_bytes: Count,
+    filecode_dictionary_value_cache_hits: Count,
+    filecode_dictionary_value_cache_misses: Count,
+    filecode_dictionary_decoded_fallback_rows: Count,
 }
 
 impl CoveStreamMetrics {
@@ -263,6 +268,16 @@ impl CoveStreamMetrics {
             ),
             arrow_export_fallback_rows: MetricBuilder::new(metrics)
                 .counter("cove_arrow_export_fallback_rows", partition),
+            filecode_dictionary_keys_rows: MetricBuilder::new(metrics)
+                .counter("cove_filecode_dictionary_keys_rows", partition),
+            filecode_dictionary_values_bytes: MetricBuilder::new(metrics)
+                .counter("cove_filecode_dictionary_values_bytes", partition),
+            filecode_dictionary_value_cache_hits: MetricBuilder::new(metrics)
+                .counter("cove_filecode_dictionary_value_cache_hits", partition),
+            filecode_dictionary_value_cache_misses: MetricBuilder::new(metrics)
+                .counter("cove_filecode_dictionary_value_cache_misses", partition),
+            filecode_dictionary_decoded_fallback_rows: MetricBuilder::new(metrics)
+                .counter("cove_filecode_dictionary_decoded_fallback_rows", partition),
         }
     }
 
@@ -341,6 +356,16 @@ impl CoveStreamMetrics {
             .add(stats.arrow_export_direct_constant_plainvarint_rows);
         self.arrow_export_fallback_rows
             .add(stats.arrow_export_fallback_rows);
+        self.filecode_dictionary_keys_rows
+            .add(stats.filecode_dictionary_keys_rows);
+        self.filecode_dictionary_values_bytes
+            .add(stats.filecode_dictionary_values_bytes);
+        self.filecode_dictionary_value_cache_hits
+            .add(stats.filecode_dictionary_value_cache_hits);
+        self.filecode_dictionary_value_cache_misses
+            .add(stats.filecode_dictionary_value_cache_misses);
+        self.filecode_dictionary_decoded_fallback_rows
+            .add(stats.filecode_dictionary_decoded_fallback_rows);
     }
 
     fn record_batch(&self, rows: usize) {

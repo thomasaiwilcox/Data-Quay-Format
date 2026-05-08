@@ -9,10 +9,13 @@
 //! - `FILE_DICTIONARY_PAYLOAD` — variable-length value bytes for inline-overflow
 //!   and payload-class values.
 
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use crate::{
-    canonical,
+    canonical::{self, CanonicalValue},
     constants::{StorageClass, ValueTag},
     error::CoveError,
 };
@@ -408,6 +411,185 @@ impl FileDictionary {
     }
 }
 
+/// Canonical key used when synthesising a file dictionary from logical values.
+///
+/// INVARIANT: ordering is over `(value_tag, canonical_bytes)`, so generated
+/// FileCodes are deterministic and independent of source row order or source
+/// engine dictionary codes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FileDictionaryKey {
+    pub value_tag: u16,
+    pub canonical: Vec<u8>,
+}
+
+impl FileDictionaryKey {
+    /// Build a dictionary key for COVE-Core's v1 repeated byte-compatible
+    /// dictionary path.
+    pub fn from_logical_bytes(
+        logical: crate::constants::CoveLogicalType,
+        value: &[u8],
+    ) -> Result<Self, CoveError> {
+        let canonical_value = match logical {
+            crate::constants::CoveLogicalType::Utf8 => {
+                CanonicalValue::Utf8(std::str::from_utf8(value).map_err(|error| {
+                    CoveError::BadSection(format!("invalid UTF-8 dictionary value: {error}"))
+                })?)
+            }
+            crate::constants::CoveLogicalType::Binary => CanonicalValue::Bytes(value),
+            other => {
+                return Err(CoveError::BadSchema(format!(
+                    "logical type {other:?} is not eligible for FileCode dictionary synthesis"
+                )));
+            }
+        };
+        Ok(Self {
+            value_tag: canonical_value.value_tag() as u16,
+            canonical: canonical_value.encode()?,
+        })
+    }
+}
+
+/// Deterministic file dictionary plus reverse assignments for writer-side
+/// FileCode page synthesis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDictionaryEncoding {
+    pub dictionary: FileDictionary,
+    assignments: BTreeMap<FileDictionaryKey, u32>,
+}
+
+impl FileDictionaryEncoding {
+    /// Build a validated file dictionary from an arbitrary set of canonical
+    /// keys. Duplicate keys are collapsed before FileCodes are assigned.
+    pub fn from_keys<I>(keys: I) -> Result<Self, CoveError>
+    where
+        I: IntoIterator<Item = FileDictionaryKey>,
+    {
+        let unique = keys.into_iter().collect::<BTreeSet<_>>();
+        let mut assignments = BTreeMap::new();
+        for (code, key) in unique.into_iter().enumerate() {
+            let code = u32::try_from(code).map_err(|_| {
+                CoveError::BadSchema("dictionary entry count exceeds u32::MAX".into())
+            })?;
+            assignments.insert(key, code);
+        }
+        let dictionary = build_file_dictionary(&assignments)?;
+        Ok(Self {
+            dictionary,
+            assignments,
+        })
+    }
+
+    pub fn file_code_for_key(&self, key: &FileDictionaryKey) -> Result<u32, CoveError> {
+        self.assignments
+            .get(key)
+            .copied()
+            .ok_or(CoveError::BadFileCode)
+    }
+
+    pub fn file_code_for_logical_bytes(
+        &self,
+        logical: crate::constants::CoveLogicalType,
+        value: &[u8],
+    ) -> Result<u32, CoveError> {
+        let key = FileDictionaryKey::from_logical_bytes(logical, value)?;
+        self.file_code_for_key(&key)
+    }
+
+    pub fn assignments(&self) -> &BTreeMap<FileDictionaryKey, u32> {
+        &self.assignments
+    }
+}
+
+/// Estimate the stored bytes for a FileCode dictionary candidate.
+///
+/// This intentionally models the v1 file dictionary index/payload plus one
+/// little-endian `u32` key per logical row. It does not include section header
+/// or compression effects, so callers should use it as a conservative local
+/// choice against plain page payload bytes.
+pub fn file_dictionary_candidate_len(
+    unique: &BTreeSet<FileDictionaryKey>,
+    row_count: usize,
+) -> Result<usize, CoveError> {
+    let payload_len = unique.iter().try_fold(0usize, |total, key| {
+        if key.canonical.len() <= 16 {
+            Ok(total)
+        } else {
+            total
+                .checked_add(key.canonical.len())
+                .ok_or(CoveError::ArithOverflow)
+        }
+    })?;
+    DICT_HEADER_SIZE
+        .checked_add(
+            unique
+                .len()
+                .checked_mul(DICT_INDEX_ENTRY_SIZE)
+                .ok_or(CoveError::ArithOverflow)?,
+        )
+        .and_then(|total| total.checked_add(payload_len))
+        .and_then(|total| total.checked_add(row_count.checked_mul(4)?))
+        .ok_or(CoveError::ArithOverflow)
+}
+
+fn build_file_dictionary(
+    assignments: &BTreeMap<FileDictionaryKey, u32>,
+) -> Result<FileDictionary, CoveError> {
+    let entry_count = u32::try_from(assignments.len())
+        .map_err(|_| CoveError::BadSchema("dictionary entry count exceeds u32::MAX".into()))?;
+    let mut entries = Vec::with_capacity(assignments.len());
+    let mut payload = Vec::new();
+
+    for (expected_code, (key, assigned_code)) in assignments.iter().enumerate() {
+        if *assigned_code != u32::try_from(expected_code).map_err(|_| CoveError::ArithOverflow)? {
+            return Err(CoveError::BadFileCode);
+        }
+        let mut inline_data = [0u8; 16];
+        let (storage_class, inline_len, payload_offset, payload_length) =
+            if key.canonical.len() <= 16 {
+                inline_data[..key.canonical.len()].copy_from_slice(&key.canonical);
+                (StorageClass::Inline as u8, key.canonical.len() as u8, 0, 0)
+            } else {
+                let offset = u64::try_from(payload.len()).map_err(|_| CoveError::ArithOverflow)?;
+                let length =
+                    u32::try_from(key.canonical.len()).map_err(|_| CoveError::ArithOverflow)?;
+                payload.extend_from_slice(&key.canonical);
+                (StorageClass::Payload as u8, 0, offset, length)
+            };
+        entries.push(FileDictionaryIndexEntryV1 {
+            value_tag: key.value_tag,
+            storage_class,
+            flags: 0,
+            inline_len,
+            reserved0: [0; 3],
+            inline_data,
+            payload_offset,
+            payload_length,
+            canonical_hash64: 0,
+            reserved1: 0,
+        });
+    }
+
+    let dictionary = FileDictionary {
+        header: FileDictionaryHeaderV1 {
+            entry_count,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: payload.len() as u64,
+            reserved: [0; 24],
+        },
+        entries,
+        payload,
+    };
+    let mut index = Vec::new();
+    index.extend_from_slice(&dictionary.header.serialize());
+    for entry in &dictionary.entries {
+        index.extend_from_slice(&entry.serialize());
+    }
+    FileDictionary::parse(&index, &dictionary.payload)?;
+    Ok(dictionary)
+}
+
 fn validate_dictionary_entry(
     entry: &FileDictionaryIndexEntryV1,
     payload_section: &[u8],
@@ -721,6 +903,83 @@ mod tests {
             dict.decode_value(0).unwrap(),
             DictionaryValue::RawBytes(vec![3, b'a', b'b', b'c'])
         );
+    }
+
+    #[test]
+    fn dictionary_encoding_assigns_deterministic_filecodes() {
+        let mut keys = BTreeSet::new();
+        keys.insert(
+            FileDictionaryKey::from_logical_bytes(
+                crate::constants::CoveLogicalType::Utf8,
+                b"bravo",
+            )
+            .unwrap(),
+        );
+        keys.insert(
+            FileDictionaryKey::from_logical_bytes(
+                crate::constants::CoveLogicalType::Utf8,
+                b"alpha",
+            )
+            .unwrap(),
+        );
+        keys.insert(
+            FileDictionaryKey::from_logical_bytes(
+                crate::constants::CoveLogicalType::Utf8,
+                b"alpha",
+            )
+            .unwrap(),
+        );
+
+        let encoding = FileDictionaryEncoding::from_keys(keys).unwrap();
+        assert_eq!(encoding.dictionary.len(), 2);
+        let alpha = FileDictionaryKey::from_logical_bytes(
+            crate::constants::CoveLogicalType::Utf8,
+            b"alpha",
+        )
+        .unwrap();
+        let bravo = FileDictionaryKey::from_logical_bytes(
+            crate::constants::CoveLogicalType::Utf8,
+            b"bravo",
+        )
+        .unwrap();
+        assert_eq!(encoding.file_code_for_key(&alpha).unwrap(), 0);
+        assert_eq!(encoding.file_code_for_key(&bravo).unwrap(), 1);
+        assert_eq!(
+            encoding.dictionary.decode_value(0).unwrap(),
+            DictionaryValue::RawBytes(alpha.canonical)
+        );
+    }
+
+    #[test]
+    fn dictionary_candidate_len_counts_keys_payload_and_codes() {
+        let keys = [
+            FileDictionaryKey::from_logical_bytes(crate::constants::CoveLogicalType::Utf8, b"a")
+                .unwrap(),
+            FileDictionaryKey::from_logical_bytes(
+                crate::constants::CoveLogicalType::Utf8,
+                b"this-value-is-longer-than-inline",
+            )
+            .unwrap(),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let expected_payload = keys
+            .iter()
+            .filter(|key| key.canonical.len() > 16)
+            .map(|key| key.canonical.len())
+            .sum::<usize>();
+        assert_eq!(
+            file_dictionary_candidate_len(&keys, 10).unwrap(),
+            DICT_HEADER_SIZE + 2 * DICT_INDEX_ENTRY_SIZE + expected_payload + 10 * 4
+        );
+    }
+
+    #[test]
+    fn dictionary_key_rejects_invalid_utf8() {
+        assert!(matches!(
+            FileDictionaryKey::from_logical_bytes(crate::constants::CoveLogicalType::Utf8, &[0xff]),
+            Err(CoveError::BadSection(_))
+        ));
     }
 
     #[test]

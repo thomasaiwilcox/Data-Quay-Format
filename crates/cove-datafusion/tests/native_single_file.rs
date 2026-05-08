@@ -1442,18 +1442,18 @@ async fn filecode_dictionary_values_are_decoded() {
     let ctx = SessionContext::new();
     register_cove_file(&ctx, "items", &path).unwrap();
 
-    let batches = ctx
-        .sql("SELECT name FROM items")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    let (batches, decoded_fallback_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM items",
+        "cove_filecode_dictionary_decoded_fallback_rows",
+    )
+    .await;
 
     let expected = [
         "+------+", "| name |", "+------+", "| red  |", "| blue |", "+------+",
     ];
     assert_batches_eq!(expected, &batches);
+    assert_eq!(decoded_fallback_rows, 2);
     fs::remove_file(path).unwrap();
 }
 
@@ -1489,6 +1489,85 @@ async fn filecode_dictionary_output_is_opt_in() {
         "+------+", "| name |", "+------+", "| red  |", "| blue |", "+------+",
     ];
     assert_batches_eq!(expected, &batches);
+
+    let filtered = ctx
+        .sql("SELECT name FROM items WHERE name = 'red'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let filtered_expected = ["+------+", "| name |", "+------+", "| red  |", "+------+"];
+    assert_batches_eq!(filtered_expected, &filtered);
+
+    let grouped = ctx
+        .sql("SELECT name, COUNT(*) AS n FROM items GROUP BY name ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let grouped_expected = [
+        "+------+---+",
+        "| name | n |",
+        "+------+---+",
+        "| blue | 1 |",
+        "| red  | 1 |",
+        "+------+---+",
+    ];
+    assert_batches_eq!(grouped_expected, &grouped);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filecode_dictionary_output_uses_direct_key_export_and_value_cache() {
+    let path = write_temp_cove(
+        "items_dictionary_metrics",
+        dictionary_items_file_with_domain_stats(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file_with_options(
+        &ctx,
+        "items",
+        &path,
+        CoveTableOptions::default().with_arrow_dictionary_output(),
+    )
+    .unwrap();
+
+    let (batches, key_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM items",
+        "cove_filecode_dictionary_keys_rows",
+    )
+    .await;
+    let expected = [
+        "+------+", "| name |", "+------+", "| red  |", "| blue |", "+------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(key_rows, 2);
+
+    let (_, value_bytes) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM items",
+        "cove_filecode_dictionary_values_bytes",
+    )
+    .await;
+    let (_, cache_misses) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM items",
+        "cove_filecode_dictionary_value_cache_misses",
+    )
+    .await;
+    let (_, cache_hits) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM items",
+        "cove_filecode_dictionary_value_cache_hits",
+    )
+    .await;
+
+    assert!(value_bytes > 0);
+    assert_eq!(cache_misses, 1);
+    assert_eq!(cache_hits, 1);
     fs::remove_file(path).unwrap();
 }
 

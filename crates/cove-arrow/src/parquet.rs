@@ -30,15 +30,13 @@ use crate::{
         covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
         covx::{CovxFile, CovxHeaderV1, CovxPostscriptV1, CovxReferencedFileV1},
     },
-    canonical::CanonicalValue,
     checksum,
     constants::{
         CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind, DigestAlgorithm,
-        SectionKind, StorageClass,
+        SectionKind,
     },
     dictionary::{
-        FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1, DICT_HEADER_SIZE,
-        DICT_INDEX_ENTRY_SIZE,
+        file_dictionary_candidate_len, FileDictionary, FileDictionaryEncoding, FileDictionaryKey,
     },
     digest::compute_digest,
     domain::ColumnDomain,
@@ -1082,7 +1080,7 @@ impl ConvertedColumn {
         }
     }
 
-    fn dictionary_key_for_row(&self, row: usize) -> Result<Option<DictionaryKey>, CoveError> {
+    fn dictionary_key_for_row(&self, row: usize) -> Result<Option<FileDictionaryKey>, CoveError> {
         if self.is_null(row) {
             return Ok(None);
         }
@@ -1092,7 +1090,7 @@ impl ConvertedColumn {
         let Some(value) = values.get(row) else {
             return Ok(None);
         };
-        Ok(Some(DictionaryKey::from_logical_bytes(
+        Ok(Some(FileDictionaryKey::from_logical_bytes(
             self.entry.logical,
             value,
         )?))
@@ -1188,34 +1186,6 @@ impl IndexKeyKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct DictionaryKey {
-    value_tag: u16,
-    canonical: Vec<u8>,
-}
-
-impl DictionaryKey {
-    fn from_logical_bytes(logical: CoveLogicalType, value: &[u8]) -> Result<Self, CoveError> {
-        let canonical_value = match logical {
-            CoveLogicalType::Utf8 => {
-                CanonicalValue::Utf8(std::str::from_utf8(value).map_err(|error| {
-                    CoveError::BadSection(format!("invalid UTF-8 dictionary value: {error}"))
-                })?)
-            }
-            CoveLogicalType::Binary => CanonicalValue::Bytes(value),
-            other => {
-                return Err(CoveError::BadSchema(format!(
-                    "logical type {other:?} is not eligible for Parquet dictionary synthesis"
-                )))
-            }
-        };
-        Ok(Self {
-            value_tag: canonical_value.value_tag() as u16,
-            canonical: canonical_value.encode()?,
-        })
-    }
-}
-
 fn apply_stable_clustering(
     columns: &mut [ConvertedColumn],
     options: &ParquetConversionOptions,
@@ -1289,7 +1259,7 @@ fn apply_dictionary_synthesis(
         }
         let unique = dictionary_unique_keys(column)?;
         let raw_len = varbytes_payload_len(column)?;
-        let dict_len = dictionary_candidate_len(&unique, column.values.row_count())?;
+        let dict_len = file_dictionary_candidate_len(&unique, column.values.row_count())?;
         if policy == ParquetDictionaryPolicy::Always || dict_len < raw_len {
             selected.push(index);
         }
@@ -1302,12 +1272,7 @@ fn apply_dictionary_synthesis(
     for index in &selected {
         all_keys.extend(dictionary_unique_keys(&columns[*index])?);
     }
-    let mut assignments = BTreeMap::new();
-    for (code, key) in all_keys.into_iter().enumerate() {
-        let code = u32::try_from(code)
-            .map_err(|_| CoveError::BadSchema("dictionary entry count exceeds u32::MAX".into()))?;
-        assignments.insert(key, code);
-    }
+    let encoding = FileDictionaryEncoding::from_keys(all_keys)?;
 
     for index in selected {
         let row_count = columns[index].values.row_count();
@@ -1320,7 +1285,7 @@ fn apply_dictionary_synthesis(
             let key = columns[index]
                 .dictionary_key_for_row(row)?
                 .ok_or_else(|| CoveError::BadSchema("missing dictionary key".into()))?;
-            codes.push(*assignments.get(&key).ok_or(CoveError::BadFileCode)?);
+            codes.push(encoding.file_code_for_key(&key)?);
         }
         columns[index].values = MaterializedValues::FileCode(codes);
         columns[index].entry.physical = CovePhysicalKind::FileCode;
@@ -1330,10 +1295,12 @@ fn apply_dictionary_synthesis(
             .push("encoded as deterministic FileCode dictionary codes".into());
     }
 
-    build_file_dictionary(&assignments).map(Some)
+    Ok(Some(encoding.dictionary))
 }
 
-fn dictionary_unique_keys(column: &ConvertedColumn) -> Result<BTreeSet<DictionaryKey>, CoveError> {
+fn dictionary_unique_keys(
+    column: &ConvertedColumn,
+) -> Result<BTreeSet<FileDictionaryKey>, CoveError> {
     let mut keys = BTreeSet::new();
     for row in 0..column.values.row_count() {
         if let Some(key) = column.dictionary_key_for_row(row)? {
@@ -1355,92 +1322,6 @@ fn varbytes_payload_len(column: &ConvertedColumn) -> Result<usize, CoveError> {
             .and_then(|total| total.checked_add(value.len()))
             .ok_or(CoveError::ArithOverflow)
     })
-}
-
-fn dictionary_candidate_len(
-    unique: &BTreeSet<DictionaryKey>,
-    row_count: usize,
-) -> Result<usize, CoveError> {
-    let payload_len = unique.iter().try_fold(0usize, |total, key| {
-        if key.canonical.len() <= 16 {
-            Ok(total)
-        } else {
-            total
-                .checked_add(key.canonical.len())
-                .ok_or(CoveError::ArithOverflow)
-        }
-    })?;
-    DICT_HEADER_SIZE
-        .checked_add(
-            unique
-                .len()
-                .checked_mul(DICT_INDEX_ENTRY_SIZE)
-                .ok_or(CoveError::ArithOverflow)?,
-        )
-        .and_then(|total| total.checked_add(payload_len))
-        .and_then(|total| total.checked_add(row_count.checked_mul(4)?))
-        .ok_or(CoveError::ArithOverflow)
-}
-
-fn build_file_dictionary(
-    assignments: &BTreeMap<DictionaryKey, u32>,
-) -> Result<FileDictionary, CoveError> {
-    let entry_count = u32::try_from(assignments.len())
-        .map_err(|_| CoveError::BadSchema("dictionary entry count exceeds u32::MAX".into()))?;
-    let mut entries = Vec::with_capacity(assignments.len());
-    let mut payload = Vec::new();
-
-    // INVARIANT: FileCodes are assigned by sorted `(value_tag, canonical_bytes)`
-    // order, never by source engine dictionary codes or Parquet statistics.
-    for (expected_code, (key, assigned_code)) in assignments.iter().enumerate() {
-        if *assigned_code != u32::try_from(expected_code).map_err(|_| CoveError::ArithOverflow)? {
-            return Err(CoveError::BadFileCode);
-        }
-        let mut inline_data = [0u8; 16];
-        let (storage_class, inline_len, payload_offset, payload_length) =
-            if key.canonical.len() <= 16 {
-                inline_data[..key.canonical.len()].copy_from_slice(&key.canonical);
-                (StorageClass::Inline as u8, key.canonical.len() as u8, 0, 0)
-            } else {
-                let offset = u64::try_from(payload.len()).map_err(|_| CoveError::ArithOverflow)?;
-                let length =
-                    u32::try_from(key.canonical.len()).map_err(|_| CoveError::ArithOverflow)?;
-                payload.extend_from_slice(&key.canonical);
-                (StorageClass::Payload as u8, 0, offset, length)
-            };
-        entries.push(FileDictionaryIndexEntryV1 {
-            value_tag: key.value_tag,
-            storage_class,
-            flags: 0,
-            inline_len,
-            reserved0: [0; 3],
-            inline_data,
-            payload_offset,
-            payload_length,
-            canonical_hash64: 0,
-            reserved1: 0,
-        });
-    }
-
-    let dictionary = FileDictionary {
-        header: FileDictionaryHeaderV1 {
-            entry_count,
-            flags: 0,
-            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
-            value_hash_algorithm: 0,
-            payload_length: payload.len() as u64,
-            reserved: [0; 24],
-        },
-        entries,
-        payload,
-    };
-    let mut index = Vec::new();
-    index.extend_from_slice(&dictionary.header.serialize());
-    for entry in &dictionary.entries {
-        index.extend_from_slice(&entry.serialize());
-    }
-    FileDictionary::parse(&index, &dictionary.payload)?;
-    Ok(dictionary)
 }
 
 fn build_column_domains(

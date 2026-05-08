@@ -6,10 +6,11 @@ mod stats;
 
 use std::{borrow::Cow, path::Path, sync::Arc};
 
-use arrow_array::{Array, RecordBatch, RecordBatchOptions};
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
 use cove_arrow::arrow::{
     arrow_buffer_owner, encoded_array_to_arrow_with_row_selection_options_and_owner,
+    encoded_filecode_array_to_arrow_dictionary_with_values, file_dictionary_values_to_arrow,
     ArrowBufferOwner, ArrowDictionaryPolicy, ArrowExportOptions, ArrowRowSelection,
     ArrowStringValidationPolicy, ArrowVarBytesExportPolicy,
 };
@@ -51,8 +52,8 @@ use crate::{
 };
 pub use stats::{DecodeStats, DecodedScan};
 
+use cache::{ArrowDictionaryValuesCacheKey, SegmentMetadataCacheKey, Utf8ProofKey};
 pub(crate) use cache::{ScanExecutionCache, Utf8ProofCache};
-use cache::{SegmentMetadataCacheKey, Utf8ProofKey};
 use selection::{DecodeScratch, Selection, SelectionMask};
 
 struct DecodedArrowColumn<'name, 'array, 'data> {
@@ -514,6 +515,7 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
                 &scratch.selection,
                 plan.output_schema.clone(),
                 arrow_options,
+                None,
                 &mut stats,
             )?
             .value;
@@ -661,6 +663,7 @@ fn record_batch_for_selection(
     selection: &Selection,
     schema: SchemaRef,
     options: ArrowExportOptions,
+    cache: Option<&ScanExecutionCache>,
     stats: &mut DecodeStats,
 ) -> Result<cove_arrow::arrow::ArrowExportResult<RecordBatch>, CoveError> {
     let arrow_selection = match selection {
@@ -692,12 +695,8 @@ fn record_batch_for_selection(
             }
         }
         let export_path = classify_arrow_export(column.array, column_options);
-        let result = encoded_array_to_arrow_with_row_selection_options_and_owner(
-            column.array,
-            arrow_selection,
-            column_options,
-            column.data_owner.as_ref(),
-        )?;
+        let result =
+            export_arrow_column(state, column, arrow_selection, column_options, cache, stats)?;
         record_arrow_export_stats(stats, export_path, result.value.as_ref());
         if let Some(key) = record_utf8_proof {
             if state.utf8_proof_cache().insert(key)? {
@@ -713,6 +712,60 @@ fn record_batch_for_selection(
         value: batch,
         report,
     })
+}
+
+fn export_arrow_column(
+    state: &DatasetState,
+    column: &DecodedArrowColumn<'_, '_, '_>,
+    arrow_selection: ArrowRowSelection<'_>,
+    options: ArrowExportOptions,
+    cache: Option<&ScanExecutionCache>,
+    stats: &mut DecodeStats,
+) -> Result<cove_arrow::arrow::ArrowExportResult<ArrayRef>, CoveError> {
+    if options.dictionary_policy == ArrowDictionaryPolicy::DictionaryKeys
+        && column.array.encoding == CoveEncodingKind::FileCode
+    {
+        if let Some(dictionary) = column.array.dictionary {
+            let values = if let Some(cache) = cache {
+                let key = ArrowDictionaryValuesCacheKey::new(
+                    state.identity(),
+                    column.array.logical,
+                    options,
+                );
+                if let Some(values) = cache.get_arrow_dictionary_values(key)? {
+                    stats.filecode_dictionary_value_cache_hits += 1;
+                    values
+                } else {
+                    stats.filecode_dictionary_value_cache_misses += 1;
+                    let values =
+                        file_dictionary_values_to_arrow(column.array.logical, dictionary, options)?;
+                    stats.filecode_dictionary_values_bytes += values.get_buffer_memory_size();
+                    cache.insert_arrow_dictionary_values(key, values)?
+                }
+            } else {
+                let values =
+                    file_dictionary_values_to_arrow(column.array.logical, dictionary, options)?;
+                stats.filecode_dictionary_values_bytes += values.get_buffer_memory_size();
+                values
+            };
+            let value = encoded_filecode_array_to_arrow_dictionary_with_values(
+                column.array,
+                arrow_selection,
+                values,
+            )?;
+            return Ok(cove_arrow::arrow::ArrowExportResult {
+                value,
+                report: cove_arrow::arrow::ArrowExportReport::default(),
+            });
+        }
+    }
+
+    encoded_array_to_arrow_with_row_selection_options_and_owner(
+        column.array,
+        arrow_selection,
+        options,
+        column.data_owner.as_ref(),
+    )
 }
 
 fn merge_export_report(
@@ -736,6 +789,7 @@ enum ArrowExportPath {
     DirectFileCodeDictionary,
     DirectTransform,
     DirectConstantPlainVarint,
+    FileCodeDecodedFallback,
     Fallback,
 }
 
@@ -745,6 +799,9 @@ fn classify_arrow_export(array: &EncodedArray<'_>, options: ArrowExportOptions) 
         && array.dictionary.is_some()
     {
         return ArrowExportPath::DirectFileCodeDictionary;
+    }
+    if array.encoding == CoveEncodingKind::FileCode && array.dictionary.is_some() {
+        return ArrowExportPath::FileCodeDecodedFallback;
     }
     if array.physical == CovePhysicalKind::VarBytes
         && matches!(
@@ -797,12 +854,17 @@ fn record_arrow_export_stats(stats: &mut DecodeStats, path: ArrowExportPath, arr
         ArrowExportPath::DirectPlainFixed => stats.arrow_export_direct_plainfixed_rows += rows,
         ArrowExportPath::DirectFileCodeDictionary => {
             stats.arrow_export_direct_filecode_dictionary_rows += rows;
+            stats.filecode_dictionary_keys_rows += rows;
         }
         ArrowExportPath::DirectTransform => stats.arrow_export_direct_transform_rows += rows,
         ArrowExportPath::DirectConstantPlainVarint => {
             stats.arrow_export_direct_constant_plainvarint_rows += rows;
         }
         ArrowExportPath::Fallback => stats.arrow_export_fallback_rows += rows,
+        ArrowExportPath::FileCodeDecodedFallback => {
+            stats.filecode_dictionary_decoded_fallback_rows += rows;
+            stats.arrow_export_fallback_rows += rows;
+        }
     }
 }
 
@@ -1086,6 +1148,7 @@ async fn decode_scan_with_reader_to_sink_cached<
                 &scratch.selection,
                 plan.output_schema.clone(),
                 arrow_options,
+                cache,
                 &mut stats,
             )?
             .value;
@@ -1326,6 +1389,7 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
                 &scratch.selection,
                 plan.output_schema.clone(),
                 arrow_options,
+                cache,
                 &mut stats,
             )?
             .value;
@@ -3371,6 +3435,7 @@ mod tests {
             &selection,
             schema,
             ArrowExportOptions::default(),
+            None,
             &mut stats,
         )
         .unwrap();

@@ -67,6 +67,11 @@ pub struct DecodeStats {
     pub arrow_export_direct_transform_rows: usize,
     pub arrow_export_direct_constant_plainvarint_rows: usize,
     pub arrow_export_fallback_rows: usize,
+    pub filecode_dictionary_keys_rows: usize,
+    pub filecode_dictionary_values_bytes: usize,
+    pub filecode_dictionary_value_cache_hits: usize,
+    pub filecode_dictionary_value_cache_misses: usize,
+    pub filecode_dictionary_decoded_fallback_rows: usize,
     pub utf8_proof_hits: usize,
     pub utf8_proof_misses: usize,
     pub utf8_proofs_earned: usize,
@@ -153,6 +158,12 @@ impl DecodeStats {
         self.arrow_export_direct_constant_plainvarint_rows +=
             other.arrow_export_direct_constant_plainvarint_rows;
         self.arrow_export_fallback_rows += other.arrow_export_fallback_rows;
+        self.filecode_dictionary_keys_rows += other.filecode_dictionary_keys_rows;
+        self.filecode_dictionary_values_bytes += other.filecode_dictionary_values_bytes;
+        self.filecode_dictionary_value_cache_hits += other.filecode_dictionary_value_cache_hits;
+        self.filecode_dictionary_value_cache_misses += other.filecode_dictionary_value_cache_misses;
+        self.filecode_dictionary_decoded_fallback_rows +=
+            other.filecode_dictionary_decoded_fallback_rows;
         self.utf8_proof_hits += other.utf8_proof_hits;
         self.utf8_proof_misses += other.utf8_proof_misses;
         self.utf8_proofs_earned += other.utf8_proofs_earned;

@@ -4,6 +4,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use arrow_array::ArrayRef;
+use cove_arrow::arrow::{
+    ArrowDictionaryPolicy, ArrowExportOptions, ArrowStringValidationPolicy,
+    ArrowVarBytesExportPolicy,
+};
 use cove_core::constants::CoveLogicalType;
 
 use super::*;
@@ -12,6 +17,7 @@ use super::*;
 pub(crate) struct ScanExecutionCache {
     local_readers: Mutex<HashMap<LocalReaderCacheKey, Arc<dyn CoveRangeReader>>>,
     segment_metadata: Mutex<HashMap<SegmentMetadataCacheKey, Arc<SegmentMetadata>>>,
+    arrow_dictionary_values: Mutex<HashMap<ArrowDictionaryValuesCacheKey, ArrayRef>>,
 }
 
 #[derive(Debug)]
@@ -48,6 +54,56 @@ pub(crate) struct Utf8ProofKey {
     pub non_null_count: u32,
     pub page_offset: u64,
     pub page_length: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ArrowDictionaryValuesCacheKey {
+    file_id: [u8; 16],
+    file_len: u64,
+    footer_crc32c: u32,
+    logical: u16,
+    dictionary_policy: u8,
+    varbytes_policy: u8,
+    string_validation_policy: u8,
+    decimal: Option<(u8, i8)>,
+    emit_uuid_extension_metadata: bool,
+    emit_json_extension_metadata: bool,
+}
+
+impl ArrowDictionaryValuesCacheKey {
+    pub(crate) fn new(
+        identity: &crate::dataset_state::FileIdentity,
+        logical: CoveLogicalType,
+        options: ArrowExportOptions,
+    ) -> Self {
+        Self {
+            file_id: identity.file_id,
+            file_len: identity.file_len,
+            footer_crc32c: identity.footer_crc32c,
+            logical: logical as u16,
+            dictionary_policy: match options.dictionary_policy {
+                ArrowDictionaryPolicy::DecodeValues => 0,
+                ArrowDictionaryPolicy::DictionaryKeys => 1,
+                _ => u8::MAX,
+            },
+            varbytes_policy: match options.varbytes_policy {
+                ArrowVarBytesExportPolicy::Standard => 0,
+                ArrowVarBytesExportPolicy::View => 1,
+                _ => u8::MAX,
+            },
+            string_validation_policy: match options.string_validation_policy {
+                ArrowStringValidationPolicy::Strict => 0,
+                ArrowStringValidationPolicy::StrictOrCachedProof => 1,
+                ArrowStringValidationPolicy::TrustedPageProof => 2,
+                _ => u8::MAX,
+            },
+            decimal: options
+                .decimal
+                .map(|decimal| (decimal.precision, decimal.scale)),
+            emit_uuid_extension_metadata: options.emit_uuid_extension_metadata,
+            emit_json_extension_metadata: options.emit_json_extension_metadata,
+        }
+    }
 }
 
 impl Utf8ProofKey {
@@ -134,6 +190,27 @@ impl ScanExecutionCache {
             CoveError::BadSection("scan execution segment-metadata cache lock poisoned".into())
         })?;
         Ok(Arc::clone(metadata.entry(key).or_insert(segment)))
+    }
+
+    pub(super) fn get_arrow_dictionary_values(
+        &self,
+        key: ArrowDictionaryValuesCacheKey,
+    ) -> Result<Option<ArrayRef>, CoveError> {
+        let values = self.arrow_dictionary_values.lock().map_err(|_| {
+            CoveError::BadSection("scan execution Arrow dictionary cache lock poisoned".into())
+        })?;
+        Ok(values.get(&key).cloned())
+    }
+
+    pub(super) fn insert_arrow_dictionary_values(
+        &self,
+        key: ArrowDictionaryValuesCacheKey,
+        value: ArrayRef,
+    ) -> Result<ArrayRef, CoveError> {
+        let mut values = self.arrow_dictionary_values.lock().map_err(|_| {
+            CoveError::BadSection("scan execution Arrow dictionary cache lock poisoned".into())
+        })?;
+        Ok(Arc::clone(values.entry(key).or_insert(value)))
     }
 }
 

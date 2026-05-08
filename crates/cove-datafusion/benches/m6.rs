@@ -21,7 +21,10 @@ use cove_core::{
         CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
         StorageClass, ValueTag,
     },
-    dictionary::{FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
+    dictionary::{
+        FileDictionary, FileDictionaryEncoding, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1,
+        FileDictionaryKey,
+    },
     domain::ColumnDomain,
     index::{
         lookup::{
@@ -345,6 +348,34 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
         &large_projection_cove,
         &large_projection_parquet,
     );
+    let large_projection_filecode_decoded = fixture.prepare_query(
+        &runtime,
+        "SELECT payload FROM large_events_filecode_decoded_cove",
+        PARQUET_COMPARE_SCAN_HEAVY_ROWS,
+        1,
+    );
+    bench_query_pair(
+        c,
+        "parquet_compare_scan_heavy_projection_scan_filecode_decoded",
+        &runtime,
+        &fixture.ctx,
+        &large_projection_filecode_decoded,
+        &large_projection_parquet,
+    );
+    let large_projection_filecode_dictionary = fixture.prepare_query(
+        &runtime,
+        "SELECT payload FROM large_events_filecode_cove",
+        PARQUET_COMPARE_SCAN_HEAVY_ROWS,
+        1,
+    );
+    bench_query_pair(
+        c,
+        "parquet_compare_scan_heavy_projection_scan_filecode_dictionary",
+        &runtime,
+        &fixture.ctx,
+        &large_projection_filecode_dictionary,
+        &large_projection_parquet,
+    );
 
     let view_fixture = ParquetCompareFixture::new_with_cove_options(
         &runtime,
@@ -434,6 +465,15 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
             ))
         })
     });
+    arrow_output_group.bench_function("filecode-dictionary", |b| {
+        b.iter(|| {
+            black_box(execute_prepared_query(
+                &runtime,
+                &fixture.ctx,
+                &large_projection_filecode_dictionary,
+            ))
+        })
+    });
     arrow_output_group.finish();
 
     let large_low_cardinality_cove = fixture.prepare_query(
@@ -454,6 +494,20 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
         &runtime,
         &fixture.ctx,
         &large_low_cardinality_cove,
+        &large_low_cardinality_parquet,
+    );
+    let large_low_cardinality_filecode_dictionary = fixture.prepare_query(
+        &runtime,
+        "SELECT payload FROM large_events_filecode_cove WHERE category = 'group_03'",
+        PARQUET_COMPARE_SCAN_HEAVY_ROWS / 8,
+        1,
+    );
+    bench_query_pair(
+        c,
+        "parquet_compare_scan_heavy_low_cardinality_filter_filecode_dictionary",
+        &runtime,
+        &fixture.ctx,
+        &large_low_cardinality_filecode_dictionary,
         &large_low_cardinality_parquet,
     );
 
@@ -481,6 +535,23 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
         &runtime,
         &fixture.ctx,
         &large_range_cove,
+        &large_range_parquet,
+    );
+    let large_range_filecode_dictionary = fixture.prepare_query(
+        &runtime,
+        &format!(
+            "SELECT payload FROM large_events_filecode_cove WHERE id >= {}",
+            scan_heavy_range_start(PARQUET_COMPARE_SCAN_HEAVY_ROWS)
+        ),
+        large_range_rows,
+        1,
+    );
+    bench_query_pair(
+        c,
+        "parquet_compare_scan_heavy_numeric_range_filter_filecode_dictionary",
+        &runtime,
+        &fixture.ctx,
+        &large_range_filecode_dictionary,
         &large_range_parquet,
     );
 
@@ -787,6 +858,7 @@ impl ParquetCompareFixture {
             cove: dir.path.join("large_events.cove"),
             parquet: dir.path.join("large_events.parquet"),
         };
+        let large_events_filecode_cove = dir.path.join("large_events_filecode.cove");
         fs::write(
             &large_events.cove,
             scan_heavy_events_file(
@@ -795,6 +867,14 @@ impl ParquetCompareFixture {
             ),
         )
         .expect("write large events COVE fixture");
+        fs::write(
+            &large_events_filecode_cove,
+            scan_heavy_events_filecode_file(
+                PARQUET_COMPARE_SCAN_HEAVY_ROWS,
+                PARQUET_COMPARE_SEGMENT_ROWS,
+            ),
+        )
+        .expect("write large FileCode events COVE fixture");
         write_parquet_file(
             &large_events.parquet,
             &scan_heavy_events_batch(PARQUET_COMPARE_SCAN_HEAVY_ROWS),
@@ -839,6 +919,20 @@ impl ParquetCompareFixture {
             cove_options,
         )
         .expect("register large_events_cove");
+        register_cove_file_with_options(
+            &ctx,
+            "large_events_filecode_decoded_cove",
+            &large_events_filecode_cove,
+            cove_options,
+        )
+        .expect("register large_events_filecode_decoded_cove");
+        register_cove_file_with_options(
+            &ctx,
+            "large_events_filecode_cove",
+            &large_events_filecode_cove,
+            cove_options.with_arrow_dictionary_output(),
+        )
+        .expect("register large_events_filecode_cove");
         register_cove_file_with_options(
             &ctx,
             "large_wide_events_cove",
@@ -1349,6 +1443,114 @@ fn scan_heavy_events_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
         writer.push_segment(segment);
     }
     writer.write().expect("write scan-heavy events fixture")
+}
+
+#[cfg(feature = "parquet-compare")]
+fn scan_heavy_events_filecode_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 21,
+            namespace: "public".into(),
+            name: "large_events".into(),
+            row_count: row_count as u64,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "category",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+                column(
+                    3,
+                    "payload",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+                column(
+                    4,
+                    "active",
+                    CoveLogicalType::Bool,
+                    CovePhysicalKind::Boolean,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let ids = (1..=row_count).map(|id| id as i64).collect::<Vec<_>>();
+    let categories = (0..row_count)
+        .map(|idx| format!("group_{:02}", idx % 8))
+        .collect::<Vec<_>>();
+    let payloads = (0..row_count)
+        .map(|idx| format!("payload_{:05}", idx % 2048))
+        .collect::<Vec<_>>();
+    let actives = (0..row_count).map(|idx| idx % 3 != 0).collect::<Vec<_>>();
+    let dictionary =
+        FileDictionaryEncoding::from_keys(categories.iter().chain(payloads.iter()).map(|value| {
+            FileDictionaryKey::from_logical_bytes(CoveLogicalType::Utf8, value.as_bytes())
+                .expect("scan-heavy dictionary key")
+        }))
+        .expect("scan-heavy FileCode dictionary");
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_file_dictionary(&dictionary.dictionary);
+    for (segment_idx, row_start) in (0..row_count).step_by(segment_rows).enumerate() {
+        let row_end = row_count.min(row_start + segment_rows);
+        let segment_len = (row_end - row_start) as u32;
+        let mut segment =
+            ScanSegment::new(21, segment_idx as u32, row_start as u64, segment_len, 4);
+        segment.set_column_pages(
+            1,
+            vec![numcode_page(
+                segment_len,
+                numcode_i64(&ids[row_start..row_end]),
+            )],
+        );
+        let category_codes = categories[row_start..row_end]
+            .iter()
+            .map(|value| {
+                dictionary
+                    .file_code_for_logical_bytes(CoveLogicalType::Utf8, value.as_bytes())
+                    .expect("scan-heavy category FileCode")
+            })
+            .collect::<Vec<_>>();
+        segment.set_column_pages(
+            2,
+            vec![filecode_page(segment_len, filecodes(&category_codes))],
+        );
+        let payload_codes = payloads[row_start..row_end]
+            .iter()
+            .map(|value| {
+                dictionary
+                    .file_code_for_logical_bytes(CoveLogicalType::Utf8, value.as_bytes())
+                    .expect("scan-heavy payload FileCode")
+            })
+            .collect::<Vec<_>>();
+        segment.set_column_pages(
+            3,
+            vec![filecode_page(segment_len, filecodes(&payload_codes))],
+        );
+        segment.set_column_pages(
+            4,
+            vec![bool_page(segment_len, bools(&actives[row_start..row_end]))],
+        );
+        writer.push_segment(segment);
+    }
+    writer
+        .write()
+        .expect("write scan-heavy FileCode events fixture")
 }
 
 #[cfg(feature = "parquet-compare")]
