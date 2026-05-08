@@ -38,8 +38,8 @@ use crate::{
     dataset_state::{DatasetBootstrapStats, DatasetState},
     options::{LocalFileReadPolicy, PagePayloadValidationPolicy},
     planner::{
-        CoveFilterUse, CovePredicate, FilterPlan, NullPredicateKind, NumericPredicateOp,
-        PredicateLiteral, ScanPlan,
+        CoveFilterUse, CovePredicate, NullPredicateKind, NumericPredicateOp, PredicateLiteral,
+        ScanPlan,
     },
     prune,
     range_reader::{
@@ -62,12 +62,111 @@ struct DecodedArrowColumn<'name, 'array, 'data> {
     utf8_proof_key: Option<Utf8ProofKey>,
 }
 
-struct PredicateDecodeInput<'filter, 'predicate, 'column> {
-    filter: &'filter FilterPlan,
-    predicate: &'predicate CovePredicate,
-    column: &'column ColumnEntry,
-    page: ColumnPageIndexEntryV1,
-    range_slot: Option<usize>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodeControl {
+    Continue,
+    Stop,
+}
+
+pub(crate) trait DecodeSink {
+    fn emit_batch(
+        &mut self,
+        batch: RecordBatch,
+        stats: &mut DecodeStats,
+    ) -> Result<DecodeControl, CoveError>;
+
+    fn should_stop(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug, Default)]
+struct VecDecodeSink {
+    batches: Vec<RecordBatch>,
+}
+
+impl VecDecodeSink {
+    fn finish(self, stats: DecodeStats) -> DecodedScan {
+        DecodedScan {
+            batches: self.batches,
+            stats,
+        }
+    }
+}
+
+impl DecodeSink for VecDecodeSink {
+    fn emit_batch(
+        &mut self,
+        batch: RecordBatch,
+        stats: &mut DecodeStats,
+    ) -> Result<DecodeControl, CoveError> {
+        stats.rows_materialized += batch.num_rows();
+        self.batches.push(batch);
+        Ok(DecodeControl::Continue)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct FetchLimitedDecodeSink<S> {
+    inner: S,
+    remaining: Option<usize>,
+    stopped: bool,
+}
+
+impl<S> FetchLimitedDecodeSink<S> {
+    pub(crate) fn new(inner: S, fetch: Option<usize>) -> Self {
+        Self {
+            inner,
+            remaining: fetch,
+            stopped: fetch == Some(0),
+        }
+    }
+}
+
+impl<S: DecodeSink> DecodeSink for FetchLimitedDecodeSink<S> {
+    fn emit_batch(
+        &mut self,
+        batch: RecordBatch,
+        stats: &mut DecodeStats,
+    ) -> Result<DecodeControl, CoveError> {
+        if self.stopped {
+            return Ok(DecodeControl::Stop);
+        }
+
+        let batch = match self.remaining {
+            Some(0) => {
+                self.stopped = true;
+                return Ok(DecodeControl::Stop);
+            }
+            Some(remaining) if batch.num_rows() > remaining => batch.slice(0, remaining),
+            _ => batch,
+        };
+        let emitted_rows = batch.num_rows();
+        let control = self.inner.emit_batch(batch, stats)?;
+        if let Some(remaining) = self.remaining.as_mut() {
+            *remaining = remaining.saturating_sub(emitted_rows);
+            if *remaining == 0 {
+                self.stopped = true;
+                return Ok(DecodeControl::Stop);
+            }
+        }
+        if control == DecodeControl::Stop {
+            self.stopped = true;
+        }
+        Ok(control)
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stopped || self.inner.should_stop()
+    }
+}
+
+fn emit_batch<S: DecodeSink + ?Sized>(
+    sink: &mut S,
+    stats: &mut DecodeStats,
+    batch: RecordBatch,
+) -> Result<DecodeControl, CoveError> {
+    sink.emit_batch(batch, stats)
 }
 
 pub fn decode_local_dataset_scan(
@@ -150,16 +249,38 @@ pub(crate) fn decode_local_dataset_scan_tasks_with_cache(
     partition_count: usize,
     cache: Arc<ScanExecutionCache>,
 ) -> Result<DecodedScan, CoveError> {
-    let mut decoded = DecodedScan {
-        batches: Vec::new(),
-        stats: DecodeStats {
-            scan_tasks: tasks.len(),
-            scan_partitions: usize::from(partition_index == 0) * partition_count,
-            ..DecodeStats::default()
-        },
+    let mut sink = VecDecodeSink::default();
+    let stats = decode_local_dataset_scan_tasks_with_sink(
+        state,
+        plan,
+        tasks,
+        partition_index,
+        partition_count,
+        cache,
+        &mut sink,
+    )?;
+    Ok(sink.finish(stats))
+}
+
+pub(crate) fn decode_local_dataset_scan_tasks_with_sink<S: DecodeSink + ?Sized>(
+    state: &DatasetState,
+    plan: &ScanPlan,
+    tasks: &[ScanTask],
+    partition_index: usize,
+    partition_count: usize,
+    cache: Arc<ScanExecutionCache>,
+    sink: &mut S,
+) -> Result<DecodeStats, CoveError> {
+    let mut stats = DecodeStats {
+        scan_tasks: tasks.len(),
+        scan_partitions: usize::from(partition_index == 0) * partition_count,
+        ..DecodeStats::default()
     };
     if partition_index == 0 {
-        decoded.stats.record_bootstrap(state.bootstrap_stats());
+        stats.record_bootstrap(state.bootstrap_stats());
+    }
+    if sink.should_stop() {
+        return Ok(stats);
     }
 
     let mut task_start = 0usize;
@@ -173,28 +294,29 @@ pub(crate) fn decode_local_dataset_scan_tasks_with_cache(
         let file_tasks = &tasks[task_start..task_end];
         let (file_plan, execution_stats) =
             state.resolved_plan_for_file_with_stats(plan, file_ordinal)?;
-        decoded.stats.execution_code_profiles_used += execution_stats.supported_files;
-        decoded.stats.execution_code_profile_fallbacks += execution_stats.fallback_files;
-        decoded.stats.execution_code_literal_resolutions += execution_stats.literal_resolutions;
+        stats.execution_code_profiles_used += execution_stats.supported_files;
+        stats.execution_code_profile_fallbacks += execution_stats.fallback_files;
+        stats.execution_code_literal_resolutions += execution_stats.literal_resolutions;
         if plan_selects_no_rows(&file_plan) {
-            decoded.stats.files_pruned += 1;
+            stats.files_pruned += 1;
             task_start = task_end;
             continue;
         }
         let file_state = state.single_file_view(file_ordinal)?;
-        let file_decoded = if let Some(bytes) = file_state
+        let file_stats = if let Some(bytes) = file_state
             .files()
             .first()
             .and_then(|file| file.full_file_bytes_arc())
         {
             let reader = MemoryRangeReader::from_arc(bytes);
-            futures::executor::block_on(decode_scan_with_reader_tasks_cached(
+            futures::executor::block_on(decode_scan_with_reader_tasks_to_sink_cached(
                 &file_state,
                 &file_plan,
                 &reader,
                 file_tasks,
                 Some(cache.as_ref()),
                 file_ordinal,
+                sink,
             ))?
         } else if Path::new(file_state.source()).is_file() {
             let reader = cache.local_reader(
@@ -202,22 +324,25 @@ pub(crate) fn decode_local_dataset_scan_tasks_with_cache(
                 file_state.local_file_read_policy(),
                 file_state.source(),
             )?;
-            futures::executor::block_on(decode_scan_with_reader_tasks_cached(
+            futures::executor::block_on(decode_scan_with_reader_tasks_to_sink_cached(
                 &file_state,
                 &file_plan,
                 reader.as_ref(),
                 file_tasks,
                 Some(cache.as_ref()),
                 file_ordinal,
+                sink,
             ))?
         } else {
-            decode_scan(&file_state, &file_plan)?
+            decode_scan_to_sink(&file_state, &file_plan, sink)?
         };
-        decoded.stats.add_decode(file_decoded.stats);
-        decoded.batches.extend(file_decoded.batches);
+        stats.add_decode(file_stats);
+        if sink.should_stop() {
+            return Ok(stats);
+        }
         task_start = task_end;
     }
-    Ok(decoded)
+    Ok(stats)
 }
 
 /// Decode a planned native single-file scan into Arrow record batches.
@@ -227,12 +352,24 @@ pub(crate) fn decode_local_dataset_scan_tasks_with_cache(
 /// predicates are resolved against this concrete single-file view before
 /// pruning or residual filtering begins.
 pub fn decode_scan(state: &DatasetState, plan: &ScanPlan) -> Result<DecodedScan, CoveError> {
+    let mut sink = VecDecodeSink::default();
+    let stats = decode_scan_to_sink(state, plan, &mut sink)?;
+    Ok(sink.finish(stats))
+}
+
+pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
+    state: &DatasetState,
+    plan: &ScanPlan,
+    sink: &mut S,
+) -> Result<DecodeStats, CoveError> {
     let plan = state.resolved_plan_for_current_state(plan)?;
     validate_scan_plan(state, &plan)?;
-    let mut batches = Vec::new();
     let mut stats = DecodeStats::default();
     record_plan_predicates(&plan, &mut stats);
     let mut scratch = DecodeScratch::default();
+    if sink.should_stop() {
+        return Ok(stats);
+    }
 
     for segment_ref in state.segments() {
         let segment_bytes = wire::read_range_checked(
@@ -314,15 +451,15 @@ pub fn decode_scan(state: &DatasetState, plan: &ScanPlan) -> Result<DecodedScan,
 
             if plan.scan_projection.is_empty() {
                 let options = RecordBatchOptions::new().with_row_count(Some(selected_len));
-                batches.push(
-                    RecordBatch::try_new_with_options(
-                        plan.output_schema.clone(),
-                        Vec::new(),
-                        &options,
-                    )
-                    .map_err(|err| CoveError::BadSection(format!("Arrow RecordBatch: {err}")))?,
-                );
-                stats.rows_materialized += selected_len;
+                let batch = RecordBatch::try_new_with_options(
+                    plan.output_schema.clone(),
+                    Vec::new(),
+                    &options,
+                )
+                .map_err(|err| CoveError::BadSection(format!("Arrow RecordBatch: {err}")))?;
+                if emit_batch(sink, &mut stats, batch)? == DecodeControl::Stop {
+                    return Ok(stats);
+                }
                 continue;
             }
 
@@ -380,12 +517,13 @@ pub fn decode_scan(state: &DatasetState, plan: &ScanPlan) -> Result<DecodedScan,
                 &mut stats,
             )?
             .value;
-            stats.rows_materialized += batch.num_rows();
-            batches.push(batch);
+            if emit_batch(sink, &mut stats, batch)? == DecodeControl::Stop {
+                return Ok(stats);
+            }
         }
     }
 
-    Ok(DecodedScan { batches, stats })
+    Ok(stats)
 }
 
 fn plan_selects_no_rows(plan: &ScanPlan) -> bool {
@@ -642,7 +780,10 @@ pub async fn decode_scan_with_reader<R: CoveRangeReader + ?Sized>(
     plan: &ScanPlan,
     reader: &R,
 ) -> Result<DecodedScan, CoveError> {
-    decode_scan_with_reader_cached(state, plan, reader, None, 0).await
+    let mut sink = VecDecodeSink::default();
+    let stats =
+        decode_scan_with_reader_to_sink_cached(state, plan, reader, None, 0, &mut sink).await?;
+    Ok(sink.finish(stats))
 }
 
 async fn decode_scan_with_reader_cached<R: CoveRangeReader + ?Sized>(
@@ -652,12 +793,44 @@ async fn decode_scan_with_reader_cached<R: CoveRangeReader + ?Sized>(
     cache: Option<&ScanExecutionCache>,
     file_ordinal: usize,
 ) -> Result<DecodedScan, CoveError> {
+    let mut sink = VecDecodeSink::default();
+    let stats =
+        decode_scan_with_reader_to_sink_cached(state, plan, reader, cache, file_ordinal, &mut sink)
+            .await?;
+    Ok(sink.finish(stats))
+}
+
+pub(crate) async fn decode_scan_with_reader_to_sink<
+    R: CoveRangeReader + ?Sized,
+    S: DecodeSink + ?Sized,
+>(
+    state: &DatasetState,
+    plan: &ScanPlan,
+    reader: &R,
+    sink: &mut S,
+) -> Result<DecodeStats, CoveError> {
+    decode_scan_with_reader_to_sink_cached(state, plan, reader, None, 0, sink).await
+}
+
+async fn decode_scan_with_reader_to_sink_cached<
+    R: CoveRangeReader + ?Sized,
+    S: DecodeSink + ?Sized,
+>(
+    state: &DatasetState,
+    plan: &ScanPlan,
+    reader: &R,
+    cache: Option<&ScanExecutionCache>,
+    file_ordinal: usize,
+    sink: &mut S,
+) -> Result<DecodeStats, CoveError> {
     let plan = state.resolved_plan_for_current_state(plan)?;
     validate_scan_plan(state, &plan)?;
-    let mut batches = Vec::new();
     let mut stats = DecodeStats::default();
     record_plan_predicates(&plan, &mut stats);
     let mut scratch = DecodeScratch::default();
+    if sink.should_stop() {
+        return Ok(stats);
+    }
 
     for segment_ref in state.segments() {
         let segment =
@@ -726,15 +899,15 @@ async fn decode_scan_with_reader_cached<R: CoveRangeReader + ?Sized>(
 
             if plan.scan_projection.is_empty() {
                 let options = RecordBatchOptions::new().with_row_count(Some(selected_len));
-                batches.push(
-                    RecordBatch::try_new_with_options(
-                        plan.output_schema.clone(),
-                        Vec::new(),
-                        &options,
-                    )
-                    .map_err(|err| CoveError::BadSection(format!("Arrow RecordBatch: {err}")))?,
-                );
-                stats.rows_materialized += selected_len;
+                let batch = RecordBatch::try_new_with_options(
+                    plan.output_schema.clone(),
+                    Vec::new(),
+                    &options,
+                )
+                .map_err(|err| CoveError::BadSection(format!("Arrow RecordBatch: {err}")))?;
+                if emit_batch(sink, &mut stats, batch)? == DecodeControl::Stop {
+                    return Ok(stats);
+                }
                 continue;
             }
 
@@ -836,12 +1009,13 @@ async fn decode_scan_with_reader_cached<R: CoveRangeReader + ?Sized>(
                 &mut stats,
             )?
             .value;
-            stats.rows_materialized += batch.num_rows();
-            batches.push(batch);
+            if emit_batch(sink, &mut stats, batch)? == DecodeControl::Stop {
+                return Ok(stats);
+            }
         }
     }
 
-    Ok(DecodedScan { batches, stats })
+    Ok(stats)
 }
 
 pub async fn decode_scan_with_reader_tasks<R: CoveRangeReader + ?Sized>(
@@ -850,23 +1024,34 @@ pub async fn decode_scan_with_reader_tasks<R: CoveRangeReader + ?Sized>(
     reader: &R,
     tasks: &[ScanTask],
 ) -> Result<DecodedScan, CoveError> {
-    decode_scan_with_reader_tasks_cached(state, plan, reader, tasks, None, 0).await
+    let mut sink = VecDecodeSink::default();
+    let stats = decode_scan_with_reader_tasks_to_sink_cached(
+        state, plan, reader, tasks, None, 0, &mut sink,
+    )
+    .await?;
+    Ok(sink.finish(stats))
 }
 
-async fn decode_scan_with_reader_tasks_cached<R: CoveRangeReader + ?Sized>(
+async fn decode_scan_with_reader_tasks_to_sink_cached<
+    R: CoveRangeReader + ?Sized,
+    S: DecodeSink + ?Sized,
+>(
     state: &DatasetState,
     plan: &ScanPlan,
     reader: &R,
     tasks: &[ScanTask],
     cache: Option<&ScanExecutionCache>,
     file_ordinal: usize,
-) -> Result<DecodedScan, CoveError> {
+    sink: &mut S,
+) -> Result<DecodeStats, CoveError> {
     let plan = state.resolved_plan_for_current_state(plan)?;
     validate_scan_plan(state, &plan)?;
-    let mut batches = Vec::new();
     let mut stats = DecodeStats::default();
     record_plan_predicates(&plan, &mut stats);
     let mut scratch = DecodeScratch::default();
+    if sink.should_stop() {
+        return Ok(stats);
+    }
 
     let mut task_start = 0usize;
     while task_start < tasks.len() {
@@ -954,15 +1139,15 @@ async fn decode_scan_with_reader_tasks_cached<R: CoveRangeReader + ?Sized>(
 
             if plan.scan_projection.is_empty() {
                 let options = RecordBatchOptions::new().with_row_count(Some(selected_len));
-                batches.push(
-                    RecordBatch::try_new_with_options(
-                        plan.output_schema.clone(),
-                        Vec::new(),
-                        &options,
-                    )
-                    .map_err(|err| CoveError::BadSection(format!("Arrow RecordBatch: {err}")))?,
-                );
-                stats.rows_materialized += selected_len;
+                let batch = RecordBatch::try_new_with_options(
+                    plan.output_schema.clone(),
+                    Vec::new(),
+                    &options,
+                )
+                .map_err(|err| CoveError::BadSection(format!("Arrow RecordBatch: {err}")))?;
+                if emit_batch(sink, &mut stats, batch)? == DecodeControl::Stop {
+                    return Ok(stats);
+                }
                 continue;
             }
 
@@ -1064,13 +1249,17 @@ async fn decode_scan_with_reader_tasks_cached<R: CoveRangeReader + ?Sized>(
                 &mut stats,
             )?
             .value;
-            stats.rows_materialized += batch.num_rows();
-            batches.push(batch);
+            if emit_batch(sink, &mut stats, batch)? == DecodeControl::Stop {
+                return Ok(stats);
+            }
+        }
+        if sink.should_stop() {
+            return Ok(stats);
         }
         task_start = task_end;
     }
 
-    Ok(DecodedScan { batches, stats })
+    Ok(stats)
 }
 
 fn validate_scan_plan(state: &DatasetState, plan: &ScanPlan) -> Result<(), CoveError> {
@@ -1562,8 +1751,6 @@ async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Sized>(
         scratch.selection = Selection::None;
         return Ok(());
     }
-    let mut predicate_inputs = Vec::new();
-    let mut predicate_ranges = Vec::new();
     for filter in &plan.filters {
         let Some(predicate) = &filter.predicate else {
             continue;
@@ -1587,74 +1774,22 @@ async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Sized>(
         let column = &state.table().columns[column_index];
         let segment_column = segment.column(column.column_id)?;
         let page = segment.page_for_morsel(segment_column, morsel_id)?;
-        let range_slot = if page.page_length == 0 {
-            None
-        } else {
-            let start = segment_ref
-                .offset
-                .checked_add(page.page_offset)
-                .ok_or(CoveError::ArithOverflow)?;
-            let end = start
-                .checked_add(page.page_length)
-                .ok_or(CoveError::ArithOverflow)?;
-            let slot = predicate_ranges.len();
-            predicate_ranges.push(start..end);
-            Some(slot)
-        };
-        predicate_inputs.push(PredicateDecodeInput {
-            filter,
-            predicate,
-            column,
-            page: page.clone(),
-            range_slot,
-        });
-    }
-    let predicate_wires = if predicate_ranges.is_empty() {
-        Vec::new()
-    } else {
-        let coalesced_plan =
-            build_coalesced_range_plan(&predicate_ranges, state.range_coalescing())?;
-        let range_stats = coalesced_plan.stats();
-        stats.original_range_requests += range_stats.original_ranges;
-        stats.range_requests += range_stats.coalesced_ranges;
-        stats.range_bytes_requested = stats
-            .range_bytes_requested
-            .checked_add(range_stats.coalesced_bytes)
-            .ok_or(CoveError::ArithOverflow)?;
-        stats.range_bytes_used = stats
-            .range_bytes_used
-            .checked_add(range_stats.original_bytes)
-            .ok_or(CoveError::ArithOverflow)?;
-        if range_stats.coalesced_ranges < range_stats.original_ranges {
-            stats.coalesced_range_requests += range_stats.coalesced_ranges;
-        }
-        let wires =
-            read_coalesced_range_buffers_for_plan(reader, RangeReadKind::Data, &coalesced_plan)
-                .await?;
-        stats.data_bytes_read = stats
-            .data_bytes_read
-            .checked_add(wires.iter().map(RetainedBytes::len).sum::<usize>())
-            .ok_or(CoveError::ArithOverflow)?;
-        wires.into_iter().map(Some).collect::<Vec<_>>()
-    };
-    for input in predicate_inputs {
-        let page_wire = input
-            .range_slot
-            .and_then(|index| predicate_wires[index].as_ref().cloned());
-        stats.pages_decoded += usize::from(input.page.page_length != 0);
+        let page_wire =
+            read_page_wire(reader, state, segment_ref, page, stats, RangeReadKind::Data).await?;
+        stats.pages_decoded += usize::from(page.page_length != 0);
         let payload = match materialize_page_payload_from_wire(
-            input.column,
-            &input.page,
+            column,
+            page,
             page_wire,
             state.page_payload_validation_policy(),
         ) {
             Ok(payload) => payload,
             Err(CoveError::UnsupportedEncoding(_)) => {
-                if input.filter.use_kind == CoveFilterUse::FullRowPredicateExact {
+                if filter.use_kind == CoveFilterUse::FullRowPredicateExact {
                     stats.exactness_fallbacks += 1;
                     return Err(CoveError::UnsupportedEncoding(format!(
                         "exact predicate {} cannot be evaluated for page encoding",
-                        input.filter.display
+                        filter.display
                     )));
                 }
                 stats.kernel_fallbacks += 1;
@@ -1665,24 +1800,24 @@ async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Sized>(
             }
             Err(error) => return Err(error),
         };
-        let dictionary = if matches!(input.predicate, CovePredicate::FileCodeIn { .. }) {
+        let dictionary = if matches!(predicate, CovePredicate::FileCodeIn { .. }) {
             None
         } else {
             state.mounted().dictionary.as_ref()
         };
-        let array = encoded_array_for_page(&payload, &input.page, dictionary)?;
+        let array = encoded_array_for_page(&payload, page, dictionary)?;
         let prepared = array.prepare()?;
         if !try_apply_predicate_to_selection(
-            input.predicate,
+            predicate,
             &prepared,
             &mut scratch.selected_mask,
             &mut scratch.filter_mask,
         )? {
-            if input.filter.use_kind == CoveFilterUse::FullRowPredicateExact {
+            if filter.use_kind == CoveFilterUse::FullRowPredicateExact {
                 stats.exactness_fallbacks += 1;
                 return Err(CoveError::UnsupportedEncoding(format!(
                     "exact predicate {} cannot be evaluated by Cove",
-                    input.filter.display
+                    filter.display
                 )));
             }
             stats.kernel_fallbacks += 1;
@@ -1698,6 +1833,48 @@ async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Sized>(
     }
     scratch.selection = Selection::from_mask(&scratch.selected_mask, &mut scratch.selected_rows)?;
     Ok(())
+}
+
+async fn read_page_wire<R: CoveRangeReader + ?Sized>(
+    reader: &R,
+    state: &DatasetState,
+    segment_ref: &TableSegmentIndexEntryV1,
+    page: &ColumnPageIndexEntryV1,
+    stats: &mut DecodeStats,
+    kind: RangeReadKind,
+) -> Result<Option<RetainedBytes>, CoveError> {
+    if page.page_length == 0 {
+        return Ok(None);
+    }
+    let start = segment_ref
+        .offset
+        .checked_add(page.page_offset)
+        .ok_or(CoveError::ArithOverflow)?;
+    let end = start
+        .checked_add(page.page_length)
+        .ok_or(CoveError::ArithOverflow)?;
+    let ranges = vec![start..end];
+    let coalesced_plan = build_coalesced_range_plan(&ranges, state.range_coalescing())?;
+    let range_stats = coalesced_plan.stats();
+    stats.original_range_requests += range_stats.original_ranges;
+    stats.range_requests += range_stats.coalesced_ranges;
+    stats.range_bytes_requested = stats
+        .range_bytes_requested
+        .checked_add(range_stats.coalesced_bytes)
+        .ok_or(CoveError::ArithOverflow)?;
+    stats.range_bytes_used = stats
+        .range_bytes_used
+        .checked_add(range_stats.original_bytes)
+        .ok_or(CoveError::ArithOverflow)?;
+    if range_stats.coalesced_ranges < range_stats.original_ranges {
+        stats.coalesced_range_requests += range_stats.coalesced_ranges;
+    }
+    let mut wires = read_coalesced_range_buffers_for_plan(reader, kind, &coalesced_plan).await?;
+    stats.data_bytes_read = stats
+        .data_bytes_read
+        .checked_add(wires.iter().map(RetainedBytes::len).sum::<usize>())
+        .ok_or(CoveError::ArithOverflow)?;
+    Ok(wires.pop())
 }
 
 fn plan_has_row_predicate(plan: &ScanPlan) -> bool {
@@ -2616,6 +2793,59 @@ mod tests {
         assert_eq!(third.stats.utf8_proof_hits, 0);
         assert_eq!(third.stats.utf8_proof_misses, 2);
         assert_eq!(third.stats.utf8_proofs_earned, 2);
+    }
+
+    #[derive(Debug, Default)]
+    struct StopAfterFirstBatchSink {
+        batches: usize,
+        rows: usize,
+    }
+
+    impl DecodeSink for StopAfterFirstBatchSink {
+        fn emit_batch(
+            &mut self,
+            batch: RecordBatch,
+            stats: &mut DecodeStats,
+        ) -> Result<DecodeControl, CoveError> {
+            let rows = batch.num_rows();
+            stats.rows_materialized += rows;
+            self.batches += 1;
+            self.rows += rows;
+            Ok(DecodeControl::Stop)
+        }
+    }
+
+    #[test]
+    fn decode_sink_stop_after_first_batch_stops_partition_cleanly() {
+        let state = DatasetState::from_bytes("events", primitive_events_file()).unwrap();
+        let plan = plan_scan(&state, None, Vec::new()).unwrap();
+        let full = decode_scan(&state, &plan).unwrap();
+        let mut sink = StopAfterFirstBatchSink::default();
+
+        let stats = decode_scan_to_sink(&state, &plan, &mut sink).unwrap();
+
+        assert_eq!(sink.batches, 1);
+        assert_eq!(sink.rows, 2);
+        assert_eq!(stats.rows_materialized, 2);
+        assert_eq!(stats.morsels_considered, 1);
+        assert!(stats.morsels_considered < full.stats.morsels_considered);
+    }
+
+    #[test]
+    fn fetch_limited_sink_slices_final_batch_and_stops() {
+        let state = DatasetState::from_bytes("events", primitive_events_file()).unwrap();
+        let projection = vec![0];
+        let plan = plan_scan(&state, Some(&projection), Vec::new()).unwrap();
+        let inner = VecDecodeSink::default();
+        let mut sink = FetchLimitedDecodeSink::new(inner, Some(1));
+
+        let stats = decode_scan_to_sink(&state, &plan, &mut sink).unwrap();
+
+        assert_eq!(stats.rows_materialized, 1);
+        assert_eq!(stats.rows_selected, 2);
+        assert_eq!(stats.morsels_considered, 1);
+        assert_eq!(sink.inner.batches.len(), 1);
+        assert_eq!(sink.inner.batches[0].num_rows(), 1);
     }
 
     #[test]

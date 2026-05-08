@@ -1779,27 +1779,35 @@ fn run_query_profile_command(command: QueryProfileCommand) {
     io::stdout().flush().expect("flush profile ready line");
     wait_for_profile_start_signal();
 
-    let iterations = match command.stage {
+    let (iterations, rows_materialized) = match command.stage {
         QueryProfileStage::FullQuery => {
-            run_full_query_profile_loop(&runtime, &fixture.ctx, &query, command.run_seconds)
+            let iterations =
+                run_full_query_profile_loop(&runtime, &fixture.ctx, &query, command.run_seconds);
+            (iterations, None)
         }
         QueryProfileStage::PlanningOnly => {
-            run_planning_profile_loop(&runtime, &fixture.ctx, &query, command.run_seconds)
+            let iterations =
+                run_planning_profile_loop(&runtime, &fixture.ctx, &query, command.run_seconds);
+            (iterations, None)
         }
-        QueryProfileStage::ExecuteOnly => run_execute_only_profile_loop(
-            &runtime,
-            &fixture.ctx,
-            &query,
-            plan.expect("execute-only plan should be prepared"),
-            command.run_seconds,
-        ),
+        QueryProfileStage::ExecuteOnly => {
+            let (iterations, rows_materialized) = run_execute_only_profile_loop(
+                &runtime,
+                &fixture.ctx,
+                &query,
+                plan.expect("execute-only plan should be prepared"),
+                command.run_seconds,
+            );
+            (iterations, Some(rows_materialized))
+        }
     };
 
     println!(
-        "PROFILE_DONE pid={} iterations={} stage={}",
+        "PROFILE_DONE pid={} iterations={} stage={} cove_rows_materialized_per_iteration={}",
         process::id(),
         iterations,
-        command.stage.as_str()
+        command.stage.as_str(),
+        format_optional_usize(rows_materialized),
     );
 }
 
@@ -1859,7 +1867,7 @@ fn run_execute_only_profile_loop(
     query: &PreparedQuery,
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     run_seconds: u64,
-) -> usize {
+) -> (usize, usize) {
     let deadline = Instant::now() + Duration::from_secs(run_seconds);
     let mut iterations = 0usize;
     while Instant::now() < deadline {
@@ -1872,7 +1880,35 @@ fn run_execute_only_profile_loop(
         black_box(assert_query_batches(&batches, query));
         iterations += 1;
     }
-    iterations
+    let metric_plan = build_physical_plan(runtime, ctx, query.sql.as_ref());
+    let collected_metric_plan = Arc::clone(&metric_plan);
+    let batches = runtime.block_on(async {
+        collect_execution_plan(metric_plan, ctx.task_ctx())
+            .await
+            .expect("execute prepared physical plan for metrics")
+    });
+    black_box(assert_query_batches(&batches, query));
+    (
+        iterations,
+        execution_plan_metric_sum(&collected_metric_plan, "cove_rows_materialized"),
+    )
+}
+
+#[cfg(feature = "parquet-compare")]
+fn execution_plan_metric_sum(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    metric_name: &str,
+) -> usize {
+    let own = plan
+        .metrics()
+        .and_then(|metrics| metrics.sum_by_name(metric_name))
+        .map(|metric| metric.as_usize())
+        .unwrap_or(0);
+    own + plan
+        .children()
+        .into_iter()
+        .map(|child| execution_plan_metric_sum(child, metric_name))
+        .sum::<usize>()
 }
 
 #[cfg(feature = "parquet-compare")]

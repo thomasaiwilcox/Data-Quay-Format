@@ -85,12 +85,39 @@ use datafusion::{
     catalog::TableProvider,
     common::{stats::Precision, Column, ScalarValue},
     logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown},
+    physical_plan::{execution_plan::collect as collect_physical_plan, ExecutionPlan},
     prelude::SessionContext,
 };
 use futures::stream::BoxStream;
 use url::Url;
 
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+async fn collect_sql_with_cove_metric(
+    ctx: &SessionContext,
+    sql: &str,
+    metric_name: &str,
+) -> (Vec<datafusion::arrow::record_batch::RecordBatch>, usize) {
+    let dataframe = ctx.sql(sql).await.unwrap();
+    let plan = dataframe.create_physical_plan().await.unwrap();
+    let batches = collect_physical_plan(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .unwrap();
+    (batches, execution_plan_metric_sum(&plan, metric_name))
+}
+
+fn execution_plan_metric_sum(plan: &Arc<dyn ExecutionPlan>, metric_name: &str) -> usize {
+    let own = plan
+        .metrics()
+        .and_then(|metrics| metrics.sum_by_name(metric_name))
+        .map(|metric| metric.as_usize())
+        .unwrap_or(0);
+    own + plan
+        .children()
+        .into_iter()
+        .map(|child| execution_plan_metric_sum(child, metric_name))
+        .sum::<usize>()
+}
 
 #[tokio::test]
 async fn select_star_reads_single_file_multi_segment() {
@@ -116,6 +143,34 @@ async fn select_star_reads_single_file_multi_segment() {
         "+----+-------+--------+",
     ];
     assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn native_limit_pushdown_materializes_only_requested_rows() {
+    let path = write_temp_cove("events_limit", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (full_batches, full_materialized) =
+        collect_sql_with_cove_metric(&ctx, "SELECT id FROM events", "cove_rows_materialized").await;
+    let full_expected = [
+        "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "+----+",
+    ];
+    assert_batches_eq!(full_expected, &full_batches);
+    assert_eq!(full_materialized, 3);
+
+    let (limit_batches, limit_materialized) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id FROM events LIMIT 1",
+        "cove_rows_materialized",
+    )
+    .await;
+    let limit_expected = ["+----+", "| id |", "+----+", "| 1  |", "+----+"];
+    assert_batches_eq!(limit_expected, &limit_batches);
+    assert_eq!(limit_materialized, 1);
+    assert!(limit_materialized < full_materialized);
+
     fs::remove_file(path).unwrap();
 }
 

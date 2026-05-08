@@ -43,12 +43,21 @@ pub struct CoveExec {
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     scan_cache: Arc<ScanExecutionCache>,
+    fetch: Option<usize>,
     #[cfg(feature = "dynamic-filters")]
     dynamic_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl CoveExec {
     pub fn try_new(state: Arc<DatasetState>, plan: ScanPlan) -> Result<Self> {
+        Self::try_new_with_fetch(state, plan, None)
+    }
+
+    pub(crate) fn try_new_with_fetch(
+        state: Arc<DatasetState>,
+        plan: ScanPlan,
+        fetch: Option<usize>,
+    ) -> Result<Self> {
         let schema = Arc::clone(&plan.output_schema);
         let task_graph = Arc::new(
             build_task_graph(&state, &plan).map_err(crate::adapter_v53::cove_to_datafusion)?,
@@ -68,6 +77,7 @@ impl CoveExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             scan_cache: Arc::new(ScanExecutionCache::default()),
+            fetch,
             #[cfg(feature = "dynamic-filters")]
             dynamic_filters: Vec::new(),
         })
@@ -148,6 +158,7 @@ impl ExecutionPlan for CoveExec {
             tasks,
             partition,
             self.task_graph.partitions.len(),
+            self.fetch,
             #[cfg(feature = "dynamic-filters")]
             self.dynamic_filters.clone(),
             metrics,
@@ -168,6 +179,29 @@ impl ExecutionPlan for CoveExec {
             }
         }
         Ok(self.statistics_for_schema(partition))
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        Some(Arc::new(Self {
+            state: Arc::clone(&self.state),
+            plan: self.plan.clone(),
+            task_graph: Arc::clone(&self.task_graph),
+            schema: Arc::clone(&self.schema),
+            properties: Arc::clone(&self.properties),
+            metrics: ExecutionPlanMetricsSet::new(),
+            scan_cache: Arc::clone(&self.scan_cache),
+            fetch: limit,
+            #[cfg(feature = "dynamic-filters")]
+            dynamic_filters: self.dynamic_filters.clone(),
+        }))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
     }
 
     #[cfg(feature = "dynamic-filters")]
@@ -198,6 +232,8 @@ impl ExecutionPlan for CoveExec {
             schema: Arc::clone(&self.schema),
             properties: Arc::clone(&self.properties),
             metrics: ExecutionPlanMetricsSet::new(),
+            scan_cache: Arc::clone(&self.scan_cache),
+            fetch: self.fetch,
             dynamic_filters,
         }) as Arc<dyn ExecutionPlan>;
         Ok(
