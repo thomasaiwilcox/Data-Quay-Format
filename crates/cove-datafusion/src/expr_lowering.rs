@@ -178,6 +178,14 @@ fn classify_column_literal(
                 Err(_) => FilterPlan::unsupported(display),
             }
         }
+        CovePhysicalKind::VarBytes
+            if op == LowerOperator::Eq && column.logical == CoveLogicalType::Utf8 =>
+        {
+            let LowerLiteral::Utf8(value) = literal else {
+                return FilterPlan::unsupported(display);
+            };
+            FilterPlan::pruning_varbytes_eq(column_index, value.as_bytes().to_vec(), display)
+        }
         _ => FilterPlan::unsupported(display),
     }
 }

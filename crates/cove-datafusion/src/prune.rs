@@ -537,6 +537,7 @@ fn filter_prunes_morsel(
             }
             Ok(true)
         }
+        CovePredicate::VarBytesEq { .. } => Ok(false),
     }
 }
 

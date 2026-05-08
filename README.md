@@ -12,6 +12,12 @@ The simplest way to think about it is:
 
 COVE is intended for converted datasets, archives, object-store workloads, and engine-facing storage where pruning, lookups, metadata-driven planning, and efficient execution matter.
 
+The Rust code in this repository is reference and example code for the file
+specification. It is intended to show what can be built using COVE's format
+features, including the Arrow and DataFusion adapters. The spec remains the
+portable contract; engine integrations are examples of how readers can map that
+contract into their own execution systems.
+
 ## What the project is trying to do
 
 Cove Format aims to define a shared spec for:
@@ -46,14 +52,36 @@ COVE is designed to help engines:
 ## Repository contents
 
 - `Spec.md`: the main Cove Format specification
-- `crates/cove-core`: core format primitives, staged validation, a minimal writer, and an early COVE-T scan-profile writer surface
+- `crates/cove-core`: core format primitives, staged validation, a minimal writer, and COVE-T/COVE-O/COVE-E/COVM/COVX support surfaces
 - `crates/cove-arrow`: Arrow schema/export/import and Parquet conversion interop layered on top of `cove-core`
-- `crates/cove-datafusion`: DataFusion integration scaffold and version-adapter boundary for future COVE query execution
+- `crates/cove-datafusion`: reference DataFusion integration showing scan planning, pruning, Arrow export, metrics, and table registration over COVE files
 - `crates/cove-validate`: validates COVE files (headers, footers, section CRCs, feature consistency, and optional semantic/profile checks)
 - `crates/cove-inspect`: prints a readable layout summary for COVE files
 - `crates/cove-dump`: dumps metadata or section bytes as hex for debugging
 - `crates/cove-convert-parquet`: converts supported Parquet files into COVE-T scan-profile files and can emit a conversion report
+- `crates/cove-conformance`: conformance runner support
+- `crates/cove-map`: reference COVE-MAP materialization helpers
+- `crates/cove-bench`: benchmark support utilities
 - `conformance`: generated capability matrix plus whole-file, artifact, and parser-focused accept/reject fixtures
+- `docs/performance/datafusion-benchmark-report.md`: current local DataFusion benchmark methodology and results
+
+## Reference implementation scope
+
+The implementation in this repository is deliberately useful, but it is not the
+normative definition of COVE. The normative definition is the specification.
+
+The reference code exists to:
+
+- exercise the wire format and validation rules;
+- provide readable examples of writer, reader, Arrow, and query-engine adapter code;
+- demonstrate how COVE features such as FileCode, zone statistics, lookup indexes, COVE-E, COVM, and COVX can be used by an engine;
+- make performance trade-offs measurable with reproducible benchmarks;
+- provide conformance evidence for the implemented parts of the spec.
+
+The DataFusion adapter should be read in that context. It is an example of what
+an engine integration can do with the format's metadata and encoding model, not
+a new COVE profile and not a requirement for other engines to follow the same
+internal design.
 
 ## Implementation status
 
@@ -67,11 +95,13 @@ the current status of each spec area across these columns:
 - written: a writer can emit the structure
 - corpus: conformance fixtures exercise the behavior through the runner
 
-Some areas are intentionally marked as partial or scaffold-only. Parquet
-conversion now has a supported reference path for non-null primitive, temporal,
-UTF-8, binary, and decimal128 columns, plus a standalone CLI; broader nested and
-dictionary-synthesis policies remain visible follow-on areas in the capability
-matrix.
+Some areas are intentionally marked as partial or reference-only. Parquet
+conversion has a supported reference path for common primitive, temporal,
+UTF-8, binary, and decimal128 columns, plus a standalone CLI. DataFusion support
+has a working reference adapter for selected scan, projection, pruning, lookup,
+Arrow export, and benchmark scenarios. Broader production policies remain
+visible in the capability matrix and benchmark documentation rather than being
+implied by the presence of reference code.
 
 Before making or publishing compliance claims, run the release gate:
 
@@ -82,24 +112,28 @@ sh scripts/release-gates.sh
 The gate checks formatting, the workspace tests, generated-corpus freshness,
 capability-matrix freshness, and the full conformance corpus.
 
-For DataFusion M6 performance work, keep the release gate fast and run the
-Criterion suite separately:
+## DataFusion benchmarks
+
+Keep the release gate fast and run DataFusion Criterion suites separately. The
+current local methodology and results are recorded in
+[`docs/performance/datafusion-benchmark-report.md`](./docs/performance/datafusion-benchmark-report.md).
+
+Run M6 scan and Parquet-comparison tracks with:
 
 ```sh
-cargo bench -p cove-datafusion --bench m6
+cargo bench -p cove-datafusion --features parquet-compare --bench m6 -- --noplot
+```
+
+Run M7 SQL mix tracks with:
+
+```sh
+cargo bench -p cove-datafusion --features parquet-compare --bench m7_sql_mix -- --noplot
 ```
 
 A short compile-and-smoke profile is useful before full measurement runs:
 
 ```sh
-cargo bench -p cove-datafusion --bench m6 -- --sample-size 10 --warm-up-time 0.1 --measurement-time 0.1
-```
-
-For cross-format DataFusion comparisons on matched COVE and Parquet fixtures,
-enable the optional Parquet bench track:
-
-```sh
-cargo bench -p cove-datafusion --features parquet-compare --bench m6 parquet_compare
+cargo bench -p cove-datafusion --features parquet-compare --bench m6 -- --sample-size 10 --warm-up-time 0.1 --measurement-time 0.1
 ```
 
 A short smoke run for that compare track is:
@@ -107,6 +141,19 @@ A short smoke run for that compare track is:
 ```sh
 cargo bench -p cove-datafusion --features parquet-compare --bench m6 parquet_compare -- --sample-size 10 --warm-up-time 0.1 --measurement-time 0.1
 ```
+
+For string-heavy local-file scans, the compare track includes the
+`standard-strict`, `standard-trusted`, `standard-strict-mmap`, and
+`standard-trusted-mmap` COVE variants. Treat Arrow view output as a separate
+measurement target rather than an assumed win on those workloads.
+
+Local COVE scans now default to mmap-backed reads. Switch back to positioned
+reads only when the file may be concurrently replaced, truncated, or modified.
+
+FileCode dictionary output is opt-in in the reference adapter. It is useful for
+testing engine-facing dictionary paths and COVE-E-style mappings, but current
+benchmark results should be checked before treating it as a default performance
+win.
 
 The compare track now includes heavier `scan_heavy` and `cold_context`
 benchmarks on larger matched fixtures. Those are intended for targeted

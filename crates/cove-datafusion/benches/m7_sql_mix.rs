@@ -14,9 +14,13 @@ use std::{
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
 #[cfg(feature = "parquet-compare")]
 use cove_core::{
-    constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
+    constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind},
+    dictionary::{FileDictionaryEncoding, FileDictionaryKey},
     table::{ColumnEntry, TableCatalog, TableEntry},
-    writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment},
+    writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload},
+    zone_stats::{
+        StatKind, StatScalar, ZoneScope, ZoneStatFlags, ZoneStats, ZoneStatsEntry, ZoneStatsSection,
+    },
 };
 #[cfg(feature = "parquet-compare")]
 use cove_datafusion::{options::CoveTableOptions, register::register_cove_file_with_options};
@@ -78,6 +82,26 @@ fn bench_m7_sql_mix(c: &mut Criterion) {
             &fixture.ctx,
             &cove,
             &parquet,
+            ExecutionMode::ExecuteOnly,
+        );
+    }
+
+    for query in sql_mix_filecode_dictionary_queries() {
+        let cove = fixture.prepare_query(&runtime, &query.sql("filecode_cove"));
+        bench_single_query(
+            c,
+            &format!("m7_sql_mix_filecode_dictionary_full_query/{}", query.name),
+            &runtime,
+            &fixture.ctx,
+            &cove,
+            ExecutionMode::FullQuery,
+        );
+        bench_single_query(
+            c,
+            &format!("m7_sql_mix_filecode_dictionary_execute_only/{}", query.name),
+            &runtime,
+            &fixture.ctx,
+            &cove,
             ExecutionMode::ExecuteOnly,
         );
     }
@@ -168,6 +192,31 @@ fn bench_query_pair(
 }
 
 #[cfg(feature = "parquet-compare")]
+fn bench_single_query(
+    c: &mut Criterion,
+    name: &str,
+    runtime: &Runtime,
+    ctx: &SessionContext,
+    query: &PreparedQuery,
+    mode: ExecutionMode,
+) {
+    let mut group = c.benchmark_group(name);
+    match mode {
+        ExecutionMode::FullQuery => {
+            group.bench_function("cove", |b| {
+                b.iter(|| black_box(execute_full_query(runtime, ctx, query)))
+            });
+        }
+        ExecutionMode::ExecuteOnly => {
+            group.bench_function("cove", |b| {
+                b.iter(|| black_box(execute_physical_plan(runtime, ctx, query)))
+            });
+        }
+    }
+    group.finish();
+}
+
+#[cfg(feature = "parquet-compare")]
 #[derive(Debug, Clone)]
 struct SqlMixQuery {
     name: &'static str,
@@ -248,6 +297,22 @@ fn sql_mix_queries() -> Vec<SqlMixQuery> {
 }
 
 #[cfg(feature = "parquet-compare")]
+fn sql_mix_filecode_dictionary_queries() -> Vec<SqlMixQuery> {
+    sql_mix_queries()
+        .into_iter()
+        .filter(|query| {
+            matches!(
+                query.name,
+                "olap_narrow_projection"
+                    | "olap_group_status"
+                    | "operational_latest_customer"
+                    | "join_selective_dimensions"
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "parquet-compare")]
 struct SqlMixFixture {
     _dir: TempFixtureDir,
     ctx: SessionContext,
@@ -269,19 +334,40 @@ impl SqlMixFixture {
             cove: dir.path.join("products.cove"),
             parquet: dir.path.join("products.parquet"),
         };
+        let orders_filecode_cove = dir.path.join("orders_filecode.cove");
+        let customers_filecode_cove = dir.path.join("customers_filecode.cove");
+        let products_filecode_cove = dir.path.join("products_filecode.cove");
 
-        fs::write(&orders.cove, orders_cove_file(ORDER_ROWS, SEGMENT_ROWS))
-            .expect("write orders COVE fixture");
+        fs::write(
+            &orders.cove,
+            orders_cove_file(ORDER_ROWS, SEGMENT_ROWS, StringStorageMode::VarBytes),
+        )
+        .expect("write orders COVE fixture");
         fs::write(
             &customers.cove,
-            customers_cove_file(CUSTOMER_ROWS, SEGMENT_ROWS),
+            customers_cove_file(CUSTOMER_ROWS, SEGMENT_ROWS, StringStorageMode::VarBytes),
         )
         .expect("write customers COVE fixture");
         fs::write(
             &products.cove,
-            products_cove_file(PRODUCT_ROWS, SEGMENT_ROWS),
+            products_cove_file(PRODUCT_ROWS, SEGMENT_ROWS, StringStorageMode::VarBytes),
         )
         .expect("write products COVE fixture");
+        fs::write(
+            &orders_filecode_cove,
+            orders_cove_file(ORDER_ROWS, SEGMENT_ROWS, StringStorageMode::FileCode),
+        )
+        .expect("write orders FileCode COVE fixture");
+        fs::write(
+            &customers_filecode_cove,
+            customers_cove_file(CUSTOMER_ROWS, SEGMENT_ROWS, StringStorageMode::FileCode),
+        )
+        .expect("write customers FileCode COVE fixture");
+        fs::write(
+            &products_filecode_cove,
+            products_cove_file(PRODUCT_ROWS, SEGMENT_ROWS, StringStorageMode::FileCode),
+        )
+        .expect("write products FileCode COVE fixture");
 
         write_parquet_file(&orders.parquet, &orders_batch(ORDER_ROWS));
         write_parquet_file(&customers.parquet, &customers_batch(CUSTOMER_ROWS));
@@ -294,6 +380,28 @@ impl SqlMixFixture {
             .expect("register customers_cove");
         register_cove_file_with_options(&ctx, "products_cove", &products.cove, cove_options)
             .expect("register products_cove");
+        let dictionary_options = cove_options.with_arrow_dictionary_output();
+        register_cove_file_with_options(
+            &ctx,
+            "orders_filecode_cove",
+            &orders_filecode_cove,
+            dictionary_options,
+        )
+        .expect("register orders_filecode_cove");
+        register_cove_file_with_options(
+            &ctx,
+            "customers_filecode_cove",
+            &customers_filecode_cove,
+            dictionary_options,
+        )
+        .expect("register customers_filecode_cove");
+        register_cove_file_with_options(
+            &ctx,
+            "products_filecode_cove",
+            &products_filecode_cove,
+            dictionary_options,
+        )
+        .expect("register products_filecode_cove");
 
         runtime.block_on(async {
             ctx.register_parquet(
@@ -442,7 +550,28 @@ impl Drop for TempFixtureDir {
 }
 
 #[cfg(feature = "parquet-compare")]
-fn orders_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringStorageMode {
+    VarBytes,
+    FileCode,
+}
+
+#[cfg(feature = "parquet-compare")]
+impl StringStorageMode {
+    fn physical(self) -> CovePhysicalKind {
+        match self {
+            Self::VarBytes => CovePhysicalKind::VarBytes,
+            Self::FileCode => CovePhysicalKind::FileCode,
+        }
+    }
+}
+
+#[cfg(feature = "parquet-compare")]
+fn orders_cove_file(
+    row_count: usize,
+    segment_rows: usize,
+    string_storage: StringStorageMode,
+) -> Vec<u8> {
     let catalog = TableCatalog {
         flags: 0,
         tables: vec![TableEntry {
@@ -493,14 +622,14 @@ fn orders_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
                     6,
                     "status",
                     CoveLogicalType::Utf8,
-                    CovePhysicalKind::VarBytes,
+                    string_storage.physical(),
                     false,
                 ),
                 column(
                     7,
                     "channel",
                     CoveLogicalType::Utf8,
-                    CovePhysicalKind::VarBytes,
+                    string_storage.physical(),
                     false,
                 ),
                 column(
@@ -514,7 +643,12 @@ fn orders_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
         }],
     };
     let rows = orders_rows(row_count);
+    let dictionary = (string_storage == StringStorageMode::FileCode)
+        .then(|| utf8_file_dictionary([rows.status.as_slice(), rows.channel.as_slice()]));
     let mut writer = ScanProfileCoveWriter::new(catalog);
+    if let Some(dictionary) = &dictionary {
+        writer.push_file_dictionary(&dictionary.dictionary);
+    }
     for (segment_idx, row_start) in (0..row_count).step_by(segment_rows).enumerate() {
         let row_end = row_count.min(row_start + segment_rows);
         let segment_len = (row_end - row_start) as u32;
@@ -555,16 +689,20 @@ fn orders_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
                 numcode_i64(&rows.created_day[row_start..row_end]),
             )],
         );
-        let status_refs = rows.status[row_start..row_end]
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        segment.set_column_pages(6, vec![varbytes_page(segment_len, varbytes(&status_refs))]);
-        let channel_refs = rows.channel[row_start..row_end]
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        segment.set_column_pages(7, vec![varbytes_page(segment_len, varbytes(&channel_refs))]);
+        set_string_page(
+            &mut segment,
+            6,
+            segment_len,
+            &rows.status[row_start..row_end],
+            dictionary.as_ref(),
+        );
+        set_string_page(
+            &mut segment,
+            7,
+            segment_len,
+            &rows.channel[row_start..row_end],
+            dictionary.as_ref(),
+        );
         segment.set_column_pages(
             8,
             vec![bool_page(
@@ -574,11 +712,89 @@ fn orders_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
         );
         writer.push_segment(segment);
     }
+    writer.push_extra_section(order_id_zone_stats_section(&rows.order_id, segment_rows));
     writer.write().expect("write orders fixture")
 }
 
 #[cfg(feature = "parquet-compare")]
-fn customers_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
+fn order_id_zone_stats_section(order_ids: &[i64], segment_rows: usize) -> SectionPayload {
+    let mut entries = Vec::new();
+    for (segment_idx, row_start) in (0..order_ids.len()).step_by(segment_rows).enumerate() {
+        let row_end = order_ids.len().min(row_start + segment_rows);
+        if row_start == row_end {
+            continue;
+        }
+        entries.push(order_id_zone_stats_entry(
+            segment_idx as u32,
+            (row_end - row_start) as u32,
+            order_ids[row_start],
+            order_ids[row_end - 1],
+        ));
+    }
+    let item_count = entries.len() as u64;
+    let row_count = order_ids.len() as u64;
+    let section = ZoneStatsSection { entries };
+    SectionPayload {
+        section_kind: SectionKind::ZoneStats as u16,
+        profile: PrimaryProfile::TableScan as u8,
+        flags: 0,
+        item_count,
+        row_count,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: 0,
+        data: section.serialize().expect("serialize order_id zone stats"),
+    }
+}
+
+#[cfg(feature = "parquet-compare")]
+fn order_id_zone_stats_entry(
+    segment_id: u32,
+    row_count: u32,
+    min: i64,
+    max: i64,
+) -> ZoneStatsEntry {
+    ZoneStatsEntry {
+        table_id: 71,
+        segment_id,
+        morsel_id: 0,
+        column_id: 1,
+        non_null_count: row_count,
+        distinct_count: row_count,
+        run_count: row_count,
+        stats: ZoneStats {
+            scope: ZoneScope::Morsel,
+            row_count: u64::from(row_count),
+            null_count: 0,
+            min: Some(int64_stat(min)),
+            max: Some(int64_stat(max)),
+            flags: ZoneStatFlags::HAS_MIN_MAX
+                | ZoneStatFlags::DISTINCT_EXACT
+                | ZoneStatFlags::SORTED_ASC,
+        },
+        min_domain_rank: u32::MAX,
+        max_domain_rank: u32::MAX,
+        exact_set_ref: u32::MAX,
+        bloom_ref: u32::MAX,
+    }
+}
+
+#[cfg(feature = "parquet-compare")]
+fn int64_stat(value: i64) -> StatScalar {
+    StatScalar {
+        kind: StatKind::Int64,
+        bytes: value.to_le_bytes().to_vec(),
+        truncated: false,
+    }
+}
+
+#[cfg(feature = "parquet-compare")]
+fn customers_cove_file(
+    row_count: usize,
+    segment_rows: usize,
+    string_storage: StringStorageMode,
+) -> Vec<u8> {
     let catalog = TableCatalog {
         flags: 0,
         tables: vec![TableEntry {
@@ -601,14 +817,14 @@ fn customers_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
                     2,
                     "region",
                     CoveLogicalType::Utf8,
-                    CovePhysicalKind::VarBytes,
+                    string_storage.physical(),
                     false,
                 ),
                 column(
                     3,
                     "tier",
                     CoveLogicalType::Utf8,
-                    CovePhysicalKind::VarBytes,
+                    string_storage.physical(),
                     false,
                 ),
                 column(
@@ -622,7 +838,12 @@ fn customers_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
         }],
     };
     let rows = customers_rows(row_count);
+    let dictionary = (string_storage == StringStorageMode::FileCode)
+        .then(|| utf8_file_dictionary([rows.region.as_slice(), rows.tier.as_slice()]));
     let mut writer = ScanProfileCoveWriter::new(catalog);
+    if let Some(dictionary) = &dictionary {
+        writer.push_file_dictionary(&dictionary.dictionary);
+    }
     for (segment_idx, row_start) in (0..row_count).step_by(segment_rows).enumerate() {
         let row_end = row_count.min(row_start + segment_rows);
         let segment_len = (row_end - row_start) as u32;
@@ -635,16 +856,20 @@ fn customers_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
                 numcode_i64(&rows.customer_id[row_start..row_end]),
             )],
         );
-        let region_refs = rows.region[row_start..row_end]
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        segment.set_column_pages(2, vec![varbytes_page(segment_len, varbytes(&region_refs))]);
-        let tier_refs = rows.tier[row_start..row_end]
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        segment.set_column_pages(3, vec![varbytes_page(segment_len, varbytes(&tier_refs))]);
+        set_string_page(
+            &mut segment,
+            2,
+            segment_len,
+            &rows.region[row_start..row_end],
+            dictionary.as_ref(),
+        );
+        set_string_page(
+            &mut segment,
+            3,
+            segment_len,
+            &rows.tier[row_start..row_end],
+            dictionary.as_ref(),
+        );
         segment.set_column_pages(
             4,
             vec![bool_page(
@@ -658,7 +883,11 @@ fn customers_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
 }
 
 #[cfg(feature = "parquet-compare")]
-fn products_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
+fn products_cove_file(
+    row_count: usize,
+    segment_rows: usize,
+    string_storage: StringStorageMode,
+) -> Vec<u8> {
     let catalog = TableCatalog {
         flags: 0,
         tables: vec![TableEntry {
@@ -681,7 +910,7 @@ fn products_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
                     2,
                     "category",
                     CoveLogicalType::Utf8,
-                    CovePhysicalKind::VarBytes,
+                    string_storage.physical(),
                     false,
                 ),
                 column(
@@ -702,7 +931,12 @@ fn products_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
         }],
     };
     let rows = products_rows(row_count);
+    let dictionary = (string_storage == StringStorageMode::FileCode)
+        .then(|| utf8_file_dictionary([rows.category.as_slice()]));
     let mut writer = ScanProfileCoveWriter::new(catalog);
+    if let Some(dictionary) = &dictionary {
+        writer.push_file_dictionary(&dictionary.dictionary);
+    }
     for (segment_idx, row_start) in (0..row_count).step_by(segment_rows).enumerate() {
         let row_end = row_count.min(row_start + segment_rows);
         let segment_len = (row_end - row_start) as u32;
@@ -715,13 +949,12 @@ fn products_cove_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
                 numcode_i64(&rows.product_id[row_start..row_end]),
             )],
         );
-        let category_refs = rows.category[row_start..row_end]
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        segment.set_column_pages(
+        set_string_page(
+            &mut segment,
             2,
-            vec![varbytes_page(segment_len, varbytes(&category_refs))],
+            segment_len,
+            &rows.category[row_start..row_end],
+            dictionary.as_ref(),
         );
         segment.set_column_pages(
             3,
@@ -964,6 +1197,11 @@ fn varbytes_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
 }
 
 #[cfg(feature = "parquet-compare")]
+fn filecode_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
+    ScanPageSpec::new(row_count, payload).with_encoding_root(CoveEncodingKind::FileCode as u32)
+}
+
+#[cfg(feature = "parquet-compare")]
 fn bool_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
     ScanPageSpec::new(row_count, payload).with_encoding_root(CoveEncodingKind::PlainFixed as u32)
 }
@@ -987,8 +1225,61 @@ fn varbytes(values: &[&str]) -> Vec<u8> {
 }
 
 #[cfg(feature = "parquet-compare")]
+fn filecodes(values: &[u32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+#[cfg(feature = "parquet-compare")]
 fn bools(values: &[bool]) -> Vec<u8> {
     values.iter().map(|value| u8::from(*value)).collect()
+}
+
+#[cfg(feature = "parquet-compare")]
+fn set_string_page(
+    segment: &mut ScanSegment,
+    column_id: u32,
+    segment_len: u32,
+    values: &[String],
+    dictionary: Option<&FileDictionaryEncoding>,
+) {
+    if let Some(dictionary) = dictionary {
+        let codes = filecodes_for_strings(dictionary, values);
+        segment.set_column_pages(
+            column_id,
+            vec![filecode_page(segment_len, filecodes(&codes))],
+        );
+    } else {
+        let refs = values.iter().map(String::as_str).collect::<Vec<_>>();
+        segment.set_column_pages(column_id, vec![varbytes_page(segment_len, varbytes(&refs))]);
+    }
+}
+
+#[cfg(feature = "parquet-compare")]
+fn utf8_file_dictionary<'a>(
+    columns: impl IntoIterator<Item = &'a [String]>,
+) -> FileDictionaryEncoding {
+    FileDictionaryEncoding::from_keys(columns.into_iter().flat_map(|column| {
+        column.iter().map(|value| {
+            FileDictionaryKey::from_logical_bytes(CoveLogicalType::Utf8, value.as_bytes())
+                .expect("M7 dictionary key")
+        })
+    }))
+    .expect("M7 FileCode dictionary")
+}
+
+#[cfg(feature = "parquet-compare")]
+fn filecodes_for_strings(dictionary: &FileDictionaryEncoding, values: &[String]) -> Vec<u32> {
+    values
+        .iter()
+        .map(|value| {
+            dictionary
+                .file_code_for_logical_bytes(CoveLogicalType::Utf8, value.as_bytes())
+                .expect("M7 FileCode value")
+        })
+        .collect()
 }
 
 #[cfg(feature = "parquet-compare")]

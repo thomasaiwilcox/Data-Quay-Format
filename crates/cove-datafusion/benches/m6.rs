@@ -21,7 +21,10 @@ use cove_core::{
         CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
         StorageClass, ValueTag,
     },
-    dictionary::{FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
+    dictionary::{
+        FileDictionary, FileDictionaryEncoding, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1,
+        FileDictionaryKey,
+    },
     domain::ColumnDomain,
     index::{
         lookup::{
@@ -52,6 +55,8 @@ use cove_datafusion::{
 };
 use criterion::{black_box, criterion_group, Criterion};
 #[cfg(feature = "parquet-compare")]
+use datafusion::execution::context::SessionConfig;
+#[cfg(feature = "parquet-compare")]
 use datafusion::physical_plan::execution_plan::{
     collect as collect_execution_plan, reset_plan_states,
 };
@@ -60,7 +65,7 @@ use datafusion::prelude::ParquetReadOptions;
 use datafusion::prelude::SessionContext;
 #[cfg(feature = "parquet-compare")]
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -343,6 +348,34 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
         &large_projection_cove,
         &large_projection_parquet,
     );
+    let large_projection_filecode_decoded = fixture.prepare_query(
+        &runtime,
+        "SELECT payload FROM large_events_filecode_decoded_cove",
+        PARQUET_COMPARE_SCAN_HEAVY_ROWS,
+        1,
+    );
+    bench_query_pair(
+        c,
+        "parquet_compare_scan_heavy_projection_scan_filecode_decoded",
+        &runtime,
+        &fixture.ctx,
+        &large_projection_filecode_decoded,
+        &large_projection_parquet,
+    );
+    let large_projection_filecode_dictionary = fixture.prepare_query(
+        &runtime,
+        "SELECT payload FROM large_events_filecode_cove",
+        PARQUET_COMPARE_SCAN_HEAVY_ROWS,
+        1,
+    );
+    bench_query_pair(
+        c,
+        "parquet_compare_scan_heavy_projection_scan_filecode_dictionary",
+        &runtime,
+        &fixture.ctx,
+        &large_projection_filecode_dictionary,
+        &large_projection_parquet,
+    );
 
     let view_fixture = ParquetCompareFixture::new_with_cove_options(
         &runtime,
@@ -355,6 +388,11 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
     let mmap_fixture = ParquetCompareFixture::new_with_cove_options(
         &runtime,
         CoveTableOptions::default().with_local_file_mmap_reads(),
+    );
+    let trusted_mmap_fixture = ParquetCompareFixture::new_with_cove_options(
+        &runtime,
+        CoveTableOptions::default()
+            .with_trusted_arrow_string_validation_and_local_file_mmap_reads(),
     );
     let large_projection_view = view_fixture.prepare_query(
         &runtime,
@@ -369,6 +407,12 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
         1,
     );
     let large_projection_mmap = mmap_fixture.prepare_query(
+        &runtime,
+        "SELECT payload FROM large_events_cove",
+        PARQUET_COMPARE_SCAN_HEAVY_ROWS,
+        1,
+    );
+    let large_projection_trusted_mmap = trusted_mmap_fixture.prepare_query(
         &runtime,
         "SELECT payload FROM large_events_cove",
         PARQUET_COMPARE_SCAN_HEAVY_ROWS,
@@ -403,12 +447,30 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
             ))
         })
     });
+    arrow_output_group.bench_function("standard-trusted-mmap", |b| {
+        b.iter(|| {
+            black_box(execute_prepared_query(
+                &runtime,
+                &trusted_mmap_fixture.ctx,
+                &large_projection_trusted_mmap,
+            ))
+        })
+    });
     arrow_output_group.bench_function("view", |b| {
         b.iter(|| {
             black_box(execute_prepared_query(
                 &runtime,
                 &view_fixture.ctx,
                 &large_projection_view,
+            ))
+        })
+    });
+    arrow_output_group.bench_function("filecode-dictionary", |b| {
+        b.iter(|| {
+            black_box(execute_prepared_query(
+                &runtime,
+                &fixture.ctx,
+                &large_projection_filecode_dictionary,
             ))
         })
     });
@@ -432,6 +494,20 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
         &runtime,
         &fixture.ctx,
         &large_low_cardinality_cove,
+        &large_low_cardinality_parquet,
+    );
+    let large_low_cardinality_filecode_dictionary = fixture.prepare_query(
+        &runtime,
+        "SELECT payload FROM large_events_filecode_cove WHERE category = 'group_03'",
+        PARQUET_COMPARE_SCAN_HEAVY_ROWS / 8,
+        1,
+    );
+    bench_query_pair(
+        c,
+        "parquet_compare_scan_heavy_low_cardinality_filter_filecode_dictionary",
+        &runtime,
+        &fixture.ctx,
+        &large_low_cardinality_filecode_dictionary,
         &large_low_cardinality_parquet,
     );
 
@@ -459,6 +535,23 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
         &runtime,
         &fixture.ctx,
         &large_range_cove,
+        &large_range_parquet,
+    );
+    let large_range_filecode_dictionary = fixture.prepare_query(
+        &runtime,
+        &format!(
+            "SELECT payload FROM large_events_filecode_cove WHERE id >= {}",
+            scan_heavy_range_start(PARQUET_COMPARE_SCAN_HEAVY_ROWS)
+        ),
+        large_range_rows,
+        1,
+    );
+    bench_query_pair(
+        c,
+        "parquet_compare_scan_heavy_numeric_range_filter_filecode_dictionary",
+        &runtime,
+        &fixture.ctx,
+        &large_range_filecode_dictionary,
         &large_range_parquet,
     );
 
@@ -715,12 +808,34 @@ struct ParquetCompareFixture {
 }
 
 #[cfg(feature = "parquet-compare")]
+#[derive(Debug, Clone, Copy, Default)]
+struct ParquetCompareSessionOptions {
+    target_partitions: Option<usize>,
+}
+
+#[cfg(feature = "parquet-compare")]
 impl ParquetCompareFixture {
     fn new(runtime: &Runtime) -> Self {
-        Self::new_with_cove_options(runtime, CoveTableOptions::default())
+        Self::new_with_options(
+            runtime,
+            CoveTableOptions::default(),
+            ParquetCompareSessionOptions::default(),
+        )
     }
 
     fn new_with_cove_options(runtime: &Runtime, cove_options: CoveTableOptions) -> Self {
+        Self::new_with_options(
+            runtime,
+            cove_options,
+            ParquetCompareSessionOptions::default(),
+        )
+    }
+
+    fn new_with_options(
+        runtime: &Runtime,
+        cove_options: CoveTableOptions,
+        session_options: ParquetCompareSessionOptions,
+    ) -> Self {
         let dir = TempFixtureDir::new("m6-parquet-compare");
 
         let events_cove = dir.path.join("events.cove");
@@ -743,6 +858,7 @@ impl ParquetCompareFixture {
             cove: dir.path.join("large_events.cove"),
             parquet: dir.path.join("large_events.parquet"),
         };
+        let large_events_filecode_cove = dir.path.join("large_events_filecode.cove");
         fs::write(
             &large_events.cove,
             scan_heavy_events_file(
@@ -751,6 +867,14 @@ impl ParquetCompareFixture {
             ),
         )
         .expect("write large events COVE fixture");
+        fs::write(
+            &large_events_filecode_cove,
+            scan_heavy_events_filecode_file(
+                PARQUET_COMPARE_SCAN_HEAVY_ROWS,
+                PARQUET_COMPARE_SEGMENT_ROWS,
+            ),
+        )
+        .expect("write large FileCode events COVE fixture");
         write_parquet_file(
             &large_events.parquet,
             &scan_heavy_events_batch(PARQUET_COMPARE_SCAN_HEAVY_ROWS),
@@ -774,7 +898,14 @@ impl ParquetCompareFixture {
             &scan_heavy_wide_events_batch(PARQUET_COMPARE_WIDE_ROWS, PARQUET_COMPARE_WIDE_COLUMNS),
         );
 
-        let ctx = SessionContext::new();
+        let ctx = session_options
+            .target_partitions
+            .map(|target_partitions| {
+                SessionContext::new_with_config(
+                    SessionConfig::new().with_target_partitions(target_partitions),
+                )
+            })
+            .unwrap_or_else(SessionContext::new);
         register_cove_file_with_options(&ctx, "events_cove", &events_cove, cove_options)
             .expect("register events_cove");
         register_cove_file_with_options(&ctx, "items_cove", &items_cove, cove_options)
@@ -788,6 +919,20 @@ impl ParquetCompareFixture {
             cove_options,
         )
         .expect("register large_events_cove");
+        register_cove_file_with_options(
+            &ctx,
+            "large_events_filecode_decoded_cove",
+            &large_events_filecode_cove,
+            cove_options,
+        )
+        .expect("register large_events_filecode_decoded_cove");
+        register_cove_file_with_options(
+            &ctx,
+            "large_events_filecode_cove",
+            &large_events_filecode_cove,
+            cove_options.with_arrow_dictionary_output(),
+        )
+        .expect("register large_events_filecode_cove");
         register_cove_file_with_options(
             &ctx,
             "large_wide_events_cove",
@@ -1301,6 +1446,114 @@ fn scan_heavy_events_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
 }
 
 #[cfg(feature = "parquet-compare")]
+fn scan_heavy_events_filecode_file(row_count: usize, segment_rows: usize) -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 21,
+            namespace: "public".into(),
+            name: "large_events".into(),
+            row_count: row_count as u64,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "category",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+                column(
+                    3,
+                    "payload",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+                column(
+                    4,
+                    "active",
+                    CoveLogicalType::Bool,
+                    CovePhysicalKind::Boolean,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let ids = (1..=row_count).map(|id| id as i64).collect::<Vec<_>>();
+    let categories = (0..row_count)
+        .map(|idx| format!("group_{:02}", idx % 8))
+        .collect::<Vec<_>>();
+    let payloads = (0..row_count)
+        .map(|idx| format!("payload_{:05}", idx % 2048))
+        .collect::<Vec<_>>();
+    let actives = (0..row_count).map(|idx| idx % 3 != 0).collect::<Vec<_>>();
+    let dictionary =
+        FileDictionaryEncoding::from_keys(categories.iter().chain(payloads.iter()).map(|value| {
+            FileDictionaryKey::from_logical_bytes(CoveLogicalType::Utf8, value.as_bytes())
+                .expect("scan-heavy dictionary key")
+        }))
+        .expect("scan-heavy FileCode dictionary");
+
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_file_dictionary(&dictionary.dictionary);
+    for (segment_idx, row_start) in (0..row_count).step_by(segment_rows).enumerate() {
+        let row_end = row_count.min(row_start + segment_rows);
+        let segment_len = (row_end - row_start) as u32;
+        let mut segment =
+            ScanSegment::new(21, segment_idx as u32, row_start as u64, segment_len, 4);
+        segment.set_column_pages(
+            1,
+            vec![numcode_page(
+                segment_len,
+                numcode_i64(&ids[row_start..row_end]),
+            )],
+        );
+        let category_codes = categories[row_start..row_end]
+            .iter()
+            .map(|value| {
+                dictionary
+                    .file_code_for_logical_bytes(CoveLogicalType::Utf8, value.as_bytes())
+                    .expect("scan-heavy category FileCode")
+            })
+            .collect::<Vec<_>>();
+        segment.set_column_pages(
+            2,
+            vec![filecode_page(segment_len, filecodes(&category_codes))],
+        );
+        let payload_codes = payloads[row_start..row_end]
+            .iter()
+            .map(|value| {
+                dictionary
+                    .file_code_for_logical_bytes(CoveLogicalType::Utf8, value.as_bytes())
+                    .expect("scan-heavy payload FileCode")
+            })
+            .collect::<Vec<_>>();
+        segment.set_column_pages(
+            3,
+            vec![filecode_page(segment_len, filecodes(&payload_codes))],
+        );
+        segment.set_column_pages(
+            4,
+            vec![bool_page(segment_len, bools(&actives[row_start..row_end]))],
+        );
+        writer.push_segment(segment);
+    }
+    writer
+        .write()
+        .expect("write scan-heavy FileCode events fixture")
+}
+
+#[cfg(feature = "parquet-compare")]
 fn scan_heavy_wide_events_file(
     row_count: usize,
     payload_columns: usize,
@@ -1515,6 +1768,9 @@ struct QueryProfileCommand {
     engine: CompareSource,
     stage: QueryProfileStage,
     run_seconds: u64,
+    worker_threads: Option<usize>,
+    target_partitions: Option<usize>,
+    cove_target_morsels_per_partition: Option<usize>,
     cove_arrow_view_output: bool,
     cove_trusted_arrow_string_validation: bool,
     cove_local_file_mmap_reads: bool,
@@ -1546,6 +1802,9 @@ fn parse_query_profile_command(
     let mut engine = None;
     let mut stage = QueryProfileStage::ExecuteOnly;
     let mut run_seconds = None;
+    let mut worker_threads = None;
+    let mut target_partitions = None;
+    let mut cove_target_morsels_per_partition = None;
     let mut cove_arrow_view_output = false;
     let mut cove_trusted_arrow_string_validation = false;
     let mut cove_local_file_mmap_reads = false;
@@ -1575,6 +1834,21 @@ fn parse_query_profile_command(
                         format!("invalid --run-seconds value '{value}': {error}")
                     })?);
             }
+            "--worker-threads" => {
+                let value = next_profile_arg(&mut args, "--worker-threads")?;
+                worker_threads = Some(parse_positive_usize_flag("--worker-threads", &value)?);
+            }
+            "--target-partitions" => {
+                let value = next_profile_arg(&mut args, "--target-partitions")?;
+                target_partitions = Some(parse_positive_usize_flag("--target-partitions", &value)?);
+            }
+            "--cove-target-morsels-per-partition" => {
+                let value = next_profile_arg(&mut args, "--cove-target-morsels-per-partition")?;
+                cove_target_morsels_per_partition = Some(parse_positive_usize_flag(
+                    "--cove-target-morsels-per-partition",
+                    &value,
+                )?);
+            }
             "--cove-arrow-view-output" => {
                 cove_arrow_view_output = true;
             }
@@ -1601,10 +1875,26 @@ fn parse_query_profile_command(
         engine: engine.ok_or_else(query_profile_usage)?,
         stage,
         run_seconds: run_seconds.unwrap_or(20),
+        worker_threads,
+        target_partitions,
+        cove_target_morsels_per_partition,
         cove_arrow_view_output,
         cove_trusted_arrow_string_validation,
         cove_local_file_mmap_reads,
     })
+}
+
+#[cfg(feature = "parquet-compare")]
+fn parse_positive_usize_flag(flag: &str, value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid {flag} value '{value}': {error}"))?;
+    if parsed == 0 {
+        return Err(format!(
+            "invalid {flag} value '{value}': expected a positive integer"
+        ));
+    }
+    Ok(parsed)
 }
 
 #[cfg(feature = "parquet-compare")]
@@ -1618,7 +1908,7 @@ fn next_profile_arg(
 
 #[cfg(feature = "parquet-compare")]
 fn query_profile_usage() -> String {
-    "usage: m6 profile-query --track <track> --engine <cove|parquet> [--stage <full-query|planning-only|execute-only>] [--run-seconds <seconds>] [--cove-arrow-view-output] [--cove-trusted-arrow-string-validation] [--cove-local-file-mmap-reads]"
+    "usage: m6 profile-query --track <track> --engine <cove|parquet> [--stage <full-query|planning-only|execute-only>] [--run-seconds <seconds>] [--worker-threads <n>] [--target-partitions <n>] [--cove-target-morsels-per-partition <n>] [--cove-arrow-view-output] [--cove-trusted-arrow-string-validation] [--cove-local-file-mmap-reads]"
         .into()
 }
 
@@ -1635,8 +1925,18 @@ fn parse_compare_source(value: &str) -> Result<CompareSource, String> {
 
 #[cfg(feature = "parquet-compare")]
 fn run_query_profile_command(command: QueryProfileCommand) {
-    let runtime = Runtime::new().expect("query profile runtime");
+    let runtime = match command.worker_threads {
+        Some(worker_threads) => RuntimeBuilder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .enable_all()
+            .build()
+            .expect("query profile runtime"),
+        None => Runtime::new().expect("query profile runtime"),
+    };
     let mut cove_options = CoveTableOptions::default();
+    if let Some(target) = command.cove_target_morsels_per_partition {
+        cove_options = cove_options.with_target_morsels_per_partition(target);
+    }
     if command.cove_arrow_view_output {
         cove_options = cove_options.with_arrow_view_output();
     }
@@ -1646,7 +1946,12 @@ fn run_query_profile_command(command: QueryProfileCommand) {
     if command.cove_local_file_mmap_reads {
         cove_options = cove_options.with_local_file_mmap_reads();
     }
-    let fixture = ParquetCompareFixture::new_with_cove_options(&runtime, cove_options);
+    let target_partitions = command.target_partitions.or(command.worker_threads);
+    let fixture = ParquetCompareFixture::new_with_options(
+        &runtime,
+        cove_options,
+        ParquetCompareSessionOptions { target_partitions },
+    );
     let query = profile_query_spec(&command.track, command.engine).unwrap_or_else(|message| {
         panic!("{message}");
     });
@@ -1661,11 +1966,14 @@ fn run_query_profile_command(command: QueryProfileCommand) {
     };
 
     println!(
-        "PROFILE_READY pid={} stage={} track={} engine={} cove_arrow_view_output={} cove_trusted_arrow_string_validation={} cove_local_file_mmap_reads={}",
+        "PROFILE_READY pid={} stage={} track={} engine={} worker_threads={} target_partitions={} cove_target_morsels_per_partition={} cove_arrow_view_output={} cove_trusted_arrow_string_validation={} cove_local_file_mmap_reads={}",
         process::id(),
         command.stage.as_str(),
         command.track,
         compare_source_name(command.engine),
+        format_optional_usize(command.worker_threads),
+        format_optional_usize(target_partitions),
+        format_optional_usize(command.cove_target_morsels_per_partition),
         command.cove_arrow_view_output,
         command.cove_trusted_arrow_string_validation,
         command.cove_local_file_mmap_reads,
@@ -1673,28 +1981,43 @@ fn run_query_profile_command(command: QueryProfileCommand) {
     io::stdout().flush().expect("flush profile ready line");
     wait_for_profile_start_signal();
 
-    let iterations = match command.stage {
+    let (iterations, rows_materialized) = match command.stage {
         QueryProfileStage::FullQuery => {
-            run_full_query_profile_loop(&runtime, &fixture.ctx, &query, command.run_seconds)
+            let iterations =
+                run_full_query_profile_loop(&runtime, &fixture.ctx, &query, command.run_seconds);
+            (iterations, None)
         }
         QueryProfileStage::PlanningOnly => {
-            run_planning_profile_loop(&runtime, &fixture.ctx, &query, command.run_seconds)
+            let iterations =
+                run_planning_profile_loop(&runtime, &fixture.ctx, &query, command.run_seconds);
+            (iterations, None)
         }
-        QueryProfileStage::ExecuteOnly => run_execute_only_profile_loop(
-            &runtime,
-            &fixture.ctx,
-            &query,
-            plan.expect("execute-only plan should be prepared"),
-            command.run_seconds,
-        ),
+        QueryProfileStage::ExecuteOnly => {
+            let (iterations, rows_materialized) = run_execute_only_profile_loop(
+                &runtime,
+                &fixture.ctx,
+                &query,
+                plan.expect("execute-only plan should be prepared"),
+                command.run_seconds,
+            );
+            (iterations, Some(rows_materialized))
+        }
     };
 
     println!(
-        "PROFILE_DONE pid={} iterations={} stage={}",
+        "PROFILE_DONE pid={} iterations={} stage={} cove_rows_materialized_per_iteration={}",
         process::id(),
         iterations,
-        command.stage.as_str()
+        command.stage.as_str(),
+        format_optional_usize(rows_materialized),
     );
+}
+
+#[cfg(feature = "parquet-compare")]
+fn format_optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "default".into())
 }
 
 #[cfg(feature = "parquet-compare")]
@@ -1746,7 +2069,7 @@ fn run_execute_only_profile_loop(
     query: &PreparedQuery,
     plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     run_seconds: u64,
-) -> usize {
+) -> (usize, usize) {
     let deadline = Instant::now() + Duration::from_secs(run_seconds);
     let mut iterations = 0usize;
     while Instant::now() < deadline {
@@ -1759,7 +2082,35 @@ fn run_execute_only_profile_loop(
         black_box(assert_query_batches(&batches, query));
         iterations += 1;
     }
-    iterations
+    let metric_plan = build_physical_plan(runtime, ctx, query.sql.as_ref());
+    let collected_metric_plan = Arc::clone(&metric_plan);
+    let batches = runtime.block_on(async {
+        collect_execution_plan(metric_plan, ctx.task_ctx())
+            .await
+            .expect("execute prepared physical plan for metrics")
+    });
+    black_box(assert_query_batches(&batches, query));
+    (
+        iterations,
+        execution_plan_metric_sum(&collected_metric_plan, "cove_rows_materialized"),
+    )
+}
+
+#[cfg(feature = "parquet-compare")]
+fn execution_plan_metric_sum(
+    plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    metric_name: &str,
+) -> usize {
+    let own = plan
+        .metrics()
+        .and_then(|metrics| metrics.sum_by_name(metric_name))
+        .map(|metric| metric.as_usize())
+        .unwrap_or(0);
+    own + plan
+        .children()
+        .into_iter()
+        .map(|child| execution_plan_metric_sum(child, metric_name))
+        .sum::<usize>()
 }
 
 #[cfg(feature = "parquet-compare")]

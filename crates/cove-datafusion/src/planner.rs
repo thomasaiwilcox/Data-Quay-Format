@@ -6,7 +6,9 @@ use cove_core::{constants::CovePhysicalKind, CoveError};
 use crate::{
     dataset_state::DatasetState,
     execution_code,
-    scan_program::{compile_scan_program, promote_filter_exactness, CoveScanProgram},
+    scan_program::{
+        compile_scan_program, order_filters_by_cost, promote_filter_exactness, CoveScanProgram,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +112,10 @@ pub enum CovePredicate {
         /// resolved against each concrete file before pruning or execution.
         canonical_values: Vec<Vec<u8>>,
     },
+    VarBytesEq {
+        column_index: usize,
+        literal: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +198,22 @@ impl FilterPlan {
             }),
         }
     }
+
+    pub fn pruning_varbytes_eq(
+        column_index: usize,
+        literal: Vec<u8>,
+        display: impl Into<String>,
+    ) -> Self {
+        Self {
+            use_kind: CoveFilterUse::PruningOnly,
+            predicate_columns: vec![column_index],
+            display: display.into(),
+            predicate: Some(CovePredicate::VarBytesEq {
+                column_index,
+                literal,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -244,8 +266,10 @@ pub fn plan_scan(
     for filter in &mut filters {
         promote_filter_exactness(state, filter);
     }
+    let predicate_ordered = order_filters_by_cost(&mut filters);
     execution_code::validate_policy_for_filters(state, &filters)?;
-    let scan_program = compile_scan_program(state, &filters);
+    let mut scan_program = compile_scan_program(state, &filters);
+    scan_program.predicate_ordered = predicate_ordered;
     Ok(ScanPlan {
         scan_projection,
         output_schema,
@@ -298,6 +322,15 @@ fn validate_filter_shapes(state: &DatasetState, filters: &[FilterPlan]) -> Resul
                 if column.physical != CovePhysicalKind::NumCode {
                     return Err(CoveError::BadSchema(format!(
                         "numeric predicate planned for non-NumCode column {}",
+                        column.name
+                    )));
+                }
+            }
+            Some(CovePredicate::VarBytesEq { column_index, .. }) => {
+                let column = &state.table().columns[*column_index];
+                if column.physical != CovePhysicalKind::VarBytes {
+                    return Err(CoveError::BadSchema(format!(
+                        "VarBytes predicate planned for non-VarBytes column {}",
                         column.name
                     )));
                 }

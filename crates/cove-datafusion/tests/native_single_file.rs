@@ -77,7 +77,9 @@ use datafusion::object_store::{
 };
 use datafusion::{
     arrow::{
-        array::{Array, BinaryViewArray, DictionaryArray, StringViewArray},
+        array::{
+            Array, BinaryArray, BinaryViewArray, DictionaryArray, StringArray, StringViewArray,
+        },
         datatypes::UInt32Type,
         util::pretty::pretty_format_batches,
     },
@@ -85,12 +87,39 @@ use datafusion::{
     catalog::TableProvider,
     common::{stats::Precision, Column, ScalarValue},
     logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown},
+    physical_plan::{execution_plan::collect as collect_physical_plan, ExecutionPlan},
     prelude::SessionContext,
 };
 use futures::stream::BoxStream;
 use url::Url;
 
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+async fn collect_sql_with_cove_metric(
+    ctx: &SessionContext,
+    sql: &str,
+    metric_name: &str,
+) -> (Vec<datafusion::arrow::record_batch::RecordBatch>, usize) {
+    let dataframe = ctx.sql(sql).await.unwrap();
+    let plan = dataframe.create_physical_plan().await.unwrap();
+    let batches = collect_physical_plan(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .unwrap();
+    (batches, execution_plan_metric_sum(&plan, metric_name))
+}
+
+fn execution_plan_metric_sum(plan: &Arc<dyn ExecutionPlan>, metric_name: &str) -> usize {
+    let own = plan
+        .metrics()
+        .and_then(|metrics| metrics.sum_by_name(metric_name))
+        .map(|metric| metric.as_usize())
+        .unwrap_or(0);
+    own + plan
+        .children()
+        .into_iter()
+        .map(|child| execution_plan_metric_sum(child, metric_name))
+        .sum::<usize>()
+}
 
 #[tokio::test]
 async fn select_star_reads_single_file_multi_segment() {
@@ -116,6 +145,135 @@ async fn select_star_reads_single_file_multi_segment() {
         "+----+-------+--------+",
     ];
     assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn native_limit_pushdown_materializes_only_requested_rows() {
+    let path = write_temp_cove("events_limit", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (full_batches, full_materialized) =
+        collect_sql_with_cove_metric(&ctx, "SELECT id FROM events", "cove_rows_materialized").await;
+    let full_expected = [
+        "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "+----+",
+    ];
+    assert_batches_eq!(full_expected, &full_batches);
+    assert_eq!(full_materialized, 3);
+    let (_, full_buffered_partitions) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id FROM events",
+        "cove_materialization_buffered_partitions",
+    )
+    .await;
+    assert_eq!(full_buffered_partitions, 1);
+
+    let (limit_batches, limit_materialized) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id FROM events LIMIT 1",
+        "cove_rows_materialized",
+    )
+    .await;
+    let limit_expected = ["+----+", "| id |", "+----+", "| 1  |", "+----+"];
+    assert_batches_eq!(limit_expected, &limit_batches);
+    assert_eq!(limit_materialized, 1);
+    assert!(limit_materialized < full_materialized);
+    let (_, limit_streaming_partitions) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id FROM events LIMIT 1",
+        "cove_materialization_streaming_partitions",
+    )
+    .await;
+    assert_eq!(limit_streaming_partitions, 1);
+
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn native_arrow_export_path_metrics_are_recorded() {
+    let path = write_temp_cove("events_export_metrics", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (_, numcode_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id, name, active FROM events",
+        "cove_arrow_export_direct_numcode_rows",
+    )
+    .await;
+    let (_, varbytes_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id, name, active FROM events",
+        "cove_arrow_export_direct_varbytes_rows",
+    )
+    .await;
+    let (_, plainfixed_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id, name, active FROM events",
+        "cove_arrow_export_direct_plainfixed_rows",
+    )
+    .await;
+    let (_, fallback_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id, name, active FROM events",
+        "cove_arrow_export_fallback_rows",
+    )
+    .await;
+
+    assert_eq!(numcode_rows, 3);
+    assert_eq!(varbytes_rows, 3);
+    assert_eq!(plainfixed_rows, 3);
+    assert_eq!(fallback_rows, 0);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn native_materialization_mode_selection_is_explained() {
+    let path = write_temp_cove("materialization_modes", topn_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("materialization_mode=buffered"),
+        "{explain_text}"
+    );
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events LIMIT 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("materialization_mode=streaming"),
+        "{explain_text}"
+    );
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events ORDER BY id DESC LIMIT 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(explain_text.contains("topn_hint=Some"), "{explain_text}");
+    assert!(
+        explain_text.contains("materialization_mode=streaming"),
+        "{explain_text}"
+    );
+
     fs::remove_file(path).unwrap();
 }
 
@@ -540,6 +698,48 @@ async fn compatibility_dictionary_output_is_option_aware() {
         .as_any()
         .downcast_ref::<DictionaryArray<UInt32Type>>()
         .is_some()));
+
+    let filtered = ctx
+        .sql("SELECT name FROM items WHERE name = 'red' ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let filtered_expected = [
+        "+------+", "| name |", "+------+", "| red  |", "| red  |", "+------+",
+    ];
+    assert_batches_eq!(filtered_expected, &filtered);
+
+    let grouped = ctx
+        .sql("SELECT name, COUNT(*) AS n FROM items GROUP BY name ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let grouped_expected = [
+        "+------+---+",
+        "| name | n |",
+        "+------+---+",
+        "| blue | 2 |",
+        "| red  | 2 |",
+        "+------+---+",
+    ];
+    assert_batches_eq!(grouped_expected, &grouped);
+
+    let ordered = ctx
+        .sql("SELECT name FROM items ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ordered_expected = [
+        "+------+", "| name |", "+------+", "| blue |", "| blue |", "| red  |", "| red  |",
+        "+------+",
+    ];
+    assert_batches_eq!(ordered_expected, &ordered);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -866,6 +1066,35 @@ fn filter_pushdown_classifies_supported_numeric_exact_and_null_inexact() {
 }
 
 #[test]
+fn filter_pushdown_classifies_varbytes_equality_exact() {
+    let path = write_temp_cove("varbytes_classification", primitive_events_file());
+    let provider = cove_table_from_path(&path).unwrap();
+    let varbytes_equality = Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(Expr::Column(Column::from_name("name"))),
+        Operator::Eq,
+        Box::new(Expr::Literal(ScalarValue::Utf8(Some("beta".into())), None)),
+    ));
+    let varbytes_range = Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(Expr::Column(Column::from_name("name"))),
+        Operator::GtEq,
+        Box::new(Expr::Literal(ScalarValue::Utf8(Some("beta".into())), None)),
+    ));
+
+    let support = provider
+        .supports_filters_pushdown(&[&varbytes_equality, &varbytes_range])
+        .unwrap();
+
+    assert_eq!(
+        support,
+        vec![
+            TableProviderFilterPushDown::Exact,
+            TableProviderFilterPushDown::Unsupported
+        ]
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn null_pruning_uses_page_indexes_without_materializing_predicate_columns() {
     let state = bootstrap_bytes("nullable", nullable_events_file()).unwrap();
     let projection = vec![0];
@@ -906,6 +1135,67 @@ fn numeric_row_selection_late_materializes_projected_columns() {
     assert_eq!(decoded.stats.rows_selected, 1);
     assert_eq!(decoded.stats.rows_materialized, 1);
     assert!(decoded.stats.pages_decoded < full.stats.pages_decoded);
+}
+
+#[test]
+fn varbytes_equality_late_materializes_projected_columns() {
+    let state = bootstrap_bytes("events", primitive_events_file()).unwrap();
+    let full = decode_scan(&state, &plan_scan(&state, None, Vec::new()).unwrap()).unwrap();
+    let projection = vec![0];
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Binary {
+            left: Box::new(LowerExpr::Column("name".into())),
+            op: LowerOperator::Eq,
+            right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("beta".into()))),
+        },
+        "name = 'beta'",
+    );
+    assert!(matches!(
+        filter.predicate,
+        Some(CovePredicate::VarBytesEq { .. })
+    ));
+    let plan = plan_scan(&state, Some(&projection), vec![filter]).unwrap();
+
+    let decoded = decode_scan(&state, &plan).unwrap();
+
+    let expected = ["+----+", "| id |", "+----+", "| 2  |", "+----+"];
+    assert_batches_eq!(expected, &decoded.batches);
+    assert_eq!(decoded.stats.rows_selected, 1);
+    assert_eq!(decoded.stats.rows_materialized, 1);
+    assert_eq!(decoded.stats.residual_predicates, 0);
+    assert_eq!(decoded.stats.exact_predicates, 1);
+    assert!(decoded.stats.pages_decoded < full.stats.pages_decoded);
+}
+
+#[tokio::test]
+async fn varbytes_equality_filter_is_pushed_down_exactly() {
+    let path = write_temp_cove("events_varbytes_filter", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT id FROM events WHERE name = 'beta'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = ["+----+", "| id |", "+----+", "| 2  |", "+----+"];
+    assert_batches_eq!(expected, &batches);
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events WHERE name = 'beta'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(explain_text.contains("CoveExec"), "{explain_text}");
+    assert!(!explain_text.contains("FilterExec"), "{explain_text}");
+    assert!(explain_text.contains("exact_filters=1"), "{explain_text}");
+    fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -1196,18 +1486,18 @@ async fn filecode_dictionary_values_are_decoded() {
     let ctx = SessionContext::new();
     register_cove_file(&ctx, "items", &path).unwrap();
 
-    let batches = ctx
-        .sql("SELECT name FROM items")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    let (batches, decoded_fallback_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM items",
+        "cove_filecode_dictionary_decoded_fallback_rows",
+    )
+    .await;
 
     let expected = [
         "+------+", "| name |", "+------+", "| red  |", "| blue |", "+------+",
     ];
     assert_batches_eq!(expected, &batches);
+    assert_eq!(decoded_fallback_rows, 2);
     fs::remove_file(path).unwrap();
 }
 
@@ -1242,6 +1532,216 @@ async fn filecode_dictionary_output_is_opt_in() {
     let expected = [
         "+------+", "| name |", "+------+", "| red  |", "| blue |", "+------+",
     ];
+    assert_batches_eq!(expected, &batches);
+
+    let filtered = ctx
+        .sql("SELECT name FROM items WHERE name = 'red'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let filtered_expected = ["+------+", "| name |", "+------+", "| red  |", "+------+"];
+    assert_batches_eq!(filtered_expected, &filtered);
+
+    let grouped = ctx
+        .sql("SELECT name, COUNT(*) AS n FROM items GROUP BY name ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let grouped_expected = [
+        "+------+---+",
+        "| name | n |",
+        "+------+---+",
+        "| blue | 1 |",
+        "| red  | 1 |",
+        "+------+---+",
+    ];
+    assert_batches_eq!(grouped_expected, &grouped);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filecode_dictionary_output_uses_direct_key_export_and_value_cache() {
+    let path = write_temp_cove(
+        "items_dictionary_metrics",
+        dictionary_items_file_with_domain_stats(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file_with_options(
+        &ctx,
+        "items",
+        &path,
+        CoveTableOptions::default().with_arrow_dictionary_output(),
+    )
+    .unwrap();
+
+    let (batches, key_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM items",
+        "cove_filecode_dictionary_keys_rows",
+    )
+    .await;
+    let expected = [
+        "+------+", "| name |", "+------+", "| red  |", "| blue |", "+------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(key_rows, 2);
+
+    let (_, value_bytes) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM items",
+        "cove_filecode_dictionary_values_bytes",
+    )
+    .await;
+    let (_, cache_misses) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM items",
+        "cove_filecode_dictionary_value_cache_misses",
+    )
+    .await;
+    let (_, cache_hits) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM items",
+        "cove_filecode_dictionary_value_cache_hits",
+    )
+    .await;
+
+    assert!(value_bytes > 0);
+    assert_eq!(cache_misses, 1);
+    assert_eq!(cache_hits, 1);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filecode_dictionary_output_remaps_mixed_file_dictionary() {
+    let path = write_temp_cove("mixed_dictionary", mixed_dictionary_items_file());
+    let ctx = SessionContext::new();
+    register_cove_file_with_options(
+        &ctx,
+        "items",
+        &path,
+        CoveTableOptions::default().with_arrow_dictionary_output(),
+    )
+    .unwrap();
+
+    let (batches, remapped_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM items",
+        "cove_filecode_dictionary_remapped_rows",
+    )
+    .await;
+    let expected = [
+        "+------+", "| name |", "+------+", "| red  |", "| blue |", "+------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(remapped_rows, 2);
+
+    let dictionary = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .unwrap();
+    assert_eq!(dictionary.keys().value(0), 0);
+    assert_eq!(dictionary.keys().value(1), 1);
+    let values = dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values.value(0), "red");
+    assert_eq!(values.value(1), "blue");
+
+    let blob_batches = ctx
+        .sql("SELECT blob FROM items")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let blob_dictionary = blob_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .unwrap();
+    let blob_values = blob_dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(blob_values.len(), 1);
+    assert_eq!(blob_values.value(0), &[0xaa, 0xbb]);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filecode_dictionary_output_ignores_view_values_for_filecode_columns() {
+    let path = write_temp_cove(
+        "items_dictionary_view_options",
+        dictionary_items_file(sample_dictionary()),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file_with_options(
+        &ctx,
+        "items",
+        &path,
+        CoveTableOptions::default()
+            .with_arrow_dictionary_output()
+            .with_arrow_view_output(),
+    )
+    .unwrap();
+
+    let batches = ctx
+        .sql("SELECT name FROM items")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let dictionary = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .unwrap();
+    assert!(dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .is_some());
+    assert!(dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .is_none());
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn unrelated_redacted_dictionary_entry_does_not_block_projection() {
+    let path = write_temp_cove(
+        "redacted_mixed_dictionary",
+        redacted_mixed_dictionary_items_file(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file_with_options(
+        &ctx,
+        "items",
+        &path,
+        CoveTableOptions::default().with_arrow_dictionary_output(),
+    )
+    .unwrap();
+
+    let batches = ctx
+        .sql("SELECT name FROM items")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = ["+------+", "| name |", "+------+", "| red  |", "+------+"];
     assert_batches_eq!(expected, &batches);
     fs::remove_file(path).unwrap();
 }
@@ -1472,6 +1972,10 @@ async fn m4d_topn_optimizer_adds_read_order_hint_without_removing_sort() {
         .unwrap();
     let explain_text = pretty_format_batches(&explain).unwrap().to_string();
     assert!(explain_text.contains("topn_hint=Some"), "{explain_text}");
+    assert!(
+        explain_text.contains("materialization_mode=streaming"),
+        "{explain_text}"
+    );
     assert!(
         explain_text.contains("SortExec") || explain_text.contains("Sort"),
         "{explain_text}"
@@ -2183,6 +2687,101 @@ fn dictionary_items_file(dictionary: FileDictionary) -> Vec<u8> {
     if has_redacted_entries(&dictionary) {
         writer.push_extra_section(redaction_manifest_section());
     }
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn mixed_dictionary_items_file() -> Vec<u8> {
+    let dictionary = FileDictionary {
+        header: FileDictionaryHeaderV1 {
+            entry_count: 3,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        },
+        entries: vec![
+            inline_binary_entry(&[0xaa, 0xbb]),
+            inline_utf8_entry("red"),
+            inline_utf8_entry("blue"),
+        ],
+        payload: Vec::new(),
+    };
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 7,
+            namespace: "public".into(),
+            name: "items".into(),
+            row_count: 2,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "name",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "blob",
+                    CoveLogicalType::Binary,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut segment = ScanSegment::new(7, 0, 0, 2, 2);
+    segment.set_column_pages(1, vec![filecode_page(2, filecodes(&[1, 2]))]);
+    segment.set_column_pages(2, vec![filecode_page(2, filecodes(&[0, 0]))]);
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_file_dictionary(&dictionary);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn redacted_mixed_dictionary_items_file() -> Vec<u8> {
+    let dictionary = FileDictionary {
+        header: FileDictionaryHeaderV1 {
+            entry_count: 2,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        },
+        entries: vec![redacted_binary_entry(), inline_utf8_entry("red")],
+        payload: Vec::new(),
+    };
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 7,
+            namespace: "public".into(),
+            name: "items".into(),
+            row_count: 1,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![column(
+                1,
+                "name",
+                CoveLogicalType::Utf8,
+                CovePhysicalKind::FileCode,
+                false,
+            )],
+        }],
+    };
+    let mut segment = ScanSegment::new(7, 0, 0, 1, 1);
+    segment.set_column_pages(1, vec![filecode_page(1, filecodes(&[1]))]);
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_file_dictionary(&dictionary);
+    writer.push_extra_section(redaction_manifest_section());
     writer.push_segment(segment);
     writer.write().unwrap()
 }
@@ -2974,9 +3573,43 @@ fn inline_utf8_entry(value: &str) -> FileDictionaryIndexEntryV1 {
     }
 }
 
+fn inline_binary_entry(value: &[u8]) -> FileDictionaryIndexEntryV1 {
+    let mut canonical = wire::encode_u64_leb128(value.len() as u64);
+    canonical.extend_from_slice(value);
+    let mut inline_data = [0u8; 16];
+    inline_data[..canonical.len()].copy_from_slice(&canonical);
+    FileDictionaryIndexEntryV1 {
+        value_tag: ValueTag::Binary as u16,
+        storage_class: StorageClass::Inline as u8,
+        flags: 0,
+        inline_len: canonical.len() as u8,
+        reserved0: [0; 3],
+        inline_data,
+        payload_offset: 0,
+        payload_length: 0,
+        canonical_hash64: 0,
+        reserved1: 0,
+    }
+}
+
 fn redacted_utf8_entry() -> FileDictionaryIndexEntryV1 {
     FileDictionaryIndexEntryV1 {
         value_tag: ValueTag::Utf8 as u16,
+        storage_class: StorageClass::Redacted as u8,
+        flags: 0,
+        inline_len: 0,
+        reserved0: [0; 3],
+        inline_data: [0; 16],
+        payload_offset: 0,
+        payload_length: 0,
+        canonical_hash64: 0,
+        reserved1: 0,
+    }
+}
+
+fn redacted_binary_entry() -> FileDictionaryIndexEntryV1 {
+    FileDictionaryIndexEntryV1 {
+        value_tag: ValueTag::Binary as u16,
         storage_class: StorageClass::Redacted as u8,
         flags: 0,
         inline_len: 0,

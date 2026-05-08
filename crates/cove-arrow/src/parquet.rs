@@ -5,6 +5,8 @@
 //! and nested JSON-fallback columns and emits explicit scan page payloads
 //! through [`crate::writer::ScanProfileCoveWriter`].
 
+mod public;
+
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
@@ -28,15 +30,13 @@ use crate::{
         covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
         covx::{CovxFile, CovxHeaderV1, CovxPostscriptV1, CovxReferencedFileV1},
     },
-    canonical::CanonicalValue,
     checksum,
     constants::{
         CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind, DigestAlgorithm,
-        SectionKind, StorageClass,
+        SectionKind,
     },
     dictionary::{
-        FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1, DICT_HEADER_SIZE,
-        DICT_INDEX_ENTRY_SIZE,
+        file_dictionary_candidate_len, FileDictionary, FileDictionaryEncoding, FileDictionaryKey,
     },
     digest::compute_digest,
     domain::ColumnDomain,
@@ -70,369 +70,7 @@ use crate::{
     CoveError,
 };
 
-/// One step in the Parquet → COVE conversion pipeline (Spec §51.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ConversionStep {
-    DecodeSource,
-    PartitionSegments,
-    BuildDictionaries,
-    ChooseFileOrNumCode,
-    RecomputeStats,
-    BuildDomainsAndIndexes,
-    EncodePages,
-    WriteSections,
-    EmitOptionalCovmCovx,
-}
-
-impl ConversionStep {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ConversionStep::DecodeSource => "DecodeSource",
-            ConversionStep::PartitionSegments => "PartitionSegments",
-            ConversionStep::BuildDictionaries => "BuildDictionaries",
-            ConversionStep::ChooseFileOrNumCode => "ChooseFileOrNumCode",
-            ConversionStep::RecomputeStats => "RecomputeStats",
-            ConversionStep::BuildDomainsAndIndexes => "BuildDomainsAndIndexes",
-            ConversionStep::EncodePages => "EncodePages",
-            ConversionStep::WriteSections => "WriteSections",
-            ConversionStep::EmitOptionalCovmCovx => "EmitOptionalCovmCovx",
-        }
-    }
-}
-
-/// Canonical conversion plan in Spec §51.2 order.
-pub fn canonical_plan() -> Vec<ConversionStep> {
-    vec![
-        ConversionStep::DecodeSource,
-        ConversionStep::PartitionSegments,
-        ConversionStep::BuildDictionaries,
-        ConversionStep::ChooseFileOrNumCode,
-        ConversionStep::RecomputeStats,
-        ConversionStep::BuildDomainsAndIndexes,
-        ConversionStep::EncodePages,
-        ConversionStep::WriteSections,
-        ConversionStep::EmitOptionalCovmCovx,
-    ]
-}
-
-/// Spec §51.3: unsupported nested source shapes MUST be downgraded to JSON
-/// or Binary and marked pushdown-limited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum UnsupportedNestedFallback {
-    Json,
-    Binary,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ParquetDictionaryPolicy {
-    Auto,
-    Never,
-    Always,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ParquetStatsPolicy {
-    None,
-    Recompute,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ParquetAccelerationPolicy {
-    None,
-    DeclaredOnly,
-    Auto,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ParquetAggregatePolicy {
-    None,
-    Auto,
-    DeclaredOnly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ParquetClusteringPolicy {
-    PreserveSourceOrder,
-    StableClusterDeclaredColumns,
-}
-
-/// Controls Parquet → COVE conversion.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParquetConversionOptions {
-    pub table_name: String,
-    pub namespace: String,
-    pub morsel_row_count: u32,
-    pub segment_row_count: u32,
-    pub page_compression: CompressionCodec,
-    pub dictionary_policy: ParquetDictionaryPolicy,
-    pub stats_policy: ParquetStatsPolicy,
-    pub acceleration_policy: ParquetAccelerationPolicy,
-    pub point_lookup_columns: Vec<String>,
-    pub cluster_columns: Vec<String>,
-    pub topn_columns: Vec<String>,
-    pub aggregate_policy: ParquetAggregatePolicy,
-    pub aggregate_columns: Vec<String>,
-    pub composite_zone_groups: Vec<Vec<String>>,
-    pub emit_covx: bool,
-    pub emit_covm: bool,
-    pub clustering_policy: ParquetClusteringPolicy,
-}
-
-impl Default for ParquetConversionOptions {
-    fn default() -> Self {
-        Self {
-            table_name: "parquet_import".into(),
-            namespace: "interop".into(),
-            morsel_row_count: 4096,
-            segment_row_count: u32::MAX,
-            page_compression: CompressionCodec::None,
-            dictionary_policy: ParquetDictionaryPolicy::Auto,
-            stats_policy: ParquetStatsPolicy::None,
-            acceleration_policy: ParquetAccelerationPolicy::None,
-            point_lookup_columns: Vec::new(),
-            cluster_columns: Vec::new(),
-            topn_columns: Vec::new(),
-            aggregate_policy: ParquetAggregatePolicy::None,
-            aggregate_columns: Vec::new(),
-            composite_zone_groups: Vec::new(),
-            emit_covx: false,
-            emit_covm: false,
-            clustering_policy: ParquetClusteringPolicy::PreserveSourceOrder,
-        }
-    }
-}
-
-/// A scalar value decoded from a materialized Parquet conversion page.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum ParquetScalarValue {
-    Null,
-    Bool(bool),
-    Int(i64),
-    UInt(u64),
-    Float32(f32),
-    Float64(f64),
-    Decimal64(i64),
-    Decimal128(i128),
-    DateDays(i32),
-    TimestampMicros(i64),
-    TimestampNanos(i64),
-    Utf8(String),
-    Json(Value),
-    Binary(Vec<u8>),
-}
-
-impl ParquetScalarValue {
-    pub fn to_json_value(&self) -> Value {
-        match self {
-            ParquetScalarValue::Null => Value::Null,
-            ParquetScalarValue::Bool(value) => json!(value),
-            ParquetScalarValue::Int(value) => json!(value),
-            ParquetScalarValue::UInt(value) => json!(value),
-            ParquetScalarValue::Float32(value) => serde_json::Number::from_f64(*value as f64)
-                .map(Value::Number)
-                .unwrap_or_else(|| Value::String(value.to_string())),
-            ParquetScalarValue::Float64(value) => serde_json::Number::from_f64(*value)
-                .map(Value::Number)
-                .unwrap_or_else(|| Value::String(value.to_string())),
-            ParquetScalarValue::Decimal64(value) => json!(value),
-            ParquetScalarValue::Decimal128(value) => Value::String(value.to_string()),
-            ParquetScalarValue::DateDays(value) => json!(value),
-            ParquetScalarValue::TimestampMicros(value) => json!(value),
-            ParquetScalarValue::TimestampNanos(value) => json!(value),
-            ParquetScalarValue::Utf8(value) => json!(value),
-            ParquetScalarValue::Json(value) => value.clone(),
-            ParquetScalarValue::Binary(value) => Value::String(hex_encode(value)),
-        }
-    }
-}
-
-/// Per-column conversion metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParquetColumnReport {
-    pub column_id: u32,
-    pub name: String,
-    pub source_type: String,
-    pub logical: CoveLogicalType,
-    pub physical: CovePhysicalKind,
-    pub nullable: bool,
-    pub pushdown_limited: bool,
-    pub fallback: Option<UnsupportedNestedFallback>,
-    pub notes: Vec<String>,
-}
-
-/// Machine-readable conversion report for Spec §51.5.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParquetConversionReport {
-    pub table_name: String,
-    pub namespace: String,
-    pub row_count: u64,
-    pub segment_count: u32,
-    pub column_count: u32,
-    pub required_features: u64,
-    pub optional_features: u64,
-    pub plan: Vec<ConversionStep>,
-    pub source_schema_fingerprint: String,
-    pub target_schema_fingerprint: String,
-    pub validation_result: bool,
-    pub generated_section_kinds: Vec<String>,
-    pub unsupported_features: Vec<String>,
-    pub lossy_features: Vec<String>,
-    pub nested_shape_fallbacks: Vec<String>,
-    pub notes: Vec<String>,
-    pub columns: Vec<ParquetColumnReport>,
-}
-
-impl ParquetConversionReport {
-    pub fn to_json_value(&self) -> Value {
-        json!({
-            "source_format": "parquet",
-            "table_name": self.table_name,
-            "namespace": self.namespace,
-            "row_count": self.row_count,
-            "segment_count": self.segment_count,
-            "column_count": self.column_count,
-            "required_features": self.required_features,
-            "optional_features": self.optional_features,
-            "plan": self.plan.iter().map(|step| step.as_str()).collect::<Vec<_>>(),
-            "source_schema_fingerprint": self.source_schema_fingerprint,
-            "target_schema_fingerprint": self.target_schema_fingerprint,
-            "validation_result": self.validation_result,
-            "generated_section_kinds": self.generated_section_kinds,
-            "unsupported_features": self.unsupported_features,
-            "lossy_features": self.lossy_features,
-            "nested_shape_fallbacks": self.nested_shape_fallbacks,
-            "notes": self.notes,
-            "columns": self
-                .columns
-                .iter()
-                .map(|column| {
-                    json!({
-                        "column_id": column.column_id,
-                        "name": column.name,
-                        "source_type": column.source_type,
-                        "logical": format!("{:?}", column.logical),
-                        "physical": format!("{:?}", column.physical),
-                        "nullable": column.nullable,
-                        "pushdown_limited": column.pushdown_limited,
-                        "fallback": column.fallback.map(|fallback| format!("{fallback:?}")),
-                        "notes": column.notes,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        })
-    }
-}
-
-/// Output of a Parquet conversion run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParquetConversionResult {
-    pub cove_bytes: Vec<u8>,
-    pub covx_bytes: Option<Vec<u8>>,
-    pub covm_bytes: Option<Vec<u8>>,
-    pub report: ParquetConversionReport,
-}
-
-/// Validate that a conversion plan starts with `DecodeSource` and ends with
-/// either `WriteSections` or `EmitOptionalCovmCovx` (Spec §51.2).
-pub fn validate_plan(plan: &[ConversionStep]) -> Result<(), CoveError> {
-    if plan.first() != Some(&ConversionStep::DecodeSource) {
-        return Err(CoveError::BadSection(
-            "conversion plan must start with DecodeSource (Spec §51.2)".into(),
-        ));
-    }
-    let last = plan.last();
-    if !matches!(
-        last,
-        Some(ConversionStep::WriteSections) | Some(ConversionStep::EmitOptionalCovmCovx)
-    ) {
-        return Err(CoveError::BadSection(
-            "conversion plan must end with WriteSections or EmitOptionalCovmCovx".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Returns the materialized page encoding used by the MVP converter for a
-/// physical kind.
-pub fn materialized_page_encoding(
-    physical: CovePhysicalKind,
-) -> Result<CoveEncodingKind, CoveError> {
-    match physical {
-        CovePhysicalKind::FileCode => Ok(CoveEncodingKind::FileCode),
-        CovePhysicalKind::NumCode => Ok(CoveEncodingKind::NumCode),
-        CovePhysicalKind::Boolean | CovePhysicalKind::FixedBytes => {
-            Ok(CoveEncodingKind::PlainFixed)
-        }
-        CovePhysicalKind::VarBytes => Ok(CoveEncodingKind::VarBytes),
-        other => Err(CoveError::BadSchema(format!(
-            "Parquet MVP converter cannot materialize physical kind {other:?}"
-        ))),
-    }
-}
-
-/// Decode materialized page payload bytes emitted by [`convert_parquet_bytes`]
-/// back into logical scalar values.
-pub fn decode_materialized_page_values(
-    column: &ColumnEntry,
-    row_count: u32,
-    payload: &[u8],
-) -> Result<Vec<ParquetScalarValue>, CoveError> {
-    decode_materialized_page_values_with_nulls(column, row_count, 0, payload)
-}
-
-/// Decode materialized page payload bytes, including the nullable-page layout
-/// emitted by [`convert_parquet_bytes`].
-///
-/// INVARIANT: when `null_count > 0`, payload starts with the COVE null bitmap
-/// for exactly `row_count` rows, followed by one physical payload slot per row.
-pub fn decode_materialized_page_values_with_nulls(
-    column: &ColumnEntry,
-    row_count: u32,
-    null_count: u32,
-    payload: &[u8],
-) -> Result<Vec<ParquetScalarValue>, CoveError> {
-    if null_count > row_count {
-        return Err(CoveError::PageCorrupt);
-    }
-    let encoding = materialized_page_encoding(column.physical)?;
-    let (validity, data) = if null_count == 0 {
-        (None, payload)
-    } else {
-        let bitmap_len = validity_bitmap_len(row_count)?;
-        if payload.len() < bitmap_len {
-            return Err(CoveError::BufferTooShort);
-        }
-        let (validity_bytes, data) = payload.split_at(bitmap_len);
-        let bitmap = ValidityBitmap::new(validity_bytes, row_count as u64);
-        bitmap.validate_len(row_count as u64)?;
-        if bitmap.null_count()? != null_count as u64 {
-            return Err(CoveError::PageCorrupt);
-        }
-        (Some(bitmap), data)
-    };
-    let array = EncodedArray::new(
-        column.logical,
-        column.physical,
-        row_count as u64,
-        encoding,
-        validity,
-        data,
-        None,
-    );
-    array
-        .decode_all_rows()?
-        .into_iter()
-        .map(|value| decoded_value_to_scalar(column, value))
-        .collect()
-}
+pub use public::*;
 
 /// Convert Parquet bytes into a semantically valid COVE-T scan-profile file.
 pub fn convert_parquet_bytes(
@@ -1442,7 +1080,7 @@ impl ConvertedColumn {
         }
     }
 
-    fn dictionary_key_for_row(&self, row: usize) -> Result<Option<DictionaryKey>, CoveError> {
+    fn dictionary_key_for_row(&self, row: usize) -> Result<Option<FileDictionaryKey>, CoveError> {
         if self.is_null(row) {
             return Ok(None);
         }
@@ -1452,7 +1090,7 @@ impl ConvertedColumn {
         let Some(value) = values.get(row) else {
             return Ok(None);
         };
-        Ok(Some(DictionaryKey::from_logical_bytes(
+        Ok(Some(FileDictionaryKey::from_logical_bytes(
             self.entry.logical,
             value,
         )?))
@@ -1548,34 +1186,6 @@ impl IndexKeyKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct DictionaryKey {
-    value_tag: u16,
-    canonical: Vec<u8>,
-}
-
-impl DictionaryKey {
-    fn from_logical_bytes(logical: CoveLogicalType, value: &[u8]) -> Result<Self, CoveError> {
-        let canonical_value = match logical {
-            CoveLogicalType::Utf8 => {
-                CanonicalValue::Utf8(std::str::from_utf8(value).map_err(|error| {
-                    CoveError::BadSection(format!("invalid UTF-8 dictionary value: {error}"))
-                })?)
-            }
-            CoveLogicalType::Binary => CanonicalValue::Bytes(value),
-            other => {
-                return Err(CoveError::BadSchema(format!(
-                    "logical type {other:?} is not eligible for Parquet dictionary synthesis"
-                )))
-            }
-        };
-        Ok(Self {
-            value_tag: canonical_value.value_tag() as u16,
-            canonical: canonical_value.encode()?,
-        })
-    }
-}
-
 fn apply_stable_clustering(
     columns: &mut [ConvertedColumn],
     options: &ParquetConversionOptions,
@@ -1649,7 +1259,7 @@ fn apply_dictionary_synthesis(
         }
         let unique = dictionary_unique_keys(column)?;
         let raw_len = varbytes_payload_len(column)?;
-        let dict_len = dictionary_candidate_len(&unique, column.values.row_count())?;
+        let dict_len = file_dictionary_candidate_len(&unique, column.values.row_count())?;
         if policy == ParquetDictionaryPolicy::Always || dict_len < raw_len {
             selected.push(index);
         }
@@ -1662,12 +1272,7 @@ fn apply_dictionary_synthesis(
     for index in &selected {
         all_keys.extend(dictionary_unique_keys(&columns[*index])?);
     }
-    let mut assignments = BTreeMap::new();
-    for (code, key) in all_keys.into_iter().enumerate() {
-        let code = u32::try_from(code)
-            .map_err(|_| CoveError::BadSchema("dictionary entry count exceeds u32::MAX".into()))?;
-        assignments.insert(key, code);
-    }
+    let encoding = FileDictionaryEncoding::from_keys(all_keys)?;
 
     for index in selected {
         let row_count = columns[index].values.row_count();
@@ -1680,7 +1285,7 @@ fn apply_dictionary_synthesis(
             let key = columns[index]
                 .dictionary_key_for_row(row)?
                 .ok_or_else(|| CoveError::BadSchema("missing dictionary key".into()))?;
-            codes.push(*assignments.get(&key).ok_or(CoveError::BadFileCode)?);
+            codes.push(encoding.file_code_for_key(&key)?);
         }
         columns[index].values = MaterializedValues::FileCode(codes);
         columns[index].entry.physical = CovePhysicalKind::FileCode;
@@ -1690,10 +1295,12 @@ fn apply_dictionary_synthesis(
             .push("encoded as deterministic FileCode dictionary codes".into());
     }
 
-    build_file_dictionary(&assignments).map(Some)
+    Ok(Some(encoding.dictionary))
 }
 
-fn dictionary_unique_keys(column: &ConvertedColumn) -> Result<BTreeSet<DictionaryKey>, CoveError> {
+fn dictionary_unique_keys(
+    column: &ConvertedColumn,
+) -> Result<BTreeSet<FileDictionaryKey>, CoveError> {
     let mut keys = BTreeSet::new();
     for row in 0..column.values.row_count() {
         if let Some(key) = column.dictionary_key_for_row(row)? {
@@ -1715,92 +1322,6 @@ fn varbytes_payload_len(column: &ConvertedColumn) -> Result<usize, CoveError> {
             .and_then(|total| total.checked_add(value.len()))
             .ok_or(CoveError::ArithOverflow)
     })
-}
-
-fn dictionary_candidate_len(
-    unique: &BTreeSet<DictionaryKey>,
-    row_count: usize,
-) -> Result<usize, CoveError> {
-    let payload_len = unique.iter().try_fold(0usize, |total, key| {
-        if key.canonical.len() <= 16 {
-            Ok(total)
-        } else {
-            total
-                .checked_add(key.canonical.len())
-                .ok_or(CoveError::ArithOverflow)
-        }
-    })?;
-    DICT_HEADER_SIZE
-        .checked_add(
-            unique
-                .len()
-                .checked_mul(DICT_INDEX_ENTRY_SIZE)
-                .ok_or(CoveError::ArithOverflow)?,
-        )
-        .and_then(|total| total.checked_add(payload_len))
-        .and_then(|total| total.checked_add(row_count.checked_mul(4)?))
-        .ok_or(CoveError::ArithOverflow)
-}
-
-fn build_file_dictionary(
-    assignments: &BTreeMap<DictionaryKey, u32>,
-) -> Result<FileDictionary, CoveError> {
-    let entry_count = u32::try_from(assignments.len())
-        .map_err(|_| CoveError::BadSchema("dictionary entry count exceeds u32::MAX".into()))?;
-    let mut entries = Vec::with_capacity(assignments.len());
-    let mut payload = Vec::new();
-
-    // INVARIANT: FileCodes are assigned by sorted `(value_tag, canonical_bytes)`
-    // order, never by source engine dictionary codes or Parquet statistics.
-    for (expected_code, (key, assigned_code)) in assignments.iter().enumerate() {
-        if *assigned_code != u32::try_from(expected_code).map_err(|_| CoveError::ArithOverflow)? {
-            return Err(CoveError::BadFileCode);
-        }
-        let mut inline_data = [0u8; 16];
-        let (storage_class, inline_len, payload_offset, payload_length) =
-            if key.canonical.len() <= 16 {
-                inline_data[..key.canonical.len()].copy_from_slice(&key.canonical);
-                (StorageClass::Inline as u8, key.canonical.len() as u8, 0, 0)
-            } else {
-                let offset = u64::try_from(payload.len()).map_err(|_| CoveError::ArithOverflow)?;
-                let length =
-                    u32::try_from(key.canonical.len()).map_err(|_| CoveError::ArithOverflow)?;
-                payload.extend_from_slice(&key.canonical);
-                (StorageClass::Payload as u8, 0, offset, length)
-            };
-        entries.push(FileDictionaryIndexEntryV1 {
-            value_tag: key.value_tag,
-            storage_class,
-            flags: 0,
-            inline_len,
-            reserved0: [0; 3],
-            inline_data,
-            payload_offset,
-            payload_length,
-            canonical_hash64: 0,
-            reserved1: 0,
-        });
-    }
-
-    let dictionary = FileDictionary {
-        header: FileDictionaryHeaderV1 {
-            entry_count,
-            flags: 0,
-            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
-            value_hash_algorithm: 0,
-            payload_length: payload.len() as u64,
-            reserved: [0; 24],
-        },
-        entries,
-        payload,
-    };
-    let mut index = Vec::new();
-    index.extend_from_slice(&dictionary.header.serialize());
-    for entry in &dictionary.entries {
-        index.extend_from_slice(&entry.serialize());
-    }
-    FileDictionary::parse(&index, &dictionary.payload)?;
-    Ok(dictionary)
 }
 
 fn build_column_domains(

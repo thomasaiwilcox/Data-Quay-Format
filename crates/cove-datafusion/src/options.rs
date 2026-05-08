@@ -63,13 +63,16 @@ pub enum LocalFileReadPolicy {
 impl Default for CoveTableOptions {
     fn default() -> Self {
         Self {
-            arrow_export_options: ArrowExportOptions::default(),
+            arrow_export_options: ArrowExportOptions {
+                string_validation_policy: ArrowStringValidationPolicy::StrictOrCachedProof,
+                ..ArrowExportOptions::default()
+            },
             covm_trust_policy: CovmTrustPolicy::Conservative,
             sidecar_digest_policy: SidecarDigestPolicy::RequireFreshFingerprint,
             covx_discovery: default_covx_discovery(),
             execution_code_policy: ExecutionCodePolicy::Opportunistic,
             page_payload_validation_policy: PagePayloadValidationPolicy::Trusted,
-            local_file_read_policy: LocalFileReadPolicy::PositionedReads,
+            local_file_read_policy: LocalFileReadPolicy::Mmap,
             target_morsels_per_partition: 128,
             range_coalescing: RangeCoalescingOptions::default(),
             #[cfg(feature = "dynamic-filters")]
@@ -111,6 +114,12 @@ impl CoveTableOptions {
 
     pub fn with_strict_arrow_string_validation(mut self) -> Self {
         self.arrow_export_options.string_validation_policy = ArrowStringValidationPolicy::Strict;
+        self
+    }
+
+    pub fn with_cached_proof_arrow_string_validation(mut self) -> Self {
+        self.arrow_export_options.string_validation_policy =
+            ArrowStringValidationPolicy::StrictOrCachedProof;
         self
     }
 
@@ -171,6 +180,17 @@ impl CoveTableOptions {
     pub fn with_local_file_mmap_reads(mut self) -> Self {
         self.local_file_read_policy = LocalFileReadPolicy::Mmap;
         self
+    }
+
+    /// Enable the two fastest knobs measured for trusted immutable local files:
+    /// skip Arrow UTF-8 revalidation and use mmap-backed local reads.
+    ///
+    /// This is only appropriate when every non-null Utf8 row slice is already
+    /// known to be valid UTF-8 and the local file will not be concurrently
+    /// replaced, truncated, or modified while it is being scanned.
+    pub fn with_trusted_arrow_string_validation_and_local_file_mmap_reads(self) -> Self {
+        self.with_trusted_arrow_string_validation()
+            .with_local_file_mmap_reads()
     }
 
     pub fn with_positioned_local_file_reads(mut self) -> Self {

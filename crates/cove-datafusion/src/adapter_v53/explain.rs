@@ -6,7 +6,11 @@ use crate::{
     planner::ScanPlan,
 };
 
-pub(crate) fn format_cove_exec(state: &DatasetState, plan: &ScanPlan) -> String {
+pub(crate) fn format_cove_exec(
+    state: &DatasetState,
+    plan: &ScanPlan,
+    materialization_mode: &str,
+) -> String {
     let execution_supported = state
         .files()
         .iter()
@@ -18,7 +22,7 @@ pub(crate) fn format_cove_exec(state: &DatasetState, plan: &ScanPlan) -> String 
         })
         .count();
     format!(
-        "CoveExec: source={}, rows={}, segments={}, files={}, projection={:?}, pushed_filters={}, predicate_columns={}, scan_program=({}), topn_hint={:?}, execution_code_policy={:?}, execution_code_supported_files={}",
+        "CoveExec: source={}, rows={}, segments={}, files={}, projection={:?}, pushed_filters={}, predicate_columns={}, scan_program=({}), topn_hint={:?}, materialization_mode={}, execution_code_policy={:?}, execution_code_supported_files={}",
         state.source(),
         state.table().row_count,
         state.segments().len(),
@@ -28,6 +32,7 @@ pub(crate) fn format_cove_exec(state: &DatasetState, plan: &ScanPlan) -> String 
         plan.predicate_columns.len(),
         plan.scan_program.display_summary(),
         plan.topn_hint,
+        materialization_mode,
         state.execution_code_policy(),
         execution_supported
     )
