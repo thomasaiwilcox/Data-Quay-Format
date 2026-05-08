@@ -1,10 +1,13 @@
 //! Immutable dataset metadata state shared across scans.
 
+mod pruning_sections;
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_schema::{Schema, SchemaRef};
 use cove_arrow::arrow::{
     arrow_data_type_for_column_export_options, ArrowExportOptions, ArrowFidelitySeverity,
+    ArrowStringValidationPolicy,
 };
 use cove_core::{
     compression,
@@ -33,12 +36,19 @@ use cove_core::{
 };
 
 use crate::{
+    decode::Utf8ProofCache,
     execution_code::{self, ExecutionCodePlanStats},
     options::{ExecutionCodePolicy, LocalFileReadPolicy, PagePayloadValidationPolicy},
     overlay::RowVisibility,
     planner::{CovePredicate, ScanPlan},
     range_reader::RangeCoalescingOptions,
     scan_program::compile_scan_program,
+};
+
+pub use pruning_sections::{
+    parse_aggregates_from_sections, parse_blooms_from_sections, parse_column_domains_from_sections,
+    parse_composites_from_sections, parse_exact_sets_from_sections, parse_inverted_from_sections,
+    parse_lookups_from_sections, parse_topn_from_sections, parse_zone_stats_from_sections,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -196,6 +206,7 @@ pub struct DatasetState {
     planning_cache: PlanningCache,
     file_table: FileTable,
     files: Arc<Vec<FileMetadata>>,
+    utf8_proof_cache: Arc<Utf8ProofCache>,
     bootstrap_stats: DatasetBootstrapStats,
 }
 
@@ -205,7 +216,10 @@ impl DatasetState {
         Self::from_bytes_with_options(
             source,
             bytes,
-            ArrowExportOptions::default(),
+            ArrowExportOptions {
+                string_validation_policy: ArrowStringValidationPolicy::StrictOrCachedProof,
+                ..ArrowExportOptions::default()
+            },
             ExecutionCodePolicy::Opportunistic,
             PagePayloadValidationPolicy::Trusted,
             LocalFileReadPolicy::PositionedReads,
@@ -266,13 +280,13 @@ impl DatasetState {
         let pruning = PruningMetadata {
             column_domains: Arc::new(mounted.column_domains.clone()),
             zone_stats: Arc::new(mounted.zone_stats.clone()),
-            exact_sets: Arc::new(parse_exact_sets(&bytes, &mounted.footer)),
-            blooms: Arc::new(parse_blooms(&bytes, &mounted.footer)),
-            lookups: Arc::new(parse_lookups(&bytes, &mounted.footer)),
-            inverted: Arc::new(parse_inverted(&bytes, &mounted.footer)),
-            aggregates: Arc::new(parse_aggregates(&bytes, &mounted.footer)),
-            composites: Arc::new(parse_composites(&bytes, &mounted.footer)),
-            topn: Arc::new(parse_topn(&bytes, &mounted.footer)),
+            exact_sets: Arc::new(parse_exact_sets_from_sections(&bytes, &mounted.footer)),
+            blooms: Arc::new(parse_blooms_from_sections(&bytes, &mounted.footer)),
+            lookups: Arc::new(parse_lookups_from_sections(&bytes, &mounted.footer)),
+            inverted: Arc::new(parse_inverted_from_sections(&bytes, &mounted.footer)),
+            aggregates: Arc::new(parse_aggregates_from_sections(&bytes, &mounted.footer)),
+            composites: Arc::new(parse_composites_from_sections(&bytes, &mounted.footer)),
+            topn: Arc::new(parse_topn_from_sections(&bytes, &mounted.footer)),
         };
         let identity = FileIdentity {
             source,
@@ -315,6 +329,7 @@ impl DatasetState {
             planning_cache,
             file_table,
             files: Arc::new(vec![file]),
+            utf8_proof_cache: Arc::new(Utf8ProofCache::default()),
             bootstrap_stats: DatasetBootstrapStats {
                 files_considered: 1,
                 files_validated: 1,
@@ -396,6 +411,7 @@ impl DatasetState {
             planning_cache,
             file_table,
             files: Arc::new(vec![file]),
+            utf8_proof_cache: Arc::new(Utf8ProofCache::default()),
             bootstrap_stats: DatasetBootstrapStats {
                 files_considered: 1,
                 files_validated: 1,
@@ -465,6 +481,7 @@ impl DatasetState {
             planning_cache,
             file_table,
             files: Arc::new(files),
+            utf8_proof_cache: Arc::new(Utf8ProofCache::default()),
             bootstrap_stats,
         })
     }
@@ -596,6 +613,7 @@ impl DatasetState {
             planning_cache,
             file_table,
             files: Arc::new(vec![file]),
+            utf8_proof_cache: Arc::clone(&self.utf8_proof_cache),
             bootstrap_stats: DatasetBootstrapStats {
                 files_considered: 1,
                 files_validated: 1,
@@ -606,6 +624,10 @@ impl DatasetState {
 
     pub fn identity(&self) -> &FileIdentity {
         &self.identity
+    }
+
+    pub(crate) fn utf8_proof_cache(&self) -> &Arc<Utf8ProofCache> {
+        &self.utf8_proof_cache
     }
 
     pub fn source(&self) -> &str {
@@ -1033,124 +1055,6 @@ impl FileMetadata {
     pub fn has_redaction(&self) -> bool {
         file_has_redaction(self)
     }
-}
-
-pub fn parse_column_domains_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<ColumnDomain> {
-    footer
-        .sections
-        .iter()
-        .filter(|entry| entry.section_kind == SectionKind::ColumnDomain as u16)
-        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
-        .filter_map(|payload| ColumnDomain::parse(&payload).ok())
-        .collect()
-}
-
-pub fn parse_zone_stats_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<ZoneStatsSection> {
-    footer
-        .sections
-        .iter()
-        .filter(|entry| entry.section_kind == SectionKind::ZoneStats as u16)
-        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
-        .filter_map(|payload| ZoneStatsSection::parse(&payload).ok())
-        .collect()
-}
-
-pub fn parse_exact_sets_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<ExactSetIndex> {
-    parse_exact_sets(bytes, footer)
-}
-
-pub fn parse_blooms_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<BloomFilterIndex> {
-    parse_blooms(bytes, footer)
-}
-
-pub fn parse_lookups_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<LookupIndex> {
-    parse_lookups(bytes, footer)
-}
-
-pub fn parse_inverted_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<InvertedMorselIndex> {
-    parse_inverted(bytes, footer)
-}
-
-pub fn parse_aggregates_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<AggregateSynopsis> {
-    parse_aggregates(bytes, footer)
-}
-
-pub fn parse_composites_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<CompositeIndex> {
-    parse_composites(bytes, footer)
-}
-
-pub fn parse_topn_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<TopNSummary> {
-    parse_topn(bytes, footer)
-}
-
-fn parse_exact_sets(bytes: &[u8], footer: &CoveFooter) -> Vec<ExactSetIndex> {
-    footer
-        .sections
-        .iter()
-        .filter(|entry| entry.section_kind == SectionKind::ExactSetIndex as u16)
-        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
-        .filter_map(|payload| ExactSetIndex::parse(&payload).ok())
-        .collect()
-}
-
-fn parse_blooms(bytes: &[u8], footer: &CoveFooter) -> Vec<BloomFilterIndex> {
-    footer
-        .sections
-        .iter()
-        .filter(|entry| entry.section_kind == SectionKind::BloomIndex as u16)
-        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
-        .filter_map(|payload| BloomFilterIndex::parse(&payload).ok())
-        .collect()
-}
-
-fn parse_lookups(bytes: &[u8], footer: &CoveFooter) -> Vec<LookupIndex> {
-    footer
-        .sections
-        .iter()
-        .filter(|entry| entry.section_kind == SectionKind::LookupIndex as u16)
-        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
-        .filter_map(|payload| LookupIndex::parse(&payload).ok())
-        .collect()
-}
-
-fn parse_inverted(bytes: &[u8], footer: &CoveFooter) -> Vec<InvertedMorselIndex> {
-    footer
-        .sections
-        .iter()
-        .filter(|entry| entry.section_kind == SectionKind::InvertedMorselIndex as u16)
-        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
-        .filter_map(|payload| InvertedMorselIndex::parse(&payload).ok())
-        .collect()
-}
-
-fn parse_aggregates(bytes: &[u8], footer: &CoveFooter) -> Vec<AggregateSynopsis> {
-    footer
-        .sections
-        .iter()
-        .filter(|entry| entry.section_kind == SectionKind::AggregateSynopsis as u16)
-        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
-        .filter_map(|payload| AggregateSynopsis::parse(&payload).ok())
-        .collect()
-}
-
-fn parse_composites(bytes: &[u8], footer: &CoveFooter) -> Vec<CompositeIndex> {
-    footer
-        .sections
-        .iter()
-        .filter(|entry| entry.section_kind == SectionKind::CompositeZoneIndex as u16)
-        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
-        .filter_map(|payload| CompositeIndex::parse(&payload).ok())
-        .collect()
-}
-
-fn parse_topn(bytes: &[u8], footer: &CoveFooter) -> Vec<TopNSummary> {
-    footer
-        .sections
-        .iter()
-        .filter(|entry| entry.section_kind == SectionKind::TopNZoneSummary as u16)
-        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
-        .filter_map(|payload| TopNSummary::parse(&payload).ok())
-        .collect()
 }
 
 fn mounted_from_metadata(

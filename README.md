@@ -108,6 +108,14 @@ A short smoke run for that compare track is:
 cargo bench -p cove-datafusion --features parquet-compare --bench m6 parquet_compare -- --sample-size 10 --warm-up-time 0.1 --measurement-time 0.1
 ```
 
+For string-heavy local-file scans, the compare track includes the
+`standard-strict`, `standard-trusted`, `standard-strict-mmap`, and
+`standard-trusted-mmap` COVE variants. Treat Arrow view output as a separate
+measurement target rather than an assumed win on those workloads.
+
+Local COVE scans now default to mmap-backed reads. Switch back to positioned
+reads only when the file may be concurrently replaced, truncated, or modified.
+
 The compare track now includes heavier `scan_heavy` and `cold_context`
 benchmarks on larger matched fixtures. Those are intended for targeted
 regression checks rather than every edit-loop run. To focus on one heavier

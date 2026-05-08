@@ -50,6 +50,14 @@ pub struct RangeReadPlan {
     pub coalesced_ranges: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoalescedRangeStats {
+    pub original_ranges: usize,
+    pub coalesced_ranges: usize,
+    pub original_bytes: usize,
+    pub coalesced_bytes: usize,
+}
+
 impl RangeReadPlan {
     pub fn choose(
         selected_rows: usize,
@@ -186,9 +194,9 @@ impl RetainedByteSource for MmapByteSource {
 
 /// Read-only mmap-backed local range reader.
 ///
-/// INVARIANT: this reader is only selected by the explicit mmap read policy.
-/// Callers must use it for immutable local COVE files; if a file may be
-/// concurrently replaced, truncated, or modified, use `LocalFileRangeReader`.
+/// INVARIANT: callers must only select this reader for immutable local COVE
+/// files. If a file may be concurrently replaced, truncated, or modified, use
+/// `LocalFileRangeReader`.
 #[derive(Debug)]
 pub struct MmapFileRangeReader {
     path: PathBuf,
@@ -217,10 +225,10 @@ impl MmapFileRangeReader {
         let owner = if len == 0 {
             Arc::new(RetainedByteOwner::from_vec(Vec::new()))
         } else {
-            // SAFETY: mmap mode is an explicit scan policy for immutable local
-            // COVE files. The returned read-only map is retained by the owner
-            // for every slice built from it, and positioned reads remain the
-            // default for files that may be concurrently modified/truncated.
+            // SAFETY: mmap mode is only sound for immutable local COVE files.
+            // The returned read-only map is retained by the owner for every
+            // slice built from it, and positioned reads remain available for
+            // files that may be concurrently modified or truncated.
             let mmap = unsafe { Mmap::map(&file)? };
             Arc::new(RetainedByteOwner::from_external(Arc::new(MmapByteSource {
                 mmap,
@@ -329,6 +337,18 @@ struct CoalescedRange {
     originals: Vec<OriginalRange>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CoalescedRangePlan {
+    stats: CoalescedRangeStats,
+    coalesced: Vec<CoalescedRange>,
+}
+
+impl CoalescedRangePlan {
+    pub(crate) fn stats(&self) -> CoalescedRangeStats {
+        self.stats
+    }
+}
+
 pub async fn read_coalesced_ranges<R: CoveRangeReader + ?Sized>(
     reader: &R,
     ranges: &[Range<u64>],
@@ -359,22 +379,31 @@ pub async fn read_coalesced_range_buffers_with_options<R: CoveRangeReader + ?Siz
     kind: RangeReadKind,
     options: RangeCoalescingOptions,
 ) -> Result<Vec<RetainedBytes>, CoveError> {
-    if ranges.is_empty() {
+    let plan = build_coalesced_range_plan(ranges, options)?;
+    read_coalesced_range_buffers_for_plan(reader, kind, &plan).await
+}
+
+pub(crate) async fn read_coalesced_range_buffers_for_plan<R: CoveRangeReader + ?Sized>(
+    reader: &R,
+    kind: RangeReadKind,
+    plan: &CoalescedRangePlan,
+) -> Result<Vec<RetainedBytes>, CoveError> {
+    if plan.stats.original_ranges == 0 {
         return Ok(Vec::new());
     }
-    let coalesced = coalesce_ranges(ranges, options.max_gap, options.max_span)?;
-    reader.record_coalescing(ranges.len(), coalesced.len());
-    let reads = coalesced
+    reader.record_coalescing(plan.stats.original_ranges, plan.stats.coalesced_ranges);
+    let reads = plan
+        .coalesced
         .iter()
         .map(|range| range.start..range.end)
         .collect::<Vec<_>>();
     let coalesced_bytes = reader.read_range_buffers(&reads, kind).await?;
-    if coalesced_bytes.len() != coalesced.len() {
+    if coalesced_bytes.len() != plan.coalesced.len() {
         return Err(CoveError::BufferTooShort);
     }
 
-    let mut out = vec![None; ranges.len()];
-    for (group, bytes) in coalesced.iter().zip(coalesced_bytes.iter()) {
+    let mut out = vec![None; plan.stats.original_ranges];
+    for (group, bytes) in plan.coalesced.iter().zip(coalesced_bytes.iter()) {
         for original in &group.originals {
             let offset = usize::try_from(
                 original
@@ -402,7 +431,45 @@ pub fn coalesced_range_count(
     ranges: &[Range<u64>],
     options: RangeCoalescingOptions,
 ) -> Result<usize, CoveError> {
-    coalesce_ranges(ranges, options.max_gap, options.max_span).map(|ranges| ranges.len())
+    build_coalesced_range_plan(ranges, options).map(|plan| plan.stats.coalesced_ranges)
+}
+
+pub fn coalesced_range_stats(
+    ranges: &[Range<u64>],
+    options: RangeCoalescingOptions,
+) -> Result<CoalescedRangeStats, CoveError> {
+    build_coalesced_range_plan(ranges, options).map(|plan| plan.stats)
+}
+
+pub(crate) fn build_coalesced_range_plan(
+    ranges: &[Range<u64>],
+    options: RangeCoalescingOptions,
+) -> Result<CoalescedRangePlan, CoveError> {
+    let coalesced = coalesce_ranges(ranges, options.max_gap, options.max_span)?;
+    let original_bytes = ranges.iter().try_fold(0usize, |total, range| {
+        total
+            .checked_add(range_len(range)?)
+            .ok_or(CoveError::ArithOverflow)
+    })?;
+    let coalesced_bytes = coalesced.iter().try_fold(0usize, |total, range| {
+        let len = usize::try_from(
+            range
+                .end
+                .checked_sub(range.start)
+                .ok_or(CoveError::OffsetRange)?,
+        )
+        .map_err(|_| CoveError::OffsetRange)?;
+        total.checked_add(len).ok_or(CoveError::ArithOverflow)
+    })?;
+    Ok(CoalescedRangePlan {
+        stats: CoalescedRangeStats {
+            original_ranges: ranges.len(),
+            coalesced_ranges: coalesced.len(),
+            original_bytes,
+            coalesced_bytes,
+        },
+        coalesced,
+    })
 }
 
 fn coalesce_ranges(
@@ -552,6 +619,24 @@ mod tests {
         assert!(out[0].shares_owner(&out[1]));
         assert_eq!(out[0].owner_offset(), 10);
         assert_eq!(out[1].owner_offset(), 16);
+    }
+
+    #[test]
+    fn coalesced_range_stats_report_requested_and_used_bytes() {
+        let ranges = vec![10..14, 16..20, 40..44];
+        let stats = coalesced_range_stats(
+            &ranges,
+            RangeCoalescingOptions {
+                max_gap: 4,
+                max_span: 16,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(stats.original_ranges, 3);
+        assert_eq!(stats.coalesced_ranges, 2);
+        assert_eq!(stats.original_bytes, 12);
+        assert_eq!(stats.coalesced_bytes, 14);
     }
 
     #[test]

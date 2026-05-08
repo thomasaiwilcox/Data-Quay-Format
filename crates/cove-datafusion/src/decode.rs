@@ -1,17 +1,17 @@
 //! Decode and materialization kernels shared by execution modes.
 
-use std::{
-    borrow::Cow,
-    collections::HashMap,
-    path::Path,
-    sync::{Arc, Mutex},
-};
+mod cache;
+mod selection;
+mod stats;
+
+use std::{borrow::Cow, path::Path, sync::Arc};
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
 use cove_arrow::arrow::{
-    arrow_buffer_owner, encoded_columns_to_arrow_arrays_with_owners_options, ArrowEncodedColumn,
-    ArrowExportOptions, ArrowRowSelection, ArrowVarBytesExportPolicy,
+    arrow_buffer_owner, encoded_array_to_arrow_with_row_selection_options_and_owner,
+    ArrowBufferOwner, ArrowExportOptions, ArrowRowSelection, ArrowStringValidationPolicy,
+    ArrowVarBytesExportPolicy,
 };
 use cove_core::{
     array::{CoveArrayValue, EncodedArray, PreparedEncodedArray},
@@ -38,406 +38,36 @@ use crate::{
     dataset_state::{DatasetBootstrapStats, DatasetState},
     options::{LocalFileReadPolicy, PagePayloadValidationPolicy},
     planner::{
-        CoveFilterUse, CovePredicate, NullPredicateKind, NumericPredicateOp, PredicateLiteral,
-        ScanPlan,
+        CoveFilterUse, CovePredicate, FilterPlan, NullPredicateKind, NumericPredicateOp,
+        PredicateLiteral, ScanPlan,
     },
     prune,
     range_reader::{
-        coalesced_range_count, read_coalesced_range_buffers_with_options, CoveRangeReader,
+        build_coalesced_range_plan, read_coalesced_range_buffers_for_plan, CoveRangeReader,
         LocalFileRangeReader, MemoryRangeReader, MmapFileRangeReader, RangeReadKind, RangeReadMode,
         RangeReadPlan,
     },
     task_graph::ScanTask,
 };
+pub use stats::{DecodeStats, DecodedScan};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DecodeStats {
-    pub files_considered: usize,
-    pub files_pruned: usize,
-    pub files_validated: usize,
-    pub overlay_files_hidden: usize,
-    pub overlay_rows_hidden: usize,
-    pub overlay_morsels_pruned: usize,
-    pub covm_entries_stale: usize,
-    pub manifest_fallbacks: usize,
-    pub covx_sidecars_loaded: usize,
-    pub covx_sidecars_stale: usize,
-    pub covx_sidecars_ignored: usize,
-    pub sidecar_index_fallbacks: usize,
-    pub pages_decoded: usize,
-    pub rows_materialized: usize,
-    pub rows_selected: usize,
-    pub morsels_pruned: usize,
-    pub morsels_considered: usize,
-    pub predicate_pages_checked: usize,
-    pub residual_rows: usize,
-    pub metadata_bytes_read: usize,
-    pub data_bytes_read: usize,
-    pub range_requests: usize,
-    pub coalesced_range_requests: usize,
-    pub scan_tasks: usize,
-    pub scan_partitions: usize,
-    pub dynamic_filter_snapshots: usize,
-    pub dynamic_filter_pruned_tasks: usize,
-    pub dynamic_filter_fallbacks: usize,
-    pub lookup_index_hits: usize,
-    pub lookup_index_misses: usize,
-    pub inverted_index_hits: usize,
-    pub index_rows_selected: usize,
-    pub index_fallbacks: usize,
-    pub execution_code_profiles_used: usize,
-    pub execution_code_profile_fallbacks: usize,
-    pub execution_code_literal_resolutions: usize,
-    pub exact_predicates: usize,
-    pub residual_predicates: usize,
-    pub exactness_fallbacks: usize,
-    pub lookup_rowref_tasks: usize,
-    pub selection_all_rows: usize,
-    pub selection_none: usize,
-    pub selection_bitsets: usize,
-    pub selection_row_indices: usize,
-    pub range_plan_sparse: usize,
-    pub range_plan_mixed: usize,
-    pub range_plan_dense: usize,
-    pub kernel_fallbacks: usize,
+pub(crate) use cache::{ScanExecutionCache, Utf8ProofCache};
+use cache::{SegmentMetadataCacheKey, Utf8ProofKey};
+use selection::{DecodeScratch, Selection, SelectionMask};
+
+struct DecodedArrowColumn<'name, 'array, 'data> {
+    name: &'name str,
+    array: &'array EncodedArray<'data>,
+    data_owner: Option<ArrowBufferOwner>,
+    utf8_proof_key: Option<Utf8ProofKey>,
 }
 
-impl DecodeStats {
-    fn record_bootstrap(&mut self, stats: DatasetBootstrapStats) {
-        self.files_considered += stats.files_considered;
-        self.files_pruned += stats.files_pruned;
-        self.files_validated += stats.files_validated;
-        self.overlay_files_hidden += stats.overlay_files_hidden;
-        self.overlay_rows_hidden += stats.overlay_rows_hidden;
-        self.covm_entries_stale += stats.covm_entries_stale;
-        self.manifest_fallbacks += stats.manifest_fallbacks;
-        self.covx_sidecars_loaded += stats.covx_sidecars_loaded;
-        self.covx_sidecars_stale += stats.covx_sidecars_stale;
-        self.covx_sidecars_ignored += stats.covx_sidecars_ignored;
-        self.sidecar_index_fallbacks += stats.sidecar_index_fallbacks;
-    }
-
-    pub(crate) fn add_decode(&mut self, other: Self) {
-        self.files_considered += other.files_considered;
-        self.files_pruned += other.files_pruned;
-        self.files_validated += other.files_validated;
-        self.overlay_files_hidden += other.overlay_files_hidden;
-        self.overlay_rows_hidden += other.overlay_rows_hidden;
-        self.overlay_morsels_pruned += other.overlay_morsels_pruned;
-        self.covm_entries_stale += other.covm_entries_stale;
-        self.manifest_fallbacks += other.manifest_fallbacks;
-        self.covx_sidecars_loaded += other.covx_sidecars_loaded;
-        self.covx_sidecars_stale += other.covx_sidecars_stale;
-        self.covx_sidecars_ignored += other.covx_sidecars_ignored;
-        self.sidecar_index_fallbacks += other.sidecar_index_fallbacks;
-        self.pages_decoded += other.pages_decoded;
-        self.rows_materialized += other.rows_materialized;
-        self.rows_selected += other.rows_selected;
-        self.morsels_pruned += other.morsels_pruned;
-        self.morsels_considered += other.morsels_considered;
-        self.predicate_pages_checked += other.predicate_pages_checked;
-        self.residual_rows += other.residual_rows;
-        self.metadata_bytes_read += other.metadata_bytes_read;
-        self.data_bytes_read += other.data_bytes_read;
-        self.range_requests += other.range_requests;
-        self.coalesced_range_requests += other.coalesced_range_requests;
-        self.scan_tasks += other.scan_tasks;
-        self.scan_partitions += other.scan_partitions;
-        self.dynamic_filter_snapshots += other.dynamic_filter_snapshots;
-        self.dynamic_filter_pruned_tasks += other.dynamic_filter_pruned_tasks;
-        self.dynamic_filter_fallbacks += other.dynamic_filter_fallbacks;
-        self.lookup_index_hits += other.lookup_index_hits;
-        self.lookup_index_misses += other.lookup_index_misses;
-        self.inverted_index_hits += other.inverted_index_hits;
-        self.index_rows_selected += other.index_rows_selected;
-        self.index_fallbacks += other.index_fallbacks;
-        self.execution_code_profiles_used += other.execution_code_profiles_used;
-        self.execution_code_profile_fallbacks += other.execution_code_profile_fallbacks;
-        self.execution_code_literal_resolutions += other.execution_code_literal_resolutions;
-        self.exact_predicates += other.exact_predicates;
-        self.residual_predicates += other.residual_predicates;
-        self.exactness_fallbacks += other.exactness_fallbacks;
-        self.lookup_rowref_tasks += other.lookup_rowref_tasks;
-        self.selection_all_rows += other.selection_all_rows;
-        self.selection_none += other.selection_none;
-        self.selection_bitsets += other.selection_bitsets;
-        self.selection_row_indices += other.selection_row_indices;
-        self.range_plan_sparse += other.range_plan_sparse;
-        self.range_plan_mixed += other.range_plan_mixed;
-        self.range_plan_dense += other.range_plan_dense;
-        self.kernel_fallbacks += other.kernel_fallbacks;
-    }
-}
-
-#[derive(Debug)]
-pub struct DecodedScan {
-    pub batches: Vec<RecordBatch>,
-    pub stats: DecodeStats,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct ScanExecutionCache {
-    local_readers: Mutex<HashMap<LocalReaderCacheKey, Arc<dyn CoveRangeReader>>>,
-    segment_metadata: Mutex<HashMap<SegmentMetadataCacheKey, Arc<SegmentMetadata>>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct LocalReaderCacheKey {
-    file_ordinal: usize,
-    policy: LocalFileReadPolicy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SegmentMetadataCacheKey {
-    file_ordinal: usize,
-    table_id: u32,
-    segment_id: u32,
-    row_start: u64,
-    offset: u64,
-    length: u64,
-}
-
-impl SegmentMetadataCacheKey {
-    fn new(file_ordinal: usize, segment_ref: &TableSegmentIndexEntryV1) -> Self {
-        Self {
-            file_ordinal,
-            table_id: segment_ref.table_id,
-            segment_id: segment_ref.segment_id,
-            row_start: u64::from(segment_ref.row_start),
-            offset: segment_ref.offset,
-            length: segment_ref.length,
-        }
-    }
-}
-
-impl ScanExecutionCache {
-    fn local_reader(
-        &self,
-        file_ordinal: usize,
-        policy: LocalFileReadPolicy,
-        path: impl AsRef<Path>,
-    ) -> Result<Arc<dyn CoveRangeReader>, CoveError> {
-        let path = path.as_ref().to_path_buf();
-        let mut readers = self.local_readers.lock().map_err(|_| {
-            CoveError::BadSection("scan execution local-reader cache lock poisoned".into())
-        })?;
-        let key = LocalReaderCacheKey {
-            file_ordinal,
-            policy,
-        };
-        Ok(Arc::clone(readers.entry(key).or_insert_with(
-            || match policy {
-                LocalFileReadPolicy::PositionedReads => Arc::new(LocalFileRangeReader::new(&path)),
-                LocalFileReadPolicy::Mmap => Arc::new(MmapFileRangeReader::new(&path)),
-            },
-        )))
-    }
-
-    fn get_segment_metadata(
-        &self,
-        key: SegmentMetadataCacheKey,
-    ) -> Result<Option<Arc<SegmentMetadata>>, CoveError> {
-        let metadata = self.segment_metadata.lock().map_err(|_| {
-            CoveError::BadSection("scan execution segment-metadata cache lock poisoned".into())
-        })?;
-        Ok(metadata.get(&key).cloned())
-    }
-
-    fn insert_segment_metadata(
-        &self,
-        key: SegmentMetadataCacheKey,
-        segment: Arc<SegmentMetadata>,
-    ) -> Result<Arc<SegmentMetadata>, CoveError> {
-        let mut metadata = self.segment_metadata.lock().map_err(|_| {
-            CoveError::BadSection("scan execution segment-metadata cache lock poisoned".into())
-        })?;
-        Ok(Arc::clone(metadata.entry(key).or_insert(segment)))
-    }
-}
-
-#[derive(Debug, Default)]
-struct DecodeScratch {
-    selected_mask: SelectionMask,
-    filter_mask: SelectionMask,
-    selected_rows: Vec<u32>,
-    selection: Selection,
-}
-
-#[derive(Debug, Default, Clone)]
-struct SelectionMask {
-    words: Vec<u64>,
-    len: usize,
-}
-
-#[derive(Debug, Clone, Default)]
-enum Selection {
-    #[default]
-    None,
-    AllRows {
-        len: usize,
-    },
-    Bitset(SelectionMask),
-    RowIndices(Vec<u32>),
-}
-
-impl Selection {
-    fn len(&self) -> usize {
-        match self {
-            Self::None => 0,
-            Self::AllRows { len } => *len,
-            Self::Bitset(mask) => mask.count_ones(),
-            Self::RowIndices(rows) => rows.len(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    fn from_mask(mask: &SelectionMask, rows: &mut Vec<u32>) -> Result<Self, CoveError> {
-        let selected = mask.count_ones();
-        if selected == 0 {
-            return Ok(Self::None);
-        }
-        if selected == mask.len {
-            return Ok(Self::AllRows { len: mask.len });
-        }
-        if selected * 5 <= mask.len {
-            mask.write_selected_rows(rows)?;
-            return Ok(Self::RowIndices(rows.clone()));
-        }
-        Ok(Self::Bitset(mask.clone()))
-    }
-
-    fn from_rows(rows: &[u32], row_count: usize) -> Self {
-        if rows.is_empty() {
-            return Self::None;
-        }
-        if rows.len() == row_count
-            && rows
-                .iter()
-                .enumerate()
-                .all(|(index, row)| u32::try_from(index).ok() == Some(*row))
-        {
-            return Self::AllRows { len: row_count };
-        }
-        if rows.len() * 5 <= row_count {
-            Self::RowIndices(rows.to_vec())
-        } else {
-            let mut mask = SelectionMask::default();
-            mask.fill_none(row_count);
-            for row in rows {
-                let index = *row as usize;
-                if index < row_count {
-                    mask.set(index);
-                }
-            }
-            Self::Bitset(mask)
-        }
-    }
-
-    fn write_rows(&self, rows: &mut Vec<u32>) -> Result<(), CoveError> {
-        rows.clear();
-        match self {
-            Self::None => Ok(()),
-            Self::AllRows { len } => {
-                rows.reserve(*len);
-                for row in 0..*len {
-                    rows.push(u32::try_from(row).map_err(|_| CoveError::ArithOverflow)?);
-                }
-                Ok(())
-            }
-            Self::Bitset(mask) => mask.write_selected_rows(rows),
-            Self::RowIndices(values) => {
-                rows.extend_from_slice(values);
-                Ok(())
-            }
-        }
-    }
-
-    fn record(&self, stats: &mut DecodeStats) {
-        match self {
-            Self::None => stats.selection_none += 1,
-            Self::AllRows { .. } => stats.selection_all_rows += 1,
-            Self::Bitset(_) => stats.selection_bitsets += 1,
-            Self::RowIndices(_) => stats.selection_row_indices += 1,
-        }
-    }
-}
-
-impl SelectionMask {
-    fn fill_all(&mut self, len: usize) {
-        self.len = len;
-        let word_len = len.div_ceil(64);
-        self.words.clear();
-        self.words.resize(word_len, u64::MAX);
-        self.mask_tail();
-    }
-
-    fn fill_none(&mut self, len: usize) {
-        self.len = len;
-        let word_len = len.div_ceil(64);
-        self.words.clear();
-        self.words.resize(word_len, 0);
-    }
-
-    fn set(&mut self, index: usize) {
-        debug_assert!(index < self.len);
-        self.words[index / 64] |= 1u64 << (index % 64);
-    }
-
-    fn clear_bit(&mut self, index: usize) {
-        debug_assert!(index < self.len);
-        self.words[index / 64] &= !(1u64 << (index % 64));
-    }
-
-    fn and_inplace(&mut self, other: &Self) {
-        debug_assert_eq!(self.len, other.len);
-        for (left, right) in self.words.iter_mut().zip(other.words.iter()) {
-            *left &= *right;
-        }
-    }
-
-    fn all_zero(&self) -> bool {
-        self.words.iter().all(|word| *word == 0)
-    }
-
-    fn count_ones(&self) -> usize {
-        self.words
-            .iter()
-            .map(|word| word.count_ones() as usize)
-            .sum()
-    }
-
-    fn write_selected_rows(&self, rows: &mut Vec<u32>) -> Result<(), CoveError> {
-        rows.clear();
-        rows.reserve(self.count_ones());
-        for (word_index, word) in self.words.iter().copied().enumerate() {
-            let mut remaining = word;
-            while remaining != 0 {
-                let bit = remaining.trailing_zeros() as usize;
-                let index = word_index
-                    .checked_mul(64)
-                    .and_then(|base| base.checked_add(bit))
-                    .ok_or(CoveError::ArithOverflow)?;
-                if index < self.len {
-                    rows.push(u32::try_from(index).map_err(|_| CoveError::ArithOverflow)?);
-                }
-                remaining &= remaining - 1;
-            }
-        }
-        Ok(())
-    }
-
-    fn mask_tail(&mut self) {
-        let tail_bits = self.len % 64;
-        if tail_bits == 0 {
-            return;
-        }
-        if let Some(last) = self.words.last_mut() {
-            *last &= (1u64 << tail_bits) - 1;
-        }
-    }
+struct PredicateDecodeInput<'filter, 'predicate, 'column> {
+    filter: &'filter FilterPlan,
+    predicate: &'predicate CovePredicate,
+    column: &'column ColumnEntry,
+    page: ColumnPageIndexEntryV1,
+    range_slot: Option<usize>,
 }
 
 pub fn decode_local_dataset_scan(
@@ -675,6 +305,12 @@ pub fn decode_scan(state: &DatasetState, plan: &ScanPlan) -> Result<DecodedScan,
             if plan_has_residual(&plan) {
                 stats.residual_rows += selected_len;
             }
+            record_late_materialization(
+                &plan,
+                morsel.row_count as usize,
+                selected_len,
+                &mut stats,
+            )?;
 
             if plan.scan_projection.is_empty() {
                 let options = RecordBatchOptions::new().with_row_count(Some(selected_len));
@@ -727,13 +363,21 @@ pub fn decode_scan(state: &DatasetState, plan: &ScanPlan) -> Result<DecodedScan,
                 ));
             }
             let arrow_options = state.arrow_export_options();
-            let column_refs =
-                arrow_encoded_columns_for_payloads(&encoded_columns, &page_payloads, arrow_options);
+            let column_refs = arrow_encoded_columns_for_payloads(
+                state,
+                &columns,
+                &encoded_columns,
+                &page_indexes,
+                &page_payloads,
+                arrow_options,
+            );
             let batch = record_batch_for_selection(
+                state,
                 &column_refs,
                 &scratch.selection,
                 plan.output_schema.clone(),
                 arrow_options,
+                &mut stats,
             )?
             .value;
             stats.rows_materialized += batch.num_rows();
@@ -756,6 +400,7 @@ fn plan_selects_no_rows(plan: &ScanPlan) -> bool {
 fn record_plan_predicates(plan: &ScanPlan, stats: &mut DecodeStats) {
     stats.exact_predicates += plan.scan_program.exact_filters;
     stats.residual_predicates += plan.scan_program.inexact_filters;
+    stats.predicate_orderings += usize::from(plan.scan_program.predicate_ordered);
 }
 
 fn record_range_plan(plan: RangeReadPlan, stats: &mut DecodeStats) {
@@ -764,6 +409,36 @@ fn record_range_plan(plan: RangeReadPlan, stats: &mut DecodeStats) {
         RangeReadMode::Mixed => stats.range_plan_mixed += 1,
         RangeReadMode::Dense => stats.range_plan_dense += 1,
     }
+}
+
+fn record_late_materialization(
+    plan: &ScanPlan,
+    row_count: usize,
+    selected_len: usize,
+    stats: &mut DecodeStats,
+) -> Result<(), CoveError> {
+    if plan.scan_projection.is_empty()
+        || selected_len >= row_count
+        || !plan_has_exact_row_predicate(plan)
+    {
+        return Ok(());
+    }
+    let skipped_rows = row_count
+        .checked_sub(selected_len)
+        .ok_or(CoveError::ArithOverflow)?;
+    let skipped_cells = skipped_rows
+        .checked_mul(plan.scan_projection.len())
+        .ok_or(CoveError::ArithOverflow)?;
+    stats.late_materialization_morsels += 1;
+    stats.late_materialization_rows_skipped = stats
+        .late_materialization_rows_skipped
+        .checked_add(skipped_rows)
+        .ok_or(CoveError::ArithOverflow)?;
+    stats.late_materialization_cells_skipped = stats
+        .late_materialization_cells_skipped
+        .checked_add(skipped_cells)
+        .ok_or(CoveError::ArithOverflow)?;
+    Ok(())
 }
 
 fn apply_overlay_to_rows(
@@ -809,15 +484,22 @@ fn apply_overlay_to_selection(
 }
 
 fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
+    state: &DatasetState,
+    columns: &[&ColumnEntry],
     encoded_columns: &'array [(&'name str, EncodedArray<'data>)],
+    page_indexes: &[ColumnPageIndexEntryV1],
     page_payloads: &[RetainedColumnPagePayloadV1],
     options: ArrowExportOptions,
-) -> Vec<ArrowEncodedColumn<'name, 'array, 'data>> {
+) -> Vec<DecodedArrowColumn<'name, 'array, 'data>> {
+    debug_assert_eq!(columns.len(), encoded_columns.len());
+    debug_assert_eq!(page_indexes.len(), encoded_columns.len());
     debug_assert_eq!(encoded_columns.len(), page_payloads.len());
-    encoded_columns
+    columns
         .iter()
+        .zip(encoded_columns.iter())
+        .zip(page_indexes.iter())
         .zip(page_payloads.iter())
-        .map(|((name, array), payload)| {
+        .map(|(((column, (name, array)), page), payload)| {
             let data_owner = if options.varbytes_policy == ArrowVarBytesExportPolicy::View
                 && array.physical == CovePhysicalKind::VarBytes
             {
@@ -825,16 +507,23 @@ fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
             } else {
                 None
             };
-            ArrowEncodedColumn::with_data_owner(*name, array, data_owner)
+            DecodedArrowColumn {
+                name: *name,
+                array,
+                data_owner,
+                utf8_proof_key: Utf8ProofKey::new(state.identity(), column, page),
+            }
         })
         .collect()
 }
 
 fn record_batch_for_selection(
-    columns: &[ArrowEncodedColumn<'_, '_, '_>],
+    state: &DatasetState,
+    columns: &[DecodedArrowColumn<'_, '_, '_>],
     selection: &Selection,
     schema: SchemaRef,
     options: ArrowExportOptions,
+    stats: &mut DecodeStats,
 ) -> Result<cove_arrow::arrow::ArrowExportResult<RecordBatch>, CoveError> {
     let arrow_selection = match selection {
         Selection::None => ArrowRowSelection::Rows(&[]),
@@ -845,14 +534,58 @@ fn record_batch_for_selection(
             len: mask.len,
         },
     };
-    let result =
-        encoded_columns_to_arrow_arrays_with_owners_options(columns, arrow_selection, options)?;
-    let batch = RecordBatch::try_new(schema, result.value)
+    let mut arrays = Vec::with_capacity(columns.len());
+    let mut report = cove_arrow::arrow::ArrowExportReport::default();
+    for column in columns {
+        let mut column_options = options;
+        let mut record_utf8_proof = None;
+        if let Some(key) = column.utf8_proof_key {
+            if options.string_validation_policy == ArrowStringValidationPolicy::StrictOrCachedProof
+            {
+                if state.utf8_proof_cache().contains(&key)? {
+                    column_options.string_validation_policy =
+                        ArrowStringValidationPolicy::TrustedPageProof;
+                    stats.utf8_proof_hits += 1;
+                } else {
+                    column_options.string_validation_policy = ArrowStringValidationPolicy::Strict;
+                    stats.utf8_proof_misses += 1;
+                    record_utf8_proof = Some(key);
+                }
+            }
+        }
+        let result = encoded_array_to_arrow_with_row_selection_options_and_owner(
+            column.array,
+            arrow_selection,
+            column_options,
+            column.data_owner.as_ref(),
+        )?;
+        if let Some(key) = record_utf8_proof {
+            if state.utf8_proof_cache().insert(key)? {
+                stats.utf8_proofs_earned += 1;
+            }
+        }
+        merge_export_report(column.name, &mut report, result.report);
+        arrays.push(result.value);
+    }
+    let batch = RecordBatch::try_new(schema, arrays)
         .map_err(|err| CoveError::BadSection(format!("Arrow RecordBatch: {err}")))?;
     Ok(cove_arrow::arrow::ArrowExportResult {
         value: batch,
-        report: result.report,
+        report,
     })
+}
+
+fn merge_export_report(
+    field: &str,
+    report: &mut cove_arrow::arrow::ArrowExportReport,
+    mut other: cove_arrow::arrow::ArrowExportReport,
+) {
+    for issue in &mut other.issues {
+        if issue.field.is_none() {
+            issue.field = Some(field.to_string());
+        }
+    }
+    report.issues.extend(other.issues);
 }
 
 fn ordered_morsels<'a>(
@@ -1031,27 +764,33 @@ async fn decode_scan_with_reader_cached<R: CoveRangeReader + ?Sized>(
                 columns.push(column);
             }
 
-            let coalesced = coalesced_range_count(&ranges, state.range_coalescing())?;
+            let coalesced_plan = build_coalesced_range_plan(&ranges, state.range_coalescing())?;
+            let range_stats = coalesced_plan.stats();
             record_range_plan(
                 RangeReadPlan::choose(
                     selected_len,
                     morsel.row_count as usize,
-                    ranges.len(),
-                    coalesced,
+                    range_stats.original_ranges,
+                    range_stats.coalesced_ranges,
                 ),
                 &mut stats,
             );
-            stats.range_requests += coalesced;
-            if coalesced < ranges.len() {
-                stats.coalesced_range_requests += coalesced;
+            stats.original_range_requests += range_stats.original_ranges;
+            stats.range_requests += range_stats.coalesced_ranges;
+            stats.range_bytes_requested = stats
+                .range_bytes_requested
+                .checked_add(range_stats.coalesced_bytes)
+                .ok_or(CoveError::ArithOverflow)?;
+            stats.range_bytes_used = stats
+                .range_bytes_used
+                .checked_add(range_stats.original_bytes)
+                .ok_or(CoveError::ArithOverflow)?;
+            if range_stats.coalesced_ranges < range_stats.original_ranges {
+                stats.coalesced_range_requests += range_stats.coalesced_ranges;
             }
-            let wires = read_coalesced_range_buffers_with_options(
-                reader,
-                &ranges,
-                RangeReadKind::Data,
-                state.range_coalescing(),
-            )
-            .await?;
+            let wires =
+                read_coalesced_range_buffers_for_plan(reader, RangeReadKind::Data, &coalesced_plan)
+                    .await?;
             stats.data_bytes_read = stats
                 .data_bytes_read
                 .checked_add(wires.iter().map(RetainedBytes::len).sum::<usize>())
@@ -1080,13 +819,21 @@ async fn decode_scan_with_reader_cached<R: CoveRangeReader + ?Sized>(
                 ));
             }
             let arrow_options = state.arrow_export_options();
-            let column_refs =
-                arrow_encoded_columns_for_payloads(&encoded_columns, &page_payloads, arrow_options);
+            let column_refs = arrow_encoded_columns_for_payloads(
+                state,
+                &columns,
+                &encoded_columns,
+                &page_indexes,
+                &page_payloads,
+                arrow_options,
+            );
             let batch = record_batch_for_selection(
+                state,
                 &column_refs,
                 &scratch.selection,
                 plan.output_schema.clone(),
                 arrow_options,
+                &mut stats,
             )?
             .value;
             stats.rows_materialized += batch.num_rows();
@@ -1198,6 +945,12 @@ async fn decode_scan_with_reader_tasks_cached<R: CoveRangeReader + ?Sized>(
             if plan_has_residual(&plan) {
                 stats.residual_rows += selected_len;
             }
+            record_late_materialization(
+                &plan,
+                morsel.row_count as usize,
+                selected_len,
+                &mut stats,
+            )?;
 
             if plan.scan_projection.is_empty() {
                 let options = RecordBatchOptions::new().with_row_count(Some(selected_len));
@@ -1239,27 +992,33 @@ async fn decode_scan_with_reader_tasks_cached<R: CoveRangeReader + ?Sized>(
                 columns.push(column);
             }
 
-            let coalesced = coalesced_range_count(&ranges, state.range_coalescing())?;
+            let coalesced_plan = build_coalesced_range_plan(&ranges, state.range_coalescing())?;
+            let range_stats = coalesced_plan.stats();
             record_range_plan(
                 RangeReadPlan::choose(
                     selected_len,
                     morsel.row_count as usize,
-                    ranges.len(),
-                    coalesced,
+                    range_stats.original_ranges,
+                    range_stats.coalesced_ranges,
                 ),
                 &mut stats,
             );
-            stats.range_requests += coalesced;
-            if coalesced < ranges.len() {
-                stats.coalesced_range_requests += coalesced;
+            stats.original_range_requests += range_stats.original_ranges;
+            stats.range_requests += range_stats.coalesced_ranges;
+            stats.range_bytes_requested = stats
+                .range_bytes_requested
+                .checked_add(range_stats.coalesced_bytes)
+                .ok_or(CoveError::ArithOverflow)?;
+            stats.range_bytes_used = stats
+                .range_bytes_used
+                .checked_add(range_stats.original_bytes)
+                .ok_or(CoveError::ArithOverflow)?;
+            if range_stats.coalesced_ranges < range_stats.original_ranges {
+                stats.coalesced_range_requests += range_stats.coalesced_ranges;
             }
-            let wires = read_coalesced_range_buffers_with_options(
-                reader,
-                &ranges,
-                RangeReadKind::Data,
-                state.range_coalescing(),
-            )
-            .await?;
+            let wires =
+                read_coalesced_range_buffers_for_plan(reader, RangeReadKind::Data, &coalesced_plan)
+                    .await?;
             stats.data_bytes_read = stats
                 .data_bytes_read
                 .checked_add(wires.iter().map(RetainedBytes::len).sum::<usize>())
@@ -1288,13 +1047,21 @@ async fn decode_scan_with_reader_tasks_cached<R: CoveRangeReader + ?Sized>(
                 ));
             }
             let arrow_options = state.arrow_export_options();
-            let column_refs =
-                arrow_encoded_columns_for_payloads(&encoded_columns, &page_payloads, arrow_options);
+            let column_refs = arrow_encoded_columns_for_payloads(
+                state,
+                &columns,
+                &encoded_columns,
+                &page_indexes,
+                &page_payloads,
+                arrow_options,
+            );
             let batch = record_batch_for_selection(
+                state,
                 &column_refs,
                 &scratch.selection,
                 plan.output_schema.clone(),
                 arrow_options,
+                &mut stats,
             )?
             .value;
             stats.rows_materialized += batch.num_rows();
@@ -1729,7 +1496,12 @@ fn selected_rows_for_morsel(
         };
         let array = encoded_array_for_page(&payload, &page, dictionary)?;
         let prepared = array.prepare()?;
-        if !try_apply_predicate_to_selection(predicate, &prepared, &mut scratch.selected_mask)? {
+        if !try_apply_predicate_to_selection(
+            predicate,
+            &prepared,
+            &mut scratch.selected_mask,
+            &mut scratch.filter_mask,
+        )? {
             if filter.use_kind == CoveFilterUse::FullRowPredicateExact {
                 stats.exactness_fallbacks += 1;
                 return Err(CoveError::UnsupportedEncoding(format!(
@@ -1790,6 +1562,8 @@ async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Sized>(
         scratch.selection = Selection::None;
         return Ok(());
     }
+    let mut predicate_inputs = Vec::new();
+    let mut predicate_ranges = Vec::new();
     for filter in &plan.filters {
         let Some(predicate) = &filter.predicate else {
             continue;
@@ -1813,7 +1587,7 @@ async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Sized>(
         let column = &state.table().columns[column_index];
         let segment_column = segment.column(column.column_id)?;
         let page = segment.page_for_morsel(segment_column, morsel_id)?;
-        let page_wire = if page.page_length == 0 {
+        let range_slot = if page.page_length == 0 {
             None
         } else {
             let start = segment_ref
@@ -1823,29 +1597,64 @@ async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Sized>(
             let end = start
                 .checked_add(page.page_length)
                 .ok_or(CoveError::ArithOverflow)?;
-            let bytes = reader
-                .read_range_buffer(start..end, RangeReadKind::Data)
-                .await?;
-            stats.data_bytes_read = stats
-                .data_bytes_read
-                .checked_add(bytes.len())
-                .ok_or(CoveError::ArithOverflow)?;
-            Some(bytes)
+            let slot = predicate_ranges.len();
+            predicate_ranges.push(start..end);
+            Some(slot)
         };
-        stats.pages_decoded += usize::from(page.page_length != 0);
-        let payload = match materialize_page_payload_from_wire(
+        predicate_inputs.push(PredicateDecodeInput {
+            filter,
+            predicate,
             column,
-            &page,
+            page: page.clone(),
+            range_slot,
+        });
+    }
+    let predicate_wires = if predicate_ranges.is_empty() {
+        Vec::new()
+    } else {
+        let coalesced_plan =
+            build_coalesced_range_plan(&predicate_ranges, state.range_coalescing())?;
+        let range_stats = coalesced_plan.stats();
+        stats.original_range_requests += range_stats.original_ranges;
+        stats.range_requests += range_stats.coalesced_ranges;
+        stats.range_bytes_requested = stats
+            .range_bytes_requested
+            .checked_add(range_stats.coalesced_bytes)
+            .ok_or(CoveError::ArithOverflow)?;
+        stats.range_bytes_used = stats
+            .range_bytes_used
+            .checked_add(range_stats.original_bytes)
+            .ok_or(CoveError::ArithOverflow)?;
+        if range_stats.coalesced_ranges < range_stats.original_ranges {
+            stats.coalesced_range_requests += range_stats.coalesced_ranges;
+        }
+        let wires =
+            read_coalesced_range_buffers_for_plan(reader, RangeReadKind::Data, &coalesced_plan)
+                .await?;
+        stats.data_bytes_read = stats
+            .data_bytes_read
+            .checked_add(wires.iter().map(RetainedBytes::len).sum::<usize>())
+            .ok_or(CoveError::ArithOverflow)?;
+        wires.into_iter().map(Some).collect::<Vec<_>>()
+    };
+    for input in predicate_inputs {
+        let page_wire = input
+            .range_slot
+            .and_then(|index| predicate_wires[index].as_ref().cloned());
+        stats.pages_decoded += usize::from(input.page.page_length != 0);
+        let payload = match materialize_page_payload_from_wire(
+            input.column,
+            &input.page,
             page_wire,
             state.page_payload_validation_policy(),
         ) {
             Ok(payload) => payload,
             Err(CoveError::UnsupportedEncoding(_)) => {
-                if filter.use_kind == CoveFilterUse::FullRowPredicateExact {
+                if input.filter.use_kind == CoveFilterUse::FullRowPredicateExact {
                     stats.exactness_fallbacks += 1;
                     return Err(CoveError::UnsupportedEncoding(format!(
                         "exact predicate {} cannot be evaluated for page encoding",
-                        filter.display
+                        input.filter.display
                     )));
                 }
                 stats.kernel_fallbacks += 1;
@@ -1856,19 +1665,24 @@ async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Sized>(
             }
             Err(error) => return Err(error),
         };
-        let dictionary = if matches!(predicate, CovePredicate::FileCodeIn { .. }) {
+        let dictionary = if matches!(input.predicate, CovePredicate::FileCodeIn { .. }) {
             None
         } else {
             state.mounted().dictionary.as_ref()
         };
-        let array = encoded_array_for_page(&payload, &page, dictionary)?;
+        let array = encoded_array_for_page(&payload, &input.page, dictionary)?;
         let prepared = array.prepare()?;
-        if !try_apply_predicate_to_selection(predicate, &prepared, &mut scratch.selected_mask)? {
-            if filter.use_kind == CoveFilterUse::FullRowPredicateExact {
+        if !try_apply_predicate_to_selection(
+            input.predicate,
+            &prepared,
+            &mut scratch.selected_mask,
+            &mut scratch.filter_mask,
+        )? {
+            if input.filter.use_kind == CoveFilterUse::FullRowPredicateExact {
                 stats.exactness_fallbacks += 1;
                 return Err(CoveError::UnsupportedEncoding(format!(
                     "exact predicate {} cannot be evaluated by Cove",
-                    filter.display
+                    input.filter.display
                 )));
             }
             stats.kernel_fallbacks += 1;
@@ -1892,6 +1706,16 @@ fn plan_has_row_predicate(plan: &ScanPlan) -> bool {
             filter.predicate,
             Some(CovePredicate::Numeric { .. } | CovePredicate::FileCodeIn { .. })
         )
+    })
+}
+
+fn plan_has_exact_row_predicate(plan: &ScanPlan) -> bool {
+    plan.filters.iter().any(|filter| {
+        filter.use_kind == CoveFilterUse::FullRowPredicateExact
+            && matches!(
+                filter.predicate,
+                Some(CovePredicate::Numeric { .. } | CovePredicate::FileCodeIn { .. })
+            )
     })
 }
 
@@ -2040,9 +1864,10 @@ fn apply_predicate_to_selection(
     predicate: &CovePredicate,
     prepared: &PreparedEncodedArray<'_>,
     selected: &mut SelectionMask,
+    scratch: &mut SelectionMask,
 ) -> Result<bool, CoveError> {
     if let Some(()) =
-        try_apply_numcode_predicate_to_selection(predicate, prepared.array(), selected)?
+        try_apply_numcode_predicate_to_selection(predicate, prepared.array(), selected, scratch)?
     {
         return Ok(true);
     }
@@ -2105,6 +1930,7 @@ fn try_apply_numcode_predicate_to_selection(
     predicate: &CovePredicate,
     array: &EncodedArray<'_>,
     selected: &mut SelectionMask,
+    scratch: &mut SelectionMask,
 ) -> Result<Option<()>, CoveError> {
     let CovePredicate::Numeric { op, literal, .. } = predicate else {
         return Ok(None);
@@ -2113,7 +1939,7 @@ fn try_apply_numcode_predicate_to_selection(
         return Ok(None);
     }
 
-    let mut next = selected.clone();
+    scratch.clone_from_mask(selected);
     for word_index in 0..selected.words.len() {
         let mut remaining = selected.words[word_index];
         while remaining != 0 {
@@ -2137,12 +1963,12 @@ fn try_apply_numcode_predicate_to_selection(
                 }
             };
             if !keep {
-                next.clear_bit(index);
+                scratch.clear_bit(index);
             }
             remaining &= remaining - 1;
         }
     }
-    *selected = next;
+    std::mem::swap(selected, scratch);
     Ok(Some(()))
 }
 
@@ -2150,8 +1976,9 @@ fn try_apply_predicate_to_selection(
     predicate: &CovePredicate,
     prepared: &PreparedEncodedArray<'_>,
     selected: &mut SelectionMask,
+    scratch: &mut SelectionMask,
 ) -> Result<bool, CoveError> {
-    match apply_predicate_to_selection(predicate, prepared, selected) {
+    match apply_predicate_to_selection(predicate, prepared, selected, scratch) {
         Ok(value) => Ok(value),
         Err(CoveError::UnsupportedEncoding(_)) => Ok(false),
         Err(error) => Err(error),
@@ -2503,7 +2330,10 @@ fn default_encoding_kind(physical: CovePhysicalKind) -> CoveEncodingKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::CoveTableOptions;
+    use crate::{
+        options::CoveTableOptions,
+        planner::{plan_scan, FilterPlan},
+    };
     use arrow_array::Array;
     use cove_arrow::arrow::ArrowStringValidationPolicy;
     use cove_core::{
@@ -2511,7 +2341,9 @@ mod tests {
         checksum,
         constants::{CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
         page_payload::{COLUMN_PAGE_PAYLOAD_HEADER_LEN, COVE_ENCODING_NODE_LEN},
+        table::{TableCatalog, TableEntry},
         wire,
+        writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment},
     };
     use std::sync::Arc;
 
@@ -2559,6 +2391,112 @@ mod tests {
         .unwrap()
     }
 
+    fn column(
+        column_id: u32,
+        name: &str,
+        logical: CoveLogicalType,
+        physical: CovePhysicalKind,
+        nullable: bool,
+    ) -> ColumnEntry {
+        ColumnEntry {
+            column_id,
+            name: name.into(),
+            logical,
+            physical,
+            nullable,
+            sort_order: 0,
+            collation_id: 0,
+            precision: 0,
+            scale: 0,
+            flags: 0,
+        }
+    }
+
+    fn numcode_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
+        ScanPageSpec::new(row_count, payload).with_encoding_root(CoveEncodingKind::NumCode as u32)
+    }
+
+    fn varbytes_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
+        ScanPageSpec::new(row_count, payload).with_encoding_root(CoveEncodingKind::VarBytes as u32)
+    }
+
+    fn bool_page(row_count: u32, payload: Vec<u8>) -> ScanPageSpec {
+        ScanPageSpec::new(row_count, payload)
+            .with_encoding_root(CoveEncodingKind::PlainFixed as u32)
+    }
+
+    fn numcode_i64(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| (*value as u64).to_le_bytes())
+            .collect()
+    }
+
+    fn varbytes(values: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in values {
+            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        out
+    }
+
+    fn bools(values: &[bool]) -> Vec<u8> {
+        values.iter().map(|value| u8::from(*value)).collect()
+    }
+
+    fn primitive_events_file() -> Vec<u8> {
+        let catalog = TableCatalog {
+            flags: 0,
+            tables: vec![TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 3,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![
+                    column(
+                        1,
+                        "id",
+                        CoveLogicalType::Int64,
+                        CovePhysicalKind::NumCode,
+                        false,
+                    ),
+                    column(
+                        2,
+                        "name",
+                        CoveLogicalType::Utf8,
+                        CovePhysicalKind::VarBytes,
+                        false,
+                    ),
+                    column(
+                        3,
+                        "active",
+                        CoveLogicalType::Bool,
+                        CovePhysicalKind::Boolean,
+                        false,
+                    ),
+                ],
+            }],
+        };
+        let mut first = ScanSegment::new(1, 0, 0, 2, 3);
+        first.set_column_pages(1, vec![numcode_page(2, numcode_i64(&[1, 2]))]);
+        first.set_column_pages(2, vec![varbytes_page(2, varbytes(&["alpha", "beta"]))]);
+        first.set_column_pages(3, vec![bool_page(2, bools(&[true, false]))]);
+
+        let mut second = ScanSegment::new(1, 1, 2, 1, 3);
+        second.set_column_pages(1, vec![numcode_page(1, numcode_i64(&[3]))]);
+        second.set_column_pages(2, vec![varbytes_page(1, varbytes(&["gamma"]))]);
+        second.set_column_pages(3, vec![bool_page(1, bools(&[true]))]);
+
+        let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_segment(first);
+        writer.push_segment(second);
+        writer.write().unwrap()
+    }
+
     #[test]
     fn cove_table_options_default_to_trusted_page_payload_validation() {
         assert_eq!(
@@ -2574,12 +2512,12 @@ mod tests {
     }
 
     #[test]
-    fn cove_table_options_default_to_strict_arrow_string_validation() {
+    fn cove_table_options_default_to_cached_proof_arrow_string_validation() {
         assert_eq!(
             CoveTableOptions::default()
                 .arrow_export_options()
                 .string_validation_policy,
-            ArrowStringValidationPolicy::Strict
+            ArrowStringValidationPolicy::StrictOrCachedProof
         );
         assert_eq!(
             CoveTableOptions::default()
@@ -2596,12 +2534,26 @@ mod tests {
                 .string_validation_policy,
             ArrowStringValidationPolicy::Strict
         );
+        assert_eq!(
+            CoveTableOptions::default()
+                .with_strict_arrow_string_validation()
+                .with_cached_proof_arrow_string_validation()
+                .arrow_export_options()
+                .string_validation_policy,
+            ArrowStringValidationPolicy::StrictOrCachedProof
+        );
     }
 
     #[test]
-    fn cove_table_options_default_to_positioned_local_file_reads() {
+    fn cove_table_options_default_to_mmap_local_file_reads() {
         assert_eq!(
             CoveTableOptions::default().local_file_read_policy(),
+            LocalFileReadPolicy::Mmap
+        );
+        assert_eq!(
+            CoveTableOptions::default()
+                .with_positioned_local_file_reads()
+                .local_file_read_policy(),
             LocalFileReadPolicy::PositionedReads
         );
         assert_eq!(
@@ -2617,6 +2569,139 @@ mod tests {
                 .local_file_read_policy(),
             LocalFileReadPolicy::PositionedReads
         );
+    }
+
+    #[test]
+    fn trusted_arrow_string_validation_and_local_file_mmap_reads_sets_both_knobs() {
+        let options = CoveTableOptions::default()
+            .with_trusted_arrow_string_validation_and_local_file_mmap_reads();
+        assert_eq!(
+            options.arrow_export_options().string_validation_policy,
+            ArrowStringValidationPolicy::TrustedPageProof
+        );
+        assert_eq!(options.local_file_read_policy(), LocalFileReadPolicy::Mmap);
+        assert_eq!(
+            options
+                .with_strict_arrow_string_validation()
+                .arrow_export_options()
+                .string_validation_policy,
+            ArrowStringValidationPolicy::Strict
+        );
+        assert_eq!(
+            options
+                .with_positioned_local_file_reads()
+                .local_file_read_policy(),
+            LocalFileReadPolicy::PositionedReads
+        );
+    }
+
+    #[test]
+    fn utf8_proof_cache_reuses_verified_pages_within_one_dataset_state() {
+        let state = DatasetState::from_bytes("events", primitive_events_file()).unwrap();
+        let plan = plan_scan(&state, None, Vec::new()).unwrap();
+
+        let first = decode_scan(&state, &plan).unwrap();
+        assert_eq!(first.stats.utf8_proof_hits, 0);
+        assert_eq!(first.stats.utf8_proof_misses, 2);
+        assert_eq!(first.stats.utf8_proofs_earned, 2);
+
+        let second = decode_scan(&state, &plan).unwrap();
+        assert_eq!(second.stats.utf8_proof_hits, 2);
+        assert_eq!(second.stats.utf8_proof_misses, 0);
+        assert_eq!(second.stats.utf8_proofs_earned, 0);
+
+        let other_state = DatasetState::from_bytes("events-copy", primitive_events_file()).unwrap();
+        let other_plan = plan_scan(&other_state, None, Vec::new()).unwrap();
+        let third = decode_scan(&other_state, &other_plan).unwrap();
+        assert_eq!(third.stats.utf8_proof_hits, 0);
+        assert_eq!(third.stats.utf8_proof_misses, 2);
+        assert_eq!(third.stats.utf8_proofs_earned, 2);
+    }
+
+    #[test]
+    fn exact_numeric_filter_records_late_materialization_for_projected_strings() {
+        let state = DatasetState::from_bytes("events", primitive_events_file()).unwrap();
+        let projection = vec![1];
+        let plan = plan_scan(
+            &state,
+            Some(&projection),
+            vec![FilterPlan::pruning_numeric(
+                0,
+                NumericPredicateOp::Gt,
+                PredicateLiteral::UInt64(1),
+                "id > 1",
+            )],
+        )
+        .unwrap();
+
+        let decoded = decode_scan(&state, &plan).unwrap();
+
+        assert_eq!(decoded.stats.exact_predicates, 1);
+        assert_eq!(decoded.stats.rows_selected, 2);
+        assert_eq!(decoded.stats.rows_materialized, 2);
+        assert_eq!(decoded.stats.late_materialization_morsels, 1);
+        assert_eq!(decoded.stats.late_materialization_rows_skipped, 1);
+        assert_eq!(decoded.stats.late_materialization_cells_skipped, 1);
+        assert_eq!(decoded.stats.utf8_proof_misses, 2);
+        assert_eq!(decoded.stats.utf8_proofs_earned, 2);
+        assert_eq!(
+            decoded
+                .batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[test]
+    fn exact_numeric_filter_with_no_matches_does_not_materialize_projected_strings() {
+        let state = DatasetState::from_bytes("events", primitive_events_file()).unwrap();
+        let projection = vec![1];
+        let plan = plan_scan(
+            &state,
+            Some(&projection),
+            vec![FilterPlan::pruning_numeric(
+                0,
+                NumericPredicateOp::Gt,
+                PredicateLiteral::UInt64(99),
+                "id > 99",
+            )],
+        )
+        .unwrap();
+
+        let decoded = decode_scan(&state, &plan).unwrap();
+
+        assert_eq!(decoded.stats.rows_selected, 0);
+        assert_eq!(decoded.stats.rows_materialized, 0);
+        assert_eq!(decoded.stats.utf8_proof_misses, 0);
+        assert_eq!(decoded.stats.utf8_proofs_earned, 0);
+        assert!(decoded.batches.is_empty());
+    }
+
+    #[test]
+    fn exact_numeric_filter_still_works_when_predicate_column_is_projected() {
+        let state = DatasetState::from_bytes("events", primitive_events_file()).unwrap();
+        let projection = vec![0, 1];
+        let plan = plan_scan(
+            &state,
+            Some(&projection),
+            vec![FilterPlan::pruning_numeric(
+                0,
+                NumericPredicateOp::Gt,
+                PredicateLiteral::UInt64(1),
+                "id > 1",
+            )],
+        )
+        .unwrap();
+
+        let decoded = decode_scan(&state, &plan).unwrap();
+
+        assert_eq!(decoded.stats.rows_selected, 2);
+        assert_eq!(decoded.stats.rows_materialized, 2);
+        assert_eq!(decoded.stats.late_materialization_rows_skipped, 1);
+        assert_eq!(decoded.stats.late_materialization_cells_skipped, 2);
+        assert!(decoded.batches.iter().all(|batch| batch.num_columns() == 2));
     }
 
     #[test]
@@ -2751,7 +2836,11 @@ mod tests {
         };
         let mut selected = SelectionMask::default();
         selected.fill_all(3);
-        assert!(apply_predicate_to_selection(&predicate, &prepared, &mut selected).unwrap());
+        let mut scratch = SelectionMask::default();
+        assert!(
+            apply_predicate_to_selection(&predicate, &prepared, &mut selected, &mut scratch)
+                .unwrap()
+        );
 
         let mut rows = Vec::new();
         selected.write_selected_rows(&mut rows).unwrap();
@@ -2783,7 +2872,11 @@ mod tests {
         };
         let mut selected = SelectionMask::default();
         selected.fill_all(3);
-        assert!(apply_predicate_to_selection(&predicate, &prepared, &mut selected).unwrap());
+        let mut scratch = SelectionMask::default();
+        assert!(
+            apply_predicate_to_selection(&predicate, &prepared, &mut selected, &mut scratch)
+                .unwrap()
+        );
 
         let mut rows = Vec::new();
         selected.write_selected_rows(&mut rows).unwrap();
@@ -2818,12 +2911,21 @@ mod tests {
             arrow_schema::DataType::Utf8,
             false,
         )]));
+        let state = DatasetState::from_bytes("selection", primitive_events_file()).unwrap();
+        let mut stats = DecodeStats::default();
 
         let result = record_batch_for_selection(
-            &[ArrowEncodedColumn::borrowed("word", &array)],
+            &state,
+            &[DecodedArrowColumn {
+                name: "word",
+                array: &array,
+                data_owner: None,
+                utf8_proof_key: None,
+            }],
             &selection,
             schema,
             ArrowExportOptions::default(),
+            &mut stats,
         )
         .unwrap();
         let strings = result

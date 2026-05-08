@@ -356,6 +356,11 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
         &runtime,
         CoveTableOptions::default().with_local_file_mmap_reads(),
     );
+    let trusted_mmap_fixture = ParquetCompareFixture::new_with_cove_options(
+        &runtime,
+        CoveTableOptions::default()
+            .with_trusted_arrow_string_validation_and_local_file_mmap_reads(),
+    );
     let large_projection_view = view_fixture.prepare_query(
         &runtime,
         "SELECT payload FROM large_events_cove",
@@ -369,6 +374,12 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
         1,
     );
     let large_projection_mmap = mmap_fixture.prepare_query(
+        &runtime,
+        "SELECT payload FROM large_events_cove",
+        PARQUET_COMPARE_SCAN_HEAVY_ROWS,
+        1,
+    );
+    let large_projection_trusted_mmap = trusted_mmap_fixture.prepare_query(
         &runtime,
         "SELECT payload FROM large_events_cove",
         PARQUET_COMPARE_SCAN_HEAVY_ROWS,
@@ -400,6 +411,15 @@ fn bench_m6_parquet_compare(c: &mut Criterion) {
                 &runtime,
                 &mmap_fixture.ctx,
                 &large_projection_mmap,
+            ))
+        })
+    });
+    arrow_output_group.bench_function("standard-trusted-mmap", |b| {
+        b.iter(|| {
+            black_box(execute_prepared_query(
+                &runtime,
+                &trusted_mmap_fixture.ctx,
+                &large_projection_trusted_mmap,
             ))
         })
     });

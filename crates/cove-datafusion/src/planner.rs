@@ -6,7 +6,9 @@ use cove_core::{constants::CovePhysicalKind, CoveError};
 use crate::{
     dataset_state::DatasetState,
     execution_code,
-    scan_program::{compile_scan_program, promote_filter_exactness, CoveScanProgram},
+    scan_program::{
+        compile_scan_program, order_filters_by_cost, promote_filter_exactness, CoveScanProgram,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,8 +246,10 @@ pub fn plan_scan(
     for filter in &mut filters {
         promote_filter_exactness(state, filter);
     }
+    let predicate_ordered = order_filters_by_cost(&mut filters);
     execution_code::validate_policy_for_filters(state, &filters)?;
-    let scan_program = compile_scan_program(state, &filters);
+    let mut scan_program = compile_scan_program(state, &filters);
+    scan_program.predicate_ordered = predicate_ordered;
     Ok(ScanPlan {
         scan_projection,
         output_schema,

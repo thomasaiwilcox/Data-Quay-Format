@@ -4,6 +4,9 @@
 //! a *validity* bitmap (bit set ⇒ valid). This module owns the bit inversion
 //! and byte-aligned conversion required to bridge the two.
 
+mod selection_utils;
+mod validity;
+
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -37,48 +40,8 @@ use crate::{
     wire, CoveError,
 };
 
-/// Invert a COVE null bitmap into an Arrow validity bitmap with the same byte
-/// length. Per Spec §49.2, the row count MUST be preserved exactly.
-pub fn cove_null_to_arrow_validity(
-    cove_null: &[u8],
-    row_count: usize,
-) -> Result<Vec<u8>, CoveError> {
-    let needed = (row_count + 7) / 8;
-    if cove_null.len() < needed {
-        return Err(CoveError::BufferTooShort);
-    }
-    let mut out = vec![0u8; needed];
-    for row in 0..row_count {
-        let byte = row / 8;
-        let bit = 1u8 << (row % 8);
-        let is_null = (cove_null[byte] & bit) != 0;
-        if !is_null {
-            out[byte] |= bit;
-        }
-    }
-    Ok(out)
-}
-
-/// Invert an Arrow validity bitmap into a COVE null bitmap.
-pub fn arrow_validity_to_cove_null(
-    arrow_validity: &[u8],
-    row_count: usize,
-) -> Result<Vec<u8>, CoveError> {
-    let needed = (row_count + 7) / 8;
-    if arrow_validity.len() < needed {
-        return Err(CoveError::BufferTooShort);
-    }
-    let mut out = vec![0u8; needed];
-    for row in 0..row_count {
-        let byte = row / 8;
-        let bit = 1u8 << (row % 8);
-        let is_valid = (arrow_validity[byte] & bit) != 0;
-        if !is_valid {
-            out[byte] |= bit;
-        }
-    }
-    Ok(out)
-}
+use selection_utils::{count_bitset_rows, mask_selection_tail, selected_rows_are_all_rows};
+pub use validity::{arrow_validity_to_cove_null, cove_null_to_arrow_validity};
 
 /// Policy for exporting FileCode-backed scalar columns to Arrow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +83,11 @@ impl Default for ArrowVarBytesExportPolicy {
 pub enum ArrowStringValidationPolicy {
     /// Validate all materialized non-null rows while exporting.
     Strict,
+    /// Validate on the first export, but allow an outer caller to replace this
+    /// with [`ArrowStringValidationPolicy::TrustedPageProof`] once it has
+    /// recorded an exact page-level proof. Inside `cove-arrow` this behaves the
+    /// same as [`ArrowStringValidationPolicy::Strict`].
+    StrictOrCachedProof,
     /// Trust a caller-supplied page-level proof that every non-null row slice is
     /// valid UTF-8.
     TrustedPageProof,
@@ -373,34 +341,6 @@ impl<'a> ArrowRowSelection<'a> {
             Ok(())
         })?;
         Ok(rows)
-    }
-}
-
-fn count_bitset_rows(words: &[u64], len: usize) -> Result<usize, CoveError> {
-    let word_len = len.div_ceil(64);
-    if words.len() < word_len {
-        return Err(CoveError::BufferTooShort);
-    }
-    let mut count = 0usize;
-    for (word_index, raw_word) in words.iter().take(word_len).copied().enumerate() {
-        let word = if word_index + 1 == word_len {
-            mask_selection_tail(raw_word, len)
-        } else {
-            raw_word
-        };
-        count = count
-            .checked_add(word.count_ones() as usize)
-            .ok_or(CoveError::ArithOverflow)?;
-    }
-    Ok(count)
-}
-
-fn mask_selection_tail(word: u64, len: usize) -> u64 {
-    let tail_bits = len % 64;
-    if tail_bits == 0 {
-        word
-    } else {
-        word & ((1u64 << tail_bits) - 1)
     }
 }
 
@@ -715,7 +655,7 @@ pub fn encoded_array_to_arrow_with_row_selection_options(
     encoded_array_to_arrow_with_row_selection_options_and_owner(array, selection, options, None)
 }
 
-fn encoded_array_to_arrow_with_row_selection_options_and_owner(
+pub fn encoded_array_to_arrow_with_row_selection_options_and_owner(
     array: &EncodedArray<'_>,
     selection: ArrowRowSelection<'_>,
     options: ArrowExportOptions,
@@ -824,14 +764,6 @@ pub fn encoded_columns_to_arrow_arrays_with_owners_options(
         value: arrays,
         report,
     })
-}
-
-fn selected_rows_are_all_rows(selected_rows: &[u32], row_count: u64) -> bool {
-    u64::try_from(selected_rows.len()).ok() == Some(row_count)
-        && selected_rows
-            .iter()
-            .enumerate()
-            .all(|(index, row)| u32::try_from(index).ok() == Some(*row))
 }
 
 /// Export named COVE array views as an Arrow [`RecordBatch`].
@@ -1686,7 +1618,8 @@ impl BytePayloadPlan {
             && matches!(self.layout, BytePayloadLayout::U32LengthPrefixed)
         {
             return match string_validation_policy {
-                ArrowStringValidationPolicy::Strict => {
+                ArrowStringValidationPolicy::Strict
+                | ArrowStringValidationPolicy::StrictOrCachedProof => {
                     self.materialize_all_u32_no_nulls_utf8_strict(array, row_count)
                 }
                 ArrowStringValidationPolicy::TrustedPageProof => {
@@ -1695,7 +1628,10 @@ impl BytePayloadPlan {
             };
         }
         let (offsets, values, nulls) = self.materialize(array, selection)?;
-        if string_validation_policy == ArrowStringValidationPolicy::Strict {
+        if matches!(
+            string_validation_policy,
+            ArrowStringValidationPolicy::Strict | ArrowStringValidationPolicy::StrictOrCachedProof
+        ) {
             validate_utf8_offsets_values(&offsets, &values)?;
         }
         Ok((offsets, values, nulls))
