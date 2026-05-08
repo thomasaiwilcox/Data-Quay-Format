@@ -6,13 +6,17 @@ mod stats;
 
 use std::{borrow::Cow, path::Path, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_array::{
+    types::UInt32Type, Array, ArrayRef, DictionaryArray, RecordBatch, RecordBatchOptions,
+};
 use arrow_schema::SchemaRef;
 use cove_arrow::arrow::{
     arrow_buffer_owner, encoded_array_to_arrow_with_row_selection_options_and_owner,
-    encoded_filecode_array_to_arrow_dictionary_with_values, file_dictionary_values_to_arrow,
-    ArrowBufferOwner, ArrowDictionaryPolicy, ArrowExportOptions, ArrowRowSelection,
-    ArrowStringValidationPolicy, ArrowVarBytesExportPolicy,
+    encoded_filecode_array_to_arrow_dictionary_remapped,
+    encoded_filecode_array_to_arrow_dictionary_with_values,
+    file_dictionary_entries_compatible_with_logical, file_dictionary_values_to_arrow,
+    filecode_dictionary_value_export_options, ArrowBufferOwner, ArrowDictionaryPolicy,
+    ArrowExportOptions, ArrowRowSelection, ArrowStringValidationPolicy, ArrowVarBytesExportPolicy,
 };
 use cove_core::{
     array::{CoveArrayValue, EncodedArray, PreparedEncodedArray},
@@ -726,33 +730,61 @@ fn export_arrow_column(
         && column.array.encoding == CoveEncodingKind::FileCode
     {
         if let Some(dictionary) = column.array.dictionary {
-            let values = if let Some(cache) = cache {
-                let key = ArrowDictionaryValuesCacheKey::new(
-                    state.identity(),
-                    column.array.logical,
-                    options,
-                );
-                if let Some(values) = cache.get_arrow_dictionary_values(key)? {
-                    stats.filecode_dictionary_value_cache_hits += 1;
+            let value = if file_dictionary_entries_compatible_with_logical(
+                column.array.logical,
+                dictionary,
+            )? {
+                let value_options = filecode_dictionary_value_export_options(options);
+                let values = if let Some(cache) = cache {
+                    let key = ArrowDictionaryValuesCacheKey::new(
+                        state.identity(),
+                        column.array.logical,
+                        value_options,
+                    );
+                    let (values, was_hit) =
+                        cache.get_or_build_arrow_dictionary_values(key, || {
+                            file_dictionary_values_to_arrow(
+                                column.array.logical,
+                                dictionary,
+                                value_options,
+                            )
+                        })?;
+                    if was_hit {
+                        stats.filecode_dictionary_value_cache_hits += 1;
+                    } else {
+                        stats.filecode_dictionary_value_cache_misses += 1;
+                        stats.filecode_dictionary_values_bytes += values.get_buffer_memory_size();
+                    }
                     values
                 } else {
-                    stats.filecode_dictionary_value_cache_misses += 1;
-                    let values =
-                        file_dictionary_values_to_arrow(column.array.logical, dictionary, options)?;
+                    let values = file_dictionary_values_to_arrow(
+                        column.array.logical,
+                        dictionary,
+                        value_options,
+                    )?;
                     stats.filecode_dictionary_values_bytes += values.get_buffer_memory_size();
-                    cache.insert_arrow_dictionary_values(key, values)?
-                }
+                    values
+                };
+                encoded_filecode_array_to_arrow_dictionary_with_values(
+                    column.array,
+                    arrow_selection,
+                    values,
+                )?
             } else {
-                let values =
-                    file_dictionary_values_to_arrow(column.array.logical, dictionary, options)?;
-                stats.filecode_dictionary_values_bytes += values.get_buffer_memory_size();
-                values
+                let value = encoded_filecode_array_to_arrow_dictionary_remapped(
+                    column.array,
+                    arrow_selection,
+                    options,
+                )?;
+                stats.filecode_dictionary_remapped_rows += value.len();
+                if let Some(dictionary) =
+                    value.as_any().downcast_ref::<DictionaryArray<UInt32Type>>()
+                {
+                    stats.filecode_dictionary_values_bytes +=
+                        dictionary.values().get_buffer_memory_size();
+                }
+                value
             };
-            let value = encoded_filecode_array_to_arrow_dictionary_with_values(
-                column.array,
-                arrow_selection,
-                values,
-            )?;
             return Ok(cove_arrow::arrow::ArrowExportResult {
                 value,
                 report: cove_arrow::arrow::ArrowExportReport::default(),

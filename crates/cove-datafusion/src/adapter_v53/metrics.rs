@@ -64,6 +64,7 @@ pub(crate) struct CoveFileMetrics {
     pub(crate) arrow_export_direct_constant_plainvarint_rows: Count,
     pub(crate) arrow_export_fallback_rows: Count,
     pub(crate) filecode_dictionary_keys_rows: Count,
+    pub(crate) filecode_dictionary_remapped_rows: Count,
     pub(crate) filecode_dictionary_values_bytes: Count,
     pub(crate) filecode_dictionary_value_cache_hits: Count,
     pub(crate) filecode_dictionary_value_cache_misses: Count,
@@ -180,6 +181,8 @@ impl CoveFileMetrics {
                 .counter("cove_arrow_export_fallback_rows", partition),
             filecode_dictionary_keys_rows: MetricBuilder::new(metrics)
                 .counter("cove_filecode_dictionary_keys_rows", partition),
+            filecode_dictionary_remapped_rows: MetricBuilder::new(metrics)
+                .counter("cove_filecode_dictionary_remapped_rows", partition),
             filecode_dictionary_values_bytes: MetricBuilder::new(metrics)
                 .counter("cove_filecode_dictionary_values_bytes", partition),
             filecode_dictionary_value_cache_hits: MetricBuilder::new(metrics)
@@ -268,6 +271,8 @@ impl CoveFileMetrics {
             .add(stats.arrow_export_fallback_rows);
         self.filecode_dictionary_keys_rows
             .add(stats.filecode_dictionary_keys_rows);
+        self.filecode_dictionary_remapped_rows
+            .add(stats.filecode_dictionary_remapped_rows);
         self.filecode_dictionary_values_bytes
             .add(stats.filecode_dictionary_values_bytes);
         self.filecode_dictionary_value_cache_hits

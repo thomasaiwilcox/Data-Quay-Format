@@ -17,7 +17,8 @@ use super::*;
 pub(crate) struct ScanExecutionCache {
     local_readers: Mutex<HashMap<LocalReaderCacheKey, Arc<dyn CoveRangeReader>>>,
     segment_metadata: Mutex<HashMap<SegmentMetadataCacheKey, Arc<SegmentMetadata>>>,
-    arrow_dictionary_values: Mutex<HashMap<ArrowDictionaryValuesCacheKey, ArrayRef>>,
+    arrow_dictionary_values:
+        Mutex<HashMap<ArrowDictionaryValuesCacheKey, Arc<Mutex<Option<ArrayRef>>>>>,
 }
 
 #[derive(Debug)]
@@ -192,25 +193,32 @@ impl ScanExecutionCache {
         Ok(Arc::clone(metadata.entry(key).or_insert(segment)))
     }
 
-    pub(super) fn get_arrow_dictionary_values(
+    pub(super) fn get_or_build_arrow_dictionary_values(
         &self,
         key: ArrowDictionaryValuesCacheKey,
-    ) -> Result<Option<ArrayRef>, CoveError> {
-        let values = self.arrow_dictionary_values.lock().map_err(|_| {
-            CoveError::BadSection("scan execution Arrow dictionary cache lock poisoned".into())
+        build: impl FnOnce() -> Result<ArrayRef, CoveError>,
+    ) -> Result<(ArrayRef, bool), CoveError> {
+        let cell = {
+            let mut values = self.arrow_dictionary_values.lock().map_err(|_| {
+                CoveError::BadSection("scan execution Arrow dictionary cache lock poisoned".into())
+            })?;
+            Arc::clone(
+                values
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(Mutex::new(None))),
+            )
+        };
+        let mut slot = cell.lock().map_err(|_| {
+            CoveError::BadSection(
+                "scan execution Arrow dictionary cache value lock poisoned".into(),
+            )
         })?;
-        Ok(values.get(&key).cloned())
-    }
-
-    pub(super) fn insert_arrow_dictionary_values(
-        &self,
-        key: ArrowDictionaryValuesCacheKey,
-        value: ArrayRef,
-    ) -> Result<ArrayRef, CoveError> {
-        let mut values = self.arrow_dictionary_values.lock().map_err(|_| {
-            CoveError::BadSection("scan execution Arrow dictionary cache lock poisoned".into())
-        })?;
-        Ok(Arc::clone(values.entry(key).or_insert(value)))
+        if let Some(value) = slot.as_ref() {
+            return Ok((Arc::clone(value), true));
+        }
+        let value = build()?;
+        *slot = Some(Arc::clone(&value));
+        Ok((value, false))
     }
 }
 

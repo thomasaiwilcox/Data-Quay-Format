@@ -68,6 +68,7 @@ pub struct DecodeStats {
     pub arrow_export_direct_constant_plainvarint_rows: usize,
     pub arrow_export_fallback_rows: usize,
     pub filecode_dictionary_keys_rows: usize,
+    pub filecode_dictionary_remapped_rows: usize,
     pub filecode_dictionary_values_bytes: usize,
     pub filecode_dictionary_value_cache_hits: usize,
     pub filecode_dictionary_value_cache_misses: usize,
@@ -159,6 +160,7 @@ impl DecodeStats {
             other.arrow_export_direct_constant_plainvarint_rows;
         self.arrow_export_fallback_rows += other.arrow_export_fallback_rows;
         self.filecode_dictionary_keys_rows += other.filecode_dictionary_keys_rows;
+        self.filecode_dictionary_remapped_rows += other.filecode_dictionary_remapped_rows;
         self.filecode_dictionary_values_bytes += other.filecode_dictionary_values_bytes;
         self.filecode_dictionary_value_cache_hits += other.filecode_dictionary_value_cache_hits;
         self.filecode_dictionary_value_cache_misses += other.filecode_dictionary_value_cache_misses;

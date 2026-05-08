@@ -77,7 +77,9 @@ use datafusion::object_store::{
 };
 use datafusion::{
     arrow::{
-        array::{Array, BinaryViewArray, DictionaryArray, StringViewArray},
+        array::{
+            Array, BinaryArray, BinaryViewArray, DictionaryArray, StringArray, StringViewArray,
+        },
         datatypes::UInt32Type,
         util::pretty::pretty_format_batches,
     },
@@ -696,6 +698,48 @@ async fn compatibility_dictionary_output_is_option_aware() {
         .as_any()
         .downcast_ref::<DictionaryArray<UInt32Type>>()
         .is_some()));
+
+    let filtered = ctx
+        .sql("SELECT name FROM items WHERE name = 'red' ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let filtered_expected = [
+        "+------+", "| name |", "+------+", "| red  |", "| red  |", "+------+",
+    ];
+    assert_batches_eq!(filtered_expected, &filtered);
+
+    let grouped = ctx
+        .sql("SELECT name, COUNT(*) AS n FROM items GROUP BY name ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let grouped_expected = [
+        "+------+---+",
+        "| name | n |",
+        "+------+---+",
+        "| blue | 2 |",
+        "| red  | 2 |",
+        "+------+---+",
+    ];
+    assert_batches_eq!(grouped_expected, &grouped);
+
+    let ordered = ctx
+        .sql("SELECT name FROM items ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ordered_expected = [
+        "+------+", "| name |", "+------+", "| blue |", "| blue |", "| red  |", "| red  |",
+        "+------+",
+    ];
+    assert_batches_eq!(ordered_expected, &ordered);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1568,6 +1612,137 @@ async fn filecode_dictionary_output_uses_direct_key_export_and_value_cache() {
     assert!(value_bytes > 0);
     assert_eq!(cache_misses, 1);
     assert_eq!(cache_hits, 1);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filecode_dictionary_output_remaps_mixed_file_dictionary() {
+    let path = write_temp_cove("mixed_dictionary", mixed_dictionary_items_file());
+    let ctx = SessionContext::new();
+    register_cove_file_with_options(
+        &ctx,
+        "items",
+        &path,
+        CoveTableOptions::default().with_arrow_dictionary_output(),
+    )
+    .unwrap();
+
+    let (batches, remapped_rows) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT name FROM items",
+        "cove_filecode_dictionary_remapped_rows",
+    )
+    .await;
+    let expected = [
+        "+------+", "| name |", "+------+", "| red  |", "| blue |", "+------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(remapped_rows, 2);
+
+    let dictionary = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .unwrap();
+    assert_eq!(dictionary.keys().value(0), 0);
+    assert_eq!(dictionary.keys().value(1), 1);
+    let values = dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values.value(0), "red");
+    assert_eq!(values.value(1), "blue");
+
+    let blob_batches = ctx
+        .sql("SELECT blob FROM items")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let blob_dictionary = blob_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .unwrap();
+    let blob_values = blob_dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(blob_values.len(), 1);
+    assert_eq!(blob_values.value(0), &[0xaa, 0xbb]);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn filecode_dictionary_output_ignores_view_values_for_filecode_columns() {
+    let path = write_temp_cove(
+        "items_dictionary_view_options",
+        dictionary_items_file(sample_dictionary()),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file_with_options(
+        &ctx,
+        "items",
+        &path,
+        CoveTableOptions::default()
+            .with_arrow_dictionary_output()
+            .with_arrow_view_output(),
+    )
+    .unwrap();
+
+    let batches = ctx
+        .sql("SELECT name FROM items")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let dictionary = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<DictionaryArray<UInt32Type>>()
+        .unwrap();
+    assert!(dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .is_some());
+    assert!(dictionary
+        .values()
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .is_none());
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn unrelated_redacted_dictionary_entry_does_not_block_projection() {
+    let path = write_temp_cove(
+        "redacted_mixed_dictionary",
+        redacted_mixed_dictionary_items_file(),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file_with_options(
+        &ctx,
+        "items",
+        &path,
+        CoveTableOptions::default().with_arrow_dictionary_output(),
+    )
+    .unwrap();
+
+    let batches = ctx
+        .sql("SELECT name FROM items")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = ["+------+", "| name |", "+------+", "| red  |", "+------+"];
+    assert_batches_eq!(expected, &batches);
     fs::remove_file(path).unwrap();
 }
 
@@ -2516,6 +2691,101 @@ fn dictionary_items_file(dictionary: FileDictionary) -> Vec<u8> {
     writer.write().unwrap()
 }
 
+fn mixed_dictionary_items_file() -> Vec<u8> {
+    let dictionary = FileDictionary {
+        header: FileDictionaryHeaderV1 {
+            entry_count: 3,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        },
+        entries: vec![
+            inline_binary_entry(&[0xaa, 0xbb]),
+            inline_utf8_entry("red"),
+            inline_utf8_entry("blue"),
+        ],
+        payload: Vec::new(),
+    };
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 7,
+            namespace: "public".into(),
+            name: "items".into(),
+            row_count: 2,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![
+                column(
+                    1,
+                    "name",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+                column(
+                    2,
+                    "blob",
+                    CoveLogicalType::Binary,
+                    CovePhysicalKind::FileCode,
+                    false,
+                ),
+            ],
+        }],
+    };
+    let mut segment = ScanSegment::new(7, 0, 0, 2, 2);
+    segment.set_column_pages(1, vec![filecode_page(2, filecodes(&[1, 2]))]);
+    segment.set_column_pages(2, vec![filecode_page(2, filecodes(&[0, 0]))]);
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_file_dictionary(&dictionary);
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn redacted_mixed_dictionary_items_file() -> Vec<u8> {
+    let dictionary = FileDictionary {
+        header: FileDictionaryHeaderV1 {
+            entry_count: 2,
+            flags: 0,
+            index_entry_len: FileDictionaryHeaderV1::INDEX_ENTRY_LEN,
+            value_hash_algorithm: 0,
+            payload_length: 0,
+            reserved: [0; 24],
+        },
+        entries: vec![redacted_binary_entry(), inline_utf8_entry("red")],
+        payload: Vec::new(),
+    };
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 7,
+            namespace: "public".into(),
+            name: "items".into(),
+            row_count: 1,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![column(
+                1,
+                "name",
+                CoveLogicalType::Utf8,
+                CovePhysicalKind::FileCode,
+                false,
+            )],
+        }],
+    };
+    let mut segment = ScanSegment::new(7, 0, 0, 1, 1);
+    segment.set_column_pages(1, vec![filecode_page(1, filecodes(&[1]))]);
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    writer.push_file_dictionary(&dictionary);
+    writer.push_extra_section(redaction_manifest_section());
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
 fn dictionary_items_file_with_domain_stats() -> Vec<u8> {
     let dictionary = sample_dictionary();
     let catalog = TableCatalog {
@@ -3303,9 +3573,43 @@ fn inline_utf8_entry(value: &str) -> FileDictionaryIndexEntryV1 {
     }
 }
 
+fn inline_binary_entry(value: &[u8]) -> FileDictionaryIndexEntryV1 {
+    let mut canonical = wire::encode_u64_leb128(value.len() as u64);
+    canonical.extend_from_slice(value);
+    let mut inline_data = [0u8; 16];
+    inline_data[..canonical.len()].copy_from_slice(&canonical);
+    FileDictionaryIndexEntryV1 {
+        value_tag: ValueTag::Binary as u16,
+        storage_class: StorageClass::Inline as u8,
+        flags: 0,
+        inline_len: canonical.len() as u8,
+        reserved0: [0; 3],
+        inline_data,
+        payload_offset: 0,
+        payload_length: 0,
+        canonical_hash64: 0,
+        reserved1: 0,
+    }
+}
+
 fn redacted_utf8_entry() -> FileDictionaryIndexEntryV1 {
     FileDictionaryIndexEntryV1 {
         value_tag: ValueTag::Utf8 as u16,
+        storage_class: StorageClass::Redacted as u8,
+        flags: 0,
+        inline_len: 0,
+        reserved0: [0; 3],
+        inline_data: [0; 16],
+        payload_offset: 0,
+        payload_length: 0,
+        canonical_hash64: 0,
+        reserved1: 0,
+    }
+}
+
+fn redacted_binary_entry() -> FileDictionaryIndexEntryV1 {
+    FileDictionaryIndexEntryV1 {
+        value_tag: ValueTag::Binary as u16,
         storage_class: StorageClass::Redacted as u8,
         flags: 0,
         inline_len: 0,
