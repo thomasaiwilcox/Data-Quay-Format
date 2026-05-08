@@ -1357,16 +1357,30 @@ fn validate_utf8_offsets_values(
     offsets: &OffsetBuffer<i32>,
     values: &Buffer,
 ) -> Result<(), CoveError> {
-    let values = values.as_slice();
+    validate_utf8_offsets_slice(offsets, values.as_slice())
+}
+
+fn validate_utf8_offsets_slice(offsets: &[i32], values: &[u8]) -> Result<(), CoveError> {
     for pair in offsets.windows(2) {
         let start = usize::try_from(pair[0]).map_err(|_| CoveError::OffsetRange)?;
         let end = usize::try_from(pair[1]).map_err(|_| CoveError::OffsetRange)?;
         if start > end || end > values.len() {
             return Err(CoveError::OffsetRange);
         }
-        validate_arrow_utf8_row(&values[start..end])?;
+        // If the concatenated values buffer is valid UTF-8, each row is valid
+        // iff every non-empty row starts on a codepoint boundary. The only way
+        // two adjacent rows can form a valid cross-row codepoint is when the
+        // later row starts with a continuation byte.
+        if start != 0 && start != end && (values[start] & 0b1100_0000) == 0b1000_0000 {
+            return Err(CoveError::BadSection(
+                "Arrow Utf8 export: row boundary splits a UTF-8 codepoint".into(),
+            ));
+        }
     }
-    Ok(())
+    if values.is_ascii() {
+        return Ok(());
+    }
+    validate_arrow_utf8(values)
 }
 
 const ASCII_HIGH_BIT_MASK_U64: u64 = 0x8080_8080_8080_8080;
@@ -1376,14 +1390,6 @@ fn validate_arrow_utf8(bytes: &[u8]) -> Result<(), CoveError> {
     simdutf8::basic::from_utf8(bytes)
         .map(|_| ())
         .map_err(|err| CoveError::BadSection(format!("Arrow Utf8 export: {err}")))
-}
-
-#[inline(always)]
-fn validate_arrow_utf8_row(bytes: &[u8]) -> Result<(), CoveError> {
-    if bytes.is_ascii() {
-        return Ok(());
-    }
-    validate_arrow_utf8(bytes)
 }
 
 #[inline(always)]
@@ -1818,6 +1824,7 @@ impl BytePayloadPlan {
         let mut values = Vec::<u8>::with_capacity(value_len);
         let mut pos = 0usize;
         let mut write = 0usize;
+        let mut saw_non_ascii = false;
         let offsets_ptr = offsets.as_mut_ptr();
         // INVARIANT: offset 0 is always initialized, and the vector length is
         // published only after all row offsets have been written.
@@ -1851,15 +1858,7 @@ impl BytePayloadPlan {
             // into immutable `data`, and both pointers are valid for `len`
             // bytes.
             if VALIDATE_UTF8 {
-                let high_bits = unsafe { copy_varbytes_value_ascii_mask(src, dst, len) };
-                if high_bits != 0 {
-                    // INVARIANT: `len <= data.len() - pos` was proven above.
-                    // SAFETY: the row slice points at the same source bytes
-                    // just copied into the values buffer and is valid for
-                    // exactly `len` bytes.
-                    let row = unsafe { std::slice::from_raw_parts(src, len) };
-                    validate_arrow_utf8(row)?;
-                }
+                saw_non_ascii |= unsafe { copy_varbytes_value_ascii_mask(src, dst, len) } != 0;
             } else {
                 unsafe {
                     copy_varbytes_value(src, dst, len);
@@ -1889,6 +1888,9 @@ impl BytePayloadPlan {
         // SAFETY: all elements in 0..offset_capacity have been written.
         unsafe {
             offsets.set_len(offset_capacity);
+        }
+        if VALIDATE_UTF8 && saw_non_ascii {
+            validate_utf8_offsets_slice(&offsets, &values)?;
         }
 
         Ok((
@@ -3690,6 +3692,57 @@ mod tests {
         );
 
         assert!(encoded_array_to_arrow(&cove).is_err());
+    }
+
+    #[test]
+    fn strict_utf8_accepts_valid_multibyte_rows() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&2u32.to_le_bytes());
+        values.extend_from_slice(&[0xc2, 0xa2]);
+        values.extend_from_slice(&2u32.to_le_bytes());
+        values.extend_from_slice(&[0xc3, 0xa9]);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            2,
+            CoveEncodingKind::VarBytes,
+            None,
+            &values,
+            None,
+        );
+
+        let arrow = encoded_array_to_arrow(&cove).unwrap();
+        let strings = arrow
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(strings.value(0), "¢");
+        assert_eq!(strings.value(1), "é");
+    }
+
+    #[test]
+    fn selected_utf8_rejects_invalid_row_boundaries_even_if_concat_valid() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&1u32.to_le_bytes());
+        values.push(0xc2);
+        values.extend_from_slice(&1u32.to_le_bytes());
+        values.push(0xa2);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            2,
+            CoveEncodingKind::VarBytes,
+            None,
+            &values,
+            None,
+        );
+
+        assert!(encoded_array_to_arrow_with_row_selection_options(
+            &cove,
+            ArrowRowSelection::Rows(&[0, 1]),
+            ArrowExportOptions::default(),
+        )
+        .is_err());
     }
 
     #[test]

@@ -52,6 +52,8 @@ use cove_datafusion::{
 };
 use criterion::{black_box, criterion_group, Criterion};
 #[cfg(feature = "parquet-compare")]
+use datafusion::execution::context::SessionConfig;
+#[cfg(feature = "parquet-compare")]
 use datafusion::physical_plan::execution_plan::{
     collect as collect_execution_plan, reset_plan_states,
 };
@@ -60,7 +62,7 @@ use datafusion::prelude::ParquetReadOptions;
 use datafusion::prelude::SessionContext;
 #[cfg(feature = "parquet-compare")]
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -735,12 +737,34 @@ struct ParquetCompareFixture {
 }
 
 #[cfg(feature = "parquet-compare")]
+#[derive(Debug, Clone, Copy, Default)]
+struct ParquetCompareSessionOptions {
+    target_partitions: Option<usize>,
+}
+
+#[cfg(feature = "parquet-compare")]
 impl ParquetCompareFixture {
     fn new(runtime: &Runtime) -> Self {
-        Self::new_with_cove_options(runtime, CoveTableOptions::default())
+        Self::new_with_options(
+            runtime,
+            CoveTableOptions::default(),
+            ParquetCompareSessionOptions::default(),
+        )
     }
 
     fn new_with_cove_options(runtime: &Runtime, cove_options: CoveTableOptions) -> Self {
+        Self::new_with_options(
+            runtime,
+            cove_options,
+            ParquetCompareSessionOptions::default(),
+        )
+    }
+
+    fn new_with_options(
+        runtime: &Runtime,
+        cove_options: CoveTableOptions,
+        session_options: ParquetCompareSessionOptions,
+    ) -> Self {
         let dir = TempFixtureDir::new("m6-parquet-compare");
 
         let events_cove = dir.path.join("events.cove");
@@ -794,7 +818,14 @@ impl ParquetCompareFixture {
             &scan_heavy_wide_events_batch(PARQUET_COMPARE_WIDE_ROWS, PARQUET_COMPARE_WIDE_COLUMNS),
         );
 
-        let ctx = SessionContext::new();
+        let ctx = session_options
+            .target_partitions
+            .map(|target_partitions| {
+                SessionContext::new_with_config(
+                    SessionConfig::new().with_target_partitions(target_partitions),
+                )
+            })
+            .unwrap_or_else(SessionContext::new);
         register_cove_file_with_options(&ctx, "events_cove", &events_cove, cove_options)
             .expect("register events_cove");
         register_cove_file_with_options(&ctx, "items_cove", &items_cove, cove_options)
@@ -1535,6 +1566,9 @@ struct QueryProfileCommand {
     engine: CompareSource,
     stage: QueryProfileStage,
     run_seconds: u64,
+    worker_threads: Option<usize>,
+    target_partitions: Option<usize>,
+    cove_target_morsels_per_partition: Option<usize>,
     cove_arrow_view_output: bool,
     cove_trusted_arrow_string_validation: bool,
     cove_local_file_mmap_reads: bool,
@@ -1566,6 +1600,9 @@ fn parse_query_profile_command(
     let mut engine = None;
     let mut stage = QueryProfileStage::ExecuteOnly;
     let mut run_seconds = None;
+    let mut worker_threads = None;
+    let mut target_partitions = None;
+    let mut cove_target_morsels_per_partition = None;
     let mut cove_arrow_view_output = false;
     let mut cove_trusted_arrow_string_validation = false;
     let mut cove_local_file_mmap_reads = false;
@@ -1595,6 +1632,21 @@ fn parse_query_profile_command(
                         format!("invalid --run-seconds value '{value}': {error}")
                     })?);
             }
+            "--worker-threads" => {
+                let value = next_profile_arg(&mut args, "--worker-threads")?;
+                worker_threads = Some(parse_positive_usize_flag("--worker-threads", &value)?);
+            }
+            "--target-partitions" => {
+                let value = next_profile_arg(&mut args, "--target-partitions")?;
+                target_partitions = Some(parse_positive_usize_flag("--target-partitions", &value)?);
+            }
+            "--cove-target-morsels-per-partition" => {
+                let value = next_profile_arg(&mut args, "--cove-target-morsels-per-partition")?;
+                cove_target_morsels_per_partition = Some(parse_positive_usize_flag(
+                    "--cove-target-morsels-per-partition",
+                    &value,
+                )?);
+            }
             "--cove-arrow-view-output" => {
                 cove_arrow_view_output = true;
             }
@@ -1621,10 +1673,26 @@ fn parse_query_profile_command(
         engine: engine.ok_or_else(query_profile_usage)?,
         stage,
         run_seconds: run_seconds.unwrap_or(20),
+        worker_threads,
+        target_partitions,
+        cove_target_morsels_per_partition,
         cove_arrow_view_output,
         cove_trusted_arrow_string_validation,
         cove_local_file_mmap_reads,
     })
+}
+
+#[cfg(feature = "parquet-compare")]
+fn parse_positive_usize_flag(flag: &str, value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid {flag} value '{value}': {error}"))?;
+    if parsed == 0 {
+        return Err(format!(
+            "invalid {flag} value '{value}': expected a positive integer"
+        ));
+    }
+    Ok(parsed)
 }
 
 #[cfg(feature = "parquet-compare")]
@@ -1638,7 +1706,7 @@ fn next_profile_arg(
 
 #[cfg(feature = "parquet-compare")]
 fn query_profile_usage() -> String {
-    "usage: m6 profile-query --track <track> --engine <cove|parquet> [--stage <full-query|planning-only|execute-only>] [--run-seconds <seconds>] [--cove-arrow-view-output] [--cove-trusted-arrow-string-validation] [--cove-local-file-mmap-reads]"
+    "usage: m6 profile-query --track <track> --engine <cove|parquet> [--stage <full-query|planning-only|execute-only>] [--run-seconds <seconds>] [--worker-threads <n>] [--target-partitions <n>] [--cove-target-morsels-per-partition <n>] [--cove-arrow-view-output] [--cove-trusted-arrow-string-validation] [--cove-local-file-mmap-reads]"
         .into()
 }
 
@@ -1655,8 +1723,18 @@ fn parse_compare_source(value: &str) -> Result<CompareSource, String> {
 
 #[cfg(feature = "parquet-compare")]
 fn run_query_profile_command(command: QueryProfileCommand) {
-    let runtime = Runtime::new().expect("query profile runtime");
+    let runtime = match command.worker_threads {
+        Some(worker_threads) => RuntimeBuilder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .enable_all()
+            .build()
+            .expect("query profile runtime"),
+        None => Runtime::new().expect("query profile runtime"),
+    };
     let mut cove_options = CoveTableOptions::default();
+    if let Some(target) = command.cove_target_morsels_per_partition {
+        cove_options = cove_options.with_target_morsels_per_partition(target);
+    }
     if command.cove_arrow_view_output {
         cove_options = cove_options.with_arrow_view_output();
     }
@@ -1666,7 +1744,12 @@ fn run_query_profile_command(command: QueryProfileCommand) {
     if command.cove_local_file_mmap_reads {
         cove_options = cove_options.with_local_file_mmap_reads();
     }
-    let fixture = ParquetCompareFixture::new_with_cove_options(&runtime, cove_options);
+    let target_partitions = command.target_partitions.or(command.worker_threads);
+    let fixture = ParquetCompareFixture::new_with_options(
+        &runtime,
+        cove_options,
+        ParquetCompareSessionOptions { target_partitions },
+    );
     let query = profile_query_spec(&command.track, command.engine).unwrap_or_else(|message| {
         panic!("{message}");
     });
@@ -1681,11 +1764,14 @@ fn run_query_profile_command(command: QueryProfileCommand) {
     };
 
     println!(
-        "PROFILE_READY pid={} stage={} track={} engine={} cove_arrow_view_output={} cove_trusted_arrow_string_validation={} cove_local_file_mmap_reads={}",
+        "PROFILE_READY pid={} stage={} track={} engine={} worker_threads={} target_partitions={} cove_target_morsels_per_partition={} cove_arrow_view_output={} cove_trusted_arrow_string_validation={} cove_local_file_mmap_reads={}",
         process::id(),
         command.stage.as_str(),
         command.track,
         compare_source_name(command.engine),
+        format_optional_usize(command.worker_threads),
+        format_optional_usize(target_partitions),
+        format_optional_usize(command.cove_target_morsels_per_partition),
         command.cove_arrow_view_output,
         command.cove_trusted_arrow_string_validation,
         command.cove_local_file_mmap_reads,
@@ -1715,6 +1801,13 @@ fn run_query_profile_command(command: QueryProfileCommand) {
         iterations,
         command.stage.as_str()
     );
+}
+
+#[cfg(feature = "parquet-compare")]
+fn format_optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "default".into())
 }
 
 #[cfg(feature = "parquet-compare")]
