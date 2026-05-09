@@ -90,6 +90,7 @@ impl PlanningCache {
 }
 
 impl DatasetState {
+    #[inline]
     pub fn zone_stats_for(
         &self,
         segment_id: u32,
@@ -116,6 +117,7 @@ impl DatasetState {
         self.zone_stats_for(segment_id, u32::MAX, column_id)
     }
 
+    #[inline]
     pub fn column_domain_for(&self, column_id: u32) -> Option<&ColumnDomain> {
         self.planning_cache
             .column_domain_by_id
@@ -123,6 +125,7 @@ impl DatasetState {
             .and_then(|index| self.pruning.column_domains.get(*index))
     }
 
+    #[inline]
     pub fn exact_set_for(&self, column_id: u32) -> Option<&ExactSetIndex> {
         self.planning_cache
             .exact_set_by_id
@@ -130,6 +133,7 @@ impl DatasetState {
             .and_then(|index| self.pruning.exact_sets.get(*index))
     }
 
+    #[inline]
     pub fn bloom_for(&self, column_id: u32) -> Option<&BloomFilterIndex> {
         self.planning_cache
             .bloom_by_id
@@ -137,6 +141,7 @@ impl DatasetState {
             .and_then(|index| self.pruning.blooms.get(*index))
     }
 
+    #[inline]
     pub fn lookup_for(&self, column_id: u32) -> Option<&LookupIndex> {
         self.planning_cache
             .lookup_by_id
@@ -144,6 +149,7 @@ impl DatasetState {
             .and_then(|index| self.pruning.lookups.get(*index))
     }
 
+    #[inline]
     pub fn inverted_for(&self, column_id: u32) -> Option<&InvertedMorselIndex> {
         self.planning_cache
             .inverted_by_id
@@ -245,65 +251,63 @@ fn exact_count_for_file_column(
     file: &FileMetadata,
     column_id: u32,
 ) -> Result<Option<u64>, CoveError> {
-    let entries = file
+    let table_id = file.table().table_id;
+    let expected_rows = file.table().row_count;
+    let mut segment_rows = 0u64;
+    let mut segment_count = 0u64;
+    let mut saw_segment_entries = false;
+    let mut morsel_rows = 0u64;
+    let mut morsel_count = 0u64;
+    let mut saw_morsel_entries = false;
+
+    for entry in file
         .pruning()
         .aggregates
         .iter()
         .flat_map(|synopsis| synopsis.entries.iter())
-        .filter(|entry| {
-            entry.table_id == file.table().table_id
-                && entry.column_id == column_id
-                && entry.synopsis_kind == SynopsisKind::Count
-                && entry.accuracy == SynopsisAccuracy::Exact
-        })
-        .collect::<Vec<_>>();
-
-    if let Some(entry) = entries
-        .iter()
-        .find(|entry| entry.segment_id == u32::MAX && entry.morsel_id == u32::MAX)
     {
-        return entry_count(entry).map(Some);
+        if entry.table_id != table_id
+            || entry.column_id != column_id
+            || entry.synopsis_kind != SynopsisKind::Count
+            || entry.accuracy != SynopsisAccuracy::Exact
+        {
+            continue;
+        }
+
+        if entry.segment_id == u32::MAX && entry.morsel_id == u32::MAX {
+            return entry_count(entry).map(Some);
+        }
+
+        let count = entry_count(entry)?;
+        if entry.segment_id != u32::MAX && entry.morsel_id == u32::MAX {
+            saw_segment_entries = true;
+            segment_rows = segment_rows
+                .checked_add(u64::from(entry.row_count))
+                .ok_or(CoveError::ArithOverflow)?;
+            segment_count = segment_count
+                .checked_add(count)
+                .ok_or(CoveError::ArithOverflow)?;
+            continue;
+        }
+
+        if entry.segment_id != u32::MAX && entry.morsel_id != u32::MAX {
+            saw_morsel_entries = true;
+            morsel_rows = morsel_rows
+                .checked_add(u64::from(entry.row_count))
+                .ok_or(CoveError::ArithOverflow)?;
+            morsel_count = morsel_count
+                .checked_add(count)
+                .ok_or(CoveError::ArithOverflow)?;
+        }
     }
 
-    let segment_entries = entries
-        .iter()
-        .copied()
-        .filter(|entry| entry.segment_id != u32::MAX && entry.morsel_id == u32::MAX)
-        .collect::<Vec<_>>();
-    if let Some(count) = exact_count_from_entries(file.table().row_count, &segment_entries)? {
-        return Ok(Some(count));
+    if saw_segment_entries && segment_rows == expected_rows {
+        return Ok(Some(segment_count));
     }
-
-    let morsel_entries = entries
-        .iter()
-        .copied()
-        .filter(|entry| entry.segment_id != u32::MAX && entry.morsel_id != u32::MAX)
-        .collect::<Vec<_>>();
-    exact_count_from_entries(file.table().row_count, &morsel_entries)
-}
-
-fn exact_count_from_entries(
-    expected_rows: u64,
-    entries: &[&AggregateEntry],
-) -> Result<Option<u64>, CoveError> {
-    if entries.is_empty() {
-        return Ok(None);
+    if saw_morsel_entries && morsel_rows == expected_rows {
+        return Ok(Some(morsel_count));
     }
-    let mut rows = 0u64;
-    let mut count = 0u64;
-    for entry in entries {
-        rows = rows
-            .checked_add(u64::from(entry.row_count))
-            .ok_or(CoveError::ArithOverflow)?;
-        count = count
-            .checked_add(entry_count(entry)?)
-            .ok_or(CoveError::ArithOverflow)?;
-    }
-    if rows == expected_rows {
-        Ok(Some(count))
-    } else {
-        Ok(None)
-    }
+    Ok(None)
 }
 
 fn entry_count(entry: &AggregateEntry) -> Result<u64, CoveError> {

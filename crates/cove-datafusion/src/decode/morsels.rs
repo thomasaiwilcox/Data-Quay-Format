@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::*;
 
 pub(super) fn ordered_morsels<'a>(
@@ -18,16 +20,24 @@ pub(super) fn ordered_morsels<'a>(
     } else {
         TopNDirection::Smallest
     };
-    ordered.sort_by_key(|morsel| {
-        let rank = state
-            .topn_for(column.column_id)
-            .into_iter()
-            .find(|summary| {
-                summary.segment_id == segment_id
-                    && summary.morsel_id == morsel.morsel_id
-                    && summary.direction == wanted_direction
-            })
-            .and_then(topn_score)
+    let table_id = state.table().table_id;
+    let mut topn_scores = HashMap::new();
+    for summary in state.pruning().topn.iter() {
+        if summary.table_id != table_id
+            || summary.column_id != column.column_id
+            || summary.segment_id != segment_id
+            || summary.direction != wanted_direction
+        {
+            continue;
+        }
+        if let Some(score) = topn_score(summary) {
+            topn_scores.entry(summary.morsel_id).or_insert(score);
+        }
+    }
+    ordered.sort_by_cached_key(|morsel| {
+        let rank = topn_scores
+            .get(&morsel.morsel_id)
+            .copied()
             .map(|score| {
                 if hint.descending {
                     u64::MAX.saturating_sub(score)
@@ -132,6 +142,7 @@ impl SegmentMetadata {
         &self.morsels.entries
     }
 
+    #[inline]
     pub(super) fn morsel(&self, morsel_id: u32) -> Result<&RowMorselEntryV1, CoveError> {
         let Some(&Some(position)) = self.morsel_positions_by_id.get(morsel_id as usize) else {
             return Err(CoveError::SegmentCorrupt);
@@ -142,6 +153,7 @@ impl SegmentMetadata {
             .ok_or(CoveError::SegmentCorrupt)
     }
 
+    #[inline]
     pub(super) fn column(&self, column_id: u32) -> Result<&PreparedSegmentColumn, CoveError> {
         let position = self
             .column_positions
@@ -152,6 +164,7 @@ impl SegmentMetadata {
             .ok_or(CoveError::SegmentCorrupt)
     }
 
+    #[inline]
     pub(super) fn page_for_morsel<'a>(
         &'a self,
         column: &'a PreparedSegmentColumn,

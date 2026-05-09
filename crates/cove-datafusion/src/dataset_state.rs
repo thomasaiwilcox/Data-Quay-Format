@@ -268,10 +268,12 @@ impl DatasetState {
         self.file_bytes.is_some()
     }
 
+    #[inline]
     pub fn mounted(&self) -> &MountedCoveFile {
         self.mounted.as_ref()
     }
 
+    #[inline]
     pub fn table(&self) -> &TableEntry {
         self.table.as_ref()
     }
@@ -292,6 +294,7 @@ impl DatasetState {
         self.execution_code_policy
     }
 
+    #[inline]
     pub fn page_payload_validation_policy(&self) -> PagePayloadValidationPolicy {
         self.page_payload_validation_policy
     }
@@ -312,6 +315,7 @@ impl DatasetState {
         self.dynamic_filters_enabled
     }
 
+    #[inline]
     pub fn pruning(&self) -> &PruningMetadata {
         &self.pruning
     }

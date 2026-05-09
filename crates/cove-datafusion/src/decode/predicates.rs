@@ -115,6 +115,7 @@ pub(super) fn lookup_selection_for_morsel(
     }
 }
 
+#[inline]
 pub(super) fn predicate_is_index_covered(state: &DatasetState, predicate: &CovePredicate) -> bool {
     match predicate {
         CovePredicate::FileCodeIn { column_index, .. } => {
@@ -139,6 +140,7 @@ pub(super) fn predicate_is_index_covered(state: &DatasetState, predicate: &CoveP
     }
 }
 
+#[inline]
 pub(crate) fn numeric_lookup_key(literal: PredicateLiteral) -> Option<u64> {
     match literal {
         PredicateLiteral::Int64(value) => u64::try_from(value).ok(),
@@ -160,6 +162,7 @@ pub(super) fn plan_has_residual(plan: &ScanPlan) -> bool {
         .any(|filter| filter.use_kind == CoveFilterUse::PruningOnly)
 }
 
+#[inline]
 pub(super) fn predicate_column_index(predicate: &CovePredicate) -> Option<usize> {
     match predicate {
         CovePredicate::Null { column_index, .. }

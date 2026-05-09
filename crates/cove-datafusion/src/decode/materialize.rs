@@ -7,6 +7,7 @@ pub(super) struct DecodedArrowColumn<'name, 'array, 'data> {
     pub(super) utf8_proof_key: Option<Utf8ProofKey>,
 }
 
+#[inline]
 pub(super) fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
     state: &DatasetState,
     columns: &[&ColumnEntry],
@@ -41,6 +42,7 @@ pub(super) fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
         .collect()
 }
 
+#[inline]
 pub(super) fn record_batch_for_selection(
     state: &DatasetState,
     columns: &[DecodedArrowColumn<'_, '_, '_>],
@@ -98,6 +100,7 @@ pub(super) fn record_batch_for_selection(
     })
 }
 
+#[inline]
 fn export_arrow_column(
     state: &DatasetState,
     column: &DecodedArrowColumn<'_, '_, '_>,
@@ -205,6 +208,7 @@ enum ArrowExportPath {
     Fallback,
 }
 
+#[inline]
 fn classify_arrow_export(array: &EncodedArray<'_>, options: ArrowExportOptions) -> ArrowExportPath {
     if options.dictionary_policy == ArrowDictionaryPolicy::DictionaryKeys
         && array.encoding == CoveEncodingKind::FileCode
