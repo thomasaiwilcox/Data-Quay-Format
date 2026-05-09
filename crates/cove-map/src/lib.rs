@@ -1,8 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use cove_core::{
     artifact::covemap::CovemapFile,
@@ -17,9 +13,8 @@ use cove_core::{
     page_payload::ColumnPagePayloadV1,
     profile::{
         cove_map::{
-            parse_embedded_section, EmbeddedMapSection, MapIdentityRule, MapIdentityRuleCatalog,
-            MapProjectionCatalog, MapProjectionEntry, MapPropertyBinding, MapRowSemanticRule,
-            MapRowSemanticsCatalog, MapSourceEntry,
+            MapIdentityRule, MapProjectionCatalog, MapProjectionEntry, MapPropertyBinding,
+            MapRowSemanticRule,
         },
         cove_o::{
             ObjectTypeCatalog, ObjectTypeEntryV1, PropertyEntryV1, RecordKind, TemporalRowEntryV1,
@@ -39,16 +34,28 @@ use cove_core::{
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+mod api;
 mod cli;
+mod context;
 mod emit;
+mod identity;
 mod input;
 mod project;
+mod sections;
+mod ui;
 
 #[cfg(test)]
 use crate::cli::{parse_args, Command, OutputFormat};
+pub use api::{
+    conversion_report_from_paths, conversion_summary_from_paths, cove_o_from_paths,
+    projected_rows_from_paths,
+};
+pub(crate) use api::{parse_map, plan_keys, preview};
+pub(crate) use context::{mapping_context, MappingContext};
 #[cfg(test)]
 use emit::build_cove_o;
 use emit::build_cove_o_with_source_states;
+pub(crate) use identity::{plan_identities, CandidateMatch, PlannedIdentity};
 #[cfg(test)]
 use input::read_csv;
 use input::{
@@ -57,483 +64,18 @@ use input::{
 use project::{diff_maps, project_rows_with_source_states, run_fixture_path};
 #[cfg(test)]
 use project::{project_rows, property_by_name};
-
-#[derive(Debug, Clone)]
-struct MappingContext {
-    identity_rules: BTreeMap<String, MapIdentityRule>,
-    identity_rule_order: BTreeMap<String, usize>,
-    source_order: BTreeMap<String, usize>,
-    sources: BTreeMap<String, MapSourceEntry>,
-    governance_reconciliation_policy: String,
-    row_rules: Vec<MapRowSemanticRule>,
-    do_not_merge: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone)]
-struct PlannedIdentity {
-    source_id: String,
-    row_index: usize,
-    row_digest: String,
-    schema_fingerprint: String,
-    source_row_identity: String,
-    row_rule_id: String,
-    identity_rule_id: String,
-    object_type: String,
-    join_key_sha256: String,
-    identity_alias: String,
-    equivalence_id: String,
-    canonical_anchor: String,
-    goid: [u8; 16],
-}
-
-#[derive(Debug, Clone)]
-struct CandidateMatch {
-    source_id: String,
-    row_index: usize,
-    row_digest: String,
-    schema_fingerprint: String,
-    source_row_identity: String,
-    row_rule_id: String,
-    identity_rule_id: String,
-    object_type: String,
-    join_key_sha256: String,
-    identity_alias: String,
-}
-
-#[derive(Debug, Clone)]
-struct IdentityPlan {
-    canonical: Vec<PlannedIdentity>,
-    candidates: Vec<CandidateMatch>,
-}
+pub(crate) use sections::{embedded_sections, mapping_identity, section_kind};
+#[cfg(test)]
+use std::fs;
+#[cfg(test)]
+use std::path::PathBuf;
+pub(crate) use ui::{
+    candidate_assertion_id, candidate_match_id, evidence_entry_for_candidate,
+    evidence_entry_for_identity, explain, identity_assertion_id, print_json, print_usage,
+    write_or_print,
+};
 
 pub use cli::run_cli;
-
-pub fn conversion_report_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value, String> {
-    Ok(materialize_from_paths(map, sources)?.conversion_report)
-}
-
-pub fn conversion_summary_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value, String> {
-    let materialized = materialize_from_paths(map, sources)?;
-    Ok(json!({
-        "report": materialized.conversion_report,
-        "materialized_row_count": materialized.rows.len(),
-        "evidence_entry_count": materialized.evidence_entries.len(),
-        "assertion_count": materialized.assertions.len(),
-    }))
-}
-
-fn materialize_from_paths(map: &Path, sources: &[PathBuf]) -> Result<MaterializedModel, String> {
-    let file = parse_map(map)?;
-    let inputs = read_source_inputs(sources)?;
-    validate_source_inputs(&file, &inputs.states)?;
-    materialize_with_source_states(&file, &inputs.rows, &inputs.states)
-}
-
-pub fn cove_o_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Vec<u8>, String> {
-    let file = parse_map(map)?;
-    let inputs = read_source_inputs(sources)?;
-    validate_source_inputs(&file, &inputs.states)?;
-    build_cove_o_with_source_states(&file, &inputs.rows, &inputs.states)
-}
-
-pub fn projected_rows_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Value, String> {
-    let file = parse_map(map)?;
-    let inputs = read_source_inputs(sources)?;
-    validate_source_inputs(&file, &inputs.states)?;
-    project_rows_with_source_states(&file, &inputs.rows, &inputs.states)
-}
-
-fn parse_map(path: &Path) -> Result<CovemapFile, String> {
-    let bytes = fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    CovemapFile::parse_validated(&bytes).map_err(|err| format!("{}: {err}", path.display()))
-}
-
-fn preview(file: &CovemapFile) -> Value {
-    json!({
-        "mapping_version": file.mapping_version,
-        "section_count": file.sections.len(),
-        "sections": file.sections.iter().map(|section| {
-            let kind = section_kind(section.entry.section_id);
-            json!({
-                "section_id": section.entry.section_id,
-                "kind": kind,
-                "required": section.entry.required,
-                "payload_len": section.payload.len(),
-            })
-        }).collect::<Vec<_>>(),
-    })
-}
-
-fn plan_keys(file: &CovemapFile, rows: &[SourceRow]) -> Value {
-    let planned = match plan_identities(file, rows) {
-        Ok(planned) => planned,
-        Err(message) => return json!({"error": message}),
-    };
-    json!({
-        "rows": planned.canonical.iter().map(|identity| {
-            json!({
-                "source_id": identity.source_id,
-                "row_index": identity.row_index,
-                "source_row_identity": identity.source_row_identity,
-                "row_digest": identity.row_digest,
-                "row_rule_id": identity.row_rule_id,
-                "identity_rule_id": identity.identity_rule_id,
-                "object_type": identity.object_type,
-                "join_key_sha256": identity.join_key_sha256,
-                "identity_alias": identity.identity_alias,
-                "equivalence_id": identity.equivalence_id,
-                "canonical_anchor": identity.canonical_anchor,
-                "goid": hex_encode(&identity.goid),
-            })
-        }).collect::<Vec<_>>(),
-        "candidate_matches": planned.candidates.iter().map(|candidate| {
-            json!({
-                "source_id": candidate.source_id,
-                "row_index": candidate.row_index,
-                "source_row_identity": candidate.source_row_identity,
-                "row_digest": candidate.row_digest,
-                "row_rule_id": candidate.row_rule_id,
-                "identity_rule_id": candidate.identity_rule_id,
-                "object_type": candidate.object_type,
-                "join_key_sha256": candidate.join_key_sha256,
-                "identity_alias": candidate.identity_alias,
-                "candidate_match_id": candidate_match_id(candidate),
-            })
-        }).collect::<Vec<_>>()
-    })
-}
-
-fn plan_identities(file: &CovemapFile, rows: &[SourceRow]) -> Result<IdentityPlan, String> {
-    let context = mapping_context(file)?;
-    let object_types = object_types_from_mapping(&context)?;
-    let type_ids = object_types
-        .iter()
-        .map(|ty| (ty.type_name.clone(), ty.object_type_id))
-        .collect::<BTreeMap<_, _>>();
-    let mut keys = Vec::<IdentityKey>::new();
-    let mut candidates = Vec::<CandidateMatch>::new();
-    for row in rows {
-        let matching_rules = context
-            .row_rules
-            .iter()
-            .filter(|rule| rule.source_id == row.source_id)
-            .collect::<Vec<_>>();
-        if matching_rules.is_empty() {
-            return Err(format!(
-                "source '{}' has no declared row semantic rule",
-                row.source_id
-            ));
-        }
-        for row_rule in matching_rules {
-            let identity_rule = context
-                .identity_rules
-                .get(&row_rule.identity_rule_id)
-                .ok_or_else(|| {
-                    format!(
-                        "row rule '{}' references missing identity rule '{}'",
-                        row_rule.rule_id, row_rule.identity_rule_id
-                    )
-                })?;
-            let object_type_id = *type_ids
-                .get(&identity_rule.object_type)
-                .ok_or_else(|| format!("unknown object type '{}'", identity_rule.object_type))?;
-            let tuple = join_key_tuple_from_rule(identity_rule, row, object_type_id)?;
-            let source_row_identity = format!("{}:{}", row.source_id, row.row_index);
-            let row_digest = row_digest(row);
-            let schema_fingerprint = schema_fingerprint(row);
-            let join_key_sha256 = sha256_hex(&tuple);
-            if is_candidate_identity_rule(identity_rule) {
-                candidates.push(CandidateMatch {
-                    source_id: row.source_id.clone(),
-                    row_index: row.row_index,
-                    row_digest,
-                    schema_fingerprint,
-                    source_row_identity,
-                    row_rule_id: row_rule.rule_id.clone(),
-                    identity_rule_id: identity_rule.rule_id.clone(),
-                    object_type: identity_rule.object_type.clone(),
-                    join_key_sha256: join_key_sha256.clone(),
-                    identity_alias: format!("{}:{join_key_sha256}", identity_rule.rule_id),
-                });
-                continue;
-            }
-            let merge_class = merge_class(identity_rule);
-            let source_order = context
-                .source_order
-                .get(&row.source_id)
-                .copied()
-                .unwrap_or(usize::MAX);
-            let rule_order = context
-                .identity_rule_order
-                .get(&identity_rule.rule_id)
-                .copied()
-                .unwrap_or(usize::MAX);
-            let join_key_sha256 = sha256_hex(&tuple);
-            keys.push(IdentityKey {
-                source_id: row.source_id.clone(),
-                row_index: row.row_index,
-                row_digest,
-                schema_fingerprint,
-                source_row_identity,
-                row_rule_id: row_rule.rule_id.clone(),
-                identity_rule_id: identity_rule.rule_id.clone(),
-                object_type: identity_rule.object_type.clone(),
-                object_type_id,
-                class_rank: identity_class_rank(&identity_rule.confidence_class),
-                rule_order,
-                source_order,
-                join_key_tuple: tuple,
-                join_key_sha256,
-                merge_class,
-            });
-        }
-    }
-
-    let mut uf = UnionFind::new(keys.len());
-    let mut merge_groups = BTreeMap::<Vec<u8>, Vec<usize>>::new();
-    for (index, key) in keys.iter().enumerate() {
-        if let Some(group_key) = key.merge_group_key() {
-            merge_groups.entry(group_key).or_default().push(index);
-        }
-    }
-    for indexes in merge_groups.values() {
-        if let Some((first, rest)) = indexes.split_first() {
-            for index in rest {
-                uf.union(*first, *index);
-            }
-        }
-    }
-
-    let mut components = BTreeMap::<usize, Vec<usize>>::new();
-    for index in 0..keys.len() {
-        components.entry(uf.find(index)).or_default().push(index);
-    }
-    validate_do_not_merge(&context.do_not_merge, &components, &keys)?;
-
-    let mut planned = Vec::with_capacity(keys.len());
-    for indexes in components.values() {
-        let anchor_index = indexes
-            .iter()
-            .copied()
-            .min_by_key(|index| keys[*index].anchor_sort_key())
-            .ok_or_else(|| "empty identity component".to_string())?;
-        let anchor = &keys[anchor_index];
-        let source_scope = anchor.goid_source_scope();
-        let goid = mapped_goid(
-            &file.header.mapping_id,
-            file.mapping_version.as_bytes(),
-            anchor.object_type_id,
-            anchor.identity_rule_id.as_bytes(),
-            &anchor.join_key_tuple,
-            source_scope.as_deref(),
-        );
-        let equivalence_id = format!("{}:{}", anchor.object_type, hex_encode(&goid));
-        let canonical_anchor = anchor.anchor_alias();
-        for index in indexes {
-            let key = &keys[*index];
-            planned.push(PlannedIdentity {
-                source_id: key.source_id.clone(),
-                row_index: key.row_index,
-                row_digest: key.row_digest.clone(),
-                schema_fingerprint: key.schema_fingerprint.clone(),
-                source_row_identity: key.source_row_identity.clone(),
-                row_rule_id: key.row_rule_id.clone(),
-                identity_rule_id: key.identity_rule_id.clone(),
-                object_type: key.object_type.clone(),
-                join_key_sha256: key.join_key_sha256.clone(),
-                identity_alias: key.anchor_alias(),
-                equivalence_id: equivalence_id.clone(),
-                canonical_anchor: canonical_anchor.clone(),
-                goid,
-            });
-        }
-    }
-    planned.sort_by_key(|identity| {
-        (
-            identity.source_id.clone(),
-            identity.row_index,
-            identity.identity_rule_id.clone(),
-            identity.goid,
-        )
-    });
-    candidates.sort_by_key(|candidate| {
-        (
-            candidate.source_id.clone(),
-            candidate.row_index,
-            candidate.identity_rule_id.clone(),
-            candidate.join_key_sha256.clone(),
-        )
-    });
-    Ok(IdentityPlan {
-        canonical: planned,
-        candidates,
-    })
-}
-
-fn is_candidate_identity_rule(rule: &MapIdentityRule) -> bool {
-    rule.candidate_only || rule.confidence_class == "candidate"
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdentityMergeClass {
-    MergeGlobal,
-    MergeWithinSource,
-    Singleton,
-}
-
-#[derive(Debug, Clone)]
-struct IdentityKey {
-    source_id: String,
-    row_index: usize,
-    row_digest: String,
-    schema_fingerprint: String,
-    source_row_identity: String,
-    row_rule_id: String,
-    identity_rule_id: String,
-    object_type: String,
-    object_type_id: u32,
-    class_rank: u8,
-    rule_order: usize,
-    source_order: usize,
-    join_key_tuple: Vec<u8>,
-    join_key_sha256: String,
-    merge_class: IdentityMergeClass,
-}
-
-impl IdentityKey {
-    fn merge_group_key(&self) -> Option<Vec<u8>> {
-        if self.merge_class == IdentityMergeClass::Singleton {
-            return None;
-        }
-        let mut out = Vec::new();
-        append_len_bytes(&mut out, self.object_type.as_bytes());
-        append_len_bytes(&mut out, self.identity_rule_id.as_bytes());
-        if self.merge_class == IdentityMergeClass::MergeWithinSource {
-            append_len_bytes(&mut out, self.source_id.as_bytes());
-        }
-        append_len_bytes(&mut out, &self.join_key_tuple);
-        Some(out)
-    }
-
-    fn anchor_sort_key(&self) -> (u8, usize, usize, Vec<u8>, String) {
-        (
-            self.class_rank,
-            self.rule_order,
-            self.source_order,
-            self.join_key_tuple.clone(),
-            self.source_row_identity.clone(),
-        )
-    }
-
-    fn goid_source_scope(&self) -> Option<String> {
-        match self.merge_class {
-            IdentityMergeClass::MergeGlobal => None,
-            IdentityMergeClass::MergeWithinSource => Some(self.source_id.clone()),
-            IdentityMergeClass::Singleton => Some(self.source_row_identity.clone()),
-        }
-    }
-
-    fn anchor_alias(&self) -> String {
-        format!("{}:{}", self.identity_rule_id, self.join_key_sha256)
-    }
-
-    fn aliases(&self) -> BTreeSet<String> {
-        BTreeSet::from([
-            self.source_row_identity.clone(),
-            self.row_digest.clone(),
-            self.anchor_alias(),
-            format!("{}:{}", self.object_type, self.join_key_sha256),
-        ])
-    }
-}
-
-struct UnionFind {
-    parent: Vec<usize>,
-}
-
-impl UnionFind {
-    fn new(len: usize) -> Self {
-        Self {
-            parent: (0..len).collect(),
-        }
-    }
-
-    fn find(&mut self, index: usize) -> usize {
-        let parent = self.parent[index];
-        if parent == index {
-            index
-        } else {
-            let root = self.find(parent);
-            self.parent[index] = root;
-            root
-        }
-    }
-
-    fn union(&mut self, left: usize, right: usize) {
-        let left_root = self.find(left);
-        let right_root = self.find(right);
-        if left_root != right_root {
-            let (keep, replace) = if left_root <= right_root {
-                (left_root, right_root)
-            } else {
-                (right_root, left_root)
-            };
-            self.parent[replace] = keep;
-        }
-    }
-}
-
-fn merge_class(rule: &MapIdentityRule) -> IdentityMergeClass {
-    match rule.confidence_class.as_str() {
-        "authoritative" => {
-            if rule.auto_merge.unwrap_or(true) {
-                IdentityMergeClass::MergeGlobal
-            } else {
-                IdentityMergeClass::Singleton
-            }
-        }
-        "strong_deterministic" => {
-            if rule.auto_merge.unwrap_or(false) {
-                IdentityMergeClass::MergeGlobal
-            } else {
-                IdentityMergeClass::Singleton
-            }
-        }
-        "source_scoped" => IdentityMergeClass::MergeWithinSource,
-        _ => IdentityMergeClass::Singleton,
-    }
-}
-
-fn identity_class_rank(class: &str) -> u8 {
-    match class {
-        "authoritative" => 0,
-        "strong_deterministic" => 1,
-        "source_scoped" => 2,
-        "weak_deterministic" => 3,
-        _ => 4,
-    }
-}
-
-fn validate_do_not_merge(
-    constraints: &[(String, String)],
-    components: &BTreeMap<usize, Vec<usize>>,
-    keys: &[IdentityKey],
-) -> Result<(), String> {
-    for indexes in components.values() {
-        let aliases = indexes
-            .iter()
-            .flat_map(|index| keys[*index].aliases())
-            .collect::<BTreeSet<_>>();
-        for (left, right) in constraints {
-            if aliases.contains(left) && aliases.contains(right) {
-                return Err(format!(
-                    "identity resolution violates do-not-merge constraint '{left}' <-> '{right}'"
-                ));
-            }
-        }
-    }
-    Ok(())
-}
 
 #[derive(Debug, Clone)]
 struct ObjectRow {
@@ -1370,53 +912,6 @@ fn resolve_association_endpoint<'a>(
     Ok(planned_by_join.get(&(rule_id.to_string(), digest)).copied())
 }
 
-fn evidence_entry_for_identity(identity: &PlannedIdentity) -> Value {
-    json!({
-        "source_id": identity.source_id,
-        "source_row_identity": identity.source_row_identity,
-        "rule_id": identity.row_rule_id,
-        "assertion_id": identity_assertion_id(identity),
-        "output_object_id": hex_encode(&identity.goid),
-        "observed_schema_fingerprint": identity.schema_fingerprint,
-    })
-}
-
-fn evidence_entry_for_candidate(candidate: &CandidateMatch) -> Value {
-    json!({
-        "source_id": candidate.source_id,
-        "source_row_identity": candidate.source_row_identity,
-        "rule_id": candidate.row_rule_id,
-        "assertion_id": candidate_assertion_id(candidate),
-        "output_object_id": candidate_match_id(candidate),
-        "observed_schema_fingerprint": candidate.schema_fingerprint,
-        "candidate": true,
-        "identity_rule_id": candidate.identity_rule_id,
-        "object_type": candidate.object_type,
-        "join_key_sha256": candidate.join_key_sha256,
-    })
-}
-
-fn identity_assertion_id(identity: &PlannedIdentity) -> String {
-    format!(
-        "assertion:{}:{}",
-        identity.identity_rule_id, identity.row_digest
-    )
-}
-
-fn candidate_assertion_id(candidate: &CandidateMatch) -> String {
-    format!(
-        "candidate:{}:{}",
-        candidate.identity_rule_id, candidate.row_digest
-    )
-}
-
-fn candidate_match_id(candidate: &CandidateMatch) -> String {
-    format!(
-        "candidate-match:{}:{}",
-        candidate.identity_rule_id, candidate.join_key_sha256
-    )
-}
-
 fn row_rule_materializes_object(row_rule: &MapRowSemanticRule) -> Result<bool, String> {
     match row_rule.row_semantics_kind.as_str() {
         "Object" | "EventObject" | "LinkObject" | "Composite" | "Dispatched"
@@ -2084,29 +1579,6 @@ fn map_passthrough_sections(file: &CovemapFile) -> Vec<SectionPayload> {
         .collect()
 }
 
-fn explain(file: &CovemapFile, id: &str) -> Result<Value, String> {
-    for section in embedded_sections(file)? {
-        if let EmbeddedMapSection::EvidenceIndex(index) = section {
-            for entry in index.entries {
-                if entry.assertion_id == id || entry.output_object_id == id {
-                    return Ok(json!({
-                        "source_id": entry.source_id,
-                        "source_row_identity": entry.source_row_identity,
-                        "rule_id": entry.rule_id,
-                        "assertion_id": entry.assertion_id,
-                        "output_object_id": entry.output_object_id,
-                        "observed_schema_fingerprint": entry.observed_schema_fingerprint,
-                        "observed_snapshot_digest": entry.observed_snapshot_digest,
-                    }));
-                }
-            }
-        }
-    }
-    Err(format!(
-        "id {id} was not found in COVE-MAP evidence sections"
-    ))
-}
-
 #[derive(Debug, Clone, Copy)]
 struct JoinKeyComponent<'a> {
     role_id: &'a str,
@@ -2136,79 +1608,6 @@ fn join_key_tuple(
         }
     }
     out
-}
-
-fn mapping_context(file: &CovemapFile) -> Result<MappingContext, String> {
-    let mut identity_rules = BTreeMap::new();
-    let mut identity_rule_order = BTreeMap::new();
-    let mut source_order = BTreeMap::new();
-    let mut sources = BTreeMap::new();
-    let mut governance_reconciliation_policy = "emit_effective_policy".to_string();
-    let mut row_rules = Vec::new();
-    let mut do_not_merge = Vec::new();
-    for section in embedded_sections(file)? {
-        match section {
-            EmbeddedMapSection::SourceCatalog(catalog) => {
-                if governance_reconciliation_policy != "emit_effective_policy"
-                    && governance_reconciliation_policy != catalog.governance_reconciliation_policy
-                {
-                    return Err("conflicting governance reconciliation policies".into());
-                }
-                governance_reconciliation_policy = catalog.governance_reconciliation_policy;
-                for source in catalog.sources {
-                    let order = source_order.len();
-                    if source_order
-                        .insert(source.source_id.clone(), order)
-                        .is_some()
-                    {
-                        return Err("duplicate source entry".into());
-                    }
-                    sources.insert(source.source_id.clone(), source);
-                }
-            }
-            EmbeddedMapSection::IdentityRuleCatalog(MapIdentityRuleCatalog {
-                identity_rules: rules,
-                do_not_merge: constraints,
-                ..
-            }) => {
-                for rule in rules {
-                    let order = identity_rule_order.len();
-                    if identity_rule_order
-                        .insert(rule.rule_id.clone(), order)
-                        .is_some()
-                    {
-                        return Err("duplicate identity rule".into());
-                    }
-                    if identity_rules.insert(rule.rule_id.clone(), rule).is_some() {
-                        return Err("duplicate identity rule".into());
-                    }
-                }
-                do_not_merge.extend(constraints.into_iter().map(|constraint| {
-                    if constraint.left_identity <= constraint.right_identity {
-                        (constraint.left_identity, constraint.right_identity)
-                    } else {
-                        (constraint.right_identity, constraint.left_identity)
-                    }
-                }));
-            }
-            EmbeddedMapSection::RowSemanticsCatalog(MapRowSemanticsCatalog { rules, .. }) => {
-                row_rules.extend(rules);
-            }
-            _ => {}
-        }
-    }
-    if identity_rules.is_empty() || row_rules.is_empty() {
-        return Err("mapping must declare identity rules and row semantic rules".into());
-    }
-    Ok(MappingContext {
-        identity_rules,
-        identity_rule_order,
-        source_order,
-        sources,
-        governance_reconciliation_policy,
-        row_rules,
-        do_not_merge,
-    })
 }
 
 fn join_key_tuple_from_rule(
@@ -2347,57 +1746,6 @@ fn goid16_parts(parts: &[&[u8]]) -> [u8; 16] {
     out
 }
 
-fn mapping_identity(file: &CovemapFile) -> Result<(String, String), String> {
-    for section in embedded_sections(file)? {
-        match section {
-            EmbeddedMapSection::SourceCatalog(section) => {
-                return Ok((section.mapping_id, section.mapping_version));
-            }
-            EmbeddedMapSection::FunctionRegistry(section) => {
-                return Ok((section.mapping_id, section.mapping_version));
-            }
-            EmbeddedMapSection::IdentityRuleCatalog(section) => {
-                return Ok((section.mapping_id, section.mapping_version));
-            }
-            EmbeddedMapSection::RowSemanticsCatalog(section) => {
-                return Ok((section.mapping_id, section.mapping_version));
-            }
-            EmbeddedMapSection::AssertionLog(section) => {
-                return Ok((section.mapping_id, section.mapping_version));
-            }
-            EmbeddedMapSection::IdentityEquivalenceIndex(section) => {
-                return Ok((section.mapping_id, section.mapping_version));
-            }
-            EmbeddedMapSection::EvidenceIndex(section) => {
-                return Ok((section.mapping_id, section.mapping_version));
-            }
-            EmbeddedMapSection::ConversionReport(section) => {
-                return Ok((section.mapping_id, section.mapping_version));
-            }
-            EmbeddedMapSection::ProjectionCatalog(section) => {
-                return Ok((section.mapping_id, section.mapping_version));
-            }
-            _ => {}
-        }
-    }
-    Err("mapping contains no embedded sections".into())
-}
-
-fn embedded_sections(file: &CovemapFile) -> Result<Vec<EmbeddedMapSection>, String> {
-    let mut out = Vec::new();
-    for section in &file.sections {
-        let kind = u16::try_from(section.entry.section_id)
-            .ok()
-            .and_then(SectionKind::from_u16)
-            .ok_or_else(|| "invalid COVE-MAP section id".to_string())?;
-        out.push(
-            parse_embedded_section(kind, &section.payload)
-                .map_err(|err| format!("invalid embedded map section: {err}"))?,
-        );
-    }
-    Ok(out)
-}
-
 fn logical_type_from_name(name: &str) -> Result<CoveLogicalType, String> {
     match name {
         "bool" | "boolean" => Ok(CoveLogicalType::Bool),
@@ -2528,14 +1876,6 @@ fn section_set(file: &CovemapFile) -> BTreeSet<String> {
         .iter()
         .map(|section| section_kind(section.entry.section_id))
         .collect()
-}
-
-fn section_kind(section_id: u32) -> String {
-    u16::try_from(section_id)
-        .ok()
-        .and_then(SectionKind::from_u16)
-        .map(|kind| format!("{kind:?}"))
-        .unwrap_or_else(|| format!("Unknown({section_id})"))
 }
 
 fn object_to_btree(object: &Map<String, Value>) -> BTreeMap<String, Value> {
@@ -2670,36 +2010,6 @@ fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("fixture.{key} must be a string"))
-}
-
-fn print_json(value: &Value) {
-    println!("{}", serde_json::to_string_pretty(value).unwrap());
-}
-
-fn write_or_print(output: Option<PathBuf>, value: &Value) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(value)
-        .map_err(|err| format!("cannot serialize JSON output: {err}"))?;
-    if let Some(output) = output {
-        fs::write(&output, text).map_err(|err| format!("cannot write {}: {err}", output.display()))
-    } else {
-        println!("{text}");
-        Ok(())
-    }
-}
-
-fn print_usage() {
-    println!(
-        "Usage: cove-map <subcommand> [options]\n\n\
-Subcommands:\n  \
-validate <mapping.covemap>\n  \
-preview <mapping.covemap>\n  \
-plan-keys <mapping.covemap> <source.csv|source.jsonl>...\n  \
-convert [--format json|cove-o] [-o output] <mapping.covemap> <source.csv|source.jsonl>...\n  \
-explain <mapping.covemap> <goid|assertion-id>\n  \
-diff <left.covemap> <right.covemap>\n  \
-project [-o output.json] <mapping.covemap> <source.csv|source.jsonl>...\n  \
-test <fixture.json>"
-    );
 }
 
 #[cfg(test)]

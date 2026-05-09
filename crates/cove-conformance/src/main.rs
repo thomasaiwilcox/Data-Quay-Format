@@ -19,6 +19,9 @@
 //! {"path":"reject/bad_crc.cove","kind":"cove","expect":"reject","error_code":"COVE_E_CHECKSUM_MISMATCH","sections":["§13"]}
 //! ```
 
+mod manifest;
+mod runner;
+
 use std::{
     borrow::Cow,
     collections::BTreeSet,
@@ -125,120 +128,24 @@ use cove_core::{
     },
     CoveError,
 };
+use manifest::Entry;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args = std::env::args().collect::<Vec<_>>();
     if args.len() < 2 {
         eprintln!("Usage: cove-conformance <corpus-dir>");
         process::exit(2);
     }
     let corpus = Path::new(&args[1]);
-    let manifest = corpus.join("manifest.jsonl");
-    let manifest_bytes = match std::fs::read(&manifest) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("cannot read manifest {}: {}", manifest.display(), e);
+    let entries = match manifest::load_manifest(corpus) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("{error}");
             process::exit(2);
         }
     };
-    let text = String::from_utf8_lossy(&manifest_bytes);
-    let mut total = 0usize;
-    let mut passed = 0usize;
-    for (lineno, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let entry = match parse_entry(line) {
-            Some(e) => e,
-            None => {
-                eprintln!("manifest line {}: malformed", lineno + 1);
-                continue;
-            }
-        };
-        total += 1;
-        let path = corpus.join(&entry.path);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("FAIL {} (read error: {})", entry.path, e);
-                continue;
-            }
-        };
-        let result = validate_fixture(&entry, corpus, &bytes);
-        let ok = match (entry.expect.as_str(), &result) {
-            ("accept", Ok(_)) => true,
-            ("reject", Err(e)) => {
-                if let Some(want) = &entry.error_code {
-                    e.spec_code() == Some(want.as_str())
-                } else if let Some(want) = &entry.error {
-                    let dbg = format!("{:?}", e);
-                    let disp = e.to_string();
-                    dbg.contains(want) || disp.contains(want)
-                } else {
-                    true
-                }
-            }
-            _ => false,
-        };
-        if ok {
-            passed += 1;
-            println!("PASS {}", entry.path);
-        } else {
-            let actual = match &result {
-                Ok(()) => "accept".to_string(),
-                Err(error) => format!("reject ({error})"),
-            };
-            println!(
-                "FAIL {} (kind {}, expected {}, got {})",
-                entry.path, entry.kind, entry.expect, actual
-            );
-        }
-    }
-    println!("\n{passed}/{total} fixtures passed");
-    process::exit(if passed == total { 0 } else { 1 });
-}
-
-struct Entry {
-    path: String,
-    kind: String,
-    expect: String,
-    error_code: Option<String>,
-    error: Option<String>,
-    morsel_count: Option<u32>,
-    raw: Value,
-}
-
-fn parse_entry(line: &str) -> Option<Entry> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let path = value.get("path")?.as_str()?.to_string();
-    let kind = value
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("cove")
-        .to_string();
-    let expect = value.get("expect")?.as_str()?.to_string();
-    let error_code = value
-        .get("error_code")
-        .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned);
-    let error = value
-        .get("error")
-        .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned);
-    let morsel_count = value
-        .get("morsel_count")
-        .and_then(|v| v.as_u64())
-        .and_then(|v| u32::try_from(v).ok());
-    Some(Entry {
-        path,
-        kind,
-        expect,
-        error_code,
-        error,
-        morsel_count,
-        raw: value,
-    })
+    let all_ok = runner::run_entries(corpus, &entries, validate_fixture);
+    process::exit(if all_ok { 0 } else { 1 });
 }
 
 fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), CoveError> {

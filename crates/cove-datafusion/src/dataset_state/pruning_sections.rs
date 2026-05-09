@@ -1,4 +1,15 @@
-use super::*;
+use cove_core::{
+    compression,
+    constants::SectionKind,
+    domain::ColumnDomain,
+    footer::CoveFooter,
+    index::{
+        aggregate::AggregateSynopsis, bloom::BloomFilterIndex, composite::CompositeIndex,
+        exact_set::ExactSetIndex, inverted::InvertedMorselIndex, lookup::LookupIndex,
+        topn::TopNSummary,
+    },
+    zone_stats::ZoneStatsSection,
+};
 
 pub fn parse_column_domains_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<ColumnDomain> {
     footer

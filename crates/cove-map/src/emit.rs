@@ -50,7 +50,7 @@ pub(crate) fn build_cove_o_with_source_states(
         SectionKind::TrustManifest,
         trust_manifest.entries.len() as u64,
         0,
-        trust_manifest.serialize(),
+        trust_manifest.serialize().map_err(|err| err.to_string())?,
     ));
     writer.sections.push(map_section(
         SectionKind::MapAssertionLog,
