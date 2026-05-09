@@ -46,15 +46,25 @@ impl TrustManifest {
     }
 
     /// Inverse of [`Self::parse`]; produces canonical bytes that round-trip.
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + self.entries.len() * TRUST_MANIFEST_ENTRY_LEN);
-        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
+        let entry_count = u32::try_from(self.entries.len())
+            .map_err(|_| CoveError::BadSchema("too many trust manifest entries".into()))?;
+        let capacity = 4usize
+            .checked_add(
+                self.entries
+                    .len()
+                    .checked_mul(TRUST_MANIFEST_ENTRY_LEN)
+                    .ok_or(CoveError::ArithOverflow)?,
+            )
+            .ok_or(CoveError::ArithOverflow)?;
+        let mut out = Vec::with_capacity(capacity);
+        out.extend_from_slice(&entry_count.to_le_bytes());
         for e in &self.entries {
             out.extend_from_slice(&e.segment_id.to_le_bytes());
             out.extend_from_slice(&e.row_index.to_le_bytes());
             out.extend_from_slice(&e.expected_hash);
         }
-        out
+        Ok(out)
     }
 
     pub fn verify_against(&self, segments: &[TemporalSegmentData]) -> Result<(), CoveError> {

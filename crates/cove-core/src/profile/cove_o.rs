@@ -526,7 +526,7 @@ mod tests {
                 },
             ],
         };
-        let bytes = m.serialize();
+        let bytes = m.serialize().unwrap();
         assert_eq!(TrustManifest::parse(&bytes).unwrap(), m);
     }
 }

@@ -314,13 +314,6 @@ fn parse_segment_metadata(
             if page.column_id != column.column_id {
                 return Err(CoveError::PageCorrupt);
             }
-            let morsel = morsels
-                .entries
-                .get(page.morsel_id as usize)
-                .ok_or(CoveError::SegmentCorrupt)?;
-            if page.row_count != morsel.row_count {
-                return Err(CoveError::PageCorrupt);
-            }
             if page_uses_payload_elision(page.flags)
                 && required_features & cove_core::constants::FEATURE_PAGE_PAYLOAD_ELISION == 0
             {
@@ -352,6 +345,115 @@ fn column_page_index(
     let len = usize::try_from(column.page_index_length).map_err(|_| CoveError::OffsetRange)?;
     let bytes = wire::read_range_checked(segment_bytes, start, len)?;
     ColumnPageIndex::parse(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_segment_metadata_accepts_sparse_morsel_ids() {
+        let morsel_directory_offset = TABLE_SEGMENT_HEADER_LEN;
+        let column_directory_offset =
+            morsel_directory_offset + cove_core::segment::ROW_MORSEL_ENTRY_LEN * 2;
+        let page_index_offset = column_directory_offset + TABLE_COLUMN_DIRECTORY_ENTRY_LEN;
+        let data_offset = page_index_offset + cove_core::page::COLUMN_PAGE_INDEX_ENTRY_LEN * 2;
+
+        let header = TableSegmentHeaderV1 {
+            table_id: 1,
+            segment_id: 7,
+            row_start: 0,
+            row_count: 5,
+            morsel_count: 2,
+            morsel_row_count: 4,
+            column_count: 1,
+            morsel_directory_offset: morsel_directory_offset as u64,
+            column_directory_offset: column_directory_offset as u64,
+            page_index_offset: page_index_offset as u64,
+            data_offset: data_offset as u64,
+            flags: 0,
+            checksum: 0,
+        };
+        let morsels = RowMorselDirectory {
+            entries: vec![
+                RowMorselEntryV1 {
+                    morsel_id: 3,
+                    first_row_in_segment: 0,
+                    row_count: 4,
+                    flags: 0,
+                    stats_ref: 0,
+                    checksum: 0,
+                },
+                RowMorselEntryV1 {
+                    morsel_id: 9,
+                    first_row_in_segment: 4,
+                    row_count: 1,
+                    flags: 0,
+                    stats_ref: 0,
+                    checksum: 0,
+                },
+            ],
+        };
+        let column = TableColumnDirectoryEntryV1 {
+            column_id: 11,
+            logical_type: CoveLogicalType::Int64,
+            physical_kind: CovePhysicalKind::NumCode,
+            flags: 0,
+            page_index_offset: page_index_offset as u64,
+            page_index_length: (cove_core::page::COLUMN_PAGE_INDEX_ENTRY_LEN * 2) as u64,
+            data_offset: data_offset as u64,
+            data_length: 40,
+            stats_ref: 0,
+            domain_ref: 0,
+            checksum: 0,
+        };
+        let first_page = ColumnPageIndexEntryV1 {
+            column_id: 11,
+            morsel_id: 3,
+            row_count: 4,
+            non_null_count: 4,
+            null_count: 0,
+            encoding_root: 0,
+            page_offset: data_offset as u64,
+            page_length: 32,
+            uncompressed_length: 32,
+            stats_ref: 0,
+            flags: 0,
+            checksum: 0,
+        };
+        let second_page = ColumnPageIndexEntryV1 {
+            column_id: 11,
+            morsel_id: 9,
+            row_count: 1,
+            non_null_count: 1,
+            null_count: 0,
+            encoding_root: 0,
+            page_offset: (data_offset + 32) as u64,
+            page_length: 8,
+            uncompressed_length: 8,
+            stats_ref: 0,
+            flags: 0,
+            checksum: 0,
+        };
+
+        let mut bytes = header.serialize().to_vec();
+        bytes.extend_from_slice(&morsels.serialize());
+        bytes.extend_from_slice(&column.serialize());
+        bytes.extend_from_slice(&first_page.serialize());
+        bytes.extend_from_slice(&second_page.serialize());
+        bytes.extend_from_slice(&[0u8; 40]);
+        let metadata = parse_segment_metadata(&bytes, bytes.len() as u64, 0).unwrap();
+
+        assert_eq!(metadata.morsel_entries()[0].morsel_id, 3);
+        assert_eq!(metadata.morsel(9).unwrap().row_count, 1);
+        assert_eq!(
+            metadata
+                .page_for_morsel(metadata.column(11).unwrap(), 3)
+                .unwrap()
+                .row_count,
+            4
+        );
+    }
 }
 
 pub(super) fn prepare_segment_payload(

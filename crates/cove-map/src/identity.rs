@@ -112,7 +112,6 @@ pub(crate) fn plan_identities(
                 .get(&identity_rule.rule_id)
                 .copied()
                 .unwrap_or(usize::MAX);
-            let join_key_sha256 = crate::sha256_hex(&tuple);
             keys.push(IdentityKey {
                 source_id: row.source_id.clone(),
                 row_index: row.row_index,
