@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use cove_core::profile::cove_map::EmbeddedMapSection;
 use serde_json::{json, Map, Value};
 
 use super::*;

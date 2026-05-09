@@ -4,6 +4,9 @@
 //! Each fixture maps to one or more Spec §76 error codes; the manifest is
 //! written alongside the binaries so the generator stays the source of truth.
 
+#[path = "../gen_corpus_support.rs"]
+mod gen_corpus_support;
+
 use std::{collections::BTreeSet, fs, io::Cursor, path::PathBuf, sync::Arc};
 
 use arrow_array::{
@@ -119,6 +122,11 @@ use cove_core::{
     CoveError,
 };
 use serde_json::{json, Value};
+
+use gen_corpus_support::{
+    check_mode, fixture, json_fixture_bytes, with_collation_count, with_expect_can_skip,
+    with_morsel_count, write_auxiliary_file, write_fixture,
+};
 
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -4623,78 +4631,36 @@ fn main() {
     }
 }
 
-fn check_mode() -> bool {
-    std::env::args().any(|arg| arg == "--check")
-}
-
-fn fixture(
-    path: &str,
-    kind: &str,
-    expect: &str,
-    error_code: Option<&str>,
-    sections: &[&str],
-) -> Value {
-    let mut sections = sections.to_vec();
-    if error_code.is_some() && !sections.contains(&"§76") {
-        sections.push("§76");
-    }
-    let mut value = json!({
-        "path": path,
-        "kind": kind,
-        "expect": expect,
-        "sections": sections,
-    });
-    if let Some(code) = error_code {
-        value["error_code"] = json!(code);
-    }
-    value
-}
-
-fn with_morsel_count(mut value: Value, morsel_count: u32) -> Value {
-    value["morsel_count"] = json!(morsel_count);
-    value
-}
-
-fn with_collation_count(mut value: Value, collation_count: usize) -> Value {
-    value["collation_count"] = json!(collation_count);
-    value
-}
-
-fn with_expect_can_skip(mut value: Value, expected: bool) -> Value {
-    value["expect_can_skip"] = json!(expected);
-    value
-}
-
 fn arrow_bitmap_fixture_bytes(value: Value) -> Vec<u8> {
-    serde_json::to_vec_pretty(&value).unwrap()
+    json_fixture_bytes(value)
 }
 
 fn encoding_fixture_bytes(value: Value) -> Vec<u8> {
-    serde_json::to_vec_pretty(&value).unwrap()
+    json_fixture_bytes(value)
 }
 
 fn error_surface_fixture_bytes(value: Value) -> Vec<u8> {
-    serde_json::to_vec_pretty(&value).unwrap()
+    json_fixture_bytes(value)
 }
 
 fn suite_contract_fixture_bytes(value: Value) -> Vec<u8> {
-    serde_json::to_vec_pretty(&value).unwrap()
+    json_fixture_bytes(value)
 }
 
 fn nested_fixture_bytes(value: Value) -> Vec<u8> {
-    serde_json::to_vec_pretty(&value).unwrap()
+    json_fixture_bytes(value)
 }
 
 fn pruning_fixture_bytes(value: Value) -> Vec<u8> {
-    serde_json::to_vec_pretty(&value).unwrap()
+    json_fixture_bytes(value)
 }
 
 fn page_codec_fixture_bytes(value: Value) -> Vec<u8> {
-    serde_json::to_vec_pretty(&value).unwrap()
+    json_fixture_bytes(value)
 }
 
 fn map_payload_bytes(value: Value) -> Vec<u8> {
-    serde_json::to_vec_pretty(&value).unwrap()
+    json_fixture_bytes(value)
 }
 
 fn extension_registry_entry(
@@ -4997,42 +4963,6 @@ fn assert_error_code_coverage(entries: &[Value]) {
         "manifest is missing Spec §76 error_code coverage for: {}",
         missing.join(", ")
     );
-}
-
-fn write_fixture(root: &PathBuf, entries: &mut Vec<Value>, entry: Value, bytes: Vec<u8>) {
-    let path = entry["path"].as_str().unwrap();
-    let full_path = root.join(path);
-    if check_mode() {
-        let existing = fs::read(&full_path).unwrap_or_else(|err| {
-            panic!("cannot read {} during --check: {err}", full_path.display())
-        });
-        assert_eq!(
-            existing,
-            bytes,
-            "{} is not up to date; run cargo run -p cove-conformance --bin gen-corpus",
-            full_path.display()
-        );
-    } else {
-        fs::write(full_path, bytes).unwrap();
-    }
-    entries.push(entry);
-}
-
-fn write_auxiliary_file(root: &PathBuf, path: &str, bytes: &[u8]) {
-    let full_path = root.join(path);
-    if check_mode() {
-        let existing = fs::read(&full_path).unwrap_or_else(|err| {
-            panic!("cannot read {} during --check: {err}", full_path.display())
-        });
-        assert_eq!(
-            existing,
-            bytes,
-            "{} is not up to date; run cargo run -p cove-conformance --bin gen-corpus",
-            full_path.display()
-        );
-    } else {
-        fs::write(full_path, bytes).unwrap();
-    }
 }
 
 fn cove_file_with_section(

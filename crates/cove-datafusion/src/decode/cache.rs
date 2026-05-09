@@ -11,6 +11,7 @@ use cove_arrow::arrow::{
 };
 use cove_core::constants::CoveLogicalType;
 
+use super::morsels::SegmentMetadata;
 use super::*;
 
 #[derive(Debug, Default)]
