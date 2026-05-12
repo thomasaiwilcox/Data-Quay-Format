@@ -1,0 +1,43 @@
+{
+  "expect_unsupported_required_hint_ids": [
+    2
+  ],
+  "hints": [
+    {
+      "hint_id": 1,
+      "kind": "engine_adapter",
+      "name": "datafusion",
+      "namespace": "org.cove",
+      "required": true,
+      "version_major": 1,
+      "version_minor": 0
+    },
+    {
+      "hint_id": 2,
+      "kind": "predicate_kernel",
+      "name": "missing-kernel",
+      "namespace": "org.cove",
+      "required": true,
+      "version_major": 1,
+      "version_minor": 0
+    },
+    {
+      "hint_id": 3,
+      "kind": "codec_registry",
+      "name": "optional-codec",
+      "namespace": "org.cove",
+      "required": false,
+      "version_major": 1,
+      "version_minor": 0
+    }
+  ],
+  "supported": [
+    {
+      "kind": "engine_adapter",
+      "name": "datafusion",
+      "namespace": "org.cove",
+      "version_major": 1,
+      "version_minor": 0
+    }
+  ]
+}

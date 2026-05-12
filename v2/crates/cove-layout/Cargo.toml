@@ -1,0 +1,11 @@
+[package]
+name = "cove-layout"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+
+[[bin]]
+name = "cove-layout-inspect"
+path = "src/bin/cove-layout-inspect.rs"

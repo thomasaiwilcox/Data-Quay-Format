@@ -1,0 +1,17 @@
+{
+  "input": [
+    128,
+    128,
+    128,
+    128,
+    128,
+    128,
+    128,
+    128,
+    128,
+    128,
+    1
+  ],
+  "op": "varint_decode_reject",
+  "reason": "11-byte varint overflows u64"
+}

@@ -1,0 +1,22 @@
+{
+  "columns": [
+    {
+      "column_id": 12,
+      "inverted": {
+        "fail_open": true,
+        "keys": [
+          3
+        ]
+      }
+    }
+  ],
+  "expect_evidence": [
+    "FallbackToScan"
+  ],
+  "expect_outcome": "unknown",
+  "predicate": {
+    "column_id": 12,
+    "key": 3,
+    "op": "inverted_lookup"
+  }
+}

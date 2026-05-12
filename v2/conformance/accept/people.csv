@@ -1,0 +1,3 @@
+person_id,person_name,team_id,team_name,valid_from,valid_to
+p1,Ada,t1,Core,2026-01-01,2026-12-31
+p2,Linus,t2,Systems,2026-02-01,2026-12-31

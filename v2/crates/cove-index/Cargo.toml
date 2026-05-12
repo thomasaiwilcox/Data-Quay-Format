@@ -1,0 +1,16 @@
+[package]
+name = "cove-index"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+cove-coverage = { path = "../cove-coverage" }
+
+[[bin]]
+name = "cove-index-inspect"
+path = "src/bin/cove-index-inspect.rs"
+
+[[bin]]
+name = "cove-build-covi"
+path = "src/bin/cove-build-covi.rs"

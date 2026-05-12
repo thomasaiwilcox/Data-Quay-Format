@@ -1,0 +1,48 @@
+{
+  "expect_cove_o_valid": true,
+  "expected_conversion": {
+    "governance": {
+      "access_policy_ids": [
+        "hipaa",
+        "internal"
+      ],
+      "effective_sensitivity_labels": [
+        "restricted"
+      ],
+      "effective_sensitivity_rank": 5,
+      "reconciliation_policy": "emit_effective_policy",
+      "sources": [
+        {
+          "access_policy_ids": [
+            "internal"
+          ],
+          "sensitivity_label": "public",
+          "sensitivity_rank": 1,
+          "source_id": "cove_map_crm",
+          "source_priority": 10
+        },
+        {
+          "access_policy_ids": [
+            "hipaa"
+          ],
+          "sensitivity_label": "restricted",
+          "sensitivity_rank": 5,
+          "source_id": "cove_map_support",
+          "source_priority": 1
+        }
+      ]
+    },
+    "mapping_id": "people-priority-map",
+    "mapping_version": "2026.05",
+    "property_value_count": 1
+  },
+  "expected_conversion_summary": {
+    "evidence_entry_count": 3,
+    "materialized_row_count": 2
+  },
+  "mapping": "accept/cove_map_source_priority.covemap",
+  "sources": [
+    "accept/cove_map_crm.csv",
+    "accept/cove_map_support.csv"
+  ]
+}

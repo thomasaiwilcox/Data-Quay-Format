@@ -1,0 +1,11 @@
+{
+  "expect_cove_o_valid": true,
+  "expected_conversion": {
+    "association_count": 0,
+    "object_count": 2
+  },
+  "mapping": "accept/cove_map_tombstone_row_semantics.covemap",
+  "sources": [
+    "accept/people.csv"
+  ]
+}

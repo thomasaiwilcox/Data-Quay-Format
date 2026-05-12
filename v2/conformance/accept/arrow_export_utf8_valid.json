@@ -1,0 +1,28 @@
+{
+  "encoding": "VarBytes",
+  "expect": [
+    "hi",
+    "there"
+  ],
+  "expect_type": "Utf8",
+  "logical": "Utf8",
+  "payload": [
+    2,
+    0,
+    0,
+    0,
+    104,
+    105,
+    5,
+    0,
+    0,
+    0,
+    116,
+    104,
+    101,
+    114,
+    101
+  ],
+  "physical": "VarBytes",
+  "row_count": 2
+}

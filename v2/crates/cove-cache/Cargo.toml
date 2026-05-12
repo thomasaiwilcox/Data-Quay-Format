@@ -1,0 +1,12 @@
+[package]
+name = "cove-cache"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+cove-coverage = { path = "../cove-coverage" }
+
+[[bin]]
+name = "cove-cache-inspect"
+path = "src/bin/cove-cache-inspect.rs"

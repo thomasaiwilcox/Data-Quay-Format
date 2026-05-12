@@ -1,0 +1,19 @@
+{
+  "columns": [
+    {
+      "aggregate": {
+        "fail_open": true,
+        "proves_no_match": true
+      },
+      "column_id": 14
+    }
+  ],
+  "expect_evidence": [
+    "FallbackToScan"
+  ],
+  "expect_outcome": "unknown",
+  "predicate": {
+    "column_id": 14,
+    "op": "aggregate_synopsis"
+  }
+}

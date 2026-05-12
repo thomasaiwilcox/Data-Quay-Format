@@ -1,0 +1,16 @@
+{
+  "input": [
+    128,
+    128,
+    128,
+    128,
+    128,
+    128,
+    128,
+    128,
+    128,
+    2
+  ],
+  "op": "varint_decode_reject",
+  "reason": "10th-byte high bits would shift past bit 63"
+}

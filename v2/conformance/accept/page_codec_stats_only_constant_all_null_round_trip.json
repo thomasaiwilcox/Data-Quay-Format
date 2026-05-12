@@ -1,0 +1,13 @@
+{
+  "codec": "none",
+  "encoding_root_override": 4294967295,
+  "expect": "round_trip",
+  "flags_override": 768,
+  "non_null_count_override": 0,
+  "null_count_override": 1,
+  "page_length_override": 0,
+  "page_offset_override": 0,
+  "payload": "",
+  "row_count_override": 1,
+  "uncompressed_length_override": 0
+}

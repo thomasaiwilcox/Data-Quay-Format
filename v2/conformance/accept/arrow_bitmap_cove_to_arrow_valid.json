@@ -1,0 +1,10 @@
+{
+  "expect": [
+    245
+  ],
+  "input": [
+    10
+  ],
+  "op": "cove_to_arrow",
+  "row_count": 8
+}

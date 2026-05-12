@@ -1,0 +1,16 @@
+{
+  "expected_conversion": {
+    "association_count": 0,
+    "candidate_match_count": 2,
+    "object_count": 0
+  },
+  "expected_conversion_summary": {
+    "assertion_count": 2,
+    "evidence_entry_count": 2,
+    "materialized_row_count": 0
+  },
+  "mapping": "accept/cove_map_candidate_identity.covemap",
+  "sources": [
+    "accept/people.csv"
+  ]
+}

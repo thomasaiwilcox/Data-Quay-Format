@@ -1,0 +1,6 @@
+{
+  "codec": "none",
+  "expect": "parse_reject",
+  "payload": "abcdef",
+  "uncompressed_length_override": 99
+}

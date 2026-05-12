@@ -1,0 +1,23 @@
+{
+  "expect_association_readback_flags": true,
+  "expect_cove_o_valid": true,
+  "expect_semantic_map_optional": true,
+  "expected_conversion": {
+    "association_count": 2,
+    "mapping_id": "people-map",
+    "mapping_version": "2026.05",
+    "object_count": 4,
+    "property_value_count": 24,
+    "row_count": 2,
+    "source_count": 1
+  },
+  "expected_conversion_summary": {
+    "assertion_count": 9,
+    "evidence_entry_count": 6,
+    "materialized_row_count": 6
+  },
+  "mapping": "accept/cove_map_execution.covemap",
+  "sources": [
+    "accept/people.csv"
+  ]
+}

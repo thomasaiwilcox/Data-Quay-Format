@@ -1,0 +1,40 @@
+{
+  "columns": [
+    {
+      "column_id": 7,
+      "exact_set": {
+        "keys": [
+          1,
+          4,
+          7
+        ]
+      }
+    },
+    {
+      "column_id": 8,
+      "zone_stats": {
+        "null_count": 2,
+        "row_count": 6
+      }
+    }
+  ],
+  "expect_evidence": [
+    "ExactSet",
+    "ZoneStats"
+  ],
+  "expect_outcome": "some_match",
+  "predicate": {
+    "op": "or",
+    "operands": [
+      {
+        "column_id": 7,
+        "file_code": 3,
+        "op": "file_code_eq"
+      },
+      {
+        "column_id": 8,
+        "op": "is_null"
+      }
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "columns": [
+    {
+      "column_id": 7,
+      "exact_set": {
+        "keys": [
+          1,
+          4,
+          7
+        ]
+      }
+    }
+  ],
+  "expect_evidence": [
+    "ExactSet"
+  ],
+  "expect_outcome": "no_match",
+  "predicate": {
+    "column_id": 7,
+    "file_code": 3,
+    "op": "file_code_eq"
+  }
+}

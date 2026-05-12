@@ -1,0 +1,11 @@
+[package]
+name = "cove-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+
+[[bin]]
+name = "cove-runtime-inspect"
+path = "src/bin/cove-runtime-inspect.rs"
