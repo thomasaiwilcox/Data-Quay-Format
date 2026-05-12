@@ -1,0 +1,23 @@
+{
+  "encoding": "VarBytes",
+  "expect": [
+    "{\"a\":1}"
+  ],
+  "expect_type": "Utf8",
+  "logical": "Json",
+  "payload": [
+    7,
+    0,
+    0,
+    0,
+    123,
+    34,
+    97,
+    34,
+    58,
+    49,
+    125
+  ],
+  "physical": "VarBytes",
+  "row_count": 1
+}

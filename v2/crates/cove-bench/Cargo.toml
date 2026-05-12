@@ -1,0 +1,8 @@
+[package]
+name = "cove-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cove-arrow = { path = "../cove-arrow" }
+cove-core = { path = "../cove-core" }

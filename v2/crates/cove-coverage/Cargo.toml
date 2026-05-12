@@ -1,0 +1,11 @@
+[package]
+name = "cove-coverage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+
+[[bin]]
+name = "cove-coverage-inspect"
+path = "src/bin/cove-coverage-inspect.rs"

@@ -1,0 +1,67 @@
+{
+  "columns": [
+    {
+      "column_id": 21,
+      "zone_stats": {
+        "flags": [],
+        "null_count": 0,
+        "row_count": 4
+      }
+    },
+    {
+      "column_id": 22,
+      "zone_stats": {
+        "flags": [
+          "has_min_max"
+        ],
+        "max": {
+          "kind": "int64",
+          "value": 20
+        },
+        "min": {
+          "kind": "int64",
+          "value": 10
+        },
+        "null_count": 0,
+        "row_count": 4
+      }
+    },
+    {
+      "column_id": 23,
+      "exact_set": {
+        "keys": [
+          1,
+          2,
+          3
+        ]
+      }
+    }
+  ],
+  "expect_outcome": "no_match",
+  "predicate": {
+    "op": "reorder_invariant_and",
+    "operands": [
+      {
+        "column_id": 21,
+        "op": "is_not_null"
+      },
+      {
+        "column_id": 22,
+        "lower": {
+          "kind": "int64",
+          "value": 8
+        },
+        "op": "numcode_range",
+        "upper": {
+          "kind": "int64",
+          "value": 25
+        }
+      },
+      {
+        "column_id": 23,
+        "file_code": 7,
+        "op": "file_code_eq"
+      }
+    ]
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "columns": [
+    {
+      "column_id": 31,
+      "zone_stats": {
+        "flags": [],
+        "null_count": 0,
+        "row_count": 6
+      }
+    },
+    {
+      "column_id": 32,
+      "zone_stats": {
+        "flags": [],
+        "null_count": 6,
+        "row_count": 6
+      }
+    },
+    {
+      "column_id": 33,
+      "exact_set": {
+        "keys": [
+          1,
+          2,
+          3
+        ]
+      }
+    }
+  ],
+  "expect_outcome": "all_match",
+  "predicate": {
+    "op": "reorder_invariant_or",
+    "operands": [
+      {
+        "column_id": 31,
+        "op": "is_not_null"
+      },
+      {
+        "column_id": 32,
+        "op": "is_null"
+      },
+      {
+        "column_id": 33,
+        "file_code": 99,
+        "op": "file_code_eq"
+      }
+    ]
+  }
+}

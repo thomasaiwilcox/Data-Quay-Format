@@ -1,0 +1,23 @@
+{
+  "columns": [
+    {
+      "bloom": {
+        "bit_count": 64,
+        "fail_open": true,
+        "values": [
+          "alpha"
+        ]
+      },
+      "column_id": 11
+    }
+  ],
+  "expect_evidence": [
+    "FallbackToScan"
+  ],
+  "expect_outcome": "unknown",
+  "predicate": {
+    "column_id": 11,
+    "op": "bloom_membership",
+    "value": "alpha"
+  }
+}

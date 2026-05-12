@@ -1,0 +1,7 @@
+{
+  "mapping": "accept/cove_map_mixed_governance_reject.covemap",
+  "sources": [
+    "accept/cove_map_crm.csv",
+    "accept/cove_map_support.csv"
+  ]
+}

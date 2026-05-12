@@ -1,0 +1,11 @@
+[package]
+name = "cove-map"
+version = "0.1.0"
+edition = "2021"
+description = "Reference COVE-MAP local tooling CLI"
+license = "MIT"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+serde_json = "1"
+sha2 = "0.10"

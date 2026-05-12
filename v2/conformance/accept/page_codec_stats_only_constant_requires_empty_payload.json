@@ -1,0 +1,11 @@
+{
+  "codec": "none",
+  "encoding_root_override": 4294967295,
+  "expect": "parse_reject",
+  "flags_override": 768,
+  "non_null_count_override": 0,
+  "null_count_override": 1,
+  "page_offset_override": 0,
+  "payload": "abcdef",
+  "row_count_override": 1
+}

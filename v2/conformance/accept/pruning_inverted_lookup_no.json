@@ -1,0 +1,23 @@
+{
+  "columns": [
+    {
+      "column_id": 12,
+      "inverted": {
+        "keys": [
+          3,
+          5,
+          7
+        ]
+      }
+    }
+  ],
+  "expect_evidence": [
+    "InvertedIndex"
+  ],
+  "expect_outcome": "no_match",
+  "predicate": {
+    "column_id": 12,
+    "key": 4,
+    "op": "inverted_lookup"
+  }
+}

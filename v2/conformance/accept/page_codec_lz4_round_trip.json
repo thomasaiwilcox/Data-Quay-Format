@@ -1,0 +1,5 @@
+{
+  "codec": "lz4",
+  "expect": "round_trip",
+  "payload": "Cove page-level LZ4 round trip Cove page-level LZ4 round trip"
+}

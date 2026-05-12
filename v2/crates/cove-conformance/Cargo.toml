@@ -1,0 +1,18 @@
+[package]
+name = "cove-conformance"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cove-arrow = { path = "../cove-arrow" }
+cove-cache = { path = "../cove-cache" }
+cove-codec = { path = "../cove-codec" }
+cove-coverage = { path = "../cove-coverage" }
+cove-core = { path = "../cove-core" }
+cove-index = { path = "../cove-index" }
+cove-layout = { path = "../cove-layout" }
+cove-map = { path = "../cove-map" }
+cove-runtime = { path = "../cove-runtime" }
+serde_json = "1"
+arrow-array = "58"
+parquet = { version = "58", default-features = false, features = ["arrow"] }

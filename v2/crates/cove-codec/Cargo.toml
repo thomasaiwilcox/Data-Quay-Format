@@ -1,0 +1,11 @@
+[package]
+name = "cove-codec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+
+[[bin]]
+name = "cove-codec-validate"
+path = "src/bin/cove-codec-validate.rs"

@@ -1,0 +1,18 @@
+{
+  "columns": [
+    {
+      "aggregate": {
+        "proves_no_match": true
+      },
+      "column_id": 14
+    }
+  ],
+  "expect_evidence": [
+    "AggregateSynopsis"
+  ],
+  "expect_outcome": "no_match",
+  "predicate": {
+    "column_id": 14,
+    "op": "aggregate_synopsis"
+  }
+}

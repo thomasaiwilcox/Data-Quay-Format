@@ -1,0 +1,21 @@
+{
+  "encoding": "plain_varint",
+  "expect_values": [
+    0,
+    -1,
+    1,
+    -2,
+    2
+  ],
+  "payload": [
+    5,
+    0,
+    0,
+    0,
+    0,
+    1,
+    2,
+    3,
+    4
+  ]
+}

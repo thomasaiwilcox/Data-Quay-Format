@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/cove-core",
+    "crates/cove-arrow",
+    "crates/cove-datafusion",
+    "crates/cove-validate",
+    "crates/cove-inspect",
+    "crates/cove-dump",
+    "crates/cove-convert-parquet",
+    "crates/cove-map",
+    "crates/cove-conformance",
+    "crates/cove-bench",
+    "crates/cove-codec",
+    "crates/cove-layout",
+    "crates/cove-runtime",
+    "crates/cove-coverage",
+    "crates/cove-index",
+    "crates/cove-cache",
+]
+resolver = "2"

@@ -1,0 +1,51 @@
+{
+  "expected_projected_rows": [
+    {
+      "membership_count": 1,
+      "name": "Ada",
+      "output_table": "people_projection",
+      "person_goid": "8a0632dea94739e96d0c556615690341",
+      "projection_id": "person_projection"
+    },
+    {
+      "membership_count": 1,
+      "name": "Linus",
+      "output_table": "people_projection",
+      "person_goid": "542aaaf0abc781290bd92b23f9a24824",
+      "projection_id": "person_projection"
+    },
+    {
+      "association_goid": "7e47a360305232482db6805e9050fb31",
+      "cardinality_policy": "many_to_one",
+      "output_table": "membership_projection",
+      "projection_id": "membership_projection",
+      "source_goid": "8a0632dea94739e96d0c556615690341",
+      "source_role": "member",
+      "target_goid": "2bda4f12de577dfba084b013da28e089",
+      "target_role": "team",
+      "valid_from": "2026-01-01",
+      "valid_to": "2026-12-31"
+    },
+    {
+      "association_goid": "d54c862d704900a103b5e1c9e3efdd9d",
+      "cardinality_policy": "many_to_one",
+      "output_table": "membership_projection",
+      "projection_id": "membership_projection",
+      "source_goid": "542aaaf0abc781290bd92b23f9a24824",
+      "source_role": "member",
+      "target_goid": "d3bbfbc147b4829657d37121dbff7361",
+      "target_role": "team",
+      "valid_from": "2026-02-01",
+      "valid_to": "2026-12-31"
+    }
+  ],
+  "expected_projection": {
+    "format": "json",
+    "mapping_id": "people-map",
+    "mapping_version": "2026.05"
+  },
+  "mapping": "accept/cove_map_execution.covemap",
+  "sources": [
+    "accept/people.csv"
+  ]
+}

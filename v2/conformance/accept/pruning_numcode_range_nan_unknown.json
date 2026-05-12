@@ -1,0 +1,39 @@
+{
+  "columns": [
+    {
+      "column_id": 9,
+      "zone_stats": {
+        "flags": [
+          "has_min_max",
+          "has_nan"
+        ],
+        "max": {
+          "kind": "float64",
+          "value": 2.0
+        },
+        "min": {
+          "kind": "float64",
+          "value": 1.0
+        },
+        "null_count": 0,
+        "row_count": 8
+      }
+    }
+  ],
+  "expect_evidence": [
+    "FallbackToScan"
+  ],
+  "expect_outcome": "unknown",
+  "predicate": {
+    "column_id": 9,
+    "lower": {
+      "kind": "float64",
+      "value": 0.0
+    },
+    "op": "numcode_range",
+    "upper": {
+      "kind": "float64",
+      "value": 3.0
+    }
+  }
+}

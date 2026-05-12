@@ -1,0 +1,7 @@
+{
+  "expect_bytes": [
+    0
+  ],
+  "op": "varint_round_trip",
+  "value": 0
+}
