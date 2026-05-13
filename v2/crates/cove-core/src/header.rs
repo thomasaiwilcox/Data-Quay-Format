@@ -35,9 +35,9 @@ pub struct CoveHeaderV1 {
     pub version_minor: u16,
     /// Primary profile of the file (see [`PrimaryProfile`]).
     pub primary_profile: u8,
-    /// Byte order indicator — 1 means little-endian (the only valid v1 value).
+    /// Byte order indicator — 1 means little-endian (the only valid v2 value).
     pub endianness: u8,
-    /// File-level flags (usage reserved for future versions; MUST be zero in v1).
+    /// File-level flags (usage reserved for future versions; MUST be zero in v2).
     pub flags: u32,
     /// Required feature bits that a reader MUST understand (Section 11).
     pub required_features: u64,
@@ -49,7 +49,7 @@ pub struct CoveHeaderV1 {
     pub producer_scope_id: [u8; 16],
     /// Kind of the producer scope (see [`ProducerScopeKind`]).
     pub producer_scope_kind: u16,
-    /// Reserved scope flags — MUST be zero in v1.
+    /// Reserved scope flags — MUST be zero in v2.
     pub reserved_scope_flags: u16,
     /// File creation timestamp in microseconds since Unix epoch.
     pub created_at_us: i64,

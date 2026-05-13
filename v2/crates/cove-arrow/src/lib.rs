@@ -14,6 +14,7 @@ pub use cove_core::digest;
 pub use cove_core::domain;
 pub use cove_core::encoding;
 pub use cove_core::index;
+pub use cove_core::nested_schema;
 pub use cove_core::page;
 pub use cove_core::page_payload;
 pub use cove_core::reader;
@@ -28,5 +29,7 @@ pub use cove_core::zone_stats;
 pub use cove_core::CoveError;
 
 pub mod arrow;
+
+pub mod convert;
 
 pub mod parquet;

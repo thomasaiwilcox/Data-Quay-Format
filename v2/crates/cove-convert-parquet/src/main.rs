@@ -135,6 +135,42 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Command>,
                 options.aggregate_columns =
                     parse_csv_list(&next_value(&mut iter, "--aggregate-columns")?);
             }
+            "--aggregate-topk-columns" => {
+                options.aggregate_topk_columns =
+                    parse_csv_list(&next_value(&mut iter, "--aggregate-topk-columns")?);
+            }
+            "--distinct-sketch-columns" => {
+                options.distinct_sketch_columns =
+                    parse_csv_list(&next_value(&mut iter, "--distinct-sketch-columns")?);
+            }
+            "--quantile-sketch-columns" => {
+                options.quantile_sketch_columns =
+                    parse_csv_list(&next_value(&mut iter, "--quantile-sketch-columns")?);
+            }
+            "--aggregate-topk-k" => {
+                let raw = next_value(&mut iter, "--aggregate-topk-k")?;
+                options.aggregate_topk_k = raw
+                    .parse::<u32>()
+                    .map_err(|_| "--aggregate-topk-k must be a u32".to_string())?;
+                if options.aggregate_topk_k == 0 {
+                    return Err("--aggregate-topk-k must be greater than zero".into());
+                }
+            }
+            "--hll-precision" => {
+                let raw = next_value(&mut iter, "--hll-precision")?;
+                options.hll_precision = raw
+                    .parse::<u8>()
+                    .map_err(|_| "--hll-precision must be a u8".to_string())?;
+            }
+            "--kll-k" => {
+                let raw = next_value(&mut iter, "--kll-k")?;
+                options.kll_k = raw
+                    .parse::<u32>()
+                    .map_err(|_| "--kll-k must be a u32".to_string())?;
+                if options.kll_k < 8 {
+                    return Err("--kll-k must be at least 8".into());
+                }
+            }
             "--composite-zone" => {
                 options
                     .composite_zone_groups
@@ -244,6 +280,12 @@ Options:\n  \
 --topn-columns <cols>       Comma-separated ordered hot columns for Top-N summaries\n  \
 --aggregate-synopsis <m>    Aggregate synopsis policy: none, declared-only, auto\n  \
 --aggregate-columns <cols>  Comma-separated columns for declared aggregate synopsis\n  \
+--aggregate-topk-columns <c> Columns for TopK aggregate synopsis payloads\n  \
+--distinct-sketch-columns <c> Columns for HLL distinct sketch payloads\n  \
+--quantile-sketch-columns <c> Columns for KLL quantile sketch payloads\n  \
+--aggregate-topk-k <n>      TopK payload size (default: 64)\n  \
+--hll-precision <p>         HLL precision for distinct sketches (default: 14)\n  \
+--kll-k <n>                 KLL compactor k for quantile sketches (default: 200)\n  \
 --composite-zone <cols>     Comma-separated composite zone group; may be repeated\n  \
 --stable-clustering         Opt in to stable clustering when implemented\n  \
 --emit-covx                 Request COVX artifact emission\n  \
@@ -286,6 +328,18 @@ mod tests {
             "declared-only".to_string(),
             "--aggregate-columns".to_string(),
             "score".to_string(),
+            "--aggregate-topk-columns".to_string(),
+            "score".to_string(),
+            "--distinct-sketch-columns".to_string(),
+            "email".to_string(),
+            "--quantile-sketch-columns".to_string(),
+            "score".to_string(),
+            "--aggregate-topk-k".to_string(),
+            "32".to_string(),
+            "--hll-precision".to_string(),
+            "12".to_string(),
+            "--kll-k".to_string(),
+            "128".to_string(),
             "--composite-zone".to_string(),
             "tenant_id,score".to_string(),
             "--emit-covx".to_string(),
@@ -320,6 +374,12 @@ mod tests {
             ParquetAggregatePolicy::DeclaredOnly
         );
         assert_eq!(command.options.aggregate_columns, vec!["score"]);
+        assert_eq!(command.options.aggregate_topk_columns, vec!["score"]);
+        assert_eq!(command.options.distinct_sketch_columns, vec!["email"]);
+        assert_eq!(command.options.quantile_sketch_columns, vec!["score"]);
+        assert_eq!(command.options.aggregate_topk_k, 32);
+        assert_eq!(command.options.hll_precision, 12);
+        assert_eq!(command.options.kll_k, 128);
         assert_eq!(
             command.options.composite_zone_groups,
             vec![vec!["tenant_id".to_string(), "score".to_string()]]

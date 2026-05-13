@@ -6,7 +6,7 @@ impl MinimalCoveWriter {
         durable::durable_replace_with_writer(path, |file| self.write_to(file))
     }
 
-    /// Validate builder inputs that have strict on-disk bounds in v1.
+    /// Validate builder inputs that have strict on-disk bounds in v2.
     fn validate_inputs(&self) -> Result<(), CoveError> {
         metadata::validate(&self.metadata_json)?;
         if self.sections.len() > u32::MAX as usize {

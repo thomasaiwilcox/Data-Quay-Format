@@ -1659,22 +1659,131 @@ fn apply_canonicalization(
     canonicalization: &str,
     declared_functions: &[String],
 ) -> Result<Value, String> {
-    match canonicalization {
-        "identity" | "none" => Ok(value.clone()),
-        "trim_lower" => {
-            if !declared_functions.iter().any(|function| function == canonicalization) {
+    let function_id = if canonicalization == "none" {
+        "identity"
+    } else {
+        canonicalization
+    };
+    if !declared_functions
+        .iter()
+        .any(|function| function == function_id || function == canonicalization)
+    {
+        return Err(format!(
+            "canonicalization function '{canonicalization}' was not declared on the identity rule"
+        ));
+    }
+    if !deterministic_builtin_function_ids().contains(&function_id) {
+        return Err(format!(
+            "canonicalization function '{canonicalization}' is not implemented by the deterministic reference runner"
+        ));
+    }
+    match function_id {
+        "identity" => Ok(value.clone()),
+        "trim" => Ok(Value::String(string_arg(value, "trim")?.trim().to_string())),
+        "ascii_lower" => Ok(Value::String(
+            string_arg(value, "ascii_lower")?.to_ascii_lowercase(),
+        )),
+        "unicode_nfc" | "unicode_nfkc" => {
+            let text = string_arg(value, function_id)?;
+            if !text.is_ascii() {
                 return Err(format!(
-                    "canonicalization function '{canonicalization}' was not declared on the identity rule"
+                    "{function_id} currently accepts ASCII-only input in the dependency-free reference runner"
                 ));
             }
-            let text = value
-                .as_str()
-                .ok_or_else(|| "trim_lower canonicalization requires a string value".to_string())?;
-            Ok(Value::String(text.trim().to_ascii_lowercase()))
+            Ok(Value::String(text.to_string()))
         }
-        other => Err(format!(
-            "canonicalization function '{other}' is not implemented by the deterministic reference runner"
+        "unicode_casefold" => Ok(Value::String(
+            string_arg(value, "unicode_casefold")?.to_lowercase(),
         )),
+        "trim_lower" => Ok(Value::String(
+            string_arg(value, "trim_lower")?.trim().to_ascii_lowercase(),
+        )),
+        "concat_delimited" => {
+            let items = value
+                .as_array()
+                .ok_or_else(|| "concat_delimited requires a JSON array".to_string())?;
+            let mut out = Vec::new();
+            for item in items {
+                out.push(string_arg(item, "concat_delimited")?);
+            }
+            Ok(Value::String(out.join("|")))
+        }
+        "parse_int64" => {
+            let text = string_arg(value, "parse_int64")?.trim();
+            let parsed = text
+                .parse::<i64>()
+                .map_err(|_| "parse_int64 requires a base-10 int64 string".to_string())?;
+            Ok(Value::Number(parsed.into()))
+        }
+        "parse_decimal" => {
+            let text = string_arg(value, "parse_decimal")?.trim();
+            validate_decimal_text(text)?;
+            Ok(Value::String(text.to_string()))
+        }
+        "parse_timestamp_utc" => {
+            let text = string_arg(value, "parse_timestamp_utc")?.trim();
+            validate_utc_timestamp_text(text)?;
+            Ok(Value::String(text.to_string()))
+        }
+        "sha256_hex" => Ok(Value::String(sha256_hex(
+            string_arg(value, "sha256_hex")?.as_bytes(),
+        ))),
+        _ => unreachable!("registry membership checked above"),
+    }
+}
+
+fn deterministic_builtin_function_ids() -> &'static [&'static str] {
+    &[
+        "identity",
+        "trim",
+        "ascii_lower",
+        "unicode_nfc",
+        "unicode_nfkc",
+        "unicode_casefold",
+        "trim_lower",
+        "concat_delimited",
+        "parse_int64",
+        "parse_decimal",
+        "parse_timestamp_utc",
+        "sha256_hex",
+    ]
+}
+
+fn string_arg<'a>(value: &'a Value, function_id: &str) -> Result<&'a str, String> {
+    value
+        .as_str()
+        .ok_or_else(|| format!("{function_id} requires a string value"))
+}
+
+fn validate_decimal_text(text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("parse_decimal requires a non-empty decimal string".into());
+    }
+    let mut chars = text.chars();
+    if matches!(chars.clone().next(), Some('+') | Some('-')) {
+        chars.next();
+    }
+    let mut digits = 0usize;
+    let mut dots = 0usize;
+    for ch in chars {
+        match ch {
+            '0'..='9' => digits += 1,
+            '.' => dots += 1,
+            _ => return Err("parse_decimal only accepts base-10 decimal text".into()),
+        }
+    }
+    if digits == 0 || dots > 1 {
+        return Err("parse_decimal only accepts base-10 decimal text".into());
+    }
+    Ok(())
+}
+
+fn validate_utc_timestamp_text(text: &str) -> Result<(), String> {
+    let has_utc_suffix = text.ends_with('Z') || text.ends_with("+00:00");
+    if has_utc_suffix && text.contains('T') {
+        Ok(())
+    } else {
+        Err("parse_timestamp_utc requires an ISO-8601 UTC timestamp".into())
     }
 }
 

@@ -1,13 +1,14 @@
 //! # cove-datafusion -- DataFusion integration for COVE
 //!
-//! M0 provides the crate boundary, pinned dependency surface, and module tree.
-//! Query planning and execution behavior land in later milestones.
+//! Reference DataFusion SQL, FileFormat, and execution integration for COVE v2.
 
 pub mod adapter_v53;
 pub mod bootstrap;
+pub mod coverage_plan;
 pub mod dataset_state;
 pub mod decode;
 pub mod execution_code;
+pub mod explain;
 pub mod expr_lowering;
 pub mod metadata_aggregate;
 pub mod options;

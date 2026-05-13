@@ -21,6 +21,13 @@ pub struct RangeCoalescingOptions {
     pub max_span: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RangeClusterHint {
+    pub cluster_start: u64,
+    pub cluster_end: u64,
+    pub preferred_coalesce_distance: u64,
+}
+
 impl Default for RangeCoalescingOptions {
     fn default() -> Self {
         Self {
@@ -469,6 +476,104 @@ pub(crate) fn build_coalesced_range_plan(
             coalesced_bytes,
         },
         coalesced,
+    })
+}
+
+pub(crate) fn build_layout_aware_coalesced_range_plan(
+    ranges: &[Range<u64>],
+    hints: &[Option<RangeClusterHint>],
+    options: RangeCoalescingOptions,
+) -> Result<CoalescedRangePlan, CoveError> {
+    if hints.len() != ranges.len() || hints.iter().all(Option::is_none) {
+        return build_coalesced_range_plan(ranges, options);
+    }
+    let mut sorted = ranges
+        .iter()
+        .enumerate()
+        .map(|(index, range)| {
+            if range.start > range.end {
+                return Err(CoveError::OffsetRange);
+            }
+            Ok((index, range.start, range.end, hints[index]))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    sorted.sort_by_key(|(_, start, end, hint)| {
+        (
+            hint.map(|hint| hint.cluster_start).unwrap_or(u64::MAX),
+            *start,
+            *end,
+        )
+    });
+    let mut groups: Vec<CoalescedRange> = Vec::new();
+    let mut group_hints: Vec<Option<RangeClusterHint>> = Vec::new();
+    for (index, start, end, hint) in sorted {
+        if let Some(hint) = hint {
+            if start < hint.cluster_start || end > hint.cluster_end {
+                return build_coalesced_range_plan(ranges, options);
+            }
+        }
+        let original = OriginalRange { index, start, end };
+        let Some(last) = groups.last_mut() else {
+            groups.push(CoalescedRange {
+                start,
+                end,
+                originals: vec![original],
+            });
+            group_hints.push(hint);
+            continue;
+        };
+        let last_hint = *group_hints.last().ok_or(CoveError::ArithOverflow)?;
+        let compatible_hint = last_hint == hint;
+        let max_gap = hint
+            .map(|hint| options.max_gap.max(hint.preferred_coalesce_distance))
+            .unwrap_or(options.max_gap);
+        let max_span = hint
+            .and_then(|hint| hint.cluster_end.checked_sub(hint.cluster_start))
+            .map(|cluster_span| options.max_span.min(cluster_span))
+            .unwrap_or(options.max_span);
+        let gap = start.saturating_sub(last.end);
+        let merged_end = last.end.max(end);
+        let merged_span = merged_end
+            .checked_sub(last.start)
+            .ok_or(CoveError::OffsetRange)?;
+        let inside_cluster = hint
+            .map(|hint| last.start >= hint.cluster_start && merged_end <= hint.cluster_end)
+            .unwrap_or(true);
+        if compatible_hint && inside_cluster && gap <= max_gap && merged_span <= max_span {
+            last.end = merged_end;
+            last.originals.push(original);
+        } else {
+            groups.push(CoalescedRange {
+                start,
+                end,
+                originals: vec![original],
+            });
+            group_hints.push(hint);
+        }
+    }
+    let original_bytes = ranges.iter().try_fold(0usize, |total, range| {
+        total
+            .checked_add(range_len(range)?)
+            .ok_or(CoveError::ArithOverflow)
+    })?;
+    let coalesced_bytes = groups.iter().try_fold(0usize, |total, range| {
+        let len = usize::try_from(
+            range
+                .end
+                .checked_sub(range.start)
+                .ok_or(CoveError::OffsetRange)?,
+        )
+        .map_err(|_| CoveError::OffsetRange)?;
+        total.checked_add(len).ok_or(CoveError::ArithOverflow)
+    })?;
+    Ok(CoalescedRangePlan {
+        stats: CoalescedRangeStats {
+            original_ranges: ranges.len(),
+            coalesced_ranges: groups.len(),
+            original_bytes,
+            coalesced_bytes,
+        },
+        coalesced: groups,
     })
 }
 

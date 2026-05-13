@@ -1,5 +1,10 @@
 use crate::{
-    checksum, compression,
+    checksum,
+    codec::{
+        materialize_registered_page_payload, CodecExtensionDescriptorV2, RegisteredCodecResolver,
+        StableRegisteredCodecResolver,
+    },
+    compression,
     constants::{CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
     dictionary::FileDictionaryView,
     encoding::{
@@ -14,11 +19,12 @@ use crate::{
         sparse::{Sparse, SparsePayload},
         Encoding,
     },
+    nested_schema::NestedSchemaNodeV1,
     page::{
         page_flag_codec, ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL,
         PAGE_FLAG_STATS_ONLY_CONSTANT, PAGE_FLAG_VALUE_STREAM_ELIDED,
     },
-    page_payload::{ColumnPagePayloadV1, PageBufferKind},
+    page_payload::{ColumnPagePayloadV1, PageBufferKind, PagePayloadTreeNode},
     wire,
     zone_stats::{StatKind, ZoneStatFlags, ZoneStatsEntry},
     CoveError,
@@ -32,6 +38,8 @@ pub(crate) struct PageValidationContext<'a> {
     pub physical_kind: CovePhysicalKind,
     pub dictionary: Option<&'a FileDictionaryView<'a>>,
     pub zone_stats: Option<&'a [ZoneStatsEntry]>,
+    pub codec_descriptors: &'a [CodecExtensionDescriptorV2],
+    pub nested_schema: Option<&'a NestedSchemaNodeV1>,
 }
 
 pub(crate) fn validate_column_page_wire(
@@ -49,11 +57,47 @@ pub(crate) fn validate_column_page_payload(
     page: &ColumnPageIndexEntryV1,
     payload: &ColumnPagePayloadV1,
 ) -> Result<(), CoveError> {
+    validate_column_page_payload_with_registered_codecs(
+        context,
+        page,
+        payload,
+        &StableRegisteredCodecResolver,
+    )
+}
+
+pub(crate) fn validate_column_page_payload_with_registered_codecs<
+    R: RegisteredCodecResolver + ?Sized,
+>(
+    context: &PageValidationContext<'_>,
+    page: &ColumnPageIndexEntryV1,
+    payload: &ColumnPagePayloadV1,
+    resolver: &R,
+) -> Result<(), CoveError> {
     if page.flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0 {
         return validate_stats_only_constant_page(context, page);
     }
 
     let root = payload.root_node()?;
+    if root.encoding_kind == CoveEncodingKind::RegisteredEncoding {
+        let materialized = materialize_registered_page_payload(
+            payload,
+            page,
+            context.logical_type,
+            context.physical_kind,
+            context.codec_descriptors,
+            resolver,
+            context.dictionary.map(|dictionary| dictionary.len()),
+        )?
+        .ok_or(CoveError::BadCodecExtension)?;
+        let mut materialized_page = page.clone();
+        materialized_page.encoding_root = materialized.payload.root_node()?.encoding_kind as u32;
+        return validate_column_page_payload_with_registered_codecs(
+            context,
+            &materialized_page,
+            &materialized.payload,
+            resolver,
+        );
+    }
     if root.logical_type != context.logical_type
         || root.physical_kind != context.physical_kind
         || root.logical_len != page.row_count
@@ -62,42 +106,21 @@ pub(crate) fn validate_column_page_payload(
         return Err(CoveError::PageCorrupt);
     }
 
-    validate_null_bitmap(payload, page)?;
+    let tree = payload.tree()?;
+    if let Some(schema) = context.nested_schema {
+        validate_tree_matches_nested_schema(&tree, schema)?;
+    }
+    validate_tree_null_bitmap(payload, &tree, page.row_count, Some(page.null_count))?;
     if page.flags & PAGE_FLAG_VALUE_STREAM_ELIDED != 0 {
         validate_value_stream_elided_page(context, page, root.encoding_kind)?;
     }
 
     match context.physical_kind {
-        CovePhysicalKind::List => {
-            let values = payload
-                .buffer_bytes(PageBufferKind::Values)?
-                .ok_or(CoveError::PageCorrupt)?;
-            let layout = crate::encoding::nested::ListLayoutPayload::parse(values)?;
-            layout.validate()?;
-            if layout.layout.row_count() != page.row_count as usize {
-                return Err(CoveError::PageCorrupt);
-            }
-        }
-        CovePhysicalKind::Struct => {
-            let values = payload
-                .buffer_bytes(PageBufferKind::Values)?
-                .ok_or(CoveError::PageCorrupt)?;
-            let layout = crate::encoding::nested::StructLayoutPayload::parse(values)?;
-            layout.validate(page.row_count as u64)?;
-        }
-        CovePhysicalKind::Map => {
-            let values = payload
-                .buffer_bytes(PageBufferKind::Values)?
-                .ok_or(CoveError::PageCorrupt)?;
-            let layout = crate::encoding::nested::MapLayoutPayload::parse(values)?;
-            layout.validate()?;
-            if layout.layout.row_count() != page.row_count as usize {
-                return Err(CoveError::PageCorrupt);
-            }
+        CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map => {
+            validate_nested_tree(context, payload, &tree)?;
         }
         _ => {
-            let values = payload
-                .buffer_bytes(PageBufferKind::Values)?
+            let values = tree_buffer_bytes(payload, &tree, PageBufferKind::Values)?
                 .ok_or(CoveError::PageCorrupt)?;
             validate_values_buffer(
                 context.logical_type,
@@ -110,6 +133,166 @@ pub(crate) fn validate_column_page_payload(
         }
     }
 
+    Ok(())
+}
+
+fn validate_nested_tree(
+    context: &PageValidationContext<'_>,
+    payload: &ColumnPagePayloadV1,
+    tree: &PagePayloadTreeNode<'_>,
+) -> Result<(), CoveError> {
+    validate_nested_node(context, payload, tree, context.nested_schema)
+}
+
+fn validate_nested_node(
+    context: &PageValidationContext<'_>,
+    payload: &ColumnPagePayloadV1,
+    tree: &PagePayloadTreeNode<'_>,
+    schema: Option<&NestedSchemaNodeV1>,
+) -> Result<(), CoveError> {
+    match tree.node.physical_kind {
+        CovePhysicalKind::List => {
+            if tree.children.len() != 1 {
+                return Err(CoveError::PageCorrupt);
+            }
+            let layout_bytes = tree_buffer_bytes(payload, tree, PageBufferKind::ChildLayout)?
+                .ok_or(CoveError::PageCorrupt)?;
+            let layout = crate::encoding::nested::ListLayoutPayload::parse(layout_bytes)?;
+            layout.validate()?;
+            if layout.layout.row_count() != tree.node.logical_len as usize {
+                return Err(CoveError::PageCorrupt);
+            }
+            if let Some(schema) = schema {
+                if schema.fixed_size_list_len != 0 {
+                    let width = schema.fixed_size_list_len;
+                    for pair in layout.layout.offsets.windows(2) {
+                        if pair[1]
+                            .checked_sub(pair[0])
+                            .ok_or(CoveError::ArithOverflow)?
+                            != width
+                        {
+                            return Err(CoveError::PageCorrupt);
+                        }
+                    }
+                    if layout.child_row_count
+                        != tree
+                            .node
+                            .logical_len
+                            .checked_mul(width)
+                            .ok_or(CoveError::ArithOverflow)?
+                    {
+                        return Err(CoveError::PageCorrupt);
+                    }
+                }
+            }
+            let child = &tree.children[0];
+            if child.node.logical_len != layout.child_row_count {
+                return Err(CoveError::PageCorrupt);
+            }
+            validate_tree_null_bitmap(payload, child, child.node.logical_len, None)?;
+            validate_nested_node(
+                context,
+                payload,
+                child,
+                schema.and_then(|schema| schema.children.first()),
+            )
+        }
+        CovePhysicalKind::Struct => {
+            let layout_bytes = tree_buffer_bytes(payload, tree, PageBufferKind::ChildLayout)?
+                .ok_or(CoveError::PageCorrupt)?;
+            let layout = crate::encoding::nested::StructLayoutPayload::parse(layout_bytes)?;
+            layout.validate(u64::from(tree.node.logical_len))?;
+            if tree.children.len() != layout.layout.field_row_counts.len() {
+                return Err(CoveError::PageCorrupt);
+            }
+            for (child_index, (child, expected)) in tree
+                .children
+                .iter()
+                .zip(&layout.layout.field_row_counts)
+                .enumerate()
+            {
+                if child.node.logical_len as u64 != *expected
+                    || child.node.logical_len != tree.node.logical_len
+                {
+                    return Err(CoveError::PageCorrupt);
+                }
+                validate_tree_null_bitmap(payload, child, child.node.logical_len, None)?;
+                validate_nested_node(
+                    context,
+                    payload,
+                    child,
+                    schema.and_then(|schema| schema.children.get(child_index)),
+                )?;
+            }
+            Ok(())
+        }
+        CovePhysicalKind::Map => {
+            if tree.children.len() != 2 {
+                return Err(CoveError::PageCorrupt);
+            }
+            let layout_bytes = tree_buffer_bytes(payload, tree, PageBufferKind::ChildLayout)?
+                .ok_or(CoveError::PageCorrupt)?;
+            let layout = crate::encoding::nested::MapLayoutPayload::parse(layout_bytes)?;
+            layout.validate()?;
+            if layout.layout.row_count() != tree.node.logical_len as usize {
+                return Err(CoveError::PageCorrupt);
+            }
+            let key = &tree.children[0];
+            let value = &tree.children[1];
+            if matches!(
+                key.node.physical_kind,
+                CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map
+            ) || key.buffer_of_kind(PageBufferKind::NullBitmap)?.is_some()
+                || key.node.logical_len != layout.layout.key_row_count
+                || value.node.logical_len != layout.layout.value_row_count
+            {
+                return Err(CoveError::PageCorrupt);
+            }
+            validate_nested_node(
+                context,
+                payload,
+                key,
+                schema.and_then(|schema| schema.children.first()),
+            )?;
+            validate_tree_null_bitmap(payload, value, value.node.logical_len, None)?;
+            validate_nested_node(
+                context,
+                payload,
+                value,
+                schema.and_then(|schema| schema.children.get(1)),
+            )
+        }
+        _ => {
+            if !tree.children.is_empty() {
+                return Err(CoveError::PageCorrupt);
+            }
+            let values = tree_buffer_bytes(payload, tree, PageBufferKind::Values)?
+                .ok_or(CoveError::PageCorrupt)?;
+            validate_values_buffer(
+                tree.node.logical_type,
+                tree.node.physical_kind,
+                tree.node.encoding_kind,
+                tree.node.logical_len,
+                values,
+                context.dictionary,
+            )
+        }
+    }
+}
+
+fn validate_tree_matches_nested_schema(
+    tree: &PagePayloadTreeNode<'_>,
+    schema: &NestedSchemaNodeV1,
+) -> Result<(), CoveError> {
+    if tree.node.logical_type != schema.logical
+        || tree.node.physical_kind != schema.physical
+        || tree.children.len() != schema.children.len()
+    {
+        return Err(CoveError::PageCorrupt);
+    }
+    for (child_tree, child_schema) in tree.children.iter().zip(&schema.children) {
+        validate_tree_matches_nested_schema(child_tree, child_schema)?;
+    }
     Ok(())
 }
 
@@ -191,26 +374,28 @@ pub(crate) fn validate_stats_only_constant_page(
     Ok(())
 }
 
-fn validate_null_bitmap(
+fn validate_tree_null_bitmap(
     payload: &ColumnPagePayloadV1,
-    page: &ColumnPageIndexEntryV1,
+    tree: &PagePayloadTreeNode<'_>,
+    row_count: u32,
+    expected_null_count: Option<u32>,
 ) -> Result<(), CoveError> {
-    let null_bitmap = payload.buffer_bytes(PageBufferKind::NullBitmap)?;
-    if page.null_count == 0 && null_bitmap.is_some() {
+    let null_bitmap = tree_buffer_bytes(payload, tree, PageBufferKind::NullBitmap)?;
+    if expected_null_count == Some(0) && null_bitmap.is_some() {
         return Err(CoveError::PageCorrupt);
     }
-    if page.null_count != 0 && null_bitmap.is_none() {
+    if expected_null_count.is_some_and(|count| count != 0) && null_bitmap.is_none() {
         return Err(CoveError::PageCorrupt);
     }
     let Some(bytes) = null_bitmap else {
         return Ok(());
     };
-    let expected_len = bitmap_len(page.row_count)?;
+    let expected_len = bitmap_len(row_count)?;
     if bytes.len() != expected_len {
         return Err(CoveError::PageCorrupt);
     }
-    if page.row_count % 8 != 0 && expected_len != 0 {
-        let valid_bits = page.row_count % 8;
+    if row_count % 8 != 0 && expected_len != 0 {
+        let valid_bits = row_count % 8;
         let mask = (1u8 << valid_bits) - 1;
         if bytes[expected_len - 1] & !mask != 0 {
             return Err(CoveError::PageCorrupt);
@@ -222,10 +407,20 @@ fn validate_null_bitmap(
             .checked_add(byte.count_ones())
             .ok_or(CoveError::ArithOverflow)?;
     }
-    if counted != page.null_count {
+    if expected_null_count.is_some_and(|expected| counted != expected) {
         return Err(CoveError::PageCorrupt);
     }
     Ok(())
+}
+
+fn tree_buffer_bytes<'a>(
+    payload: &'a ColumnPagePayloadV1,
+    tree: &PagePayloadTreeNode<'_>,
+    kind: PageBufferKind,
+) -> Result<Option<&'a [u8]>, CoveError> {
+    tree.buffer_of_kind(kind)?
+        .map(|descriptor| payload.buffer_bytes_for_descriptor(descriptor))
+        .transpose()
 }
 
 fn validate_values_buffer(
@@ -384,7 +579,8 @@ fn validate_values_buffer(
         CoveEncodingKind::Validity
         | CoveEncodingKind::Sequence
         | CoveEncodingKind::Lz4Block
-        | CoveEncodingKind::ZstdBlock => {
+        | CoveEncodingKind::ZstdBlock
+        | CoveEncodingKind::RegisteredEncoding => {
             Err(CoveError::UnsupportedEncoding(format!("{encoding_kind:?}")))
         }
     }
@@ -649,6 +845,8 @@ mod tests {
             physical_kind,
             dictionary: None,
             zone_stats,
+            codec_descriptors: &[],
+            nested_schema: None,
         }
     }
 

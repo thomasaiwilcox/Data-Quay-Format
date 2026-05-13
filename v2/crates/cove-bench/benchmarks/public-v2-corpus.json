@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "name": "cove-v2-public-reference",
+  "profiles": {
+    "ci": {
+      "rows": 2048,
+      "purpose": "fast deterministic coverage for PR and release gates"
+    },
+    "standard": {
+      "rows": 32768,
+      "purpose": "developer-local benchmark corpus"
+    },
+    "publication": {
+      "rows": 262144,
+      "purpose": "larger public report corpus"
+    }
+  },
+  "datasets": [
+    {
+      "id": "events",
+      "kind": "arrow-generated-cove-parquet",
+      "seed": 1,
+      "artifacts": ["events.cove", "events.parquet", "events.covx", "events.covm", "events.covi"],
+      "columns": ["id", "amount", "bucket", "name", "active"]
+    },
+    {
+      "id": "synthetic-cache",
+      "kind": "coverage-cache-fixture",
+      "seed": 2,
+      "artifacts": ["synthetic-cache.cove", "synthetic-cache.cove.cache"],
+      "columns": ["id", "name", "active"]
+    }
+  ],
+  "query_groups": [
+    "full_numeric_scan",
+    "string_category_scan",
+    "equality_filter",
+    "in_filter",
+    "range_filter",
+    "point_lookup",
+    "top_n",
+    "metadata_count_min_max",
+    "covm_many_file_planning",
+    "parquet_conversion_cost",
+    "file_size_overhead",
+    "covx_acceleration",
+    "covi_index_latency",
+    "covi_index_only_count",
+    "cove_map_identity",
+    "layout_scan_split",
+    "coverage_provider_lookup",
+    "coverage_cache_hit_miss_invalidation"
+  ],
+  "required_report_fields": [
+    "planning_ns",
+    "scan_ns",
+    "end_to_end_ns",
+    "rows_materialized",
+    "bytes_read",
+    "coverage_cache"
+  ]
+}

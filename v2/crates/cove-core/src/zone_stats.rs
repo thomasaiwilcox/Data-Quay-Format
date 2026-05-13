@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Zone statistics (Spec §28).
+//! Cove Format (COVE) v2.0 — Zone statistics (Spec §28).
 //!
 //! Zone stats summarise a contiguous range of rows so a planner can prove or
 //! disprove a predicate without decoding. Spec §28.5 safety rules:

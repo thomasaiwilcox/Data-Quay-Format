@@ -51,10 +51,99 @@ pub(super) fn apply_overlay_to_selection(
     Ok(())
 }
 
+pub(super) fn covi_morsel_pruned(
+    plan: &ScanPlan,
+    segment_id: u32,
+    morsel_id: u32,
+    morsel_row_start: u64,
+    row_count: u32,
+) -> bool {
+    let Some(candidates) = plan.covi_candidates.as_ref() else {
+        return false;
+    };
+    let morsel_end = morsel_row_start.saturating_add(u64::from(row_count));
+    !candidates.iter().any(|candidate| {
+        candidate.segment_id == segment_id
+            && candidate.morsel_id == morsel_id
+            && candidate.row_start < morsel_end
+            && candidate.row_start.saturating_add(candidate.row_count) > morsel_row_start
+    })
+}
+
+fn apply_covi_candidates_to_selection(
+    plan: &ScanPlan,
+    segment_id: u32,
+    morsel_id: u32,
+    morsel_row_start: u64,
+    row_count: u32,
+    scratch: &mut DecodeScratch,
+    stats: &mut DecodeStats,
+) -> Result<(), CoveError> {
+    let Some(candidates) = plan.covi_candidates.as_ref() else {
+        return Ok(());
+    };
+    if scratch.selection.is_empty() {
+        return Ok(());
+    }
+    let mut candidate_rows = Vec::new();
+    let morsel_end = morsel_row_start
+        .checked_add(u64::from(row_count))
+        .ok_or(CoveError::ArithOverflow)?;
+    for candidate in candidates {
+        if candidate.segment_id != segment_id || candidate.morsel_id != morsel_id {
+            continue;
+        }
+        let candidate_end = candidate
+            .row_start
+            .checked_add(candidate.row_count)
+            .ok_or(CoveError::ArithOverflow)?;
+        let start = candidate.row_start.max(morsel_row_start);
+        let end = candidate_end.min(morsel_end);
+        if start >= end {
+            continue;
+        }
+        for absolute in start..end {
+            candidate_rows.push(
+                u32::try_from(
+                    absolute
+                        .checked_sub(morsel_row_start)
+                        .ok_or(CoveError::ArithOverflow)?,
+                )
+                .map_err(|_| CoveError::ArithOverflow)?,
+            );
+        }
+    }
+    if candidate_rows.is_empty() {
+        let previous = scratch.selection.len();
+        scratch.selection = Selection::None;
+        stats.covi_candidate_pruned += usize::from(previous != 0);
+        return Ok(());
+    }
+    candidate_rows.sort_unstable();
+    candidate_rows.dedup();
+    scratch.selection.write_rows(&mut scratch.selected_rows)?;
+    let mut write = 0usize;
+    for read in 0..scratch.selected_rows.len() {
+        let row = scratch.selected_rows[read];
+        if candidate_rows.binary_search(&row).is_ok() {
+            scratch.selected_rows[write] = row;
+            write += 1;
+        }
+    }
+    let previous = scratch.selection.len();
+    scratch.selected_rows.truncate(write);
+    scratch.selection = Selection::from_rows(&scratch.selected_rows, row_count as usize);
+    if scratch.selection.len() < previous {
+        stats.covi_candidate_pruned += 1;
+    }
+    Ok(())
+}
+
 pub(super) fn selected_rows_for_morsel(
     state: &DatasetState,
     segment_bytes: &[u8],
     segment: &SegmentMetadata,
+    segment_ref: &TableSegmentIndexEntryV1,
     segment_id: u32,
     morsel_id: u32,
     plan: &ScanPlan,
@@ -68,6 +157,18 @@ pub(super) fn selected_rows_for_morsel(
         scratch.selection = Selection::AllRows {
             len: morsel.row_count as usize,
         };
+        apply_covi_candidates_to_selection(
+            plan,
+            segment_id,
+            morsel_id,
+            segment_ref
+                .row_start
+                .checked_add(u64::from(morsel.first_row_in_segment))
+                .ok_or(CoveError::ArithOverflow)?,
+            morsel.row_count,
+            scratch,
+            stats,
+        )?;
         return Ok(());
     }
     let skip_index_predicates = match lookup_selection_for_morsel(
@@ -88,6 +189,27 @@ pub(super) fn selected_rows_for_morsel(
     if scratch.selected_mask.all_zero() {
         scratch.selection = Selection::None;
         return Ok(());
+    }
+    scratch.selection = Selection::from_mask(&scratch.selected_mask, &mut scratch.selected_rows)?;
+    apply_covi_candidates_to_selection(
+        plan,
+        segment_id,
+        morsel_id,
+        segment_ref
+            .row_start
+            .checked_add(u64::from(morsel.first_row_in_segment))
+            .ok_or(CoveError::ArithOverflow)?,
+        morsel.row_count,
+        scratch,
+        stats,
+    )?;
+    if scratch.selection.is_empty() {
+        return Ok(());
+    }
+    scratch.selection.write_rows(&mut scratch.selected_rows)?;
+    scratch.selected_mask.fill_none(morsel.row_count as usize);
+    for row in &scratch.selected_rows {
+        scratch.selected_mask.set(*row as usize);
     }
     for filter in &plan.filters {
         let Some(predicate) = &filter.predicate else {
@@ -112,10 +234,17 @@ pub(super) fn selected_rows_for_morsel(
         let column = &state.table().columns[column_index];
         let segment_column = segment.column(column.column_id)?;
         let page = segment.page_for_morsel(segment_column, morsel_id)?;
+        state.reject_table_scan_page_feature_use(segment_ref, page)?;
         let payload = match materialize_page_payload(
             segment_bytes,
             column,
             &page,
+            state.pruning().codec_descriptors.as_slice(),
+            state
+                .mounted()
+                .dictionary
+                .as_ref()
+                .map(|dictionary| dictionary.len()),
             state.page_payload_validation_policy(),
         ) {
             Ok(payload) => payload,
@@ -203,6 +332,18 @@ pub(super) async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Size
         scratch.selection = Selection::AllRows {
             len: morsel.row_count as usize,
         };
+        apply_covi_candidates_to_selection(
+            plan,
+            segment_ref.segment_id,
+            morsel_id,
+            segment_ref
+                .row_start
+                .checked_add(u64::from(morsel.first_row_in_segment))
+                .ok_or(CoveError::ArithOverflow)?,
+            morsel.row_count,
+            scratch,
+            stats,
+        )?;
         return Ok(());
     }
     let skip_index_predicates = match lookup_selection_for_morsel(
@@ -223,6 +364,27 @@ pub(super) async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Size
     if scratch.selected_mask.all_zero() {
         scratch.selection = Selection::None;
         return Ok(());
+    }
+    scratch.selection = Selection::from_mask(&scratch.selected_mask, &mut scratch.selected_rows)?;
+    apply_covi_candidates_to_selection(
+        plan,
+        segment_ref.segment_id,
+        morsel_id,
+        segment_ref
+            .row_start
+            .checked_add(u64::from(morsel.first_row_in_segment))
+            .ok_or(CoveError::ArithOverflow)?,
+        morsel.row_count,
+        scratch,
+        stats,
+    )?;
+    if scratch.selection.is_empty() {
+        return Ok(());
+    }
+    scratch.selection.write_rows(&mut scratch.selected_rows)?;
+    scratch.selected_mask.fill_none(morsel.row_count as usize);
+    for row in &scratch.selected_rows {
+        scratch.selected_mask.set(*row as usize);
     }
     for filter in &plan.filters {
         let Some(predicate) = &filter.predicate else {
@@ -247,6 +409,7 @@ pub(super) async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Size
         let column = &state.table().columns[column_index];
         let segment_column = segment.column(column.column_id)?;
         let page = segment.page_for_morsel(segment_column, morsel_id)?;
+        state.reject_table_scan_page_feature_use(segment_ref, page)?;
         let page_wire =
             read_page_wire(reader, state, segment_ref, page, stats, RangeReadKind::Data).await?;
         stats.pages_decoded += usize::from(page.page_length != 0);
@@ -254,6 +417,12 @@ pub(super) async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Size
             column,
             page,
             page_wire,
+            state.pruning().codec_descriptors.as_slice(),
+            state
+                .mounted()
+                .dictionary
+                .as_ref()
+                .map(|dictionary| dictionary.len()),
             state.page_payload_validation_policy(),
         ) {
             Ok(payload) => payload,
@@ -338,7 +507,9 @@ async fn read_page_wire<R: CoveRangeReader + ?Sized>(
         .checked_add(page.page_length)
         .ok_or(CoveError::ArithOverflow)?;
     let ranges = vec![start..end];
-    let coalesced_plan = build_coalesced_range_plan(&ranges, state.range_coalescing())?;
+    let hints = vec![state.range_cluster_hint(segment_ref.segment_id, page.morsel_id, start, end)];
+    let coalesced_plan =
+        build_layout_aware_coalesced_range_plan(&ranges, &hints, state.range_coalescing())?;
     let range_stats = coalesced_plan.stats();
     stats.original_range_requests += range_stats.original_ranges;
     stats.range_requests += range_stats.coalesced_ranges;
@@ -363,6 +534,7 @@ async fn read_page_wire<R: CoveRangeReader + ?Sized>(
 
 pub(super) fn should_prune_morsel(
     state: &DatasetState,
+    segment_ref: &TableSegmentIndexEntryV1,
     segment: &SegmentMetadata,
     morsel_id: u32,
     plan: &ScanPlan,
@@ -378,6 +550,7 @@ pub(super) fn should_prune_morsel(
         let column = &state.table().columns[*column_index];
         let segment_column = segment.column(column.column_id)?;
         let page = segment.page_for_morsel(segment_column, morsel_id)?;
+        state.reject_table_scan_page_feature_use(segment_ref, page)?;
         stats.predicate_pages_checked += 1;
         match *kind {
             NullPredicateKind::IsNull if page.null_count == 0 => return Ok(true),
@@ -390,6 +563,7 @@ pub(super) fn should_prune_morsel(
 
 pub(super) fn should_prune_morsel_metadata(
     state: &DatasetState,
+    segment_ref: &TableSegmentIndexEntryV1,
     segment: &SegmentMetadata,
     morsel_id: u32,
     plan: &ScanPlan,
@@ -405,6 +579,7 @@ pub(super) fn should_prune_morsel_metadata(
         let column = &state.table().columns[*column_index];
         let segment_column = segment.column(column.column_id)?;
         let page = segment.page_for_morsel(segment_column, morsel_id)?;
+        state.reject_table_scan_page_feature_use(segment_ref, page)?;
         stats.predicate_pages_checked += 1;
         match *kind {
             NullPredicateKind::IsNull if page.null_count == 0 => return Ok(true),

@@ -1,6 +1,6 @@
-//! Cove Format (COVE) v1.0 — File dictionary structures.
+//! Cove Format (COVE) v2.0 — File dictionary structures.
 //!
-//! Corresponds to Section 16 of the COVE v1.0 specification.
+//! Corresponds to Section 16 of the COVE v2.0 specification.
 //!
 //! The file dictionary maps dense file-local FileCodes (zero-based ordinals)
 //! to canonical logical values.  It is split across two sections:
@@ -36,7 +36,7 @@ pub struct FileDictionaryHeaderV1 {
     pub entry_count: u32,
     /// Dictionary-level flags.
     pub flags: u32,
-    /// Byte length of each index entry (fixed at 48 for v1).
+    /// Byte length of each index entry (fixed at 48 for v2).
     pub index_entry_len: u16,
     /// Hash algorithm used for `canonical_hash64`.
     /// 0 = None, 1 = xxh3_64, 2 = sha256_truncated64.
@@ -48,7 +48,7 @@ pub struct FileDictionaryHeaderV1 {
 }
 
 impl FileDictionaryHeaderV1 {
-    /// Fixed byte length of each dictionary index entry in v1.
+    /// Fixed byte length of each dictionary index entry in v2.
     ///
     /// Field breakdown: `value_tag`(2) + `storage_class`(1) + `flags`(1) +
     /// `inline_len`(1) + `reserved0`(3) + `inline_data`(16) +
@@ -347,7 +347,7 @@ impl<'a> FileDictionaryView<'a> {
 /// section into a queryable structure.
 ///
 /// Corresponds to the `FILE_DICTIONARY_INDEX` and `FILE_DICTIONARY_PAYLOAD`
-/// sections described in Section 16 of the COVE v1.0 specification.
+/// sections described in Section 16 of the COVE v2.0 specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDictionary {
     /// Parsed dictionary header.
@@ -423,7 +423,7 @@ pub struct FileDictionaryKey {
 }
 
 impl FileDictionaryKey {
-    /// Build a dictionary key for COVE-Core's v1 repeated byte-compatible
+    /// Build a dictionary key for COVE-Core's repeated byte-compatible
     /// dictionary path.
     pub fn from_logical_bytes(
         logical: crate::constants::CoveLogicalType,

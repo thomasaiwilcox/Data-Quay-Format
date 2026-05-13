@@ -8,7 +8,27 @@ license = "MIT"
 [dependencies]
 cove-arrow = { path = "../cove-arrow" }
 cove-core = { path = "../cove-core" }
+arrow-ipc = "58"
+arrow-array = "58"
+arrow-schema = "58"
+orc-rust = "0.8"
 serde_json = "1"
+
+[[bin]]
+name = "cove-convert-parquet"
+path = "src/main.rs"
+
+[[bin]]
+name = "cove-convert-arrow"
+path = "src/bin/cove-convert-arrow.rs"
+
+[[bin]]
+name = "cove-convert-orc"
+path = "src/bin/cove-convert-orc.rs"
+
+[[bin]]
+name = "cove-conversion-report"
+path = "src/bin/cove-conversion-report.rs"
 
 [dev-dependencies]
 arrow-array = "58"

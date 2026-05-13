@@ -14,6 +14,8 @@ use cove_core::{
     CoveError,
 };
 
+#[cfg(feature = "covi")]
+use crate::bootstrap::covi::validate_covi_for_file;
 use crate::{
     bootstrap::local::bootstrap_local_path_with_options,
     dataset_state::{DatasetBootstrapStats, DatasetState, FileMetadata},
@@ -57,6 +59,8 @@ pub async fn bootstrap_covm_local_file_with_options_async(
 
         let mut file = state.files()[0].clone();
         validate_covx_for_file(&cove_path, &file, options, &mut stats)?;
+        #[cfg(feature = "covi")]
+        let covi = validate_covi_for_file(&cove_path, &file, options, &mut stats);
         file = FileMetadata::new(
             file.identity().clone(),
             None,
@@ -65,7 +69,13 @@ pub async fn bootstrap_covm_local_file_with_options_async(
             Arc::new(file.segments().to_vec()),
             file.pruning().clone(),
             entry.flags,
-        );
+        )
+        .with_layout(file.layout().clone())
+        .with_coverage_cache(file.coverage_cache().clone());
+        #[cfg(feature = "covi")]
+        {
+            file = file.with_covi(covi);
+        }
         files.push(file);
     }
 

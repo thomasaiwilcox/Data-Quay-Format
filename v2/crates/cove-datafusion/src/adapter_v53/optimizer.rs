@@ -3,7 +3,7 @@
 use std::{fmt::Debug, sync::Arc};
 
 use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use datafusion::{
     common::{tree_node::Transformed, DataFusionError, Result, ScalarValue},
     datasource::{provider_as_source, source_as_provider},
@@ -12,6 +12,8 @@ use datafusion::{
     optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule},
 };
 
+#[cfg(feature = "covi")]
+use crate::metadata_aggregate::exact_covi_unfiltered_min_max;
 use crate::{
     adapter_v53::{
         filter::classify_filter, metadata::CoveMetadataTableProvider,
@@ -19,11 +21,14 @@ use crate::{
     },
     metadata_aggregate::{
         canonical_utf8, exact_filecode_filtered_count, exact_filecode_group_counts,
-        exact_unfiltered_counts, MetadataAggregatePlan,
+        exact_unfiltered_aggregate_synopses, exact_unfiltered_counts, MetadataAggregatePlan,
+        MetadataAggregateValue, MetadataSynopsisAggregateKind,
     },
     planner::{CovePredicate, TopNScanHint},
 };
-use cove_core::constants::CovePhysicalKind;
+use cove_core::constants::{CoveLogicalType, CovePhysicalKind};
+#[cfg(feature = "covi")]
+use cove_index::execution::CoviAggregateKindV2;
 
 pub(crate) const COVE_METADATA_OPTIMIZER: &str = "cove_metadata_optimizer";
 
@@ -110,6 +115,39 @@ fn metadata_aggregate_plan(
     provider: &CoveTableProvider,
 ) -> Result<Option<MetadataAggregatePlan>> {
     if aggregate.group_expr.is_empty() {
+        if filters.is_empty() {
+            let synopsis_requests = aggregate
+                .aggr_expr
+                .iter()
+                .map(|expr| synopsis_aggregate_request(expr, provider))
+                .collect::<Option<Vec<_>>>();
+            if let Some(synopsis_requests) = synopsis_requests {
+                if !synopsis_requests.is_empty() {
+                    if let Some(plan) =
+                        exact_unfiltered_aggregate_synopses(provider.state(), &synopsis_requests)
+                            .map_err(crate::adapter_v53::cove_to_datafusion)?
+                    {
+                        return Ok(Some(plan));
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "covi")]
+        if filters.is_empty() {
+            let min_max_requests = aggregate
+                .aggr_expr
+                .iter()
+                .map(|expr| min_max_request(expr, provider))
+                .collect::<Option<Vec<_>>>();
+            if let Some(min_max_requests) = min_max_requests {
+                if !min_max_requests.is_empty() {
+                    return exact_covi_unfiltered_min_max(provider.state(), &min_max_requests)
+                        .map_err(crate::adapter_v53::cove_to_datafusion);
+                }
+            }
+        }
+
         let mut count_columns = Vec::with_capacity(aggregate.aggr_expr.len());
         for expr in &aggregate.aggr_expr {
             let Some(column_index) = count_column_index(expr, provider) else {
@@ -221,6 +259,71 @@ fn filecode_filter(provider: &CoveTableProvider, expr: &Expr) -> Option<(usize, 
     }
 }
 
+#[allow(deprecated)]
+fn synopsis_aggregate_request(
+    expr: &Expr,
+    provider: &CoveTableProvider,
+) -> Option<(usize, MetadataSynopsisAggregateKind)> {
+    let Expr::AggregateFunction(func) = expr else {
+        return None;
+    };
+    if func.params.distinct || func.params.filter.is_some() || !func.params.order_by.is_empty() {
+        return None;
+    }
+    let aggregate_kind = if func.func.name().eq_ignore_ascii_case("min") {
+        MetadataSynopsisAggregateKind::Min
+    } else if func.func.name().eq_ignore_ascii_case("max") {
+        MetadataSynopsisAggregateKind::Max
+    } else if func.func.name().eq_ignore_ascii_case("sum") {
+        MetadataSynopsisAggregateKind::Sum
+    } else if func.func.name().eq_ignore_ascii_case("avg") {
+        MetadataSynopsisAggregateKind::Avg
+    } else {
+        return None;
+    };
+    let [Expr::Column(column)] = func.params.args.as_slice() else {
+        return None;
+    };
+    provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == column.name)
+        .map(|column_index| (column_index, aggregate_kind))
+}
+
+#[cfg(feature = "covi")]
+#[allow(deprecated)]
+fn min_max_request(
+    expr: &Expr,
+    provider: &CoveTableProvider,
+) -> Option<(usize, CoviAggregateKindV2)> {
+    let Expr::AggregateFunction(func) = expr else {
+        return None;
+    };
+    if func.params.distinct || func.params.filter.is_some() || !func.params.order_by.is_empty() {
+        return None;
+    }
+    let aggregate_kind = if func.func.name().eq_ignore_ascii_case("min") {
+        CoviAggregateKindV2::Min
+    } else if func.func.name().eq_ignore_ascii_case("max") {
+        CoviAggregateKindV2::Max
+    } else {
+        return None;
+    };
+    let [Expr::Column(column)] = func.params.args.as_slice() else {
+        return None;
+    };
+    provider
+        .state()
+        .table()
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == column.name)
+        .map(|column_index| (column_index, aggregate_kind))
+}
+
 fn record_batch_for_metadata_plan(
     plan: &MetadataAggregatePlan,
     schema: SchemaRef,
@@ -231,6 +334,14 @@ fn record_batch_for_metadata_plan(
             for (index, count) in counts.iter().enumerate() {
                 let field = schema.field(index);
                 arrays.push(count_array_for_type(*count, field.data_type())?);
+            }
+            arrays
+        }
+        MetadataAggregatePlan::ScalarValues { values, .. } => {
+            let mut arrays = Vec::with_capacity(values.len());
+            for (index, value) in values.iter().enumerate() {
+                let field = schema.field(index);
+                arrays.push(canonical_value_array(value, field.data_type())?);
             }
             arrays
         }
@@ -360,6 +471,122 @@ fn count_array_for_type(count: u64, data_type: &DataType) -> Result<arrow_array:
             }
         };
     scalar.to_array()
+}
+
+fn canonical_value_array(
+    value: &MetadataAggregateValue,
+    data_type: &DataType,
+) -> Result<arrow_array::ArrayRef> {
+    canonical_scalar_value(value, data_type)?.to_array()
+}
+
+fn canonical_scalar_value(
+    value: &MetadataAggregateValue,
+    data_type: &DataType,
+) -> Result<ScalarValue> {
+    let Some(bytes) = value.canonical_value.as_deref() else {
+        return null_scalar_for_type(data_type);
+    };
+    match (value.logical, data_type) {
+        (
+            CoveLogicalType::Int8
+            | CoveLogicalType::Int16
+            | CoveLogicalType::Int32
+            | CoveLogicalType::Int64,
+            DataType::Int64,
+        ) => Ok(ScalarValue::Int64(Some(i64::from_le_bytes(fixed_bytes(
+            bytes,
+        )?)))),
+        (CoveLogicalType::Int32, DataType::Int32) => Ok(ScalarValue::Int32(Some(
+            i32::try_from(i64::from_le_bytes(fixed_bytes(bytes)?))
+                .map_err(|_| DataFusionError::Plan("COVI min/max value exceeds Int32".into()))?,
+        ))),
+        (
+            CoveLogicalType::UInt8
+            | CoveLogicalType::UInt16
+            | CoveLogicalType::UInt32
+            | CoveLogicalType::UInt64,
+            DataType::UInt64,
+        ) => Ok(ScalarValue::UInt64(Some(u64::from_le_bytes(fixed_bytes(
+            bytes,
+        )?)))),
+        (CoveLogicalType::UInt32, DataType::UInt32) => Ok(ScalarValue::UInt32(Some(
+            u32::try_from(u64::from_le_bytes(fixed_bytes(bytes)?))
+                .map_err(|_| DataFusionError::Plan("COVI min/max value exceeds UInt32".into()))?,
+        ))),
+        (CoveLogicalType::Float32, DataType::Float32) => Ok(ScalarValue::Float32(Some(
+            f32::from_bits(u32::from_le_bytes(fixed_bytes(bytes)?)),
+        ))),
+        (CoveLogicalType::Float64, DataType::Float64) => Ok(ScalarValue::Float64(Some(
+            f64::from_bits(u64::from_le_bytes(fixed_bytes(bytes)?)),
+        ))),
+        (CoveLogicalType::Decimal128, DataType::Decimal128(precision, scale)) => {
+            Ok(ScalarValue::Decimal128(
+                Some(i128::from_le_bytes(fixed_bytes(bytes)?)),
+                *precision,
+                *scale,
+            ))
+        }
+        (CoveLogicalType::DateDays, DataType::Date32) => Ok(ScalarValue::Date32(Some(
+            i32::from_le_bytes(fixed_bytes(bytes)?),
+        ))),
+        (CoveLogicalType::TimestampMicros, DataType::Timestamp(TimeUnit::Microsecond, tz)) => {
+            Ok(ScalarValue::TimestampMicrosecond(
+                Some(i64::from_le_bytes(fixed_bytes(bytes)?)),
+                tz.clone(),
+            ))
+        }
+        (CoveLogicalType::TimestampNanos, DataType::Timestamp(TimeUnit::Nanosecond, tz)) => {
+            Ok(ScalarValue::TimestampNanosecond(
+                Some(i64::from_le_bytes(fixed_bytes(bytes)?)),
+                tz.clone(),
+            ))
+        }
+        (CoveLogicalType::Utf8, DataType::Utf8) => Ok(ScalarValue::Utf8(Some(
+            canonical_utf8(bytes).map_err(crate::adapter_v53::cove_to_datafusion)?,
+        ))),
+        (CoveLogicalType::Utf8, DataType::LargeUtf8) => Ok(ScalarValue::LargeUtf8(Some(
+            canonical_utf8(bytes).map_err(crate::adapter_v53::cove_to_datafusion)?,
+        ))),
+        other => Err(DataFusionError::Plan(format!(
+            "unsupported COVI min/max output type {other:?}"
+        ))),
+    }
+}
+
+fn null_scalar_for_type(data_type: &DataType) -> Result<ScalarValue> {
+    match data_type {
+        DataType::Int32 => Ok(ScalarValue::Int32(None)),
+        DataType::Int64 => Ok(ScalarValue::Int64(None)),
+        DataType::UInt32 => Ok(ScalarValue::UInt32(None)),
+        DataType::UInt64 => Ok(ScalarValue::UInt64(None)),
+        DataType::Float32 => Ok(ScalarValue::Float32(None)),
+        DataType::Float64 => Ok(ScalarValue::Float64(None)),
+        DataType::Decimal128(precision, scale) => {
+            Ok(ScalarValue::Decimal128(None, *precision, *scale))
+        }
+        DataType::Date32 => Ok(ScalarValue::Date32(None)),
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            Ok(ScalarValue::TimestampMicrosecond(None, tz.clone()))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            Ok(ScalarValue::TimestampNanosecond(None, tz.clone()))
+        }
+        DataType::Utf8 => Ok(ScalarValue::Utf8(None)),
+        DataType::LargeUtf8 => Ok(ScalarValue::LargeUtf8(None)),
+        other => Err(DataFusionError::Plan(format!(
+            "unsupported COVI null min/max output type {other:?}"
+        ))),
+    }
+}
+
+fn fixed_bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
+    bytes.try_into().map_err(|_| {
+        DataFusionError::Plan(format!(
+            "COVI min/max canonical value has {} bytes, expected {N}",
+            bytes.len()
+        ))
+    })
 }
 
 fn count_array_for_values(counts: &[u64], data_type: &DataType) -> Result<arrow_array::ArrayRef> {

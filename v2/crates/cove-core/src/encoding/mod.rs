@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Encoding cascades (Spec §20.3).
+//! Cove Format (COVE) v2.0 — Encoding cascades (Spec §20.3).
 //!
 //! Each encoding implements the same logical contract:
 //!
@@ -32,7 +32,7 @@ pub mod sparse;
 
 use crate::CoveError;
 
-/// Common contract for every COVE v1 cascade (Spec §20.3, §21).
+/// Common contract for every COVE v2 cascade (Spec §20.3, §21).
 pub trait Encoding {
     /// Encoded payload for a single page.
     type Payload;

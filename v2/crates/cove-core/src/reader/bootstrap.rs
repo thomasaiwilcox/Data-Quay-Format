@@ -69,6 +69,7 @@ pub(super) fn validate_bytes_with_optional_pushdown_policy(
             "header and postscript feature bits differ".to_string(),
         ));
     }
+    super::validate_scoped_feature_metadata(data, &header, &footer)?;
 
     let validated = ValidatedCoveFile {
         header,

@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Stable row references (Spec §54).
+//! Cove Format (COVE) v2.0 — Stable row references (Spec §54).
 //!
 //! Each row in a COVE-T table can be addressed by the Spec §54.1
 //! `CoveTableRowRefV1` tuple: `(table_id, segment_id, morsel_id,

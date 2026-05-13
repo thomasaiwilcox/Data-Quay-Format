@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Digest manifest (Spec §65).
+//! Cove Format (COVE) v2.0 — Digest manifest (Spec §65).
 //!
 //! Digest manifests bind cryptographic hashes to sections, pages, the whole
 //! file, or custom targets. Validation is policy-aware: a missing digest entry

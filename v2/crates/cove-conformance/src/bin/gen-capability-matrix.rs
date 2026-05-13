@@ -50,6 +50,15 @@ fn rows() -> Vec<Row> {
             notes: "header.rs; accept/reject bootstrap fixtures",
         },
         Row {
+            section: "§11.1",
+            capability: "Extended feature set and profile matrix",
+            modeled: "yes",
+            parsed: "yes",
+            validated: "yes",
+            written: "yes",
+            notes: "feature_scope.rs parses and serializes `EXTENDED_FEATURE_SET` and `PROFILE_CAPABILITY_MATRIX`, validates word-0 parity, horizons, sorted profile entries, and scoped unknown extended required bits before operation use",
+        },
+        Row {
             section: "§11.3",
             capability: "Section feature binding",
             modeled: "yes",
@@ -137,7 +146,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-codec parses, validates, and serializes `CodecExtensionDescriptorV2`; descriptor accept/reject corpus covers checksums and duplicate codec IDs; cove-codec-validate inspects descriptor sections; broad codec bitstream conformance remains gated on future codec vectors",
+            notes: "cove-codec parses, validates, and serializes `CodecExtensionDescriptorV2`; stable descriptor identities and registry dispatch are implemented for `fsst-utf8.v2`, `alp-float.v2`, and `fastlanes-integer.v2`",
         },
         Row {
             section: "§20.9",
@@ -146,7 +155,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-codec models, serializes, and validates `RegisteredEncodingEnvelopeV2` checksums and fallback bounds with codec/ corpus vectors; exact codec payload equivalence vectors remain outside broad COVE-CX decode conformance",
+            notes: "cove-codec models, serializes, and validates `RegisteredEncodingEnvelopeV2` checksums, fallback bounds, stable registered codec payloads, and fallback equivalence entrypoints",
         },
         Row {
             section: "§21",
@@ -245,7 +254,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-coverage structurally parses and serializes proof records, validates proof/provider/set/predicate/snapshot bindings, under-inclusive and unsafe-null pruning rules, duplicate proof IDs, and coverage-set checksum binding; proof records are not yet planner-executed",
+            notes: "cove-coverage structurally parses and serializes proof records, validates proof/provider/set/predicate/snapshot bindings, under-inclusive and unsafe-null pruning rules, duplicate proof IDs, and coverage-set checksum binding; cove-datafusion matches SQL-lowered predicates to payload-bearing predicate forms and uses exact coverage proof pruning with residual filtering preserved",
         },
         Row {
             section: "§29.4",
@@ -254,7 +263,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-coverage structurally parses and serializes predicate normal-form and interval predicate records with operand/context refs, interval-bound checks, and malformed ref/bounds corpus coverage; full AST execution remains out of scope",
+            notes: "cove-coverage parses payload-level AST, CNF/DNF, interval-set, and encoded predicate forms; validates dense refs, arity, mirrors, acyclic ASTs, intervals, proof-safe terms, and encoded equivalence safety",
         },
         Row {
             section: "§29.5",
@@ -308,7 +317,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-index parses `.covi` postscript/header/section directory with `CVI2` magic and builds empty plus single-section artifacts; block-level COVI key/entry/postings vectors are pending",
+            notes: "cove-index validates `.covi` framing, CIK2 key-data checksums, referenced-file digest freshness, snapshot/schema/map/visibility validity, root-to-block identity, sorted keys, duplicate chains, all fixed posting payload layouts, row-ordinal bitsets, and byte-range bounds; cove-build-covi emits SHA-256-bound row-range roots for selected columns",
         },
         Row {
             section: "§33.2",
@@ -317,7 +326,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-index models, parses, validates, and serializes `IndexCapabilityV2` and `IndexOnlyCapabilityV2`; COVI corpus covers valid records, checksums, strict boolean fields, and aggregate kind bounds; full index execution semantics remain outside this row",
+            notes: "cove-index models, parses, validates, and serializes `IndexCapabilityV2` and `IndexOnlyCapabilityV2`; COVI execution validates aggregate-answer refs, snapshot exactness, and rejects approximate answers for exact index-only requests; DataFusion can use validated exact answers and candidate pruning when the optional `covi` feature is enabled",
         },
         Row {
             section: "§34",
@@ -326,7 +335,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "index/aggregate.rs; accept/reject corpus plus pruning_case aggregate_synopsis accept and fail-open fixtures; `AggregateSynopsis::serialize` round-trips with parser",
+            notes: "index/aggregate.rs models payload-aware §34 entries for Count, MinMax, Sum, SumAndCount, BoolTrueFalseCounts, FileCodeHistogram, NumCodeHistogram, DistinctSketch/HLL, QuantileSketch/KLL, and TopK; conformance covers valid payloads plus checksum, bounds, kind/payload, sorting, duplicate, count-total, canonical-value, accuracy, HLL, and KLL rejects; DataFusion consumes exact payloads only when all-visible and unredacted",
         },
         Row {
             section: "§35",
@@ -452,7 +461,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "interop/parquet.rs plus cove-convert-parquet CLI convert primitive/temporal/utf8/binary/nested JSON-fallback parquet batches into COVE-T scan-profile files with machine-readable reports; parquet_conversion_case corpus covers primitive, nullable, and nested fallback accept cases",
+            notes: "interop/parquet.rs plus cove-convert-parquet CLI convert primitive/temporal/utf8/binary batches into COVE-T scan-profile files with machine-readable reports; supported List/Struct/Map Arrow/Parquet shapes now emit native NestedSchema/page trees, while unsupported nested child shapes remain explicit JSON fallbacks; parquet_conversion_case corpus covers primitive, nullable, and fallback accept cases",
         },
         Row {
             section: "§52",
@@ -461,7 +470,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "encoding/nested.rs payload parsers plus ScanProfileCoveWriter explicit nested page specs, semantic TableSegmentData validation, nested_case JSON fixtures, and accept/reject nested .cove files for list/struct/map invariants",
+            notes: "NestedSchema section parsing/serialization, recursive page payload tree ownership, ScanProfileCoveWriter native nested page specs, semantic TableSegmentData validation, nested_case JSON fixtures, and accept/reject nested .cove files for list/struct/map invariants including missing/mismatched schema",
         },
         Row {
             section: "§53",
@@ -581,13 +590,31 @@ fn rows() -> Vec<Row> {
             notes: "io_hints.rs parses the six-field §67 `CoveIoHintV1`; accept/reject corpus; `IoHints::encode` round-trips with parser",
         },
         Row {
+            section: "§67.2",
+            capability: "COVE-L fast metadata index",
+            modeled: "yes",
+            parsed: "yes",
+            validated: "yes",
+            written: "yes",
+            notes: "cove-layout parses and serializes `FastMetadataIndexV2`, validates fixed entry lengths, CRCs, reserved fields, deterministic order, duplicate target refs, offset/length overflow, and authoritative footer-section references; DataFusion parses and stores valid optional fast metadata for planning consumers while falling back to footer authority when absent or invalid",
+        },
+        Row {
+            section: "§67.3",
+            capability: "COVE-L page cluster directory",
+            modeled: "yes",
+            parsed: "yes",
+            validated: "yes",
+            written: "yes",
+            notes: "cove-layout parses and serializes `PageClusterDirectoryV2`, validates per-entry CRCs, sorted unique cluster IDs, row/page range overflow, non-empty cluster spans, and authority against table/segment/morsel ranges; DataFusion consumes validated clusters for bounded range coalescing and falls back to ordinary coalescing when absent or invalid",
+        },
+        Row {
             section: "§67.4",
             capability: "COVE-L zero-copy buffer map",
             modeled: "yes",
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-layout parses and serializes zero-copy targets and map entries, validates target references, and gates compatibility/materialisation reasons for compressed, null-polarity, dictionary, nested, lifetime, unknown-role, and active-visibility-overlay cases",
+            notes: "cove-layout parses and serializes zero-copy targets and map entries, validates target references, gates compatibility/materialisation reasons for compressed, null-polarity, dictionary, nested, lifetime, unknown-role, and active-visibility-overlay cases, and cove-arrow conformance verifies selected Arrow View exports use compact owned buffers instead of exposing unselected COVE bytes",
         },
         Row {
             section: "§67.5",
@@ -731,7 +758,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "profile/cove_map.rs rejects undeclared or nondeterministic functions; cove-map conversion executes declared canonicalization functions",
+            notes: "profile/cove_map.rs rejects undeclared or nondeterministic functions; cove-map conversion executes declared built-ins through a deterministic registry (`identity`, `trim`, `ascii_lower`, Unicode-normalisation IDs, `trim_lower`, `concat_delimited`, parsing helpers, `sha256_hex`)",
         },
         Row {
             section: "§70.14",
@@ -821,7 +848,25 @@ fn rows() -> Vec<Row> {
             parsed: "n/a",
             validated: "yes",
             written: "yes",
-            notes: "suite_contract_case corpus, CLI smoke tests including cove-convert-parquet, release-gate bench/conformance smoke, and deterministic robustness harness",
+            notes: "suite_contract_case corpus, CLI smoke tests including cove-convert-parquet, release-gate bench/conformance/fuzz smoke, and deterministic robustness harness",
+        },
+        Row {
+            section: "§80.2",
+            capability: "Reference CLI utilities",
+            modeled: "yes",
+            parsed: "n/a",
+            validated: "yes",
+            written: "yes",
+            notes: "release gates exercise pruning/cost/export utilities, conversion reports, Arrow conversion, digest/canonical/profile tools, COVM/COVX builders, and COVE-MAP wrapper binaries",
+        },
+        Row {
+            section: "§80.3A",
+            capability: "Coverage-centred benchmark reporting",
+            modeled: "yes",
+            parsed: "n/a",
+            validated: "yes",
+            written: "yes",
+            notes: "cove-plan-cost reports range plan, coverage metrics, fallbacks, and optional observed DecodeStats; cove-explain-pruning exposes kept/pruned decisions and residual status through JSON",
         },
     ]
 }
@@ -843,21 +888,39 @@ fn row_gate_met(row: &Row, corpus_status: &str) -> bool {
 
 fn corpus_requirement(row: &Row) -> CorpusRequirement {
     let reject_exemption = match row.section {
-        "§8" => Some("wire negative cases are executable fixture operations inside accept corpus rows"),
-        "§29" => Some("predicate truth-table failures are asserted as expected outcomes inside pruning fixtures"),
+        "§8" => {
+            Some("wire negative cases are executable fixture operations inside accept corpus rows")
+        }
+        "§29" => Some(
+            "predicate truth-table failures are asserted as expected outcomes inside pruning fixtures",
+        ),
         "§37" => Some("fail-open and negative pruning paths are asserted inside pruning fixtures"),
-        "§51" => Some("conversion fixtures are positive CLI/library conversions without a stable negative corpus surface"),
+        "§51" => Some(
+            "conversion fixtures are positive CLI/library conversions without a stable negative corpus surface",
+        ),
         "§61" => Some("property-column coverage is validated through generated COVE-O outputs"),
-        "§70.3" => Some("row-semantic failures are covered through referenced MAP validation rows"),
-        "§70.5" => Some("join-key behavior is validated through deterministic execution fixtures and unit tests"),
-        "§70.6" => Some("identity-resolution negative behavior is covered by do-not-merge unit tests"),
+        "§70.3" => {
+            Some("row-semantic failures are covered through referenced MAP validation rows")
+        }
+        "§70.5" => Some(
+            "join-key behavior is validated through deterministic execution fixtures and unit tests",
+        ),
+        "§70.6" => {
+            Some("identity-resolution negative behavior is covered by do-not-merge unit tests")
+        }
         "§70.9" => Some("association readback is a positive preservation contract"),
         "§70.10" => Some("projection readback is a positive preservation contract"),
         "§70.12" => Some("evidence rejection is covered by referenced MAP validation rows"),
-        "§70.13" => Some("function-registry rejection is covered by COVE_E_MAP_FUNCTION_UNDECLARED fixtures"),
+        "§70.13" => Some(
+            "function-registry rejection is covered by COVE_E_MAP_FUNCTION_UNDECLARED fixtures",
+        ),
         "§75" => Some("durable replace is a positive publication contract"),
         "§78" => Some("suite requirements are self-checking accept fixtures"),
         "§79" => Some("open suite packaging is checked by suite-contract accept fixtures"),
+        "§80.2" => Some("utility availability is checked by release-gate suite-contract fixtures"),
+        "§80.3A" => {
+            Some("coverage-centred reporting is checked through positive utility contract fixtures")
+        }
         _ => None,
     };
     if row.section == "§76" {
@@ -865,6 +928,20 @@ fn corpus_requirement(row: &Row) -> CorpusRequirement {
             min_accept: 0,
             min_reject: 1,
             reject_exemption: Some("error-code surface is demonstrated by reject fixtures"),
+        };
+    }
+    if row.section == "§33.1" {
+        return CorpusRequirement {
+            min_accept: 8,
+            min_reject: 10,
+            reject_exemption: None,
+        };
+    }
+    if row.section == "§33.2" {
+        return CorpusRequirement {
+            min_accept: 3,
+            min_reject: 5,
+            reject_exemption: None,
         };
     }
     CorpusRequirement {
@@ -1019,7 +1096,10 @@ fn spec_sections(spec_text: &str) -> BTreeSet<String> {
             let trimmed = line.trim_start_matches('#').trim_start();
             let number = trimmed.split_whitespace().next()?;
             let number = number.strip_suffix('.').unwrap_or(number);
-            if number.chars().all(|ch| ch.is_ascii_digit() || ch == '.') {
+            if number
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ch == '.' || ch.is_ascii_uppercase())
+            {
                 Some(format!("§{number}"))
             } else {
                 None
@@ -1105,7 +1185,7 @@ fn main() {
     out.push_str(&format!(
         "\n**Fully gated capabilities:** {fully_gated} / {total}\n"
     ));
-    out.push_str("\n**Intentionally contextual or indirectly tracked sections:** §1-§7, §11, §14, §18, §38-§39, §48, §55, §59, §71, §80-§81. These sections define terminology, invariants, registries, or suite process rather than a single reference-code capability row.\n");
+    out.push_str("\n**Intentionally contextual or indirectly tracked sections:** §1-§7, §11, §14, §18, §38-§39, §48, §55, §59, §71, §80.1, §80.3, §80.4-§80.6, §81. These sections define terminology, invariants, registries, or suite process rather than a single reference-code capability row.\n");
 
     if check_mode() {
         assert!(

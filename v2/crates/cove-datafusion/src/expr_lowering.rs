@@ -37,10 +37,17 @@ pub enum LowerExpr {
     Literal(LowerLiteral),
     IsNull(Box<LowerExpr>),
     IsNotNull(Box<LowerExpr>),
+    And(Vec<LowerExpr>),
+    Or(Vec<LowerExpr>),
     Binary {
         left: Box<LowerExpr>,
         op: LowerOperator,
         right: Box<LowerExpr>,
+    },
+    Between {
+        expr: Box<LowerExpr>,
+        low: Box<LowerExpr>,
+        high: Box<LowerExpr>,
     },
     InList {
         expr: Box<LowerExpr>,
@@ -50,12 +57,92 @@ pub enum LowerExpr {
     Unsupported(String),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilterLowering {
+    pub filters: Vec<FilterPlan>,
+    pub fallbacks: usize,
+}
+
 pub fn lower_filter(
     state: &DatasetState,
     expr: &LowerExpr,
     display: impl Into<String>,
 ) -> FilterPlan {
     let display = display.into();
+    let lowering = lower_filters(state, expr, display.clone());
+    if lowering.fallbacks == 0 && lowering.filters.len() == 1 {
+        return lowering.filters.into_iter().next().expect("single filter");
+    }
+    FilterPlan::unsupported(display)
+}
+
+pub fn lower_filters(
+    state: &DatasetState,
+    expr: &LowerExpr,
+    display: impl Into<String>,
+) -> FilterLowering {
+    let display = display.into();
+    let mut lowering = FilterLowering::default();
+    lower_filters_into(state, expr, &display, &mut lowering);
+    lowering
+}
+
+fn lower_filters_into(
+    state: &DatasetState,
+    expr: &LowerExpr,
+    display: &str,
+    lowering: &mut FilterLowering,
+) {
+    match expr {
+        LowerExpr::And(children) => {
+            for child in children {
+                lower_filters_into(state, child, display, lowering);
+            }
+        }
+        LowerExpr::Between { expr, low, high } => {
+            push_lowered_atom(
+                state,
+                &LowerExpr::Binary {
+                    left: expr.clone(),
+                    op: LowerOperator::GtEq,
+                    right: low.clone(),
+                },
+                format!("{display} lower"),
+                lowering,
+            );
+            push_lowered_atom(
+                state,
+                &LowerExpr::Binary {
+                    left: expr.clone(),
+                    op: LowerOperator::LtEq,
+                    right: high.clone(),
+                },
+                format!("{display} upper"),
+                lowering,
+            );
+        }
+        LowerExpr::Or(_) | LowerExpr::Unsupported(_) => {
+            lowering.fallbacks += 1;
+        }
+        _ => push_lowered_atom(state, expr, display.to_string(), lowering),
+    }
+}
+
+fn push_lowered_atom(
+    state: &DatasetState,
+    expr: &LowerExpr,
+    display: String,
+    lowering: &mut FilterLowering,
+) {
+    let filter = lower_atom_filter(state, expr, display);
+    if filter.use_kind == crate::planner::CoveFilterUse::Unsupported {
+        lowering.fallbacks += 1;
+    } else {
+        lowering.filters.push(filter);
+    }
+}
+
+fn lower_atom_filter(state: &DatasetState, expr: &LowerExpr, display: String) -> FilterPlan {
     let mut filter = match expr {
         LowerExpr::IsNull(input) => {
             classify_null_filter(state, input, NullPredicateKind::IsNull, display)

@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Canonical value encoding (Spec §17).
+//! Cove Format (COVE) v2.0 — Canonical value encoding (Spec §17).
 //!
 //! The canonical encoding is the byte-level identity of a value in COVE. Two
 //! values are equal in a dictionary if and only if their `(value_tag,

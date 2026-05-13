@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Validity / null bitmap support.
+//! Cove Format (COVE) v2.0 — Validity / null bitmap support.
 //!
 //! Null bitmap convention (Spec §6.6):
 //! - bit 1 means **null**

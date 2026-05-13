@@ -1,6 +1,6 @@
 # COVE DataFusion Benchmark Report
 
-Status: current local benchmark report
+Status: current local Criterion report plus public v2 corpus contract
 
 Audience: maintainers evaluating COVE's DataFusion integration and its comparison with Parquet through DataFusion.
 
@@ -58,6 +58,9 @@ git diff --check
 Benchmark commands:
 
 ```text
+cargo run -p cove-bench -- check
+cargo run -p cove-bench -- gen --profile standard --out target/cove-bench/standard
+cargo run -p cove-bench -- run --corpus target/cove-bench/standard --report-json target/cove-bench/standard/report.json --report-md target/cove-bench/standard/report.md
 cargo bench -p cove-datafusion --features parquet-compare --bench m6 -- --noplot
 cargo bench -p cove-datafusion --features parquet-compare --bench m7_sql_mix -- --noplot
 ```
@@ -79,6 +82,16 @@ Both formats use their own structural and adapter advantages inside DataFusion:
 - The comparison does not force either format through a deliberately weakened path.
 
 The result is intended to answer: "How does the current COVE DataFusion integration behave against DataFusion's Parquet path for these fixtures and queries?"
+
+### 4.1.1 Public v2 Corpus Harness
+
+`cove-bench` now provides the public reproducible corpus surface required by Spec §78:
+
+- `gen --profile ci|standard|publication --out <dir>` writes deterministic generated artifacts outside the tracked source tree.
+- `run --corpus <dir> --report-json <path> --report-md <path>` executes the query matrix and emits machine-readable and Markdown reports.
+- `check` runs the CI-sized generate-and-run path and fails if required cases or report fields are missing.
+
+The committed manifest lives in `crates/cove-bench/benchmarks/public-v2-corpus.json`. Generated outputs include COVE, Parquet, COVX/COVM where the converter emits them, a synthetic COVE-CACHE fixture, corpus lock metadata with digests, and benchmark reports with planning, scan, end-to-end, row, coverage, and cache metrics.
 
 ### 4.2 M6
 
@@ -115,7 +128,8 @@ The benchmark includes default COVE and Parquet tracks, plus explicit opt-in Fil
 - Criterion's terminal "regressed" or "improved" labels compare against whatever local saved baseline was present. They are not used as the basis for this report.
 - Some tracks had Criterion warnings that 100 samples could not complete within the default target time. Those results are still recorded, but the confidence interval should be checked before making narrow claims.
 - Some M7 tracks show wide confidence intervals and outliers. Treat those as directional until repeated on a controlled machine.
-- The benchmark fixtures are synthetic and intentionally small enough to run in CI/developer environments. They do not cover large object-store datasets, many-file manifests, or all real archive-query patterns.
+- The `ci` benchmark profile is synthetic and intentionally small enough to run in PR/release gates. The `standard` and `publication` profiles increase row counts but remain deterministic generated corpora, not real customer datasets.
+- Object-store cold scans are represented by report fields and disclosure metadata in this first public corpus, but the local harness does not yet drive a remote object-store service.
 - FileCode dictionary output is opt-in. It is currently retained for correctness and engine-integration testing, not enabled as the default performance path.
 - The production-safe FileCode dictionary fix may trade speed for correctness when a file dictionary contains entries from multiple logical domains.
 

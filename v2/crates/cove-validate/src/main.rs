@@ -1,4 +1,4 @@
-//! `cove-validate` — Cove Format (COVE) v1.0 file validator.
+//! `cove-validate` — Cove Format (COVE) v2.0 file validator.
 //!
 //! Validates the structural integrity of a COVE file by checking:
 //!

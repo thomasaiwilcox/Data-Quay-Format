@@ -1,9 +1,9 @@
 # COVE-MAP JSON Schema v1
 
 This is the reference implementation companion schema for JSON payloads inside
-`.covemap` artifacts and embedded `MAP_*` sections. It preserves the COVE v1
-binary framing and defines the JSON fields that `cove-map` validates, replays,
-converts, explains, and projects.
+`.covemap` artifacts and embedded `MAP_*` sections. It targets the COVE-MAP v2
+artifact framing and defines the JSON fields that `cove-map` validates,
+replays, converts, explains, and projects.
 
 ## Row Semantics
 
@@ -25,7 +25,7 @@ converts, explains, and projects.
 - `temporal_policy`: optional, defaults to `latest_committed`.
 - `conflict_policy`: optional, defaults to `reject_conflict`.
 - `property_bindings`: object property materialization rules.
-- `association_bindings`: link-object materialization rules for COVE-O v1.
+- `association_bindings`: link-object materialization rules for COVE-O v2.
 
 The reference materializer creates object rows for `Object`, `EventObject`,
 `LinkObject`, `Composite`, `Dispatched`, `KeyValueFragment`, and `Tombstone`.

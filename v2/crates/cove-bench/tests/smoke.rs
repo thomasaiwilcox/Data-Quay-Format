@@ -13,7 +13,7 @@ fn bench_cli_smoke() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("crc32c:"), "stdout: {stdout}");
-    assert!(stdout.contains("canonical_int:"), "stdout: {stdout}");
-    assert!(stdout.contains("arrow_inversion:"), "stdout: {stdout}");
+    assert!(stdout.contains("cove-bench gen"), "stdout: {stdout}");
+    assert!(stdout.contains("cove-bench run"), "stdout: {stdout}");
+    assert!(stdout.contains("cove-bench check"), "stdout: {stdout}");
 }

@@ -13,9 +13,12 @@ pub struct CoveTableOptions {
     covm_trust_policy: CovmTrustPolicy,
     sidecar_digest_policy: SidecarDigestPolicy,
     covx_discovery: CovxDiscovery,
+    covi_discovery: CoviDiscovery,
+    coverage_cache_discovery: CoverageCacheDiscovery,
     execution_code_policy: ExecutionCodePolicy,
     page_payload_validation_policy: PagePayloadValidationPolicy,
     local_file_read_policy: LocalFileReadPolicy,
+    filter_residual_policy: FilterResidualPolicy,
     target_morsels_per_partition: usize,
     range_coalescing: RangeCoalescingOptions,
     #[cfg(feature = "dynamic-filters")]
@@ -42,6 +45,18 @@ pub enum CovxDiscovery {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoviDiscovery {
+    Disabled,
+    SiblingExtension,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageCacheDiscovery {
+    Disabled,
+    SiblingDiagnostic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionCodePolicy {
     Disabled,
     Opportunistic,
@@ -60,6 +75,12 @@ pub enum LocalFileReadPolicy {
     Mmap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FilterResidualPolicy {
+    PreserveAll,
+    ElideExactWhenProven,
+}
+
 impl Default for CoveTableOptions {
     fn default() -> Self {
         Self {
@@ -70,9 +91,12 @@ impl Default for CoveTableOptions {
             covm_trust_policy: CovmTrustPolicy::Conservative,
             sidecar_digest_policy: SidecarDigestPolicy::RequireFreshFingerprint,
             covx_discovery: default_covx_discovery(),
+            covi_discovery: default_covi_discovery(),
+            coverage_cache_discovery: CoverageCacheDiscovery::Disabled,
             execution_code_policy: ExecutionCodePolicy::Opportunistic,
             page_payload_validation_policy: PagePayloadValidationPolicy::Trusted,
             local_file_read_policy: LocalFileReadPolicy::Mmap,
+            filter_residual_policy: FilterResidualPolicy::PreserveAll,
             target_morsels_per_partition: 128,
             range_coalescing: RangeCoalescingOptions::default(),
             #[cfg(feature = "dynamic-filters")]
@@ -150,6 +174,28 @@ impl CoveTableOptions {
         self
     }
 
+    pub fn covi_discovery(self) -> CoviDiscovery {
+        self.covi_discovery
+    }
+
+    pub fn with_covi_discovery(mut self, discovery: CoviDiscovery) -> Self {
+        self.covi_discovery = discovery;
+        self
+    }
+
+    pub fn coverage_cache_discovery(self) -> CoverageCacheDiscovery {
+        self.coverage_cache_discovery
+    }
+
+    pub fn with_coverage_cache_discovery(mut self, discovery: CoverageCacheDiscovery) -> Self {
+        self.coverage_cache_discovery = discovery;
+        self
+    }
+
+    pub fn with_sibling_coverage_cache(self) -> Self {
+        self.with_coverage_cache_discovery(CoverageCacheDiscovery::SiblingDiagnostic)
+    }
+
     pub fn execution_code_policy(self) -> ExecutionCodePolicy {
         self.execution_code_policy
     }
@@ -198,6 +244,15 @@ impl CoveTableOptions {
         self
     }
 
+    pub fn filter_residual_policy(self) -> FilterResidualPolicy {
+        self.filter_residual_policy
+    }
+
+    pub fn with_filter_residual_policy(mut self, policy: FilterResidualPolicy) -> Self {
+        self.filter_residual_policy = policy;
+        self
+    }
+
     pub fn target_morsels_per_partition(self) -> usize {
         self.target_morsels_per_partition
     }
@@ -238,5 +293,13 @@ fn default_covx_discovery() -> CovxDiscovery {
         CovxDiscovery::SiblingExtension
     } else {
         CovxDiscovery::Disabled
+    }
+}
+
+fn default_covi_discovery() -> CoviDiscovery {
+    if cfg!(feature = "covi") {
+        CoviDiscovery::SiblingExtension
+    } else {
+        CoviDiscovery::Disabled
     }
 }

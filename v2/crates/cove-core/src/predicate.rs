@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Predicate truth table (Spec §29).
+//! Cove Format (COVE) v2.0 — Predicate truth table (Spec §29).
 //!
 //! Predicate evaluation against a zone (segment, morsel, page) yields a
 //! [`PredicateZoneOutcome`]. Three-valued logic propagation is governed by

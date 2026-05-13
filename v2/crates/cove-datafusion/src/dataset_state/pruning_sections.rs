@@ -1,4 +1,5 @@
 use cove_core::{
+    codec::CodecExtensionDescriptorV2,
     compression,
     constants::SectionKind,
     domain::ColumnDomain,
@@ -10,6 +11,10 @@ use cove_core::{
     },
     zone_stats::ZoneStatsSection,
 };
+use cove_coverage::{
+    CoveragePlanCandidateV2, CoverageProofRecordV2, CoverageProviderDescriptorV2, CoverageSetV2,
+    PredicateNormalFormV2, PredicateNormalFormWithPayloadV2,
+};
 
 pub fn parse_column_domains_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<ColumnDomain> {
     footer
@@ -18,6 +23,20 @@ pub fn parse_column_domains_from_sections(bytes: &[u8], footer: &CoveFooter) -> 
         .filter(|entry| entry.section_kind == SectionKind::ColumnDomain as u16)
         .filter_map(|entry| compression::section_payload(bytes, entry).ok())
         .filter_map(|payload| ColumnDomain::parse(&payload).ok())
+        .collect()
+}
+
+pub fn parse_codec_descriptors_from_sections(
+    bytes: &[u8],
+    footer: &CoveFooter,
+) -> Vec<CodecExtensionDescriptorV2> {
+    footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == SectionKind::CodecExtensionRegistry as u16)
+        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
+        .filter_map(|payload| CodecExtensionDescriptorV2::parse_many(&payload).ok())
+        .flatten()
         .collect()
 }
 
@@ -57,6 +76,86 @@ pub fn parse_composites_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<
 
 pub fn parse_topn_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<TopNSummary> {
     parse_topn(bytes, footer)
+}
+
+pub fn parse_coverage_providers_from_sections(
+    bytes: &[u8],
+    footer: &CoveFooter,
+) -> Vec<CoverageProviderDescriptorV2> {
+    footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == SectionKind::CoverageProviderRegistry as u16)
+        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
+        .filter_map(|payload| CoverageProviderDescriptorV2::parse_many(&payload).ok())
+        .flatten()
+        .collect()
+}
+
+pub fn parse_coverage_sets_from_sections(bytes: &[u8], footer: &CoveFooter) -> Vec<CoverageSetV2> {
+    footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == SectionKind::CoverageSet as u16)
+        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
+        .filter_map(|payload| CoverageSetV2::parse(&payload).ok())
+        .collect()
+}
+
+pub fn parse_coverage_proofs_from_sections(
+    bytes: &[u8],
+    footer: &CoveFooter,
+) -> Vec<CoverageProofRecordV2> {
+    footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == SectionKind::CoverageProofRecord as u16)
+        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
+        .filter_map(|payload| CoverageProofRecordV2::parse_many(&payload).ok())
+        .flatten()
+        .collect()
+}
+
+pub fn parse_coverage_plan_candidates_from_sections(
+    bytes: &[u8],
+    footer: &CoveFooter,
+) -> Vec<CoveragePlanCandidateV2> {
+    footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == SectionKind::CoveragePlanCandidate as u16)
+        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
+        .filter_map(|payload| CoveragePlanCandidateV2::parse_many(&payload).ok())
+        .flatten()
+        .collect()
+}
+
+pub fn parse_predicate_forms_from_sections(
+    bytes: &[u8],
+    footer: &CoveFooter,
+) -> Vec<PredicateNormalFormV2> {
+    footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == SectionKind::PredicateNormalForm as u16)
+        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
+        .filter_map(|payload| PredicateNormalFormV2::parse_many(&payload).ok())
+        .flatten()
+        .collect()
+}
+
+pub fn parse_predicate_forms_with_payloads_from_sections(
+    bytes: &[u8],
+    footer: &CoveFooter,
+) -> Vec<PredicateNormalFormWithPayloadV2> {
+    footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == SectionKind::PredicateNormalForm as u16)
+        .filter_map(|entry| compression::section_payload(bytes, entry).ok())
+        .filter_map(|payload| PredicateNormalFormWithPayloadV2::parse_many(&payload).ok())
+        .flatten()
+        .collect()
 }
 
 fn parse_exact_sets(bytes: &[u8], footer: &CoveFooter) -> Vec<ExactSetIndex> {

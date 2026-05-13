@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Pruning explanation (Spec §37).
+//! Cove Format (COVE) v2.0 — Pruning explanation (Spec §37).
 //!
 //! `explain_pruning` returns a structured description of which validated
 //! metadata proved each scan decision, so users can audit *why* a zone was

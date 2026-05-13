@@ -5,4 +5,12 @@ edition = "2021"
 
 [dependencies]
 cove-arrow = { path = "../cove-arrow" }
+cove-cache = { path = "../cove-cache" }
+cove-coverage = { path = "../cove-coverage" }
 cove-core = { path = "../cove-core" }
+cove-datafusion = { path = "../cove-datafusion", features = ["covm", "covx", "covi", "parquet-compare"] }
+cove-index = { path = "../cove-index" }
+arrow-array = "58"
+arrow-schema = "58"
+parquet = { version = "58", default-features = false, features = ["arrow"] }
+serde_json = "1"

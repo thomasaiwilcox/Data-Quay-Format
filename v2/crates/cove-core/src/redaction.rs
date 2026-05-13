@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Redaction manifest (Spec §64).
+//! Cove Format (COVE) v2.0 — Redaction manifest (Spec §64).
 //!
 //! Redactions are first-class structural metadata. A redacted value is present
 //! but inaccessible, and the redaction manifest records the target section,

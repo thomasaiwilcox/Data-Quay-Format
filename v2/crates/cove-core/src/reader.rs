@@ -1,16 +1,18 @@
-//! Cove Format (COVE) v1.0 — reference reader and structural validator.
+//! Cove Format (COVE) v2.0 — reference reader and structural validator.
 
 use std::{collections::BTreeSet, fs, path::Path};
 
 use crate::{
-    checksum,
+    checksum, compression,
     constants::{
         PrimaryProfile, SectionKind, FEATURE_ARCHIVE_PROFILE, FEATURE_CODEC_EXTENSION_REGISTRY,
         FEATURE_CODEC_LZ4, FEATURE_CODEC_ZSTD, FEATURE_COVERAGE_METADATA, FEATURE_ENGINE_PROFILE,
-        FEATURE_HARBOR_PROFILE, FEATURE_LAYOUT_PLAN, FEATURE_OBJECT_PROFILE,
-        FEATURE_RUNTIME_COMPATIBILITY_HINTS, FEATURE_SECONDARY_INDEX_ARTIFACT,
-        FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE,
+        FEATURE_EXTENDED_FEATURE_SET, FEATURE_HARBOR_PROFILE, FEATURE_LAYOUT_PLAN,
+        FEATURE_OBJECT_PROFILE, FEATURE_RUNTIME_COMPATIBILITY_HINTS,
+        FEATURE_SECONDARY_INDEX_ARTIFACT, FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE,
     },
+    feature_binding::SectionFeatureBindingSectionV2,
+    feature_scope::{ExtendedFeatureSetV2, FeatureScopeTable, ProfileCapabilityMatrixV2},
     footer::CoveFooter,
     header::{CoveHeaderV1, HEADER_SIZE},
     postscript::CovePostscriptV1,
@@ -23,8 +25,9 @@ mod digest_verification;
 mod reports;
 
 pub use reports::{
-    validate_bytes_with_options, IgnoredOptionalSection, OptionalPushdownPolicy, ValidationOptions,
-    ValidationReport, ValidationStage, ValidationStageReport, ValidationStageStatus,
+    validate_bytes_for_feature_use, validate_bytes_with_options, IgnoredOptionalSection,
+    OptionalPushdownPolicy, ValidationOptions, ValidationReport, ValidationStage,
+    ValidationStageReport, ValidationStageStatus,
 };
 #[path = "reader/bootstrap.rs"]
 mod bootstrap;
@@ -40,6 +43,17 @@ pub struct ValidatedCoveFile {
     pub header: CoveHeaderV1,
     pub postscript: CovePostscriptV1,
     pub footer: CoveFooter,
+}
+
+#[derive(Debug, Clone)]
+struct ScopedFeatureMetadata {
+    #[allow(dead_code)]
+    extended: Option<ExtendedFeatureSetV2>,
+    #[allow(dead_code)]
+    profile_matrix: Option<ProfileCapabilityMatrixV2>,
+    #[allow(dead_code)]
+    section_binding: Option<SectionFeatureBindingSectionV2>,
+    scope_table: FeatureScopeTable,
 }
 
 /// Read a complete COVE file and validate its COVE-Core structure.
@@ -146,6 +160,153 @@ fn validate_sections(
     Ok(ignored_optional_sections)
 }
 
+pub fn feature_scope_table_for(
+    data: &[u8],
+    validated: &ValidatedCoveFile,
+) -> Result<FeatureScopeTable, CoveError> {
+    Ok(parse_scoped_feature_metadata(data, &validated.header, &validated.footer)?.scope_table)
+}
+
+fn validate_scoped_feature_metadata(
+    data: &[u8],
+    header: &CoveHeaderV1,
+    footer: &CoveFooter,
+) -> Result<(), CoveError> {
+    let metadata = parse_scoped_feature_metadata(data, header, footer)?;
+    metadata.scope_table.reject_file_required_unknowns()?;
+    Ok(())
+}
+
+fn parse_scoped_feature_metadata(
+    data: &[u8],
+    header: &CoveHeaderV1,
+    footer: &CoveFooter,
+) -> Result<ScopedFeatureMetadata, CoveError> {
+    let extended_entry = resolve_header_section_id(
+        footer,
+        header.feature_set_section_id,
+        SectionKind::ExtendedFeatureSet,
+        "feature_set_section_id",
+    )?;
+    let profile_matrix_entry = resolve_header_section_id(
+        footer,
+        header.profile_capability_section_id,
+        SectionKind::ProfileCapabilityMatrix,
+        "profile_capability_section_id",
+    )?;
+    resolve_header_section_id(
+        footer,
+        header.fast_metadata_section_id,
+        SectionKind::FastMetadataIndex,
+        "fast_metadata_section_id",
+    )?;
+
+    if header.required_features & FEATURE_EXTENDED_FEATURE_SET != 0 && extended_entry.is_none() {
+        return Err(CoveError::BadSection(
+            "FEATURE_EXTENDED_FEATURE_SET is required but feature_set_section_id is absent".into(),
+        ));
+    }
+
+    let extended = extended_entry
+        .map(|entry| {
+            let payload = compression::section_payload(data, entry)?;
+            let set = ExtendedFeatureSetV2::parse(&payload)?;
+            set.validate_against_low_words(header.required_features, header.optional_features)?;
+            Ok::<ExtendedFeatureSetV2, CoveError>(set)
+        })
+        .transpose()?;
+
+    let profile_matrix = profile_matrix_entry
+        .map(|entry| {
+            let payload = compression::section_payload(data, entry)?;
+            ProfileCapabilityMatrixV2::parse(&payload)
+        })
+        .transpose()?;
+
+    let mut section_binding: Option<SectionFeatureBindingSectionV2> = None;
+    for entry in footer
+        .sections
+        .iter()
+        .filter(|entry| entry.section_kind == SectionKind::SectionFeatureBinding as u16)
+    {
+        if section_binding.is_some() {
+            return Err(CoveError::BadSection(
+                "multiple SECTION_FEATURE_BINDING sections are not supported by the v2 reference validator"
+                    .into(),
+            ));
+        }
+        let payload = compression::section_payload(data, entry)?;
+        let parsed = SectionFeatureBindingSectionV2::parse(&payload)?;
+        let Some(extended) = extended.as_ref() else {
+            return Err(CoveError::BadSection(
+                "SECTION_FEATURE_BINDING requires EXTENDED_FEATURE_SET".into(),
+            ));
+        };
+        extended.validate_binding_horizon(&parsed)?;
+        section_binding = Some(parsed);
+    }
+
+    if let Some(matrix) = profile_matrix.as_ref() {
+        for entry in &matrix.entries {
+            if entry.global_feature_word_index == 0 {
+                continue;
+            }
+            let Some(extended) = extended.as_ref() else {
+                return Err(CoveError::BadSection(
+                    "PROFILE_CAPABILITY_MATRIX references extended feature word without EXTENDED_FEATURE_SET"
+                        .into(),
+                ));
+            };
+            if entry.global_feature_word_index >= extended.header.word_count {
+                return Err(CoveError::BadSection(
+                    "PROFILE_CAPABILITY_MATRIX references a feature word beyond EXTENDED_FEATURE_SET horizon"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    let scope_table = FeatureScopeTable::build(
+        header,
+        footer,
+        extended.as_ref(),
+        profile_matrix.as_ref(),
+        section_binding.as_ref(),
+    )?;
+    Ok(ScopedFeatureMetadata {
+        extended,
+        profile_matrix,
+        section_binding,
+        scope_table,
+    })
+}
+
+fn resolve_header_section_id<'a>(
+    footer: &'a CoveFooter,
+    section_id: u32,
+    expected_kind: SectionKind,
+    field_name: &str,
+) -> Result<Option<&'a crate::footer::CoveSectionEntryV1>, CoveError> {
+    if section_id == 0 {
+        return Ok(None);
+    }
+    let Some(entry) = footer
+        .sections
+        .iter()
+        .find(|entry| entry.section_id == section_id)
+    else {
+        return Err(CoveError::BadSection(format!(
+            "header {field_name} references missing section id {section_id}"
+        )));
+    };
+    if entry.section_kind != expected_kind as u16 {
+        return Err(CoveError::BadSection(format!(
+            "header {field_name} references section id {section_id} with wrong kind"
+        )));
+    }
+    Ok(Some(entry))
+}
+
 fn validate_footer_codec_feature_advertisement(
     postscript: &CovePostscriptV1,
 ) -> Result<(), CoveError> {
@@ -202,7 +363,7 @@ fn validate_section_profile_feature_bit(profile: u8, file_features: u64) -> Resu
         _ => {
             return Err(CoveError::BadSection(format!(
                 "unknown profile {profile} in section directory"
-            )))
+            )));
         }
     };
     if file_features & required_profile_bit == 0 {
@@ -291,6 +452,7 @@ fn validate_section_profile(section_kind: u16, profile: u8) -> Result<(), CoveEr
         | SectionKind::VendorExtension => &[0],
         // COVE-T only (profile 2)
         SectionKind::TableCatalog
+        | SectionKind::NestedSchema
         | SectionKind::TableSegmentIndex
         | SectionKind::TableSegmentData
         | SectionKind::ColumnDomain
@@ -361,11 +523,17 @@ mod tests {
     use crate::{
         constants::{
             SectionKind, FEATURE_BLOOM_FILTERS, FEATURE_CODEC_LZ4, FEATURE_ENGINE_PROFILE,
-            FEATURE_EXTENSION_REGISTRY, FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE,
-            FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE,
+            FEATURE_EXTENDED_FEATURE_SET, FEATURE_EXTENSION_REGISTRY, FEATURE_FILE_DICTIONARY,
+            FEATURE_HARBOR_PROFILE, FEATURE_OBJECT_PROFILE, FEATURE_TABLE_PROFILE,
         },
         digest::{DigestEntry, DigestManifest, DigestScope, DigestTargetKind},
         extensions::{ExtensionKind, ExtensionRegistry, ExtensionRegistryEntry},
+        feature_binding::{FeatureScopeV2, OperationKindV2},
+        feature_scope::{
+            ExtendedFeatureSetHeaderV2, ExtendedFeatureSetV2, FeatureTargetRefV2,
+            FeatureUseRequestV2, ProfileCapabilityEntryV2, ProfileCapabilityMatrixHeaderV2,
+            ProfileCapabilityMatrixV2,
+        },
         postscript::POSTSCRIPT_TOTAL_SIZE,
         segment::TableSegmentPayloadV1,
         table::{ColumnEntry, TableCatalog, TableEntry},
@@ -422,6 +590,158 @@ mod tests {
         }
         .serialize()
         .unwrap()
+    }
+
+    const UNKNOWN_EXTENDED_FEATURE: u64 = 0x01;
+
+    fn scoped_feature_entry(
+        scope: FeatureScopeV2,
+        profile: u8,
+        operation_kind: OperationKindV2,
+        section_id: u32,
+        target_local_ref: u64,
+        required_mask: u64,
+        optional_mask: u64,
+    ) -> ProfileCapabilityEntryV2 {
+        ProfileCapabilityEntryV2 {
+            profile,
+            scope,
+            operation_kind,
+            global_feature_word_index: 1,
+            required_mask,
+            optional_mask,
+            section_id,
+            target_local_ref,
+            flags: 0,
+            reserved: 0,
+            checksum: 0,
+        }
+    }
+
+    fn scoped_feature_file(
+        matrix_entries: Vec<ProfileCapabilityEntryV2>,
+        extended_required_word_1: u64,
+        extended_optional_word_1: u64,
+    ) -> Vec<u8> {
+        let required_features = FEATURE_TABLE_PROFILE | FEATURE_EXTENDED_FEATURE_SET;
+        let extended = ExtendedFeatureSetV2 {
+            header: ExtendedFeatureSetHeaderV2 {
+                word_count: 2,
+                required_word_count: 2,
+                optional_word_count: 2,
+                flags: 0,
+                checksum: 0,
+            },
+            required_feature_words: vec![required_features, extended_required_word_1],
+            optional_feature_words: vec![0, extended_optional_word_1],
+        }
+        .serialize()
+        .unwrap();
+        let matrix = ProfileCapabilityMatrixV2 {
+            header: ProfileCapabilityMatrixHeaderV2 {
+                magic: *b"PCM2",
+                version_major: 2,
+                header_len: ProfileCapabilityMatrixHeaderV2::LEN as u16,
+                entry_len: ProfileCapabilityEntryV2::LEN as u16,
+                reserved: 0,
+                entry_count: matrix_entries.len() as u32,
+                flags: 0,
+                entries_offset: ProfileCapabilityMatrixHeaderV2::LEN as u64,
+                entries_length: (matrix_entries.len() * ProfileCapabilityEntryV2::LEN) as u64,
+                checksum: 0,
+            },
+            entries: matrix_entries,
+        }
+        .serialize()
+        .unwrap();
+        let mut writer = MinimalCoveWriter::new();
+        writer.required_features = required_features;
+        writer.sections.extend([
+            SectionPayload {
+                section_kind: SectionKind::ExtendedFeatureSet as u16,
+                profile: 0,
+                flags: 0,
+                item_count: 0,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: 0,
+                data: extended,
+            },
+            SectionPayload {
+                section_kind: SectionKind::ProfileCapabilityMatrix as u16,
+                profile: 0,
+                flags: 0,
+                item_count: 0,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: 0,
+                data: matrix,
+            },
+            SectionPayload {
+                section_kind: SectionKind::VendorExtension as u16,
+                profile: 0,
+                flags: 0,
+                item_count: 0,
+                row_count: 0,
+                compression: 0,
+                alignment_log2: 0,
+                required_features: 0,
+                optional_features: 0,
+                data: Vec::new(),
+            },
+        ]);
+        let mut bytes = writer.write().unwrap();
+        set_header_scoped_feature_sections(&mut bytes, 1, 2);
+        bytes
+    }
+
+    fn unscoped_extended_feature_file() -> Vec<u8> {
+        let required_features = FEATURE_TABLE_PROFILE | FEATURE_EXTENDED_FEATURE_SET;
+        let extended = ExtendedFeatureSetV2 {
+            header: ExtendedFeatureSetHeaderV2 {
+                word_count: 2,
+                required_word_count: 2,
+                optional_word_count: 1,
+                flags: 0,
+                checksum: 0,
+            },
+            required_feature_words: vec![required_features, UNKNOWN_EXTENDED_FEATURE],
+            optional_feature_words: vec![0],
+        }
+        .serialize()
+        .unwrap();
+        let mut writer = MinimalCoveWriter::new();
+        writer.required_features = required_features;
+        writer.sections.push(SectionPayload {
+            section_kind: SectionKind::ExtendedFeatureSet as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: extended,
+        });
+        let mut bytes = writer.write().unwrap();
+        set_header_scoped_feature_sections(&mut bytes, 1, 0);
+        bytes
+    }
+
+    fn set_header_scoped_feature_sections(
+        bytes: &mut [u8],
+        feature_set_section_id: u32,
+        profile_capability_section_id: u32,
+    ) {
+        let mut header = CoveHeaderV1::parse(bytes).unwrap();
+        header.feature_set_section_id = feature_set_section_id;
+        header.profile_capability_section_id = profile_capability_section_id;
+        bytes[..HEADER_SIZE].copy_from_slice(&header.serialize());
     }
 
     #[test]
@@ -1294,6 +1614,210 @@ mod tests {
         let report = validate_bytes_with_options(&bytes, opts).expect("should validate");
         assert!(!report.semantic_checked);
         assert!(report.dict_entry_count.is_none());
+    }
+
+    #[test]
+    fn unscoped_extended_required_feature_is_file_required() {
+        let bytes = unscoped_extended_feature_file();
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(CoveError::UnknownRequiredFeature(UNKNOWN_EXTENDED_FEATURE))
+        ));
+    }
+
+    #[test]
+    fn scoped_extended_required_feature_does_not_reject_bootstrap() {
+        let bytes = scoped_feature_file(
+            vec![scoped_feature_entry(
+                FeatureScopeV2::OperationRequired,
+                PrimaryProfile::TableScan as u8,
+                OperationKindV2::CoveragePlanning,
+                0,
+                u64::MAX,
+                UNKNOWN_EXTENDED_FEATURE,
+                0,
+            )],
+            UNKNOWN_EXTENDED_FEATURE,
+            0,
+        );
+        validate_bytes(&bytes).unwrap();
+    }
+
+    #[test]
+    fn operation_required_unknown_rejects_only_matching_operation() {
+        let bytes = scoped_feature_file(
+            vec![scoped_feature_entry(
+                FeatureScopeV2::OperationRequired,
+                PrimaryProfile::TableScan as u8,
+                OperationKindV2::CoveragePlanning,
+                0,
+                u64::MAX,
+                UNKNOWN_EXTENDED_FEATURE,
+                0,
+            )],
+            UNKNOWN_EXTENDED_FEATURE,
+            0,
+        );
+        validate_bytes_for_feature_use(
+            &bytes,
+            ValidationOptions::default(),
+            FeatureUseRequestV2::new()
+                .with_profile(PrimaryProfile::TableScan as u8)
+                .with_operation(OperationKindV2::OrdinaryTableScan),
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_bytes_for_feature_use(
+                &bytes,
+                ValidationOptions::default(),
+                FeatureUseRequestV2::new()
+                    .with_profile(PrimaryProfile::TableScan as u8)
+                    .with_operation(OperationKindV2::CoveragePlanning),
+            ),
+            Err(CoveError::UnknownRequiredFeature(UNKNOWN_EXTENDED_FEATURE))
+        ));
+    }
+
+    #[test]
+    fn profile_required_unknown_rejects_only_matching_profile() {
+        let bytes = scoped_feature_file(
+            vec![scoped_feature_entry(
+                FeatureScopeV2::ProfileRequired,
+                PrimaryProfile::SemanticMapping as u8,
+                OperationKindV2::None,
+                0,
+                u64::MAX,
+                UNKNOWN_EXTENDED_FEATURE,
+                0,
+            )],
+            UNKNOWN_EXTENDED_FEATURE,
+            0,
+        );
+        validate_bytes_for_feature_use(
+            &bytes,
+            ValidationOptions::default(),
+            FeatureUseRequestV2::new().with_profile(PrimaryProfile::TableScan as u8),
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_bytes_for_feature_use(
+                &bytes,
+                ValidationOptions::default(),
+                FeatureUseRequestV2::new().with_profile(PrimaryProfile::SemanticMapping as u8),
+            ),
+            Err(CoveError::UnknownRequiredFeature(UNKNOWN_EXTENDED_FEATURE))
+        ));
+    }
+
+    #[test]
+    fn section_required_unknown_rejects_only_requested_section() {
+        let bytes = scoped_feature_file(
+            vec![scoped_feature_entry(
+                FeatureScopeV2::SectionRequired,
+                PrimaryProfile::TableScan as u8,
+                OperationKindV2::None,
+                3,
+                u64::MAX,
+                UNKNOWN_EXTENDED_FEATURE,
+                0,
+            )],
+            UNKNOWN_EXTENDED_FEATURE,
+            0,
+        );
+        validate_bytes_for_feature_use(
+            &bytes,
+            ValidationOptions::default(),
+            FeatureUseRequestV2::new().with_section(99),
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_bytes_for_feature_use(
+                &bytes,
+                ValidationOptions::default(),
+                FeatureUseRequestV2::new().with_section(3),
+            ),
+            Err(CoveError::UnknownRequiredFeature(UNKNOWN_EXTENDED_FEATURE))
+        ));
+    }
+
+    #[test]
+    fn page_required_unknown_rejects_only_exact_page_ref() {
+        let target = FeatureTargetRefV2::cove_t_column_page(3, 11, 12);
+        let bytes = scoped_feature_file(
+            vec![scoped_feature_entry(
+                FeatureScopeV2::PageRequired,
+                PrimaryProfile::TableScan as u8,
+                OperationKindV2::None,
+                target.section_id,
+                target.target_local_ref,
+                UNKNOWN_EXTENDED_FEATURE,
+                0,
+            )],
+            UNKNOWN_EXTENDED_FEATURE,
+            0,
+        );
+        validate_bytes_for_feature_use(
+            &bytes,
+            ValidationOptions::default(),
+            FeatureUseRequestV2::new().with_cove_t_column_page(3, 11, 13),
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_bytes_for_feature_use(
+                &bytes,
+                ValidationOptions::default(),
+                FeatureUseRequestV2::new().with_cove_t_column_page(3, 11, 12),
+            ),
+            Err(CoveError::UnknownRequiredFeature(UNKNOWN_EXTENDED_FEATURE))
+        ));
+    }
+
+    #[test]
+    fn advisory_optional_feature_never_rejects() {
+        let bytes = scoped_feature_file(
+            vec![scoped_feature_entry(
+                FeatureScopeV2::AdvisoryOnly,
+                PrimaryProfile::TableScan as u8,
+                OperationKindV2::None,
+                0,
+                u64::MAX,
+                0,
+                UNKNOWN_EXTENDED_FEATURE,
+            )],
+            0,
+            UNKNOWN_EXTENDED_FEATURE,
+        );
+        validate_bytes_for_feature_use(
+            &bytes,
+            ValidationOptions::default(),
+            FeatureUseRequestV2::new()
+                .with_profile(PrimaryProfile::TableScan as u8)
+                .with_operation(OperationKindV2::CoveragePlanning)
+                .with_section(3)
+                .with_cove_t_column_page(3, 11, 12),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn malformed_page_required_scope_rejects_bootstrap() {
+        let bytes = scoped_feature_file(
+            vec![scoped_feature_entry(
+                FeatureScopeV2::PageRequired,
+                PrimaryProfile::TableScan as u8,
+                OperationKindV2::None,
+                0,
+                u64::MAX,
+                UNKNOWN_EXTENDED_FEATURE,
+                0,
+            )],
+            UNKNOWN_EXTENDED_FEATURE,
+            0,
+        );
+        assert!(matches!(
+            validate_bytes(&bytes),
+            Err(CoveError::BadSection(_))
+        ));
     }
 
     #[test]

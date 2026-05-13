@@ -1,6 +1,6 @@
-//! Cove Format (COVE) v1.0 — Error types.
+//! Cove Format (COVE) v2.0 — Error types.
 //!
-//! Corresponds to Section 76 of the COVE v1.0 specification.
+//! Corresponds to Section 76 of the COVE v2.0 specification.
 
 use std::{error::Error, fmt};
 

@@ -1,2 +1,60 @@
+# Build output
 target/
+
+# Project-local generated artifacts and profiling captures
 artifacts/
+*.log
+*.trace
+*.profraw
+*.profdata
+perf.data*
+flamegraph.svg
+
+# Rust/Cargo byproducts
+**/*.rs.bk
+*.pdb
+
+# Coverage reports
+coverage/
+lcov.info
+cobertura.xml
+tarpaulin-report.html
+
+# Python helper-script caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.envrc.local
+
+# Editor and IDE state
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.swp
+*.swo
+*~
+
+# Local AI/tool settings
+.claude/settings.local.json
+
+# OS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini

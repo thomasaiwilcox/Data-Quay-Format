@@ -26,8 +26,8 @@ Each manifest line is one JSON object:
     `cove_h_mount_hints`, `cove_o_object_catalog`,
     `cove_o_temporal_segment_index`, `cove_o_temporal_bloom_index`,
     `extension_registry`, `extension_logical_type`, `extension_index_descriptor`,
-    `durable_publish_case`, `sidecar_freshness_case`, `cove_map_convert_case`, and
-    `cove_map_project_case`
+    `durable_publish_case`, `sidecar_freshness_case`, `cove_map_convert_case`,
+    `cove_map_project_case`, and `arrow_view_materialization_case`
 - `expect`   — `"accept"` or `"reject"`
 - `error_code` — (preferred when `expect=reject`) stable Spec §76 error code
     Fixtures with `error_code` are automatically tagged as `§76` evidence by `gen-corpus`.

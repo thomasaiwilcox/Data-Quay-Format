@@ -1,5 +1,7 @@
 //! Footer and dataset bootstrap helpers for COVE-backed DataFusion datasets.
 
+#[cfg(feature = "covi")]
+mod covi;
 #[cfg(feature = "covm")]
 mod covm;
 mod local;
@@ -17,6 +19,8 @@ use crate::dataset_state::DatasetState;
 pub use covm::{
     bootstrap_covm_local_file_with_options, bootstrap_covm_local_file_with_options_async,
 };
+#[cfg(feature = "covi")]
+pub use local::bootstrap_bytes_with_covi_artifacts;
 pub use local::{
     bootstrap_bytes, bootstrap_bytes_with_options, bootstrap_local_file,
     bootstrap_local_file_async, bootstrap_local_file_with_options,

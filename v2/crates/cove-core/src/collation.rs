@@ -1,6 +1,6 @@
-//! Cove Format (COVE) v1.0 — Collation registry (Spec §22).
+//! Cove Format (COVE) v2.0 — Collation registry (Spec §22).
 //!
-//! Every COVE v1 reader MUST recognise the six minimum collations defined by the
+//! Every COVE v2 reader MUST recognise the six minimum collations defined by the
 //! spec. Each collation has a stable name and a deterministic comparison rule.
 //! Comparisons are total orders so they can drive ColumnDomain rank maps,
 //! min/max statistics, and ordered indexes safely.
@@ -26,7 +26,7 @@ impl From<std::cmp::Ordering> for Ordering3 {
     }
 }
 
-/// One of the six v1 collations, plus `None` for unspecified.
+/// One of the six v2 collations, plus `None` for unspecified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CollationKind {
@@ -231,12 +231,12 @@ impl CollationRegistry {
         Ok(out)
     }
 
-    /// Returns true if every named collation is one of the six v1 collations.
+    /// Returns true if every named collation is one of the six v2 collations.
     pub fn all_known(&self) -> bool {
         self.entries.iter().all(|e| e.kind.is_some())
     }
 
-    /// Whether a given collation name is recognised by this v1 reader.
+    /// Whether a given collation name is recognised by this v2 reader.
     pub fn is_known_collation(name: &str) -> bool {
         CollationKind::from_name(name).is_some()
     }

@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Section decompression layer.
+//! Cove Format (COVE) v2.0 — Section decompression layer.
 //!
 //! Implements Spec §66 codec dispatch: section payloads MAY be compressed
 //! with `None`, `LZ4`, or `Zstd`. The codec is feature-gated so that small

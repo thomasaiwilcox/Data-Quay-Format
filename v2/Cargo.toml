@@ -16,5 +16,6 @@ members = [
     "crates/cove-coverage",
     "crates/cove-index",
     "crates/cove-cache",
+    "crates/cove-fuzz",
 ]
 resolver = "2"

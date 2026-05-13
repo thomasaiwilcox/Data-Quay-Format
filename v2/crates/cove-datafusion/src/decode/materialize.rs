@@ -3,18 +3,22 @@ use super::*;
 pub(super) struct DecodedArrowColumn<'name, 'array, 'data> {
     pub(super) name: &'name str,
     pub(super) array: &'array EncodedArray<'data>,
+    pub(super) payload: Option<&'array RetainedColumnPagePayloadV1>,
+    pub(super) nested_schema: Option<NestedSchemaNodeV1>,
     pub(super) data_owner: Option<ArrowBufferOwner>,
     pub(super) utf8_proof_key: Option<Utf8ProofKey>,
+    pub(super) zero_copy: Option<ZeroCopyCompatibilityV2>,
 }
 
 #[inline]
 pub(super) fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
     state: &DatasetState,
+    segment_id: u32,
     columns: &[&ColumnEntry],
     encoded_columns: &'array [(&'name str, EncodedArray<'data>)],
-    page_indexes: &[ColumnPageIndexEntryV1],
-    page_payloads: &[RetainedColumnPagePayloadV1],
-    options: ArrowExportOptions,
+    page_indexes: &'array [ColumnPageIndexEntryV1],
+    page_payloads: &'array [RetainedColumnPagePayloadV1],
+    _options: ArrowExportOptions,
 ) -> Vec<DecodedArrowColumn<'name, 'array, 'data>> {
     debug_assert_eq!(columns.len(), encoded_columns.len());
     debug_assert_eq!(page_indexes.len(), encoded_columns.len());
@@ -25,9 +29,8 @@ pub(super) fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
         .zip(page_indexes.iter())
         .zip(page_payloads.iter())
         .map(|(((column, (name, array)), page), payload)| {
-            let data_owner = if options.varbytes_policy == ArrowVarBytesExportPolicy::View
-                && array.physical == CovePhysicalKind::VarBytes
-            {
+            let nested_schema = state.nested_schema_for_column(column.column_id).cloned();
+            let data_owner = if array.physical == CovePhysicalKind::VarBytes {
                 Some(arrow_buffer_owner(payload.data.owner()))
             } else {
                 None
@@ -35,8 +38,11 @@ pub(super) fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
             DecodedArrowColumn {
                 name: *name,
                 array,
+                payload: Some(payload),
+                nested_schema,
                 data_owner,
                 utf8_proof_key: Utf8ProofKey::new(state.identity(), column, page),
+                zero_copy: state.zero_copy_compatibility_for_page(segment_id, column, page),
             }
         })
         .collect()
@@ -64,6 +70,19 @@ pub(super) fn record_batch_for_selection(
     let mut arrays = Vec::with_capacity(columns.len());
     let mut report = cove_arrow::arrow::ArrowExportReport::default();
     for column in columns {
+        if let Some(nested_schema) = column.nested_schema.as_ref() {
+            let payload = column.payload.ok_or(CoveError::PageCorrupt)?;
+            let result = nested_page_payload_to_arrow_array(
+                payload,
+                nested_schema,
+                arrow_selection,
+                state.mounted().dictionary.as_ref(),
+                options,
+            )?;
+            merge_export_report(column.name, &mut report, result.report);
+            arrays.push(result.value);
+            continue;
+        }
         let mut column_options = options;
         let mut record_utf8_proof = None;
         if let Some(key) = column.utf8_proof_key {
@@ -81,8 +100,25 @@ pub(super) fn record_batch_for_selection(
             }
         }
         let export_path = classify_arrow_export(column.array, column_options);
-        let result =
-            export_arrow_column(state, column, arrow_selection, column_options, cache, stats)?;
+        let zero_copy_data_owner =
+            zero_copy_data_owner_for_export(column, selection, export_path, column_options);
+        record_zero_copy_decision(
+            stats,
+            column.zero_copy,
+            selection,
+            export_path,
+            column_options,
+            zero_copy_data_owner.is_some(),
+        );
+        let result = export_arrow_column(
+            state,
+            column,
+            arrow_selection,
+            column_options,
+            zero_copy_data_owner,
+            cache,
+            stats,
+        )?;
         record_arrow_export_stats(stats, export_path, result.value.as_ref());
         if let Some(key) = record_utf8_proof {
             if state.utf8_proof_cache().insert(key)? {
@@ -106,6 +142,7 @@ fn export_arrow_column(
     column: &DecodedArrowColumn<'_, '_, '_>,
     arrow_selection: ArrowRowSelection<'_>,
     options: ArrowExportOptions,
+    data_owner: Option<&ArrowBufferOwner>,
     cache: Option<&ScanExecutionCache>,
     stats: &mut DecodeStats,
 ) -> Result<cove_arrow::arrow::ArrowExportResult<ArrayRef>, CoveError> {
@@ -179,7 +216,7 @@ fn export_arrow_column(
         column.array,
         arrow_selection,
         options,
-        column.data_owner.as_ref(),
+        data_owner,
     )
 }
 
@@ -284,10 +321,89 @@ fn record_arrow_export_stats(stats: &mut DecodeStats, path: ArrowExportPath, arr
     }
 }
 
+fn record_zero_copy_decision(
+    stats: &mut DecodeStats,
+    decision: Option<ZeroCopyCompatibilityV2>,
+    selection: &Selection,
+    export_path: ArrowExportPath,
+    options: ArrowExportOptions,
+    direct_owner_used: bool,
+) {
+    if options.varbytes_policy != ArrowVarBytesExportPolicy::View
+        || !zero_copy_direct_export_path(export_path)
+    {
+        return;
+    }
+    let Some(decision) = decision else {
+        return;
+    };
+    match decision {
+        ZeroCopyCompatibilityV2::Compatible => {
+            if direct_owner_used {
+                stats.zero_copy_compatible_buffers += 1;
+            } else if !matches!(selection, Selection::AllRows { .. }) {
+                stats.zero_copy_materialized_buffers += 1;
+                stats.zero_copy_materialized_selection_mismatch += 1;
+            } else {
+                stats.zero_copy_materialized_buffers += 1;
+                stats.zero_copy_materialized_insufficient_lifetime += 1;
+            }
+        }
+        ZeroCopyCompatibilityV2::MaterializeRequired(reason) => {
+            stats.zero_copy_materialized_buffers += 1;
+            match reason {
+                ZeroCopyMaterializationReasonV2::UnknownRole => {
+                    stats.zero_copy_materialized_unknown_role += 1;
+                }
+                ZeroCopyMaterializationReasonV2::NullPolarityMismatch => {
+                    stats.zero_copy_materialized_null_polarity_mismatch += 1;
+                }
+                ZeroCopyMaterializationReasonV2::CompressedBuffer => {
+                    stats.zero_copy_materialized_compressed_buffer += 1;
+                }
+                ZeroCopyMaterializationReasonV2::DictionaryMismatch => {
+                    stats.zero_copy_materialized_dictionary_mismatch += 1;
+                }
+                ZeroCopyMaterializationReasonV2::NestedLayoutMismatch => {
+                    stats.zero_copy_materialized_nested_layout_mismatch += 1;
+                }
+                ZeroCopyMaterializationReasonV2::InsufficientLifetime => {
+                    stats.zero_copy_materialized_insufficient_lifetime += 1;
+                }
+                ZeroCopyMaterializationReasonV2::ActiveVisibilityOverlay => {
+                    stats.zero_copy_materialized_active_visibility_overlay += 1;
+                }
+            }
+        }
+    }
+}
+
+fn zero_copy_data_owner_for_export<'a>(
+    column: &'a DecodedArrowColumn<'_, '_, '_>,
+    selection: &Selection,
+    export_path: ArrowExportPath,
+    options: ArrowExportOptions,
+) -> Option<&'a ArrowBufferOwner> {
+    if options.varbytes_policy != ArrowVarBytesExportPolicy::View
+        || !matches!(selection, Selection::AllRows { .. })
+        || !zero_copy_direct_export_path(export_path)
+        || !matches!(column.zero_copy, Some(ZeroCopyCompatibilityV2::Compatible))
+    {
+        return None;
+    }
+    column.data_owner.as_ref()
+}
+
+fn zero_copy_direct_export_path(path: ArrowExportPath) -> bool {
+    matches!(path, ArrowExportPath::DirectVarBytes)
+}
+
 pub(super) fn materialize_page_payload(
     segment_bytes: &[u8],
     column: &ColumnEntry,
     page: &ColumnPageIndexEntryV1,
+    codec_descriptors: &[cove_core::codec::CodecExtensionDescriptorV2],
+    dictionary_len: Option<u32>,
     validation_policy: PagePayloadValidationPolicy,
 ) -> Result<RetainedColumnPagePayloadV1, CoveError> {
     if page.flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0 {
@@ -306,9 +422,16 @@ pub(super) fn materialize_page_payload(
         Cow::Borrowed(bytes) => bytes.to_vec(),
         Cow::Owned(bytes) => bytes,
     };
-    RetainedColumnPagePayloadV1::parse_with_buffer_checksum_validation(
+    let payload = RetainedColumnPagePayloadV1::parse_with_buffer_checksum_validation(
         RetainedBytes::from_vec(decoded),
         buffer_checksum_validation(validation_policy),
+    )?;
+    materialize_registered_page_payload_if_needed(
+        payload,
+        column,
+        page,
+        codec_descriptors,
+        dictionary_len,
     )
 }
 
@@ -316,6 +439,8 @@ pub(super) fn materialize_page_payload_from_wire(
     column: &ColumnEntry,
     page: &ColumnPageIndexEntryV1,
     page_wire: Option<RetainedBytes>,
+    codec_descriptors: &[cove_core::codec::CodecExtensionDescriptorV2],
+    dictionary_len: Option<u32>,
     validation_policy: PagePayloadValidationPolicy,
 ) -> Result<RetainedColumnPagePayloadV1, CoveError> {
     if page.flags & PAGE_FLAG_STATS_ONLY_CONSTANT != 0 {
@@ -329,9 +454,16 @@ pub(super) fn materialize_page_payload_from_wire(
         page,
         page_checksum_validation(validation_policy),
     )?;
-    RetainedColumnPagePayloadV1::parse_with_buffer_checksum_validation(
+    let payload = RetainedColumnPagePayloadV1::parse_with_buffer_checksum_validation(
         decoded,
         buffer_checksum_validation(validation_policy),
+    )?;
+    materialize_registered_page_payload_if_needed(
+        payload,
+        column,
+        page,
+        codec_descriptors,
+        dictionary_len,
     )
 }
 
@@ -388,6 +520,35 @@ fn materialize_stats_only_page(
         ));
     }
     Err(CoveError::PageCorrupt)
+}
+
+fn materialize_registered_page_payload_if_needed(
+    payload: RetainedColumnPagePayloadV1,
+    column: &ColumnEntry,
+    page: &ColumnPageIndexEntryV1,
+    codec_descriptors: &[cove_core::codec::CodecExtensionDescriptorV2],
+    dictionary_len: Option<u32>,
+) -> Result<RetainedColumnPagePayloadV1, CoveError> {
+    if payload.root_node()?.encoding_kind != CoveEncodingKind::RegisteredEncoding {
+        return Ok(payload);
+    }
+    let owned = ColumnPagePayloadV1 {
+        header: payload.header.clone(),
+        nodes: payload.nodes.clone(),
+        buffers: payload.buffers.clone(),
+        data: payload.data.as_slice().to_vec(),
+    };
+    let materialized = cove_core::codec::materialize_registered_page_payload(
+        &owned,
+        page,
+        column.logical,
+        column.physical,
+        codec_descriptors,
+        &cove_core::codec::StableRegisteredCodecResolver,
+        dictionary_len,
+    )?
+    .ok_or(CoveError::BadCodecExtension)?;
+    RetainedColumnPagePayloadV1::parse(RetainedBytes::from_vec(materialized.payload.serialize()?))
 }
 
 pub(super) fn encoded_array_for_page<'a>(

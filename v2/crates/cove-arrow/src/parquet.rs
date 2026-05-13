@@ -32,15 +32,23 @@ use crate::{
     checksum,
     constants::{
         CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind, DigestAlgorithm,
-        SectionKind,
+        SectionKind, ValueTag,
     },
     dictionary::{
         file_dictionary_candidate_len, FileDictionary, FileDictionaryEncoding, FileDictionaryKey,
     },
     digest::compute_digest,
     domain::ColumnDomain,
+    encoding::nested::{
+        ListLayout, ListLayoutPayload, MapLayout, MapLayoutPayload, StructLayout,
+        StructLayoutPayload,
+    },
     index::{
-        aggregate::{AggregateEntry, AggregateSynopsis, SynopsisAccuracy, SynopsisKind},
+        aggregate::{
+            cove_sketch_hash, hll_registers_from_hashes, kll_compactors_from_values,
+            AggregateEntry, AggregatePayloadV2, AggregateSynopsis, HistogramBucket,
+            NumericAggregateOverflowPolicy, SynopsisAccuracy, SynopsisKind, TaggedCanonicalValue,
+        },
         bloom::{
             BloomAlgorithm, BloomFilterIndex, BloomGranularity, BloomHashDomain,
             BloomIndexHeaderV1, BLOOM_INDEX_HEADER_LEN,
@@ -56,12 +64,15 @@ use crate::{
         },
         topn::{TopNDirection, TopNSummary},
     },
+    nested_schema::{NestedSchemaEntryV1, NestedSchemaNodeV1, NestedSchemaSectionV1},
     page::{PAGE_FLAG_ALL_NON_NULL, PAGE_FLAG_ALL_NULL},
+    page_payload::{ColumnPagePayloadV1, CoveEncodingNodeV1, PageBufferKind},
     reader::{validate_bytes_with_options, ValidationOptions},
     row_ref::RowRef,
     table::{ColumnEntry, TableCatalog, TableEntry},
     types,
     validity::{ValidityBitmap, ValidityBitmapBuilder},
+    wire,
     writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment},
     zone_stats::{
         StatKind, StatScalar, ZoneScope, ZoneStatFlags, ZoneStats, ZoneStatsEntry, ZoneStatsSection,
@@ -69,7 +80,7 @@ use crate::{
     CoveError,
 };
 
-pub use convert::convert_parquet_bytes;
+pub use convert::{convert_arrow_record_batches, convert_parquet_bytes};
 pub use public::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +106,11 @@ enum SourceColumnKind {
     Binary,
     LargeBinary,
     Decimal128,
+    List,
+    LargeList,
+    FixedSizeList,
+    Struct,
+    Map,
     NestedJson,
 }
 
@@ -105,6 +121,32 @@ enum MaterializedValues {
     NumCode(Vec<u64>),
     VarBytes(Vec<Vec<u8>>),
     FixedBytes { width: usize, values: Vec<Vec<u8>> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NestedColumnData {
+    schema: NestedSchemaNodeV1,
+    source_kind: SourceColumnKind,
+    values: NestedValues,
+    nulls: Vec<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NestedValues {
+    Scalar(MaterializedValues),
+    List {
+        offsets: Vec<u32>,
+        child: Box<NestedColumnData>,
+    },
+    Struct {
+        fields: Vec<NestedColumnData>,
+    },
+    Map {
+        offsets: Vec<u32>,
+        keys: Box<NestedColumnData>,
+        values: Box<NestedColumnData>,
+        canonical_keys: Vec<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +260,357 @@ impl MaterializedValues {
     }
 }
 
+impl NestedColumnData {
+    fn row_count(&self) -> usize {
+        self.nulls.len()
+    }
+
+    fn append_array(&mut self, array: &dyn Array) -> Result<(), CoveError> {
+        match &mut self.values {
+            NestedValues::Scalar(values) => append_scalar_materialized_array(
+                self.source_kind,
+                &self.schema.name,
+                values,
+                &mut self.nulls,
+                array,
+            ),
+            NestedValues::List { offsets, child } => match self.source_kind {
+                SourceColumnKind::List => {
+                    let array = downcast_array::<ListArray>(array, &self.schema.name)?;
+                    append_list_offsets_i32(offsets, &mut self.nulls, array)?;
+                    let child_slice = list_child_slice_i32(array.values(), array.value_offsets())?;
+                    child.append_array(child_slice.as_ref())
+                }
+                SourceColumnKind::LargeList => {
+                    let array = downcast_array::<LargeListArray>(array, &self.schema.name)?;
+                    append_list_offsets_i64(offsets, &mut self.nulls, array)?;
+                    let child_slice = list_child_slice_i64(array.values(), array.value_offsets())?;
+                    child.append_array(child_slice.as_ref())
+                }
+                SourceColumnKind::FixedSizeList => {
+                    let array = downcast_array::<FixedSizeListArray>(array, &self.schema.name)?;
+                    let width = u32::try_from(array.value_length())
+                        .map_err(|_| CoveError::ArithOverflow)?;
+                    if self.schema.fixed_size_list_len != width {
+                        return Err(CoveError::BadSchema(format!(
+                            "FixedSizeList width mismatch for '{}'",
+                            self.schema.name
+                        )));
+                    }
+                    let base = offsets.last().copied().unwrap_or(0);
+                    for row in 0..array.len() {
+                        self.nulls.push(array.is_null(row));
+                        let next = base
+                            .checked_add(
+                                width
+                                    .checked_mul(
+                                        u32::try_from(row + 1)
+                                            .map_err(|_| CoveError::ArithOverflow)?,
+                                    )
+                                    .ok_or(CoveError::ArithOverflow)?,
+                            )
+                            .ok_or(CoveError::ArithOverflow)?;
+                        offsets.push(next);
+                    }
+                    let child_len = array
+                        .len()
+                        .checked_mul(width as usize)
+                        .ok_or(CoveError::ArithOverflow)?;
+                    child.append_array(array.values().slice(0, child_len).as_ref())
+                }
+                _ => Err(CoveError::BadSchema(
+                    "nested list storage/source kind mismatch".into(),
+                )),
+            },
+            NestedValues::Struct { fields } => {
+                let array = downcast_array::<StructArray>(array, &self.schema.name)?;
+                if fields.len() != array.columns().len() {
+                    return Err(CoveError::BadSchema(format!(
+                        "Struct column '{}' field count mismatch",
+                        self.schema.name
+                    )));
+                }
+                self.nulls.reserve(array.len());
+                for row in 0..array.len() {
+                    self.nulls.push(array.is_null(row));
+                }
+                for (field, child_array) in fields.iter_mut().zip(array.columns()) {
+                    field.append_array(child_array.as_ref())?;
+                }
+                Ok(())
+            }
+            NestedValues::Map {
+                offsets,
+                keys,
+                values,
+                canonical_keys,
+            } => {
+                let array = downcast_array::<MapArray>(array, &self.schema.name)?;
+                append_map_offsets(offsets, &mut self.nulls, array)?;
+                let child_slice = list_child_slice_i32(array.keys(), array.value_offsets())?;
+                if child_slice.null_count() != 0 {
+                    return Err(CoveError::BadSchema(format!(
+                        "Map column '{}' contains null keys",
+                        self.schema.name
+                    )));
+                }
+                let value_slice = list_child_slice_i32(array.values(), array.value_offsets())?;
+                let key_start = canonical_keys.len();
+                keys.append_array(child_slice.as_ref())?;
+                values.append_array(value_slice.as_ref())?;
+                let appended = keys
+                    .row_count()
+                    .checked_sub(key_start)
+                    .ok_or(CoveError::ArithOverflow)?;
+                for row in 0..appended {
+                    canonical_keys.push(
+                        serde_json::to_vec(&arrow_value_to_json(child_slice.as_ref(), row)?)
+                            .map_err(|error| {
+                                CoveError::BadSection(format!(
+                                    "map key canonicalization failed: {error}"
+                                ))
+                            })?,
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn null_count_range(&self, start: usize, len: usize) -> Result<usize, CoveError> {
+        let end = start.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+        let slice = self
+            .nulls
+            .get(start..end)
+            .ok_or_else(|| CoveError::BadSchema("nested null range exceeds rows".into()))?;
+        Ok(slice.iter().filter(|is_null| **is_null).count())
+    }
+
+    fn non_null_indices(&self, start: usize, len: usize) -> Result<Vec<usize>, CoveError> {
+        let end = start.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+        self.nulls
+            .get(start..end)
+            .ok_or_else(|| CoveError::BadSchema("nested null range exceeds rows".into()))?;
+        Ok((start..end)
+            .filter(|row| !self.nulls.get(*row).copied().unwrap_or(false))
+            .collect())
+    }
+
+    fn encode_page_payload(
+        &self,
+        start: usize,
+        len: usize,
+        root_encoding: CoveEncodingKind,
+    ) -> Result<Vec<u8>, CoveError> {
+        let mut nodes = Vec::new();
+        let mut buffers = Vec::new();
+        self.push_page_node(start, len, root_encoding, &mut nodes, &mut buffers)?;
+        ColumnPagePayloadV1::build_tree(
+            u32::try_from(len).map_err(|_| CoveError::ArithOverflow)?,
+            0,
+            nodes,
+            buffers,
+        )
+    }
+
+    fn push_page_node(
+        &self,
+        start: usize,
+        len: usize,
+        encoding: CoveEncodingKind,
+        nodes: &mut Vec<CoveEncodingNodeV1>,
+        buffers: &mut Vec<(PageBufferKind, Vec<u8>)>,
+    ) -> Result<(), CoveError> {
+        let node_id = u16::try_from(nodes.len()).map_err(|_| CoveError::ArithOverflow)?;
+        let mut local_buffers = Vec::new();
+        if self.null_count_range(start, len)? != 0 {
+            local_buffers.push((PageBufferKind::NullBitmap, self.validity_bytes(start, len)?));
+        }
+        let child_count = match &self.values {
+            NestedValues::Scalar(values) => {
+                local_buffers.push((PageBufferKind::Values, values.encode_rows(start, len)?));
+                0
+            }
+            NestedValues::List { offsets, .. } => {
+                let (normalized, child_start, child_len) = slice_offsets(offsets, start, len)?;
+                local_buffers.push((
+                    PageBufferKind::ChildLayout,
+                    ListLayoutPayload {
+                        layout: ListLayout {
+                            offsets: normalized,
+                        },
+                        child_row_count: u32::try_from(child_len)
+                            .map_err(|_| CoveError::ArithOverflow)?,
+                    }
+                    .encode(),
+                ));
+                let _ = (child_start, child_len);
+                1
+            }
+            NestedValues::Struct { fields } => {
+                local_buffers.push((
+                    PageBufferKind::ChildLayout,
+                    StructLayoutPayload {
+                        layout: StructLayout {
+                            field_row_counts: vec![len as u64; fields.len()],
+                        },
+                        parent_null_handling_declared: true,
+                    }
+                    .encode(),
+                ));
+                fields.len()
+            }
+            NestedValues::Map { offsets, .. } => {
+                let (normalized, _child_start, child_len) = slice_offsets(offsets, start, len)?;
+                local_buffers.push((
+                    PageBufferKind::ChildLayout,
+                    MapLayoutPayload {
+                        layout: MapLayout {
+                            offsets: normalized,
+                            key_row_count: u32::try_from(child_len)
+                                .map_err(|_| CoveError::ArithOverflow)?,
+                            value_row_count: u32::try_from(child_len)
+                                .map_err(|_| CoveError::ArithOverflow)?,
+                            keys_are_scalar: true,
+                            allow_duplicate_keys: false,
+                            canonical_keys: self.map_canonical_keys(start, len)?,
+                        },
+                    }
+                    .encode(),
+                ));
+                2
+            }
+        };
+        let buffer_count =
+            u16::try_from(local_buffers.len()).map_err(|_| CoveError::ArithOverflow)?;
+        nodes.push(CoveEncodingNodeV1 {
+            node_id,
+            encoding_kind: encoding,
+            logical_type: self.schema.logical,
+            physical_kind: self.schema.physical,
+            flags: 0,
+            logical_len: u32::try_from(len).map_err(|_| CoveError::ArithOverflow)?,
+            child_count: u16::try_from(child_count).map_err(|_| CoveError::ArithOverflow)?,
+            buffer_count,
+            params_offset: 0,
+            params_length: 0,
+            stats_id: 0,
+            reserved: 0,
+        });
+        buffers.extend(local_buffers);
+        match &self.values {
+            NestedValues::Scalar(_) => {}
+            NestedValues::List { offsets, child } => {
+                let (_normalized, child_start, child_len) = slice_offsets(offsets, start, len)?;
+                child.push_page_node(
+                    child_start,
+                    child_len,
+                    materialized_page_encoding(child.schema.physical)?,
+                    nodes,
+                    buffers,
+                )?;
+            }
+            NestedValues::Struct { fields } => {
+                for field in fields {
+                    field.push_page_node(
+                        start,
+                        len,
+                        materialized_page_encoding(field.schema.physical)?,
+                        nodes,
+                        buffers,
+                    )?;
+                }
+            }
+            NestedValues::Map {
+                offsets,
+                keys,
+                values,
+                ..
+            } => {
+                let (_normalized, child_start, child_len) = slice_offsets(offsets, start, len)?;
+                keys.push_page_node(
+                    child_start,
+                    child_len,
+                    materialized_page_encoding(keys.schema.physical)?,
+                    nodes,
+                    buffers,
+                )?;
+                values.push_page_node(
+                    child_start,
+                    child_len,
+                    materialized_page_encoding(values.schema.physical)?,
+                    nodes,
+                    buffers,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validity_bytes(&self, start: usize, len: usize) -> Result<Vec<u8>, CoveError> {
+        let row_count = u64::try_from(len).map_err(|_| CoveError::ArithOverflow)?;
+        let mut builder = ValidityBitmapBuilder::new(row_count)?;
+        for relative_row in 0..len {
+            if self.nulls[start + relative_row] {
+                builder.set_null(relative_row as u64)?;
+            }
+        }
+        Ok(builder.into_bytes())
+    }
+
+    fn map_canonical_keys(&self, start: usize, len: usize) -> Result<Vec<Vec<u8>>, CoveError> {
+        let NestedValues::Map {
+            offsets,
+            canonical_keys,
+            ..
+        } = &self.values
+        else {
+            return Ok(Vec::new());
+        };
+        let child_start = offsets[start] as usize;
+        let child_end = offsets[start + len] as usize;
+        canonical_keys
+            .get(child_start..child_end)
+            .map(|slice| slice.to_vec())
+            .ok_or_else(|| CoveError::BadSchema("map canonical key range exceeds rows".into()))
+    }
+
+    fn reorder(&mut self, order: &[usize]) -> Result<(), CoveError> {
+        match &mut self.values {
+            NestedValues::Scalar(values) => {
+                values.reorder(order);
+                reorder_copy(&mut self.nulls, order);
+            }
+            NestedValues::Struct { fields } => {
+                reorder_copy(&mut self.nulls, order);
+                for field in fields {
+                    field.reorder(order)?;
+                }
+            }
+            NestedValues::List { offsets, child } => {
+                let (new_offsets, child_order) = reordered_child_order(offsets, order)?;
+                reorder_copy(&mut self.nulls, order);
+                *offsets = new_offsets;
+                child.reorder(&child_order)?;
+            }
+            NestedValues::Map {
+                offsets,
+                keys,
+                values,
+                canonical_keys,
+            } => {
+                let (new_offsets, child_order) = reordered_child_order(offsets, order)?;
+                reorder_copy(&mut self.nulls, order);
+                *offsets = new_offsets;
+                keys.reorder(&child_order)?;
+                values.reorder(&child_order)?;
+                reorder_clone(canonical_keys, &child_order);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConvertedColumn {
     entry: ColumnEntry,
@@ -228,12 +621,29 @@ struct ConvertedColumn {
     pushdown_limited: bool,
     notes: Vec<String>,
     values: MaterializedValues,
+    nested: Option<NestedColumnData>,
     nulls: Vec<bool>,
 }
 
 impl ConvertedColumn {
     fn from_field(column_id: u32, field: &arrow_schema::Field) -> Result<Self, CoveError> {
         let nullable = field.is_nullable();
+        if let Some((entry, source_kind, notes, nested)) =
+            native_nested_converted_column(column_id, field)?
+        {
+            return Ok(Self {
+                entry,
+                source_kind,
+                source_type: format!("{:?}", field.data_type()),
+                encoding: CoveEncodingKind::Canonical,
+                fallback: None,
+                pushdown_limited: true,
+                notes,
+                values: MaterializedValues::VarBytes(Vec::new()),
+                nested: Some(nested),
+                nulls: Vec::new(),
+            });
+        }
         let (logical, physical, source_kind, values, precision, scale, notes) =
             match field.data_type() {
                 DataType::Boolean => (
@@ -402,6 +812,7 @@ impl ConvertedColumn {
             pushdown_limited: is_nested_arrow_type(field.data_type()),
             notes,
             values,
+            nested: None,
             nulls: Vec::new(),
         })
     }
@@ -677,6 +1088,19 @@ impl ConvertedColumn {
                     |row| Ok(array.value(row).to_le_bytes().to_vec()),
                 )?;
             }
+            SourceColumnKind::List
+            | SourceColumnKind::LargeList
+            | SourceColumnKind::FixedSizeList
+            | SourceColumnKind::Struct
+            | SourceColumnKind::Map => {
+                let Some(nested) = self.nested.as_mut() else {
+                    return Err(CoveError::BadSchema(format!(
+                        "native nested column '{}' is missing recursive storage",
+                        self.entry.name
+                    )));
+                };
+                nested.append_array(array)?;
+            }
             SourceColumnKind::NestedJson => {
                 let values = expect_varbytes_values(&mut self.values)?;
                 append_materialized_values(
@@ -693,7 +1117,22 @@ impl ConvertedColumn {
                 )?;
             }
         }
+        if matches!(
+            self.source_kind,
+            SourceColumnKind::List
+                | SourceColumnKind::LargeList
+                | SourceColumnKind::FixedSizeList
+                | SourceColumnKind::Struct
+                | SourceColumnKind::Map
+        ) {
+            return Ok(());
+        }
         if self.values.row_count() != self.nulls.len() {
+            if let Some(nested) = &self.nested {
+                if nested.row_count() == self.nulls.len() || self.nulls.is_empty() {
+                    return Ok(());
+                }
+            }
             return Err(CoveError::BadSchema(format!(
                 "column '{}' materialized row/null counts diverged",
                 self.entry.name
@@ -714,7 +1153,7 @@ impl ConvertedColumn {
                 "morsel_row_count must be greater than zero".into(),
             ));
         }
-        let total_rows = self.values.row_count();
+        let total_rows = self.row_count();
         let row_end = row_start
             .checked_add(row_count)
             .ok_or(CoveError::ArithOverflow)?;
@@ -727,7 +1166,7 @@ impl ConvertedColumn {
         if row_count == 0 {
             return Ok(Vec::new());
         }
-        if self.nulls.len() != total_rows {
+        if self.nested.is_none() && self.nulls.len() != total_rows {
             return Err(CoveError::BadSchema(format!(
                 "column '{}' materialized row/null counts diverged",
                 self.entry.name
@@ -738,24 +1177,37 @@ impl ConvertedColumn {
         let step = morsel_row_count as usize;
         while start < row_end {
             let len = (row_end - start).min(step);
-            let physical_payload = self.values.encode_rows(start, len)?;
             let null_count = self.null_count_range(start, len)?;
-            let (payload, flags) = if null_count == 0 {
-                (physical_payload, PAGE_FLAG_ALL_NON_NULL)
+            let (payload, flags) = if let Some(nested) = &self.nested {
+                (
+                    nested.encode_page_payload(start, len, self.encoding)?,
+                    if null_count == 0 {
+                        PAGE_FLAG_ALL_NON_NULL
+                    } else if null_count == len {
+                        PAGE_FLAG_ALL_NULL
+                    } else {
+                        0
+                    },
+                )
             } else {
-                let mut payload = self.validity_bytes(start, len)?;
-                let capacity = payload
-                    .len()
-                    .checked_add(physical_payload.len())
-                    .ok_or(CoveError::ArithOverflow)?;
-                payload.reserve(capacity.saturating_sub(payload.len()));
-                payload.extend_from_slice(&physical_payload);
-                let flags = if null_count == len {
-                    PAGE_FLAG_ALL_NULL
+                let physical_payload = self.values.encode_rows(start, len)?;
+                if null_count == 0 {
+                    (physical_payload, PAGE_FLAG_ALL_NON_NULL)
                 } else {
-                    0
-                };
-                (payload, flags)
+                    let mut payload = self.validity_bytes(start, len)?;
+                    let capacity = payload
+                        .len()
+                        .checked_add(physical_payload.len())
+                        .ok_or(CoveError::ArithOverflow)?;
+                    payload.reserve(capacity.saturating_sub(payload.len()));
+                    payload.extend_from_slice(&physical_payload);
+                    let flags = if null_count == len {
+                        PAGE_FLAG_ALL_NULL
+                    } else {
+                        0
+                    };
+                    (payload, flags)
+                }
             };
             let non_null_count = len
                 .checked_sub(null_count)
@@ -773,6 +1225,9 @@ impl ConvertedColumn {
     }
 
     fn key_u64(&self, row: usize) -> Option<(u64, IndexKeyKind)> {
+        if self.nested.is_some() {
+            return None;
+        }
         if self.is_null(row) {
             return None;
         }
@@ -791,6 +1246,9 @@ impl ConvertedColumn {
     }
 
     fn key_kind(&self) -> Option<IndexKeyKind> {
+        if self.nested.is_some() {
+            return None;
+        }
         match &self.values {
             MaterializedValues::Boolean(_) | MaterializedValues::NumCode(_) => {
                 Some(IndexKeyKind::NumCode)
@@ -812,6 +1270,9 @@ impl ConvertedColumn {
     }
 
     fn dictionary_key_for_row(&self, row: usize) -> Result<Option<FileDictionaryKey>, CoveError> {
+        if self.nested.is_some() {
+            return Ok(None);
+        }
         if self.is_null(row) {
             return Ok(None);
         }
@@ -828,6 +1289,9 @@ impl ConvertedColumn {
     }
 
     fn compare_rows_for_cluster(&self, left: usize, right: usize) -> Ordering {
+        if self.nested.is_some() {
+            return left.cmp(&right);
+        }
         match (self.is_null(left), self.is_null(right)) {
             (true, true) => return Ordering::Equal,
             (true, false) => return Ordering::Less,
@@ -849,10 +1313,16 @@ impl ConvertedColumn {
     }
 
     fn is_null(&self, row: usize) -> bool {
+        if let Some(nested) = &self.nested {
+            return nested.nulls.get(row).copied().unwrap_or(false);
+        }
         self.nulls.get(row).copied().unwrap_or(false)
     }
 
     fn null_count_range(&self, start: usize, len: usize) -> Result<usize, CoveError> {
+        if let Some(nested) = &self.nested {
+            return nested.null_count_range(start, len);
+        }
         let end = start.checked_add(len).ok_or(CoveError::ArithOverflow)?;
         let slice = self
             .nulls
@@ -862,6 +1332,9 @@ impl ConvertedColumn {
     }
 
     fn non_null_indices(&self, start: usize, len: usize) -> Result<Vec<usize>, CoveError> {
+        if let Some(nested) = &self.nested {
+            return nested.non_null_indices(start, len);
+        }
         let end = start.checked_add(len).ok_or(CoveError::ArithOverflow)?;
         self.nulls
             .get(start..end)
@@ -878,6 +1351,13 @@ impl ConvertedColumn {
             }
         }
         Ok(builder.into_bytes())
+    }
+
+    fn row_count(&self) -> usize {
+        self.nested
+            .as_ref()
+            .map(NestedColumnData::row_count)
+            .unwrap_or_else(|| self.values.row_count())
     }
 
     fn report(self) -> ParquetColumnReport {
@@ -947,10 +1427,7 @@ fn apply_stable_clustering(
         cluster_indices.push(index);
     }
 
-    let row_count = columns
-        .first()
-        .map(|column| column.values.row_count())
-        .unwrap_or(0);
+    let row_count = columns.first().map(ConvertedColumn::row_count).unwrap_or(0);
     let mut order = (0..row_count).collect::<Vec<_>>();
     order.sort_by(|left, right| {
         for index in &cluster_indices {
@@ -962,8 +1439,12 @@ fn apply_stable_clustering(
         left.cmp(right)
     });
     for column in columns {
-        column.values.reorder(&order);
-        reorder_copy(&mut column.nulls, &order);
+        if let Some(nested) = column.nested.as_mut() {
+            nested.reorder(&order)?;
+        } else {
+            column.values.reorder(&order);
+            reorder_copy(&mut column.nulls, &order);
+        }
     }
     Ok(Some(format!(
         "Applied stable clustering by declared columns: {}",
@@ -990,7 +1471,7 @@ fn apply_dictionary_synthesis(
         }
         let unique = dictionary_unique_keys(column)?;
         let raw_len = varbytes_payload_len(column)?;
-        let dict_len = file_dictionary_candidate_len(&unique, column.values.row_count())?;
+        let dict_len = file_dictionary_candidate_len(&unique, column.row_count())?;
         if policy == ParquetDictionaryPolicy::Always || dict_len < raw_len {
             selected.push(index);
         }
@@ -1006,7 +1487,7 @@ fn apply_dictionary_synthesis(
     let encoding = FileDictionaryEncoding::from_keys(all_keys)?;
 
     for index in selected {
-        let row_count = columns[index].values.row_count();
+        let row_count = columns[index].row_count();
         let mut codes = Vec::with_capacity(row_count);
         for row in 0..row_count {
             if columns[index].is_null(row) {
@@ -1033,7 +1514,7 @@ fn dictionary_unique_keys(
     column: &ConvertedColumn,
 ) -> Result<BTreeSet<FileDictionaryKey>, CoveError> {
     let mut keys = BTreeSet::new();
-    for row in 0..column.values.row_count() {
+    for row in 0..column.row_count() {
         if let Some(key) = column.dictionary_key_for_row(row)? {
             keys.insert(key);
         }
@@ -1475,10 +1956,7 @@ fn build_acceleration_artifacts(
     segments: &[SegmentLayout],
 ) -> Result<AccelerationArtifacts, CoveError> {
     let mut artifacts = AccelerationArtifacts::default();
-    let row_count = columns
-        .first()
-        .map(|column| column.values.row_count())
-        .unwrap_or(0);
+    let row_count = columns.first().map(ConvertedColumn::row_count).unwrap_or(0);
     let point_lookup = options
         .point_lookup_columns
         .iter()
@@ -1494,9 +1972,35 @@ fn build_acceleration_artifacts(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
+    let aggregate_topk_columns = options
+        .aggregate_topk_columns
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let distinct_sketch_columns = options
+        .distinct_sketch_columns
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let quantile_sketch_columns = options
+        .quantile_sketch_columns
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     validate_declared_columns(columns, &point_lookup, "point lookup")?;
     validate_declared_columns(columns, &topn, "Top-N")?;
     validate_declared_columns(columns, &aggregate_columns, "aggregate synopsis")?;
+    validate_declared_columns(columns, &aggregate_topk_columns, "aggregate TopK synopsis")?;
+    validate_declared_columns(
+        columns,
+        &distinct_sketch_columns,
+        "distinct sketch synopsis",
+    )?;
+    validate_declared_columns(
+        columns,
+        &quantile_sketch_columns,
+        "quantile sketch synopsis",
+    )?;
     for group in &options.composite_zone_groups {
         let declared = group.iter().cloned().collect::<BTreeSet<_>>();
         validate_declared_columns(columns, &declared, "composite zone")?;
@@ -1551,16 +2055,28 @@ fn build_acceleration_artifacts(
                 ));
             }
         }
-        if should_emit_aggregate(
+        let declared_aggregate = aggregate_columns.contains(&column.entry.name);
+        let emit_base_aggregates = should_emit_aggregate(
             options.aggregate_policy,
-            aggregate_columns.contains(&column.entry.name),
-            key_kind.is_some(),
-        ) {
-            if let Some(synopsis) = build_aggregate_synopsis(column, segments)? {
+            declared_aggregate,
+            aggregate_supported(column),
+        );
+        let aggregate_request = AggregateBuildRequest {
+            emit_base_aggregates,
+            emit_histogram: emit_base_aggregates && (declared_aggregate || low_or_medium),
+            emit_topk: aggregate_topk_columns.contains(&column.entry.name),
+            emit_distinct_sketch: distinct_sketch_columns.contains(&column.entry.name),
+            emit_quantile_sketch: quantile_sketch_columns.contains(&column.entry.name),
+            topk_k: options.aggregate_topk_k,
+            hll_precision: options.hll_precision,
+            kll_k: options.kll_k,
+        };
+        if aggregate_request.any() {
+            if let Some(synopsis) = build_aggregate_synopsis(column, segments, aggregate_request)? {
                 artifacts.aggregates.push(synopsis);
             } else {
                 artifacts.unsupported.push(format!(
-                    "Aggregate synopsis for column '{}' requires Boolean, FileCode, or NumCode materialization",
+                    "Aggregate synopsis for column '{}' requires a supported materialized primitive column",
                     column.entry.name
                 ));
             }
@@ -1654,7 +2170,7 @@ fn should_emit_aggregate(policy: ParquetAggregatePolicy, declared: bool, support
 
 fn column_unique_keys(column: &ConvertedColumn) -> Result<Vec<u64>, CoveError> {
     let mut keys = BTreeSet::new();
-    for row in 0..column.values.row_count() {
+    for row in 0..column.row_count() {
         if column.is_null(row) {
             continue;
         }
@@ -1666,46 +2182,722 @@ fn column_unique_keys(column: &ConvertedColumn) -> Result<Vec<u64>, CoveError> {
     Ok(keys.into_iter().collect())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AggregateBuildRequest {
+    emit_base_aggregates: bool,
+    emit_histogram: bool,
+    emit_topk: bool,
+    emit_distinct_sketch: bool,
+    emit_quantile_sketch: bool,
+    topk_k: u32,
+    hll_precision: u8,
+    kll_k: u32,
+}
+
+impl AggregateBuildRequest {
+    fn any(self) -> bool {
+        self.emit_base_aggregates
+            || self.emit_histogram
+            || self.emit_topk
+            || self.emit_distinct_sketch
+            || self.emit_quantile_sketch
+    }
+}
+
+fn aggregate_supported(column: &ConvertedColumn) -> bool {
+    column.nested.is_none()
+}
+
 fn build_aggregate_synopsis(
     column: &ConvertedColumn,
     segments: &[SegmentLayout],
+    request: AggregateBuildRequest,
 ) -> Result<Option<AggregateSynopsis>, CoveError> {
-    if column.key_kind().is_none() {
+    if !aggregate_supported(column) {
         return Ok(None);
     }
-    let mut entries = Vec::with_capacity(segments.len());
+
+    let mut entries = Vec::new();
+    let mut payloads = Vec::new();
     for segment in segments {
-        let row_end = segment
-            .row_start
-            .checked_add(segment.row_count)
-            .ok_or(CoveError::ArithOverflow)?;
-        let row_count = u32::try_from(segment.row_count).map_err(|_| CoveError::ArithOverflow)?;
-        let null_count = u32::try_from(
-            (segment.row_start..row_end)
-                .filter(|row| column.is_null(*row))
-                .count(),
-        )
-        .map_err(|_| CoveError::ArithOverflow)?;
-        entries.push(AggregateEntry {
-            table_id: 1,
-            segment_id: segment.segment_id,
-            morsel_id: u32::MAX,
-            column_id: column.entry.column_id,
-            synopsis_kind: SynopsisKind::Count,
-            key_kind: column
-                .key_kind()
-                .map(|kind| kind.exact_set_kind() as u8)
-                .unwrap_or(0),
-            accuracy: SynopsisAccuracy::Exact,
-            flags: 0,
-            row_count,
-            null_count,
-            payload_offset: 0,
-            payload_length: 0,
-            checksum: 0,
-        });
+        let (row_count, null_count, non_null_rows) = aggregate_segment_counts(column, segment)?;
+
+        if request.emit_base_aggregates {
+            push_aggregate_payload(
+                &mut entries,
+                &mut payloads,
+                aggregate_entry(
+                    column,
+                    segment,
+                    SynopsisKind::Count,
+                    SynopsisAccuracy::Exact,
+                    row_count,
+                    null_count,
+                ),
+                AggregatePayloadV2::None,
+            );
+            if let Some(payload) = aggregate_min_max_payload(column, &non_null_rows)? {
+                push_aggregate_payload(
+                    &mut entries,
+                    &mut payloads,
+                    aggregate_entry(
+                        column,
+                        segment,
+                        SynopsisKind::MinMax,
+                        SynopsisAccuracy::Exact,
+                        row_count,
+                        null_count,
+                    ),
+                    payload,
+                );
+            }
+            if let Some((sum, sum_and_count)) =
+                aggregate_sum_payloads(column, &non_null_rows, row_count - null_count)?
+            {
+                push_aggregate_payload(
+                    &mut entries,
+                    &mut payloads,
+                    aggregate_entry(
+                        column,
+                        segment,
+                        SynopsisKind::Sum,
+                        SynopsisAccuracy::Exact,
+                        row_count,
+                        null_count,
+                    ),
+                    sum,
+                );
+                push_aggregate_payload(
+                    &mut entries,
+                    &mut payloads,
+                    aggregate_entry(
+                        column,
+                        segment,
+                        SynopsisKind::SumAndCount,
+                        SynopsisAccuracy::Exact,
+                        row_count,
+                        null_count,
+                    ),
+                    sum_and_count,
+                );
+            }
+            if let Some(payload) = aggregate_bool_counts_payload(column, &non_null_rows)? {
+                push_aggregate_payload(
+                    &mut entries,
+                    &mut payloads,
+                    aggregate_entry(
+                        column,
+                        segment,
+                        SynopsisKind::BoolTrueFalseCounts,
+                        SynopsisAccuracy::Exact,
+                        row_count,
+                        null_count,
+                    ),
+                    payload,
+                );
+            }
+        }
+
+        if request.emit_histogram {
+            if let Some((kind, payload)) = aggregate_histogram_payload(column, &non_null_rows)? {
+                push_aggregate_payload(
+                    &mut entries,
+                    &mut payloads,
+                    aggregate_entry(
+                        column,
+                        segment,
+                        kind,
+                        SynopsisAccuracy::Exact,
+                        row_count,
+                        null_count,
+                    ),
+                    payload,
+                );
+            }
+        }
+        if request.emit_topk {
+            if let Some(payload) = aggregate_topk_payload(column, &non_null_rows, request.topk_k)? {
+                push_aggregate_payload(
+                    &mut entries,
+                    &mut payloads,
+                    aggregate_entry(
+                        column,
+                        segment,
+                        SynopsisKind::TopK,
+                        SynopsisAccuracy::Exact,
+                        row_count,
+                        null_count,
+                    ),
+                    payload,
+                );
+            }
+        }
+        if request.emit_distinct_sketch {
+            if let Some(payload) =
+                aggregate_distinct_sketch_payload(column, &non_null_rows, request.hll_precision)?
+            {
+                push_aggregate_payload(
+                    &mut entries,
+                    &mut payloads,
+                    aggregate_entry(
+                        column,
+                        segment,
+                        SynopsisKind::DistinctSketch,
+                        SynopsisAccuracy::Approximate,
+                        row_count,
+                        null_count,
+                    ),
+                    payload,
+                );
+            }
+        }
+        if request.emit_quantile_sketch {
+            if let Some(payload) =
+                aggregate_quantile_sketch_payload(column, &non_null_rows, request.kll_k)?
+            {
+                push_aggregate_payload(
+                    &mut entries,
+                    &mut payloads,
+                    aggregate_entry(
+                        column,
+                        segment,
+                        SynopsisKind::QuantileSketch,
+                        SynopsisAccuracy::Approximate,
+                        row_count,
+                        null_count,
+                    ),
+                    payload,
+                );
+            }
+        }
     }
-    Ok(Some(AggregateSynopsis { entries }))
+
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    AggregateSynopsis::from_parts(entries, payloads).map(Some)
+}
+
+fn push_aggregate_payload(
+    entries: &mut Vec<AggregateEntry>,
+    payloads: &mut Vec<AggregatePayloadV2>,
+    entry: AggregateEntry,
+    payload: AggregatePayloadV2,
+) {
+    entries.push(entry);
+    payloads.push(payload);
+}
+
+fn aggregate_segment_counts(
+    column: &ConvertedColumn,
+    segment: &SegmentLayout,
+) -> Result<(u32, u32, Vec<usize>), CoveError> {
+    let row_end = segment
+        .row_start
+        .checked_add(segment.row_count)
+        .ok_or(CoveError::ArithOverflow)?;
+    let row_count = u32::try_from(segment.row_count).map_err(|_| CoveError::ArithOverflow)?;
+    let mut non_null_rows = Vec::new();
+    let mut null_count = 0u32;
+    for row in segment.row_start..row_end {
+        if column.is_null(row) {
+            null_count = null_count.checked_add(1).ok_or(CoveError::ArithOverflow)?;
+        } else {
+            non_null_rows.push(row);
+        }
+    }
+    Ok((row_count, null_count, non_null_rows))
+}
+
+fn aggregate_entry(
+    column: &ConvertedColumn,
+    segment: &SegmentLayout,
+    synopsis_kind: SynopsisKind,
+    accuracy: SynopsisAccuracy,
+    row_count: u32,
+    null_count: u32,
+) -> AggregateEntry {
+    AggregateEntry {
+        table_id: 1,
+        segment_id: segment.segment_id,
+        morsel_id: u32::MAX,
+        column_id: column.entry.column_id,
+        synopsis_kind,
+        key_kind: column
+            .key_kind()
+            .map(|kind| kind.exact_set_kind() as u8)
+            .unwrap_or(0),
+        accuracy,
+        flags: 0,
+        row_count,
+        null_count,
+        payload_offset: 0,
+        payload_length: 0,
+        checksum: 0,
+    }
+}
+
+fn aggregate_min_max_payload(
+    column: &ConvertedColumn,
+    non_null_rows: &[usize],
+) -> Result<Option<AggregatePayloadV2>, CoveError> {
+    if !supports_exact_min_max(column) {
+        return Ok(None);
+    }
+    if non_null_rows.is_empty() {
+        return Ok(Some(AggregatePayloadV2::MinMax {
+            min: None,
+            max: None,
+        }));
+    }
+    let mut min_row = non_null_rows[0];
+    let mut max_row = non_null_rows[0];
+    for row in &non_null_rows[1..] {
+        if column.compare_rows_for_cluster(*row, min_row) == Ordering::Less {
+            min_row = *row;
+        }
+        if column.compare_rows_for_cluster(*row, max_row) == Ordering::Greater {
+            max_row = *row;
+        }
+    }
+    Ok(Some(AggregatePayloadV2::MinMax {
+        min: Some(tagged_canonical_value_for_row(column, min_row)?),
+        max: Some(tagged_canonical_value_for_row(column, max_row)?),
+    }))
+}
+
+fn supports_exact_min_max(column: &ConvertedColumn) -> bool {
+    matches!(
+        column.values,
+        MaterializedValues::Boolean(_)
+            | MaterializedValues::NumCode(_)
+            | MaterializedValues::FixedBytes { .. }
+    ) && !matches!(
+        column.entry.logical,
+        CoveLogicalType::Float32 | CoveLogicalType::Float64 | CoveLogicalType::Json
+    )
+}
+
+fn aggregate_sum_payloads(
+    column: &ConvertedColumn,
+    non_null_rows: &[usize],
+    non_null_count: u32,
+) -> Result<Option<(AggregatePayloadV2, AggregatePayloadV2)>, CoveError> {
+    let Some(sum) = checked_numeric_sum(column, non_null_rows)? else {
+        return Ok(None);
+    };
+    let sum_and_count = AggregatePayloadV2::SumAndCount {
+        overflow_policy: NumericAggregateOverflowPolicy::CheckedExact,
+        non_null_count: u64::from(non_null_count),
+        sum: sum.clone(),
+    };
+    Ok(Some((
+        AggregatePayloadV2::Sum {
+            overflow_policy: NumericAggregateOverflowPolicy::CheckedExact,
+            sum,
+        },
+        sum_and_count,
+    )))
+}
+
+fn checked_numeric_sum(
+    column: &ConvertedColumn,
+    non_null_rows: &[usize],
+) -> Result<Option<TaggedCanonicalValue>, CoveError> {
+    match (&column.values, column.entry.logical) {
+        (
+            MaterializedValues::NumCode(values),
+            CoveLogicalType::Int8
+            | CoveLogicalType::Int16
+            | CoveLogicalType::Int32
+            | CoveLogicalType::Int64,
+        ) => {
+            let mut sum = 0i128;
+            for row in non_null_rows {
+                let value = signed_i128_from_numcode(column.entry.logical, values[*row]);
+                sum = sum.checked_add(value).ok_or(CoveError::ArithOverflow)?;
+            }
+            let sum = i64::try_from(sum).map_err(|_| CoveError::ArithOverflow)?;
+            Ok(Some(TaggedCanonicalValue {
+                value_tag: ValueTag::Int64,
+                payload: sum.to_le_bytes().to_vec(),
+            }))
+        }
+        (
+            MaterializedValues::NumCode(values),
+            CoveLogicalType::UInt8
+            | CoveLogicalType::UInt16
+            | CoveLogicalType::UInt32
+            | CoveLogicalType::UInt64,
+        ) => {
+            let mut sum = 0u128;
+            for row in non_null_rows {
+                let value = unsigned_u128_from_numcode(column.entry.logical, values[*row]);
+                sum = sum.checked_add(value).ok_or(CoveError::ArithOverflow)?;
+            }
+            let sum = u64::try_from(sum).map_err(|_| CoveError::ArithOverflow)?;
+            Ok(Some(TaggedCanonicalValue {
+                value_tag: ValueTag::UInt64,
+                payload: sum.to_le_bytes().to_vec(),
+            }))
+        }
+        (MaterializedValues::FixedBytes { values, .. }, CoveLogicalType::Decimal128) => {
+            let mut sum = 0i128;
+            for row in non_null_rows {
+                let raw: [u8; 16] = values[*row]
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| CoveError::BadSchema("Decimal128 value width mismatch".into()))?;
+                sum = sum
+                    .checked_add(i128::from_le_bytes(raw))
+                    .ok_or(CoveError::ArithOverflow)?;
+            }
+            Ok(Some(TaggedCanonicalValue {
+                value_tag: ValueTag::Decimal128,
+                payload: sum.to_le_bytes().to_vec(),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn aggregate_bool_counts_payload(
+    column: &ConvertedColumn,
+    non_null_rows: &[usize],
+) -> Result<Option<AggregatePayloadV2>, CoveError> {
+    let MaterializedValues::Boolean(values) = &column.values else {
+        return Ok(None);
+    };
+    let mut true_count = 0u64;
+    let mut false_count = 0u64;
+    for row in non_null_rows {
+        if values[*row] == 0 {
+            false_count = false_count.checked_add(1).ok_or(CoveError::ArithOverflow)?;
+        } else {
+            true_count = true_count.checked_add(1).ok_or(CoveError::ArithOverflow)?;
+        }
+    }
+    Ok(Some(AggregatePayloadV2::BoolTrueFalseCounts {
+        true_count,
+        false_count,
+    }))
+}
+
+fn aggregate_histogram_payload(
+    column: &ConvertedColumn,
+    non_null_rows: &[usize],
+) -> Result<Option<(SynopsisKind, AggregatePayloadV2)>, CoveError> {
+    let Some(kind) = column.key_kind() else {
+        return Ok(None);
+    };
+    let buckets = aggregate_key_counts(column, non_null_rows)?;
+    let payload = match kind {
+        IndexKeyKind::FileCode => AggregatePayloadV2::FileCodeHistogram { buckets },
+        IndexKeyKind::NumCode => AggregatePayloadV2::NumCodeHistogram { buckets },
+    };
+    let synopsis_kind = match kind {
+        IndexKeyKind::FileCode => SynopsisKind::FileCodeHistogram,
+        IndexKeyKind::NumCode => SynopsisKind::NumCodeHistogram,
+    };
+    Ok(Some((synopsis_kind, payload)))
+}
+
+fn aggregate_topk_payload(
+    column: &ConvertedColumn,
+    non_null_rows: &[usize],
+    k: u32,
+) -> Result<Option<AggregatePayloadV2>, CoveError> {
+    if column.key_kind().is_none() || k == 0 {
+        return Ok(None);
+    }
+    let mut entries = aggregate_key_counts(column, non_null_rows)?;
+    entries.sort_by(|left, right| right.count.cmp(&left.count).then(left.key.cmp(&right.key)));
+    entries.truncate(k as usize);
+    Ok(Some(AggregatePayloadV2::TopK { k, entries }))
+}
+
+fn aggregate_distinct_sketch_payload(
+    column: &ConvertedColumn,
+    non_null_rows: &[usize],
+    precision: u8,
+) -> Result<Option<AggregatePayloadV2>, CoveError> {
+    let mut hashes = Vec::with_capacity(non_null_rows.len());
+    for row in non_null_rows {
+        let bytes = sketch_value_bytes_for_row(column, *row)?;
+        hashes.push(cove_sketch_hash(&bytes));
+    }
+    Ok(Some(AggregatePayloadV2::DistinctSketch {
+        precision,
+        registers: hll_registers_from_hashes(precision, hashes)?,
+    }))
+}
+
+fn aggregate_quantile_sketch_payload(
+    column: &ConvertedColumn,
+    non_null_rows: &[usize],
+    k: u32,
+) -> Result<Option<AggregatePayloadV2>, CoveError> {
+    let Some(value_tag) = kll_value_tag_for_column(column) else {
+        return Ok(None);
+    };
+    let mut raw_values = Vec::with_capacity(non_null_rows.len());
+    for row in non_null_rows {
+        let value = tagged_canonical_value_for_row(column, *row)?;
+        if value.value_tag != value_tag {
+            return Ok(None);
+        }
+        raw_values.push(value.payload);
+    }
+    let (level_offsets, values) = kll_compactors_from_values(k, value_tag, raw_values)?;
+    Ok(Some(AggregatePayloadV2::QuantileSketch {
+        k,
+        value_tag,
+        level_offsets,
+        values,
+    }))
+}
+
+fn aggregate_key_counts(
+    column: &ConvertedColumn,
+    non_null_rows: &[usize],
+) -> Result<Vec<HistogramBucket>, CoveError> {
+    let mut counts = BTreeMap::<u64, u64>::new();
+    for row in non_null_rows {
+        let Some((key, _)) = column.key_u64(*row) else {
+            return Ok(Vec::new());
+        };
+        let slot = counts.entry(key).or_default();
+        *slot = slot.checked_add(1).ok_or(CoveError::ArithOverflow)?;
+    }
+    Ok(counts
+        .into_iter()
+        .map(|(key, count)| HistogramBucket { key, count })
+        .collect())
+}
+
+fn aggregate_payload_summary(payload: &AggregatePayloadV2) -> String {
+    match payload {
+        AggregatePayloadV2::None => "none".into(),
+        AggregatePayloadV2::MinMax { min, max } => format!(
+            "min_present={}, max_present={}, exact_sql=true",
+            min.is_some(),
+            max.is_some()
+        ),
+        AggregatePayloadV2::Sum {
+            overflow_policy, ..
+        } => {
+            format!("overflow_policy={overflow_policy:?}, exact_sql=true")
+        }
+        AggregatePayloadV2::SumAndCount {
+            overflow_policy,
+            non_null_count,
+            ..
+        } => format!(
+            "overflow_policy={overflow_policy:?}, non_null_count={non_null_count}, exact_sql=true"
+        ),
+        AggregatePayloadV2::BoolTrueFalseCounts {
+            true_count,
+            false_count,
+        } => format!("true_count={true_count}, false_count={false_count}, exact_sql=true"),
+        AggregatePayloadV2::FileCodeHistogram { buckets }
+        | AggregatePayloadV2::NumCodeHistogram { buckets } => format!(
+            "bucket_count={}, count_total={}, exact_sql=true",
+            buckets.len(),
+            buckets.iter().map(|bucket| bucket.count).sum::<u64>()
+        ),
+        AggregatePayloadV2::TopK { k, entries } => {
+            format!("k={k}, item_count={}, exact_sql=true", entries.len())
+        }
+        AggregatePayloadV2::DistinctSketch {
+            precision,
+            registers,
+        } => format!(
+            "hll_p={precision}, register_count={}, exact_sql=false",
+            registers.len()
+        ),
+        AggregatePayloadV2::QuantileSketch {
+            k,
+            level_offsets,
+            values,
+            ..
+        } => format!(
+            "kll_k={k}, level_count={}, value_count={}, exact_sql=false",
+            level_offsets.len(),
+            values.len()
+        ),
+        _ => "unknown-payload".into(),
+    }
+}
+
+fn tagged_canonical_value_for_row(
+    column: &ConvertedColumn,
+    row: usize,
+) -> Result<TaggedCanonicalValue, CoveError> {
+    match (&column.values, column.entry.logical) {
+        (MaterializedValues::Boolean(values), CoveLogicalType::Bool) => Ok(TaggedCanonicalValue {
+            value_tag: if values[row] == 0 {
+                ValueTag::BoolFalse
+            } else {
+                ValueTag::BoolTrue
+            },
+            payload: Vec::new(),
+        }),
+        (MaterializedValues::NumCode(values), logical) => {
+            tagged_canonical_numcode(logical, values[row])
+        }
+        (MaterializedValues::FileCode(values), _) => Ok(TaggedCanonicalValue {
+            value_tag: ValueTag::UInt64,
+            payload: u64::from(values[row]).to_le_bytes().to_vec(),
+        }),
+        (MaterializedValues::FixedBytes { values, .. }, CoveLogicalType::Decimal128) => {
+            Ok(TaggedCanonicalValue {
+                value_tag: ValueTag::Decimal128,
+                payload: values[row].clone(),
+            })
+        }
+        (MaterializedValues::VarBytes(values), CoveLogicalType::Utf8) => {
+            let mut payload = wire::encode_u64_leb128(values[row].len() as u64);
+            payload.extend_from_slice(&values[row]);
+            Ok(TaggedCanonicalValue {
+                value_tag: ValueTag::Utf8,
+                payload,
+            })
+        }
+        (MaterializedValues::VarBytes(values), CoveLogicalType::Binary) => {
+            let mut payload = wire::encode_u64_leb128(values[row].len() as u64);
+            payload.extend_from_slice(&values[row]);
+            Ok(TaggedCanonicalValue {
+                value_tag: ValueTag::Binary,
+                payload,
+            })
+        }
+        _ => Err(CoveError::BadSchema(format!(
+            "column '{}' cannot be encoded as a canonical aggregate value",
+            column.entry.name
+        ))),
+    }
+}
+
+fn tagged_canonical_numcode(
+    logical: CoveLogicalType,
+    code: u64,
+) -> Result<TaggedCanonicalValue, CoveError> {
+    let value = match logical {
+        CoveLogicalType::Int8
+        | CoveLogicalType::Int16
+        | CoveLogicalType::Int32
+        | CoveLogicalType::Int64 => TaggedCanonicalValue {
+            value_tag: ValueTag::Int64,
+            payload: i64::try_from(signed_i128_from_numcode(logical, code))
+                .map_err(|_| CoveError::ArithOverflow)?
+                .to_le_bytes()
+                .to_vec(),
+        },
+        CoveLogicalType::UInt8
+        | CoveLogicalType::UInt16
+        | CoveLogicalType::UInt32
+        | CoveLogicalType::UInt64 => TaggedCanonicalValue {
+            value_tag: ValueTag::UInt64,
+            payload: u64::try_from(unsigned_u128_from_numcode(logical, code))
+                .map_err(|_| CoveError::ArithOverflow)?
+                .to_le_bytes()
+                .to_vec(),
+        },
+        CoveLogicalType::Float32 => TaggedCanonicalValue {
+            value_tag: ValueTag::Float32Bits,
+            payload: (code as u32).to_le_bytes().to_vec(),
+        },
+        CoveLogicalType::Float64 => TaggedCanonicalValue {
+            value_tag: ValueTag::Float64Bits,
+            payload: code.to_le_bytes().to_vec(),
+        },
+        CoveLogicalType::DateDays => TaggedCanonicalValue {
+            value_tag: ValueTag::DateDays,
+            payload: types::numcode_as_date_days(code).to_le_bytes().to_vec(),
+        },
+        CoveLogicalType::TimestampMicros => TaggedCanonicalValue {
+            value_tag: ValueTag::TimestampMicros,
+            payload: types::numcode_as_timestamp_micros(code)
+                .to_le_bytes()
+                .to_vec(),
+        },
+        CoveLogicalType::TimestampNanos => TaggedCanonicalValue {
+            value_tag: ValueTag::TimestampNanos,
+            payload: types::numcode_as_timestamp_nanos(code)
+                .to_le_bytes()
+                .to_vec(),
+        },
+        _ => {
+            return Err(CoveError::BadSchema(format!(
+                "logical type {logical:?} is not a canonical NumCode aggregate value"
+            )))
+        }
+    };
+    Ok(value)
+}
+
+fn signed_i128_from_numcode(logical: CoveLogicalType, code: u64) -> i128 {
+    match logical {
+        CoveLogicalType::Int8 => i128::from(types::numcode_as_i8(code)),
+        CoveLogicalType::Int16 => i128::from(types::numcode_as_i16(code)),
+        CoveLogicalType::Int32 => i128::from(types::numcode_as_i32(code)),
+        CoveLogicalType::Int64 => i128::from(types::numcode_as_i64(code)),
+        CoveLogicalType::DateDays => i128::from(types::numcode_as_date_days(code)),
+        CoveLogicalType::TimestampMicros => i128::from(types::numcode_as_timestamp_micros(code)),
+        CoveLogicalType::TimestampNanos => i128::from(types::numcode_as_timestamp_nanos(code)),
+        _ => 0,
+    }
+}
+
+fn unsigned_u128_from_numcode(logical: CoveLogicalType, code: u64) -> u128 {
+    match logical {
+        CoveLogicalType::UInt8 => u128::from(types::numcode_as_u8(code)),
+        CoveLogicalType::UInt16 => u128::from(types::numcode_as_u16(code)),
+        CoveLogicalType::UInt32 => u128::from(types::numcode_as_u32(code)),
+        CoveLogicalType::UInt64 => u128::from(types::numcode_as_u64(code)),
+        _ => 0,
+    }
+}
+
+fn sketch_value_bytes_for_row(column: &ConvertedColumn, row: usize) -> Result<Vec<u8>, CoveError> {
+    let value = tagged_canonical_value_for_row(column, row)?;
+    let mut bytes = Vec::with_capacity(6 + value.payload.len());
+    bytes.extend_from_slice(&(value.value_tag as u16).to_le_bytes());
+    bytes.extend_from_slice(&(value.payload.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&value.payload);
+    Ok(bytes)
+}
+
+fn kll_value_tag_for_column(column: &ConvertedColumn) -> Option<ValueTag> {
+    match (&column.values, column.entry.logical) {
+        (
+            MaterializedValues::NumCode(_),
+            CoveLogicalType::Int8
+            | CoveLogicalType::Int16
+            | CoveLogicalType::Int32
+            | CoveLogicalType::Int64,
+        ) => Some(ValueTag::Int64),
+        (
+            MaterializedValues::NumCode(_),
+            CoveLogicalType::UInt8
+            | CoveLogicalType::UInt16
+            | CoveLogicalType::UInt32
+            | CoveLogicalType::UInt64,
+        ) => Some(ValueTag::UInt64),
+        (MaterializedValues::NumCode(_), CoveLogicalType::Float32) => Some(ValueTag::Float32Bits),
+        (MaterializedValues::NumCode(_), CoveLogicalType::Float64) => Some(ValueTag::Float64Bits),
+        (MaterializedValues::NumCode(_), CoveLogicalType::DateDays) => Some(ValueTag::DateDays),
+        (MaterializedValues::NumCode(_), CoveLogicalType::TimestampMicros) => {
+            Some(ValueTag::TimestampMicros)
+        }
+        (MaterializedValues::NumCode(_), CoveLogicalType::TimestampNanos) => {
+            Some(ValueTag::TimestampNanos)
+        }
+        (MaterializedValues::FixedBytes { .. }, CoveLogicalType::Decimal128) => {
+            Some(ValueTag::Decimal128)
+        }
+        _ => None,
+    }
 }
 
 fn build_exact_set(
@@ -1752,10 +2944,7 @@ fn build_composite_zone_index(
         }
         selected.push(column);
     }
-    let row_count = columns
-        .first()
-        .map(|column| column.values.row_count())
-        .unwrap_or(0);
+    let row_count = columns.first().map(ConvertedColumn::row_count).unwrap_or(0);
     if row_count == 0 {
         return Ok(None);
     }
@@ -1815,10 +3004,10 @@ fn build_composite_zone_index(
 }
 
 fn build_bloom_index(column: &ConvertedColumn) -> Result<BloomFilterIndex, CoveError> {
-    let row_count = column.values.row_count().max(1);
+    let row_count = column.row_count().max(1);
     let bits_len =
         (row_count.checked_mul(12).ok_or(CoveError::ArithOverflow)? / 8).clamp(64, 16 * 1024);
-    let (_, domain) = (0..column.values.row_count())
+    let (_, domain) = (0..column.row_count())
         .find_map(|row| column.key_bytes_for_bloom(row))
         .ok_or_else(|| CoveError::BadSchema("column is not bloom-index keyable".into()))?;
     let mut index = BloomFilterIndex {
@@ -1838,7 +3027,7 @@ fn build_bloom_index(column: &ConvertedColumn) -> Result<BloomFilterIndex, CoveE
         hash_count: 7,
         bits: vec![0u8; bits_len],
     };
-    for row in 0..column.values.row_count() {
+    for row in 0..column.row_count() {
         if let Some((key, _)) = column.key_bytes_for_bloom(row) {
             index.insert(&key);
         }
@@ -1853,7 +3042,7 @@ fn build_lookup_index(
     morsel_row_count: u32,
 ) -> Result<LookupIndex, CoveError> {
     let mut rows_by_key: BTreeMap<u64, Vec<RowRef>> = BTreeMap::new();
-    for row in 0..column.values.row_count() {
+    for row in 0..column.row_count() {
         if column.is_null(row) {
             continue;
         }
@@ -2133,6 +3322,510 @@ fn reorder_clone<T: Clone>(values: &mut Vec<T>, order: &[usize]) {
     values.extend(order.iter().map(|index| original[*index].clone()));
 }
 
+fn native_nested_converted_column(
+    column_id: u32,
+    field: &arrow_schema::Field,
+) -> Result<Option<(ColumnEntry, SourceColumnKind, Vec<String>, NestedColumnData)>, CoveError> {
+    if !is_nested_arrow_type(field.data_type()) {
+        return Ok(None);
+    }
+    let Some(nested) = nested_data_from_field(field)? else {
+        return Ok(None);
+    };
+    let source_kind = nested.source_kind;
+    let entry = ColumnEntry {
+        column_id,
+        name: field.name().to_string(),
+        logical: nested.schema.logical,
+        physical: nested.schema.physical,
+        nullable: field.is_nullable(),
+        sort_order: 0,
+        collation_id: 0,
+        precision: 0,
+        scale: 0,
+        flags: 0,
+    };
+    Ok(Some((
+        entry,
+        source_kind,
+        vec![
+            "converted supported Arrow nested column to native COVE-T nested page trees".into(),
+            "nested predicate pushdown remains residual-only in this implementation".into(),
+        ],
+        nested,
+    )))
+}
+
+fn nested_data_from_field(
+    field: &arrow_schema::Field,
+) -> Result<Option<NestedColumnData>, CoveError> {
+    let nullable = field.is_nullable();
+    match field.data_type() {
+        DataType::List(child) => {
+            let Some(child) = nested_data_from_field(child.as_ref())? else {
+                return Ok(None);
+            };
+            Ok(Some(NestedColumnData {
+                schema: nested_schema_node(
+                    field.name(),
+                    CoveLogicalType::List,
+                    CovePhysicalKind::List,
+                    nullable,
+                    0,
+                    0,
+                    0,
+                    vec![child.schema.clone()],
+                ),
+                source_kind: SourceColumnKind::List,
+                values: NestedValues::List {
+                    offsets: vec![0],
+                    child: Box::new(child),
+                },
+                nulls: Vec::new(),
+            }))
+        }
+        DataType::LargeList(child) => {
+            let Some(child) = nested_data_from_field(child.as_ref())? else {
+                return Ok(None);
+            };
+            Ok(Some(NestedColumnData {
+                schema: nested_schema_node(
+                    field.name(),
+                    CoveLogicalType::List,
+                    CovePhysicalKind::List,
+                    nullable,
+                    0,
+                    0,
+                    0,
+                    vec![child.schema.clone()],
+                ),
+                source_kind: SourceColumnKind::LargeList,
+                values: NestedValues::List {
+                    offsets: vec![0],
+                    child: Box::new(child),
+                },
+                nulls: Vec::new(),
+            }))
+        }
+        DataType::FixedSizeList(child, width) => {
+            if *width < 0 {
+                return Ok(None);
+            }
+            let Some(child) = nested_data_from_field(child.as_ref())? else {
+                return Ok(None);
+            };
+            let mut schema = nested_schema_node(
+                field.name(),
+                CoveLogicalType::List,
+                CovePhysicalKind::List,
+                nullable,
+                0,
+                0,
+                0,
+                vec![child.schema.clone()],
+            );
+            schema.fixed_size_list_len =
+                u32::try_from(*width).map_err(|_| CoveError::ArithOverflow)?;
+            Ok(Some(NestedColumnData {
+                schema,
+                source_kind: SourceColumnKind::FixedSizeList,
+                values: NestedValues::List {
+                    offsets: vec![0],
+                    child: Box::new(child),
+                },
+                nulls: Vec::new(),
+            }))
+        }
+        DataType::Struct(fields) => {
+            let mut children = Vec::with_capacity(fields.len());
+            let mut child_schemas = Vec::with_capacity(fields.len());
+            for child_field in fields {
+                let Some(child) = nested_data_from_field(child_field.as_ref())? else {
+                    return Ok(None);
+                };
+                child_schemas.push(child.schema.clone());
+                children.push(child);
+            }
+            Ok(Some(NestedColumnData {
+                schema: nested_schema_node(
+                    field.name(),
+                    CoveLogicalType::Struct,
+                    CovePhysicalKind::Struct,
+                    nullable,
+                    0,
+                    0,
+                    0,
+                    child_schemas,
+                ),
+                source_kind: SourceColumnKind::Struct,
+                values: NestedValues::Struct { fields: children },
+                nulls: Vec::new(),
+            }))
+        }
+        DataType::Map(entries_field, _ordered) => {
+            let DataType::Struct(fields) = entries_field.data_type() else {
+                return Ok(None);
+            };
+            if fields.len() != 2 {
+                return Ok(None);
+            }
+            let Some(mut key) = nested_data_from_field(fields[0].as_ref())? else {
+                return Ok(None);
+            };
+            if key.schema.is_container() || key.schema.nullable {
+                return Ok(None);
+            }
+            key.schema.name = "key".into();
+            let Some(mut value) = nested_data_from_field(fields[1].as_ref())? else {
+                return Ok(None);
+            };
+            value.schema.name = "value".into();
+            Ok(Some(NestedColumnData {
+                schema: nested_schema_node(
+                    field.name(),
+                    CoveLogicalType::Map,
+                    CovePhysicalKind::Map,
+                    nullable,
+                    0,
+                    0,
+                    0,
+                    vec![key.schema.clone(), value.schema.clone()],
+                ),
+                source_kind: SourceColumnKind::Map,
+                values: NestedValues::Map {
+                    offsets: vec![0],
+                    keys: Box::new(key),
+                    values: Box::new(value),
+                    canonical_keys: Vec::new(),
+                },
+                nulls: Vec::new(),
+            }))
+        }
+        data_type => scalar_nested_data_from_field(field.name(), data_type, nullable),
+    }
+}
+
+fn nested_schema_node(
+    name: &str,
+    logical: CoveLogicalType,
+    physical: CovePhysicalKind,
+    nullable: bool,
+    precision: u16,
+    scale: i16,
+    collation_id: u16,
+    children: Vec<NestedSchemaNodeV1>,
+) -> NestedSchemaNodeV1 {
+    NestedSchemaNodeV1 {
+        name: name.to_string(),
+        logical,
+        physical,
+        nullable,
+        precision,
+        scale,
+        collation_id,
+        flags: 0,
+        fixed_size_list_len: 0,
+        children,
+    }
+}
+
+fn scalar_nested_data_from_field(
+    name: &str,
+    data_type: &DataType,
+    nullable: bool,
+) -> Result<Option<NestedColumnData>, CoveError> {
+    let Some((logical, physical, source_kind, values, precision, scale)) =
+        scalar_mapping_for_data_type(data_type)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(NestedColumnData {
+        schema: nested_schema_node(
+            name,
+            logical,
+            physical,
+            nullable,
+            precision,
+            scale,
+            0,
+            Vec::new(),
+        ),
+        source_kind,
+        values: NestedValues::Scalar(values),
+        nulls: Vec::new(),
+    }))
+}
+
+fn scalar_mapping_for_data_type(
+    data_type: &DataType,
+) -> Result<
+    Option<(
+        CoveLogicalType,
+        CovePhysicalKind,
+        SourceColumnKind,
+        MaterializedValues,
+        u16,
+        i16,
+    )>,
+    CoveError,
+> {
+    Ok(Some(match data_type {
+        DataType::Boolean => (
+            CoveLogicalType::Bool,
+            CovePhysicalKind::Boolean,
+            SourceColumnKind::Boolean,
+            MaterializedValues::Boolean(Vec::new()),
+            0,
+            0,
+        ),
+        DataType::Int8 => scalar_numcode(CoveLogicalType::Int8, SourceColumnKind::Int8),
+        DataType::Int16 => scalar_numcode(CoveLogicalType::Int16, SourceColumnKind::Int16),
+        DataType::Int32 => scalar_numcode(CoveLogicalType::Int32, SourceColumnKind::Int32),
+        DataType::Int64 => scalar_numcode(CoveLogicalType::Int64, SourceColumnKind::Int64),
+        DataType::UInt8 => scalar_numcode(CoveLogicalType::UInt8, SourceColumnKind::UInt8),
+        DataType::UInt16 => scalar_numcode(CoveLogicalType::UInt16, SourceColumnKind::UInt16),
+        DataType::UInt32 => scalar_numcode(CoveLogicalType::UInt32, SourceColumnKind::UInt32),
+        DataType::UInt64 => scalar_numcode(CoveLogicalType::UInt64, SourceColumnKind::UInt64),
+        DataType::Float32 => scalar_numcode(CoveLogicalType::Float32, SourceColumnKind::Float32),
+        DataType::Float64 => scalar_numcode(CoveLogicalType::Float64, SourceColumnKind::Float64),
+        DataType::Date32 => scalar_numcode(CoveLogicalType::DateDays, SourceColumnKind::Date32),
+        DataType::Timestamp(TimeUnit::Second, _) => scalar_numcode(
+            CoveLogicalType::TimestampMicros,
+            SourceColumnKind::TimestampSecond,
+        ),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => scalar_numcode(
+            CoveLogicalType::TimestampMicros,
+            SourceColumnKind::TimestampMillisecond,
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => scalar_numcode(
+            CoveLogicalType::TimestampMicros,
+            SourceColumnKind::TimestampMicrosecond,
+        ),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => scalar_numcode(
+            CoveLogicalType::TimestampNanos,
+            SourceColumnKind::TimestampNanosecond,
+        ),
+        DataType::Utf8 => (
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            SourceColumnKind::Utf8,
+            MaterializedValues::VarBytes(Vec::new()),
+            0,
+            0,
+        ),
+        DataType::LargeUtf8 => (
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            SourceColumnKind::LargeUtf8,
+            MaterializedValues::VarBytes(Vec::new()),
+            0,
+            0,
+        ),
+        DataType::Binary => (
+            CoveLogicalType::Binary,
+            CovePhysicalKind::VarBytes,
+            SourceColumnKind::Binary,
+            MaterializedValues::VarBytes(Vec::new()),
+            0,
+            0,
+        ),
+        DataType::LargeBinary => (
+            CoveLogicalType::Binary,
+            CovePhysicalKind::VarBytes,
+            SourceColumnKind::LargeBinary,
+            MaterializedValues::VarBytes(Vec::new()),
+            0,
+            0,
+        ),
+        DataType::Decimal128(precision, scale) => (
+            CoveLogicalType::Decimal128,
+            CovePhysicalKind::FixedBytes,
+            SourceColumnKind::Decimal128,
+            MaterializedValues::FixedBytes {
+                width: 16,
+                values: Vec::new(),
+            },
+            *precision as u16,
+            *scale as i16,
+        ),
+        _ => return Ok(None),
+    }))
+}
+
+fn scalar_numcode(
+    logical: CoveLogicalType,
+    source_kind: SourceColumnKind,
+) -> (
+    CoveLogicalType,
+    CovePhysicalKind,
+    SourceColumnKind,
+    MaterializedValues,
+    u16,
+    i16,
+) {
+    (
+        logical,
+        CovePhysicalKind::NumCode,
+        source_kind,
+        MaterializedValues::NumCode(Vec::new()),
+        0,
+        0,
+    )
+}
+
+fn append_list_offsets_i32(
+    offsets: &mut Vec<u32>,
+    nulls: &mut Vec<bool>,
+    array: &ListArray,
+) -> Result<(), CoveError> {
+    append_offsets_from_i32(offsets, nulls, array.value_offsets(), array)
+}
+
+fn append_map_offsets(
+    offsets: &mut Vec<u32>,
+    nulls: &mut Vec<bool>,
+    array: &MapArray,
+) -> Result<(), CoveError> {
+    append_offsets_from_i32(offsets, nulls, array.value_offsets(), array)
+}
+
+fn append_list_offsets_i64(
+    offsets: &mut Vec<u32>,
+    nulls: &mut Vec<bool>,
+    array: &LargeListArray,
+) -> Result<(), CoveError> {
+    let source_offsets = array.value_offsets();
+    if source_offsets.is_empty() {
+        return Err(CoveError::BadSchema(
+            "list offsets must not be empty".into(),
+        ));
+    }
+    let mut previous_source = source_offsets[0];
+    for row in 0..array.len() {
+        nulls.push(array.is_null(row));
+        let next_source = source_offsets[row + 1];
+        let delta = next_source
+            .checked_sub(previous_source)
+            .ok_or(CoveError::ArithOverflow)?;
+        let next_offset = offsets
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(u32::try_from(delta).map_err(|_| CoveError::ArithOverflow)?)
+            .ok_or(CoveError::ArithOverflow)?;
+        offsets.push(next_offset);
+        previous_source = next_source;
+    }
+    Ok(())
+}
+
+fn append_offsets_from_i32(
+    offsets: &mut Vec<u32>,
+    nulls: &mut Vec<bool>,
+    source_offsets: &[i32],
+    array: &dyn Array,
+) -> Result<(), CoveError> {
+    if source_offsets.is_empty() {
+        return Err(CoveError::BadSchema(
+            "list offsets must not be empty".into(),
+        ));
+    }
+    let first = source_offsets[0];
+    for row in 0..array.len() {
+        nulls.push(array.is_null(row));
+        let previous = source_offsets[row]
+            .checked_sub(first)
+            .ok_or(CoveError::ArithOverflow)?;
+        let next = source_offsets[row + 1]
+            .checked_sub(first)
+            .ok_or(CoveError::ArithOverflow)?;
+        let delta = next.checked_sub(previous).ok_or(CoveError::ArithOverflow)?;
+        let next_offset = offsets
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(u32::try_from(delta).map_err(|_| CoveError::ArithOverflow)?)
+            .ok_or(CoveError::ArithOverflow)?;
+        offsets.push(next_offset);
+    }
+    Ok(())
+}
+
+fn list_child_slice_i32(
+    values: &arrow_array::ArrayRef,
+    offsets: &[i32],
+) -> Result<arrow_array::ArrayRef, CoveError> {
+    let start = usize::try_from(*offsets.first().ok_or(CoveError::PageCorrupt)?)
+        .map_err(|_| CoveError::OffsetRange)?;
+    let end = usize::try_from(*offsets.last().ok_or(CoveError::PageCorrupt)?)
+        .map_err(|_| CoveError::OffsetRange)?;
+    if end < start {
+        return Err(CoveError::PageCorrupt);
+    }
+    Ok(values.slice(start, end - start))
+}
+
+fn list_child_slice_i64(
+    values: &arrow_array::ArrayRef,
+    offsets: &[i64],
+) -> Result<arrow_array::ArrayRef, CoveError> {
+    let start = usize::try_from(*offsets.first().ok_or(CoveError::PageCorrupt)?)
+        .map_err(|_| CoveError::OffsetRange)?;
+    let end = usize::try_from(*offsets.last().ok_or(CoveError::PageCorrupt)?)
+        .map_err(|_| CoveError::OffsetRange)?;
+    if end < start {
+        return Err(CoveError::PageCorrupt);
+    }
+    Ok(values.slice(start, end - start))
+}
+
+fn slice_offsets(
+    offsets: &[u32],
+    start: usize,
+    len: usize,
+) -> Result<(Vec<u32>, usize, usize), CoveError> {
+    let end = start.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+    if end >= offsets.len() {
+        return Err(CoveError::BadSchema(
+            "nested offset range exceeds rows".into(),
+        ));
+    }
+    let base = offsets[start];
+    let child_start = base as usize;
+    let child_end = offsets[end] as usize;
+    let mut normalized = Vec::with_capacity(len + 1);
+    for offset in &offsets[start..=end] {
+        normalized.push(offset.checked_sub(base).ok_or(CoveError::ArithOverflow)?);
+    }
+    Ok((normalized, child_start, child_end - child_start))
+}
+
+fn reordered_child_order(
+    offsets: &[u32],
+    order: &[usize],
+) -> Result<(Vec<u32>, Vec<usize>), CoveError> {
+    let mut new_offsets = Vec::with_capacity(order.len() + 1);
+    let mut child_order = Vec::new();
+    new_offsets.push(0);
+    let mut next_offset = 0u32;
+    for row in order {
+        let start = *offsets
+            .get(*row)
+            .ok_or_else(|| CoveError::BadSchema("nested reorder row out of range".into()))?;
+        let end = *offsets
+            .get(*row + 1)
+            .ok_or_else(|| CoveError::BadSchema("nested reorder row out of range".into()))?;
+        for child_row in start..end {
+            child_order.push(child_row as usize);
+        }
+        next_offset = next_offset
+            .checked_add(end.checked_sub(start).ok_or(CoveError::ArithOverflow)?)
+            .ok_or(CoveError::ArithOverflow)?;
+        new_offsets.push(next_offset);
+    }
+    Ok((new_offsets, child_order))
+}
+
 fn numcode_column(
     logical: CoveLogicalType,
     source_kind: SourceColumnKind,
@@ -2335,6 +4028,263 @@ fn downcast_array<'a, T: 'static>(
     })
 }
 
+fn append_scalar_materialized_array(
+    source_kind: SourceColumnKind,
+    name: &str,
+    values: &mut MaterializedValues,
+    nulls: &mut Vec<bool>,
+    array: &dyn Array,
+) -> Result<(), CoveError> {
+    match source_kind {
+        SourceColumnKind::Boolean => {
+            let array = downcast_array::<BooleanArray>(array, name)?;
+            let values = expect_boolean_values(values)?;
+            append_materialized_values(
+                array.len(),
+                values,
+                nulls,
+                0,
+                |row| array.is_null(row),
+                |row| Ok(u8::from(array.value(row))),
+            )
+        }
+        SourceColumnKind::Int8 => {
+            let array = downcast_array::<Int8Array>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row) as i64 as u64),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::Int16 => {
+            let array = downcast_array::<Int16Array>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row) as i64 as u64),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::Int32 => {
+            let array = downcast_array::<Int32Array>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row) as i64 as u64),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::Int64 => {
+            let array = downcast_array::<Int64Array>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row) as u64),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::UInt8 => {
+            let array = downcast_array::<UInt8Array>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row) as u64),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::UInt16 => {
+            let array = downcast_array::<UInt16Array>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row) as u64),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::UInt32 => {
+            let array = downcast_array::<UInt32Array>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row) as u64),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::UInt64 => {
+            let array = downcast_array::<UInt64Array>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row)),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::Float32 => {
+            let array = downcast_array::<Float32Array>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row).to_bits() as u64),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::Float64 => {
+            let array = downcast_array::<Float64Array>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row).to_bits()),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::Date32 => {
+            let array = downcast_array::<Date32Array>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row) as i64 as u64),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::TimestampSecond => {
+            let array = downcast_array::<TimestampSecondArray>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| {
+                    Ok(array
+                        .value(row)
+                        .checked_mul(1_000_000)
+                        .ok_or(CoveError::ArithOverflow)? as u64)
+                },
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::TimestampMillisecond => {
+            let array = downcast_array::<TimestampMillisecondArray>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| {
+                    Ok(array
+                        .value(row)
+                        .checked_mul(1_000)
+                        .ok_or(CoveError::ArithOverflow)? as u64)
+                },
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::TimestampMicrosecond => {
+            let array = downcast_array::<TimestampMicrosecondArray>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row) as u64),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::TimestampNanosecond => {
+            let array = downcast_array::<TimestampNanosecondArray>(array, name)?;
+            append_numcode_array(
+                array.len(),
+                values,
+                nulls,
+                |row| Ok(array.value(row) as u64),
+                |row| array.is_null(row),
+            )
+        }
+        SourceColumnKind::Utf8 => {
+            let array = downcast_array::<StringArray>(array, name)?;
+            let values = expect_varbytes_values(values)?;
+            append_materialized_values(
+                array.len(),
+                values,
+                nulls,
+                Vec::new(),
+                |row| array.is_null(row),
+                |row| Ok(array.value(row).as_bytes().to_vec()),
+            )
+        }
+        SourceColumnKind::LargeUtf8 => {
+            let array = downcast_array::<LargeStringArray>(array, name)?;
+            let values = expect_varbytes_values(values)?;
+            append_materialized_values(
+                array.len(),
+                values,
+                nulls,
+                Vec::new(),
+                |row| array.is_null(row),
+                |row| Ok(array.value(row).as_bytes().to_vec()),
+            )
+        }
+        SourceColumnKind::Binary => {
+            let array = downcast_array::<BinaryArray>(array, name)?;
+            let values = expect_varbytes_values(values)?;
+            append_materialized_values(
+                array.len(),
+                values,
+                nulls,
+                Vec::new(),
+                |row| array.is_null(row),
+                |row| Ok(array.value(row).to_vec()),
+            )
+        }
+        SourceColumnKind::LargeBinary => {
+            let array = downcast_array::<LargeBinaryArray>(array, name)?;
+            let values = expect_varbytes_values(values)?;
+            append_materialized_values(
+                array.len(),
+                values,
+                nulls,
+                Vec::new(),
+                |row| array.is_null(row),
+                |row| Ok(array.value(row).to_vec()),
+            )
+        }
+        SourceColumnKind::Decimal128 => {
+            let array = downcast_array::<Decimal128Array>(array, name)?;
+            let values = expect_fixed_values(values, 16)?;
+            append_materialized_values(
+                array.len(),
+                values,
+                nulls,
+                vec![0u8; 16],
+                |row| array.is_null(row),
+                |row| Ok(array.value(row).to_le_bytes().to_vec()),
+            )
+        }
+        _ => Err(CoveError::BadSchema(
+            "expected scalar nested source kind".into(),
+        )),
+    }
+}
+
+fn append_numcode_array(
+    len: usize,
+    values: &mut MaterializedValues,
+    nulls: &mut Vec<bool>,
+    value_at: impl FnMut(usize) -> Result<u64, CoveError>,
+    is_null_at: impl FnMut(usize) -> bool,
+) -> Result<(), CoveError> {
+    let values = expect_numcode_values(values)?;
+    append_materialized_values(len, values, nulls, 0, is_null_at, value_at)
+}
+
 fn append_materialized_values<T: Clone>(
     row_count: usize,
     values: &mut Vec<T>,
@@ -2501,7 +4451,7 @@ mod tests {
     use std::{io::Cursor, sync::Arc};
 
     use arrow_array::{
-        builder::{Int32Builder, ListBuilder},
+        builder::{Int32Builder, ListBuilder, Time32MillisecondBuilder},
         ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
         TimestampMicrosecondArray,
     };
@@ -2705,6 +4655,57 @@ mod tests {
     }
 
     #[test]
+    fn emits_payload_aware_aggregate_synopses_when_requested() {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from(vec![10, 20, 10, 30])) as ArrayRef,
+            ),
+            (
+                "city",
+                Arc::new(StringArray::from(vec!["lon", "lon", "par", "lon"])) as ArrayRef,
+            ),
+            (
+                "active",
+                Arc::new(BooleanArray::from(vec![true, false, true, true])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let options = ParquetConversionOptions {
+            dictionary_policy: ParquetDictionaryPolicy::Always,
+            aggregate_policy: ParquetAggregatePolicy::Auto,
+            aggregate_topk_columns: vec!["id".into()],
+            distinct_sketch_columns: vec!["id".into()],
+            quantile_sketch_columns: vec!["id".into()],
+            ..ParquetConversionOptions::default()
+        };
+        let result = convert_parquet_bytes(&parquet_bytes(&batch), &options).unwrap();
+        for expected in [
+            "Count",
+            "MinMax",
+            "Sum",
+            "SumAndCount",
+            "BoolTrueFalseCounts",
+            "FileCodeHistogram",
+            "NumCodeHistogram",
+            "TopK",
+            "DistinctSketch",
+            "QuantileSketch",
+        ] {
+            assert!(
+                result
+                    .report
+                    .aggregate_synopsis_kinds
+                    .iter()
+                    .any(|summary| summary.contains(expected)),
+                "missing aggregate synopsis kind {expected}: {:?}",
+                result.report.aggregate_synopsis_kinds
+            );
+        }
+        assert!(result.report.unsupported_features.is_empty());
+    }
+
+    #[test]
     fn stable_clustering_reorders_rows_deterministically() {
         let batch = RecordBatch::try_from_iter(vec![
             ("id", Arc::new(Int64Array::from(vec![3, 1, 2])) as ArrayRef),
@@ -2856,7 +4857,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_nested_parquet_columns_to_json_fallback() {
+    fn converts_supported_nested_parquet_columns_to_native_pages() {
         let mut builder = ListBuilder::new(Int32Builder::new());
         builder.values().append_value(1);
         builder.values().append_value(2);
@@ -2866,6 +4867,79 @@ mod tests {
         builder.append(true);
         let batch =
             RecordBatch::try_from_iter(vec![("tags", Arc::new(builder.finish()) as ArrayRef)])
+                .unwrap();
+
+        let result =
+            convert_parquet_bytes(&parquet_bytes(&batch), &ParquetConversionOptions::default())
+                .unwrap();
+        assert_eq!(result.report.segment_count, 1);
+        assert!(result.report.nested_shape_fallbacks.is_empty());
+        assert!(result.report.columns[0].pushdown_limited);
+        assert_eq!(result.report.columns[0].fallback, None);
+
+        let report = validate_bytes_with_options(
+            &result.cove_bytes,
+            ValidationOptions {
+                semantic: true,
+                verify_digests: false,
+                allow_unknown_optional_extensions: true,
+                ..ValidationOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(report
+            .validated
+            .footer
+            .sections
+            .iter()
+            .any(|entry| { entry.section_kind == SectionKind::NestedSchema as u16 }));
+
+        let catalog = first_table_catalog(&result.cove_bytes);
+        let column = &catalog.tables[0].columns[0];
+        assert_eq!(column.logical, CoveLogicalType::List);
+        assert_eq!(column.physical, CovePhysicalKind::List);
+
+        let segment_entry = report
+            .validated
+            .footer
+            .sections
+            .iter()
+            .find(|entry| entry.section_kind == SectionKind::TableSegmentData as u16)
+            .unwrap();
+        let segment_bytes = &result.cove_bytes
+            [segment_entry.offset as usize..segment_entry.end_offset().unwrap() as usize];
+        let segment = TableSegmentPayloadV1::parse(segment_bytes).unwrap();
+        let page_index_bytes = &segment_bytes[segment.columns[0].page_index_offset as usize
+            ..(segment.columns[0].page_index_offset + segment.columns[0].page_index_length)
+                as usize];
+        let page_index = ColumnPageIndex::parse(page_index_bytes).unwrap();
+        let page = &page_index.entries[0];
+        let page_wire = &segment_bytes
+            [page.page_offset as usize..(page.page_offset + page.page_length) as usize];
+        let decoded = column_page_payload(page_wire, page).unwrap();
+        let payload = ColumnPagePayloadV1::parse(&decoded).unwrap();
+        let tree = payload.tree().unwrap();
+        assert_eq!(tree.node.physical_kind, CovePhysicalKind::List);
+        assert_eq!(tree.children.len(), 1);
+        assert!(tree
+            .buffer_of_kind(PageBufferKind::ChildLayout)
+            .unwrap()
+            .is_some());
+        assert!(tree.children[0]
+            .buffer_of_kind(PageBufferKind::Values)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn keeps_json_fallback_for_unsupported_nested_child_type() {
+        let mut builder = ListBuilder::new(Time32MillisecondBuilder::new());
+        builder.values().append_value(1_000);
+        builder.values().append_value(2_000);
+        builder.append(true);
+        builder.append(false);
+        let batch =
+            RecordBatch::try_from_iter(vec![("times", Arc::new(builder.finish()) as ArrayRef)])
                 .unwrap();
 
         let result =
@@ -2883,10 +4957,6 @@ mod tests {
         let column = &catalog.tables[0].columns[0];
         assert_eq!(column.logical, CoveLogicalType::Json);
         assert_eq!(column.physical, CovePhysicalKind::VarBytes);
-        assert_eq!(
-            decoded_table_values(&result.cove_bytes, &catalog)[0],
-            vec![json!([1, 2]), Value::Null, json!([3])]
-        );
     }
 
     fn parquet_bytes(batch: &RecordBatch) -> Vec<u8> {

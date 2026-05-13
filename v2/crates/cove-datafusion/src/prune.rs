@@ -10,8 +10,14 @@ use cove_core::{
     zone_stats::NumericStatValue,
     CoveError,
 };
+use cove_coverage::{
+    can_use_proof_for_pruning, coverage_set_payload_checksum, CoverageExactnessV2,
+    CoverageGranularityV2, CoverageProofRecordV2, CoverageProofStrengthV2,
+    CoverageProviderDescriptorV2, CoverageSetEntryV2, CoverageSetV2,
+};
 
 use crate::{
+    coverage_plan::{CoveragePlanDecision, CoveragePredicateAtom, CoveragePredicateExpr},
     dataset_state::DatasetState,
     planner::{
         CovePredicate, FilterPlan, NullPredicateKind, NumericPredicateOp, PredicateLiteral,
@@ -370,6 +376,13 @@ pub fn morsel_pruned(
     if composite_prunes_morsel(state, segment_id, morsel_id, plan) {
         return Ok(true);
     }
+    if let Some(expr) = &plan.coverage_expr {
+        if coverage_expr_decision(state, segment_id, morsel_id, expr)
+            == CoveragePlanDecision::Pruned
+        {
+            return Ok(true);
+        }
+    }
     for filter in &plan.filters {
         if filter_prunes_morsel(state, segment_id, morsel_id, filter)? {
             return Ok(true);
@@ -476,6 +489,9 @@ fn filter_prunes_morsel(
     let Some(predicate) = &filter.predicate else {
         return Ok(false);
     };
+    if coverage_proof_prunes_morsel(state, segment_id, morsel_id, filter, predicate) {
+        return Ok(true);
+    }
     match predicate {
         CovePredicate::Null { column_index, kind } => {
             let column = &state.table().columns[*column_index];
@@ -538,6 +554,349 @@ fn filter_prunes_morsel(
             Ok(true)
         }
         CovePredicate::VarBytesEq { .. } => Ok(false),
+    }
+}
+
+fn coverage_proof_prunes_morsel(
+    state: &DatasetState,
+    segment_id: u32,
+    morsel_id: u32,
+    filter: &FilterPlan,
+    predicate: &CovePredicate,
+) -> bool {
+    let Some(predicate_form_ref) = filter.coverage_predicate_form_ref else {
+        return false;
+    };
+    let Some(column_index) = predicate_column_index(predicate) else {
+        return false;
+    };
+    coverage_atom_prunes_morsel(
+        state,
+        segment_id,
+        morsel_id,
+        &CoveragePredicateAtom {
+            predicate_form_ref,
+            column_index,
+            column_id: state
+                .table()
+                .columns
+                .get(column_index)
+                .map(|column| column.column_id)
+                .unwrap_or(u32::MAX),
+            cache_coverage_set_refs: Vec::new(),
+        },
+    ) == CoveragePlanDecision::Pruned
+}
+
+fn coverage_expr_decision(
+    state: &DatasetState,
+    segment_id: u32,
+    morsel_id: u32,
+    expr: &CoveragePredicateExpr,
+) -> CoveragePlanDecision {
+    match expr {
+        CoveragePredicateExpr::Atom(atom) => {
+            coverage_atom_prunes_morsel(state, segment_id, morsel_id, atom)
+        }
+        CoveragePredicateExpr::And(children) => {
+            let mut saw_unknown = false;
+            for child in children {
+                match coverage_expr_decision(state, segment_id, morsel_id, child) {
+                    CoveragePlanDecision::Pruned => return CoveragePlanDecision::Pruned,
+                    CoveragePlanDecision::Included => {}
+                    CoveragePlanDecision::Unknown => saw_unknown = true,
+                }
+            }
+            if saw_unknown {
+                CoveragePlanDecision::Unknown
+            } else {
+                CoveragePlanDecision::Included
+            }
+        }
+        CoveragePredicateExpr::Or(children) => {
+            let mut saw_unknown = false;
+            for child in children {
+                match coverage_expr_decision(state, segment_id, morsel_id, child) {
+                    CoveragePlanDecision::Pruned => {}
+                    CoveragePlanDecision::Included => return CoveragePlanDecision::Included,
+                    CoveragePlanDecision::Unknown => saw_unknown = true,
+                }
+            }
+            if saw_unknown {
+                CoveragePlanDecision::Unknown
+            } else {
+                CoveragePlanDecision::Pruned
+            }
+        }
+    }
+}
+
+fn coverage_atom_prunes_morsel(
+    state: &DatasetState,
+    segment_id: u32,
+    morsel_id: u32,
+    atom: &CoveragePredicateAtom,
+) -> CoveragePlanDecision {
+    if state.file_count() != 1 {
+        return CoveragePlanDecision::Unknown;
+    }
+    let Ok(file) = state.file(0) else {
+        return CoveragePlanDecision::Unknown;
+    };
+    if !file.visibility().is_all() {
+        return CoveragePlanDecision::Unknown;
+    }
+    if !state
+        .pruning()
+        .predicate_forms
+        .iter()
+        .any(|form| form.predicate_form_id == atom.predicate_form_ref)
+        && !state
+            .pruning()
+            .predicate_forms_with_payloads
+            .iter()
+            .any(|form| form.form.predicate_form_id == atom.predicate_form_ref)
+    {
+        return CoveragePlanDecision::Unknown;
+    };
+    let Some(column) = state.table().columns.get(atom.column_index) else {
+        return CoveragePlanDecision::Unknown;
+    };
+    let table_id = state.table().table_id;
+    let column_id = column.column_id;
+    if atom.column_id != column_id {
+        return CoveragePlanDecision::Unknown;
+    }
+
+    match cached_coverage_atom_decision(state, table_id, segment_id, morsel_id, atom) {
+        CoveragePlanDecision::Unknown => {}
+        decision => return decision,
+    }
+
+    let mut saw_usable = false;
+    for record in state
+        .pruning()
+        .coverage_proofs
+        .iter()
+        .filter(|record| record.predicate_form_ref == atom.predicate_form_ref)
+    {
+        if !coverage_record_usable_for_pruning(record) {
+            continue;
+        }
+        let Some(provider) = state.pruning().coverage_providers.iter().find(|provider| {
+            coverage_provider_matches_filter(
+                provider,
+                record,
+                table_id,
+                column_id,
+                atom.predicate_form_ref,
+            )
+        }) else {
+            continue;
+        };
+        let Some(set) = state
+            .pruning()
+            .coverage_sets
+            .iter()
+            .find(|set| set.header.coverage_set_id == record.coverage_set_id)
+        else {
+            continue;
+        };
+        if !coverage_record_matches_set(record, provider, set, atom.predicate_form_ref) {
+            continue;
+        }
+        if !coverage_set_payload_matches(record, set) {
+            continue;
+        }
+        if !coverage_set_supports_morsel_pruning(set) {
+            continue;
+        }
+        saw_usable = true;
+        if !coverage_set_covers_morsel(set, 0, table_id, segment_id, morsel_id) {
+            return CoveragePlanDecision::Pruned;
+        }
+    }
+    if saw_usable {
+        CoveragePlanDecision::Included
+    } else {
+        CoveragePlanDecision::Unknown
+    }
+}
+
+fn cached_coverage_atom_decision(
+    state: &DatasetState,
+    table_id: u32,
+    segment_id: u32,
+    morsel_id: u32,
+    atom: &CoveragePredicateAtom,
+) -> CoveragePlanDecision {
+    if atom.cache_coverage_set_refs.is_empty() {
+        return CoveragePlanDecision::Unknown;
+    }
+    let mut saw_usable = false;
+    for coverage_set_ref in &atom.cache_coverage_set_refs {
+        let Some(set) = state
+            .pruning()
+            .coverage_sets
+            .iter()
+            .find(|set| set.header.coverage_set_id == *coverage_set_ref)
+        else {
+            continue;
+        };
+        if set.header.predicate_form_ref != atom.predicate_form_ref
+            || set.header.exactness.may_under_include()
+            || !set.header.proof_strength.allows_pruning()
+            || !coverage_set_supports_morsel_pruning(set)
+        {
+            continue;
+        }
+        saw_usable = true;
+        if !coverage_set_covers_morsel(set, 0, table_id, segment_id, morsel_id) {
+            return CoveragePlanDecision::Pruned;
+        }
+    }
+    if saw_usable {
+        CoveragePlanDecision::Included
+    } else {
+        CoveragePlanDecision::Unknown
+    }
+}
+
+fn predicate_column_index(predicate: &CovePredicate) -> Option<usize> {
+    match predicate {
+        CovePredicate::Null { column_index, .. }
+        | CovePredicate::Numeric { column_index, .. }
+        | CovePredicate::FileCodeIn { column_index, .. }
+        | CovePredicate::VarBytesEq { column_index, .. } => Some(*column_index),
+    }
+}
+
+fn coverage_record_usable_for_pruning(record: &CoverageProofRecordV2) -> bool {
+    can_use_proof_for_pruning(record)
+        && coverage_strength_is_exact(record.proof_strength)
+        && matches!(
+            record.exactness,
+            CoverageExactnessV2::Exact | CoverageExactnessV2::ApproximateOverInclusiveOnly
+        )
+}
+
+fn coverage_provider_matches_filter(
+    provider: &CoverageProviderDescriptorV2,
+    record: &CoverageProofRecordV2,
+    table_id: u32,
+    column_id: u32,
+    predicate_form_ref: u32,
+) -> bool {
+    provider.provider_id == record.provider_id
+        && provider.referenced_table_id == table_id
+        && provider.referenced_column_id == column_id
+        && provider.snapshot_validity_ref == record.snapshot_validity_ref
+        && provider.granularity == record.granularity
+        && provider.proof_strength == record.proof_strength
+        && provider.exactness == record.exactness
+        && provider.null_semantics == record.null_semantics
+        && provider.null_semantics != 255
+        && coverage_strength_is_exact(provider.proof_strength)
+        && !provider.exactness.may_under_include()
+        && (provider.predicate_form_ref == u32::MAX
+            || provider.predicate_form_ref == predicate_form_ref)
+}
+
+fn coverage_record_matches_set(
+    record: &CoverageProofRecordV2,
+    provider: &CoverageProviderDescriptorV2,
+    set: &CoverageSetV2,
+    predicate_form_ref: u32,
+) -> bool {
+    set.header.provider_id == provider.provider_id
+        && set.header.provider_id == record.provider_id
+        && set.header.coverage_set_id == record.coverage_set_id
+        && set.header.predicate_form_ref == predicate_form_ref
+        && set.header.snapshot_validity_ref == record.snapshot_validity_ref
+        && set.header.snapshot_validity_ref == provider.snapshot_validity_ref
+        && set.header.proof_strength == record.proof_strength
+        && set.header.exactness == record.exactness
+        && set.header.granularity == record.granularity
+}
+
+fn coverage_set_payload_matches(record: &CoverageProofRecordV2, set: &CoverageSetV2) -> bool {
+    let Ok(bytes) = set.serialize() else {
+        return false;
+    };
+    let checksum = coverage_set_payload_checksum(&bytes);
+    record.validate_against_coverage_set(set, checksum).is_ok()
+}
+
+fn coverage_strength_is_exact(strength: CoverageProofStrengthV2) -> bool {
+    matches!(
+        strength,
+        CoverageProofStrengthV2::ExactTight | CoverageProofStrengthV2::ExactConservative
+    )
+}
+
+fn coverage_set_supports_morsel_pruning(set: &CoverageSetV2) -> bool {
+    coverage_granularity_maps_to_morsels(set.header.granularity)
+        && set
+            .entries
+            .iter()
+            .all(|entry| coverage_granularity_maps_to_morsels(entry.target_kind))
+}
+
+fn coverage_granularity_maps_to_morsels(granularity: CoverageGranularityV2) -> bool {
+    matches!(
+        granularity,
+        CoverageGranularityV2::Dataset
+            | CoverageGranularityV2::File
+            | CoverageGranularityV2::Segment
+            | CoverageGranularityV2::Page
+            | CoverageGranularityV2::Morsel
+            | CoverageGranularityV2::RowRange
+            | CoverageGranularityV2::RowOrdinalSet
+    )
+}
+
+fn coverage_set_covers_morsel(
+    set: &CoverageSetV2,
+    current_file_ref: u32,
+    table_id: u32,
+    segment_id: u32,
+    morsel_id: u32,
+) -> bool {
+    set.entries.iter().any(|entry| {
+        coverage_entry_covers_morsel(entry, current_file_ref, table_id, segment_id, morsel_id)
+    })
+}
+
+fn coverage_entry_covers_morsel(
+    entry: &CoverageSetEntryV2,
+    current_file_ref: u32,
+    table_id: u32,
+    segment_id: u32,
+    morsel_id: u32,
+) -> bool {
+    match entry.target_kind {
+        CoverageGranularityV2::Dataset => true,
+        CoverageGranularityV2::File => entry.file_ref == current_file_ref,
+        CoverageGranularityV2::Segment => {
+            entry.file_ref == current_file_ref
+                && entry.table_id == table_id
+                && entry.segment_id == segment_id
+        }
+        CoverageGranularityV2::Morsel => {
+            entry.file_ref == current_file_ref
+                && entry.table_id == table_id
+                && entry.segment_id == segment_id
+                && entry.morsel_id == morsel_id
+        }
+        CoverageGranularityV2::Page | CoverageGranularityV2::RowRange => {
+            entry.file_ref == current_file_ref
+                && entry.table_id == table_id
+                && entry.segment_id == segment_id
+        }
+        CoverageGranularityV2::RowOrdinalSet => {
+            entry.file_ref == current_file_ref && entry.table_id == table_id
+        }
+        _ => false,
     }
 }
 
@@ -705,7 +1064,8 @@ fn numeric_stat_value(literal: PredicateLiteral) -> Result<NumericStatValue, Cov
 
 #[cfg(test)]
 mod tests {
-    use super::CandidateSet;
+    use super::{coverage_entry_covers_morsel, coverage_granularity_maps_to_morsels, CandidateSet};
+    use cove_coverage::{CoverageGranularityV2, CoverageSetEntryV2};
 
     #[test]
     fn candidate_sets_intersect_all_sparse_and_bitmap() {
@@ -781,5 +1141,53 @@ mod tests {
                 bits: vec![0b1010, 0b10010],
             }
         );
+    }
+
+    #[test]
+    fn coverage_entries_map_only_safe_granularities_to_morsels() {
+        let segment = coverage_entry(CoverageGranularityV2::Segment, 0, 7, 2, u32::MAX);
+        let morsel = coverage_entry(CoverageGranularityV2::Morsel, 0, 7, 2, 3);
+        let page = coverage_entry(CoverageGranularityV2::Page, 0, 7, 2, u32::MAX);
+        let row_range = coverage_entry(CoverageGranularityV2::RowRange, 0, 7, 2, u32::MAX);
+
+        assert!(coverage_entry_covers_morsel(&segment, 0, 7, 2, 0));
+        assert!(!coverage_entry_covers_morsel(&segment, 0, 7, 3, 0));
+        assert!(coverage_entry_covers_morsel(&morsel, 0, 7, 2, 3));
+        assert!(!coverage_entry_covers_morsel(&morsel, 0, 7, 2, 4));
+        assert!(coverage_entry_covers_morsel(&page, 0, 7, 2, 99));
+        assert!(coverage_entry_covers_morsel(&row_range, 0, 7, 2, 99));
+        assert!(!coverage_entry_covers_morsel(&row_range, 1, 7, 2, 99));
+        assert!(coverage_granularity_maps_to_morsels(
+            CoverageGranularityV2::RowRange
+        ));
+        assert!(!coverage_granularity_maps_to_morsels(
+            CoverageGranularityV2::RowGroup
+        ));
+    }
+
+    fn coverage_entry(
+        target_kind: CoverageGranularityV2,
+        file_ref: u32,
+        table_id: u32,
+        segment_id: u32,
+        morsel_id: u32,
+    ) -> CoverageSetEntryV2 {
+        CoverageSetEntryV2 {
+            target_kind,
+            flags: 0,
+            file_ref,
+            table_id,
+            segment_id,
+            morsel_id,
+            page_ref: u32::MAX,
+            object_type_id: u32::MAX,
+            path_ref: u32::MAX,
+            dimensional_bucket_ref: u32::MAX,
+            row_start: 0,
+            row_count: 1,
+            row_ordinal_bitmap_ref: u32::MAX,
+            byte_range_ref: u32::MAX,
+            checksum: 0,
+        }
     }
 }

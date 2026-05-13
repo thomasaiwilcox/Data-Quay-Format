@@ -553,6 +553,8 @@ impl TableSegmentPayloadV1 {
                         physical_kind: column.physical_kind,
                         dictionary: None,
                         zone_stats: None,
+                        codec_descriptors: &[],
+                        nested_schema: None,
                     };
                     validate_column_page_wire(&context, &page, page_wire)?;
                 }

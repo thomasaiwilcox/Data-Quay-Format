@@ -5,7 +5,7 @@
 //! Spec §69:
 //!
 //! * The file ends with the pattern
-//!   `[postscript bytes][postscript_version: u16][postscript_len: u16][magic: "CVM1"]`.
+//!   `[postscript bytes][postscript_version: u16][postscript_len: u16][magic: "CVM2"]`.
 //! * The header is [`CovmHeaderV1`] (Spec §69.1) carrying a `dataset_id`,
 //!   `table_count`, `file_count`, and a CRC32C checksum.
 //! * Each file is described by a [`CovmFileEntryV1`] (Spec §69.2) with
@@ -36,10 +36,10 @@ use crate::error::CoveError;
 ///       + created_at_us(8) + reserved(32) + checksum(4) = 82.
 pub const COVM_HEADER_LEN: u16 = 82;
 
-/// Required `version_major` for COVM v1.
+/// Required artifact header `version_major` for COVM v2.
 pub const COVM_VERSION_MAJOR_V1: u16 = 1;
 
-/// Required `version_minor` for COVM v1.
+/// Required artifact header `version_minor` for COVM v2.
 pub const COVM_VERSION_MINOR_V1: u16 = 0;
 
 /// Encoded length of [`CovmPostscriptV1`] in bytes (implementation-defined
@@ -47,7 +47,7 @@ pub const COVM_VERSION_MINOR_V1: u16 = 0;
 /// standardised by Spec §69).
 pub const COVM_POSTSCRIPT_LEN: u16 = 48;
 
-/// Postscript version field value for COVM v1.
+/// Postscript version field value for COVM v2.
 pub const COVM_POSTSCRIPT_VERSION_V1: u16 = POSTSCRIPT_VERSION_V1;
 
 /// Size of the fixed tail after the postscript payload.
@@ -58,15 +58,15 @@ pub const COVM_POSTSCRIPT_TAIL_SIZE: usize = 2 + 2 + 4;
 /// Spec §69.1 `CovmHeaderV1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CovmHeaderV1 {
-    /// Magic bytes — MUST equal [`MAGIC_COVM`] (`"CVM1"`).
+    /// Magic bytes — MUST equal [`MAGIC_COVM`] (`"CVM2"`).
     pub magic: [u8; 4],
-    /// Header length in bytes — MUST equal [`COVM_HEADER_LEN`] for v1.
+    /// Header length in bytes — MUST equal [`COVM_HEADER_LEN`] for the v2 artifact.
     pub header_len: u16,
-    /// Major version — MUST equal [`COVM_VERSION_MAJOR_V1`] for v1.
+    /// Major version — MUST equal [`COVM_VERSION_MAJOR_V1`] for the v2 artifact.
     pub version_major: u16,
-    /// Minor version — MUST equal [`COVM_VERSION_MINOR_V1`] for v1.
+    /// Minor version — MUST equal [`COVM_VERSION_MINOR_V1`] for the v2 artifact.
     pub version_minor: u16,
-    /// Header flags (reserved; v1 readers ignore unknown bits).
+    /// Header flags reserved for future artifact versions.
     pub flags: u32,
     /// Stable identifier for this dataset.
     pub dataset_id: [u8; 16],
@@ -76,7 +76,7 @@ pub struct CovmHeaderV1 {
     pub file_count: u32,
     /// Creation timestamp in microseconds since the Unix epoch.
     pub created_at_us: i64,
-    /// Reserved — MUST be zero in v1.
+    /// Reserved — MUST be zero in the v2 artifact.
     pub reserved: [u8; 32],
     /// CRC32C of the 82-byte header with this `checksum` field zeroed.
     pub checksum: u32,

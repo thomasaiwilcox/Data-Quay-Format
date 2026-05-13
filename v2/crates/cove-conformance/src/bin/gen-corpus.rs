@@ -10,7 +10,7 @@ mod gen_corpus_support;
 use std::{collections::BTreeSet, fs, io::Cursor, path::PathBuf, sync::Arc};
 
 use arrow_array::{
-    builder::{Int32Builder, ListBuilder},
+    builder::{ListBuilder, Time32MillisecondBuilder},
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Float64Array, Int64Array, RecordBatch,
     StringArray, TimestampMicrosecondArray,
 };
@@ -37,9 +37,10 @@ use cove_core::{
         CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind, DigestAlgorithm,
         PrimaryProfile, SectionKind, StorageClass, ValueTag, FEATURE_CODEC_EXTENSION_REGISTRY,
         FEATURE_CODEC_LZ4, FEATURE_CODEC_ZSTD, FEATURE_COLUMN_DOMAINS, FEATURE_ENGINE_PROFILE,
-        FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE, FEATURE_LAYOUT_PLAN,
-        FEATURE_OBJECT_PROFILE, FEATURE_PAGE_PAYLOAD_ELISION, FEATURE_SEMANTIC_MAP,
-        FEATURE_TABLE_PROFILE, FEATURE_TRUST_CHAIN, FEATURE_ZERO_COPY_BUFFER_MAP,
+        FEATURE_EXTENDED_FEATURE_SET, FEATURE_FILE_DICTIONARY, FEATURE_HARBOR_PROFILE,
+        FEATURE_LAYOUT_PLAN, FEATURE_OBJECT_PROFILE, FEATURE_PAGE_PAYLOAD_ELISION,
+        FEATURE_REGISTERED_ENCODINGS, FEATURE_SEMANTIC_MAP, FEATURE_TABLE_PROFILE,
+        FEATURE_TRUST_CHAIN, FEATURE_ZERO_COPY_BUFFER_MAP,
     },
     dictionary::{FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
     digest::{compute_digest, DigestEntry, DigestManifest, DigestScope, DigestTargetKind},
@@ -67,10 +68,18 @@ use cove_core::{
         SectionFeatureBindingPayloadRefV2, SectionFeatureBindingSectionHeaderV2,
         SectionFeatureBindingSectionV2, SectionFeatureBindingV2,
     },
+    feature_scope::{
+        cove_column_page_target_ref, ExtendedFeatureSetHeaderV2, ExtendedFeatureSetV2,
+        ProfileCapabilityEntryV2, ProfileCapabilityMatrixHeaderV2, ProfileCapabilityMatrixV2,
+    },
     footer::{CoveFooterHeaderV1, CoveSectionEntryV1, FOOTER_HEADER_SIZE, SECTION_ENTRY_SIZE},
     header::{CoveHeaderV1, HEADER_SIZE},
     index::{
-        aggregate::{AggregateEntry, SynopsisAccuracy, SynopsisKind},
+        aggregate::{
+            AggregateEntry, AggregatePayloadV2, AggregateSynopsis, HistogramBucket,
+            NumericAggregateOverflowPolicy, SynopsisAccuracy, SynopsisKind, TaggedCanonicalValue,
+            DEFAULT_HLL_PRECISION, DEFAULT_KLL_K,
+        },
         bloom::{
             BloomAlgorithm, BloomGranularity, BloomHashDomain, BloomIndexHeaderV1,
             BLOOM_INDEX_HEADER_LEN,
@@ -95,9 +104,14 @@ use cove_core::{
     interop::lakehouse::{LakehouseHints, LakehouseVisibilityOverlayRef},
     io_hints::defaults_object_store,
     kernel::{KernelCapabilities, KernelCapabilityEntry},
+    nested_schema::{NestedSchemaEntryV1, NestedSchemaNodeV1, NestedSchemaSectionV1},
     page::{
         ColumnPageIndexEntryV1, COLUMN_PAGE_INDEX_ENTRY_LEN, PAGE_FLAG_ALL_NON_NULL,
         PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT, PAGE_FLAG_VALUE_STREAM_ELIDED,
+    },
+    page_payload::{
+        ColumnPagePayloadV1, CoveEncodingNodeV1, PageBufferKind, COLUMN_PAGE_PAYLOAD_HEADER_LEN,
+        COVE_ENCODING_NODE_LEN, PAGE_BUFFER_DESCRIPTOR_LEN,
     },
     postscript::{CovePostscriptV1, POSTSCRIPT_SIZE, POSTSCRIPT_TOTAL_SIZE},
     profile::{
@@ -140,14 +154,26 @@ use cove_coverage::{
     PredicateNormalFormV2, COVERAGE_PLAN_FLAG_MAY_UNDER_INCLUDE,
     COVERAGE_PLAN_FLAG_PRUNING_CANDIDATE,
 };
-use cove_index::{CoviArtifactV2, CoviSectionKindV2, COVI_HEADER_LEN, COVI_SECTION_ENTRY_LEN};
-use cove_index::{IndexCapabilityExactnessV2, IndexCapabilityV2, IndexOnlyCapabilityV2};
+use cove_index::{
+    CoviAggregateAnswerBlockHeaderV2, CoviAggregateAnswerBlockV2, CoviAggregateAnswerV2,
+    CoviArtifactV2, CoviByteRangePostingV2, CoviComparatorKindV2, CoviDimensionalBucketPostingV2,
+    CoviEntryBlockHeaderV2, CoviEntryBlockV2, CoviFileRefPostingV2, CoviIndexEntryV2,
+    CoviIndexKindV2, CoviIndexRootV2, CoviIndexedTargetKindV2, CoviKeyBlockHeaderV2,
+    CoviKeyBlockV2, CoviKeyEncodingKindV2, CoviMorselRefPostingV2, CoviObjectPathPostingV2,
+    CoviPageRefPostingV2, CoviPostingRepresentationV2, CoviPostingsBlockHeaderV2,
+    CoviPostingsBlockV2, CoviPostingsHeaderV2, CoviReferencedFileV2, CoviRowOrdinalSetHeaderV2,
+    CoviRowRangePostingV2, CoviSectionKindV2, CoviSectionPayloadV2, CoviSegmentRefPostingV2,
+    CoviSnapshotValidityV2, IndexCapabilityExactnessV2, IndexCapabilityV2, IndexOnlyCapabilityV2,
+    COVI_HEADER_LEN, COVI_SECTION_ENTRY_LEN,
+};
 use cove_layout::{
-    LayoutPlanHeaderV2, LayoutPlanNodeV2, LayoutPlanV2, ScanSplitEntryV2, ScanSplitIndexHeaderV2,
-    ScanSplitIndexV2, ZeroCopyBufferMapEntryV2, ZeroCopyBufferMapHeaderV2, ZeroCopyBufferMapV2,
-    ZeroCopyDictionarySemanticsV2, ZeroCopyLifetimeScopeV2, ZeroCopyNestedLayoutKindV2,
-    ZeroCopyNullBitmapPolarityV2, ZeroCopySourceBufferRoleV2, ZeroCopyTargetBufferRoleV2,
-    ZeroCopyTargetV2,
+    build_default_layout_plan, build_default_scan_split_index, FastMetadataIndexEntryV2,
+    FastMetadataIndexHeaderV2, FastMetadataIndexV2, LayoutPlanHeaderV2, LayoutPlanNodeV2,
+    PageClusterDirectoryHeaderV2, PageClusterDirectoryV2, PageClusterEntryV2, ScanSplitEntryV2,
+    ScanSplitIndexHeaderV2, ZeroCopyBufferMapEntryV2, ZeroCopyBufferMapHeaderV2,
+    ZeroCopyBufferMapV2, ZeroCopyDictionarySemanticsV2, ZeroCopyLifetimeScopeV2,
+    ZeroCopyNestedLayoutKindV2, ZeroCopyNullBitmapPolarityV2, ZeroCopySourceBufferRoleV2,
+    ZeroCopyTargetBufferRoleV2, ZeroCopyTargetV2,
 };
 use cove_runtime::{RuntimeCompatibilityHintV2, RuntimeHintKindV2};
 use serde_json::{json, Value};
@@ -210,6 +236,71 @@ fn main() {
             &["§24", "§25", "§26", "§27", "§72.2", "§72.3", "§73"],
         ),
         cove_t_scan_table_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/cove_t_registered_stable_codec_valid.cove",
+            "cove",
+            "accept",
+            None,
+            &["§20.8", "§20.9", "§72.2", "§73"],
+        ),
+        cove_t_registered_codec_file(RegisteredFixtureKind::SupportedStable),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/cove_t_registered_unsupported_with_fallback.cove",
+            "cove",
+            "accept",
+            None,
+            &["§20.9", "§72.2", "§73"],
+        ),
+        cove_t_registered_codec_file(RegisteredFixtureKind::UnsupportedWithFallback),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_t_registered_required_without_fallback.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_CODEC_UNSUPPORTED"),
+            &["§20.9", "§72.2", "§73"],
+        ),
+        cove_t_registered_codec_file(RegisteredFixtureKind::UnsupportedNoFallback),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_t_registered_fallback_mismatch.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_BAD_CODEC_EXTENSION"),
+            &["§20.8", "§20.9", "§73"],
+        ),
+        cove_t_registered_codec_file(RegisteredFixtureKind::FallbackMismatch),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_t_registered_malformed_envelope.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_CHECKSUM_MISMATCH"),
+            &["§20.9", "§73"],
+        ),
+        cove_t_registered_codec_file(RegisteredFixtureKind::MalformedEnvelope),
     );
 
     write_fixture(
@@ -532,13 +623,19 @@ fn main() {
     );
     parquet_nested["table_name"] = json!("parquet_nested_json");
     parquet_nested["namespace"] = json!("interop");
-    parquet_nested["expected_row_count"] = json!(3u64);
+    parquet_nested["expected_row_count"] = json!(2u64);
     parquet_nested["expected_columns"] = json!([
         {
-            "name": "tags",
+            "name": "times",
             "logical": "Json",
             "physical": "VarBytes",
-            "values": [[1, 2], [], [3]]
+            "values": [
+                [
+                    "unsupported Arrow JSON fallback value for Time32(Millisecond): PrimitiveArray<Time32(ms)>\n[\n  00:00:01,\n]",
+                    "unsupported Arrow JSON fallback value for Time32(Millisecond): PrimitiveArray<Time32(ms)>\n[\n  00:00:02,\n]"
+                ],
+                null
+            ]
         }
     ]);
     write_fixture(
@@ -2099,7 +2196,7 @@ fn main() {
         page_codec_fixture_bytes(json!({
             "codec": "none",
             "payload": "abcdef",
-            // Reserved bits above the codec byte must be zero in v1.0.
+            // Reserved bits above the codec byte must be zero in the v2 page format.
             "flags_override": 0x0000_1000u64,
             "expect": "parse_reject"
         })),
@@ -2511,6 +2608,19 @@ fn main() {
             &["§34"],
         ),
         aggregate_synopsis_payload(123),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "accept/aggregate_synopsis_all_payloads_valid.bin",
+            "aggregate_synopsis",
+            "accept",
+            None,
+            &["§34"],
+        ),
+        aggregate_synopsis_all_payloads(),
     );
 
     write_fixture(
@@ -3370,6 +3480,32 @@ fn main() {
         &root,
         &mut entries,
         fixture(
+            "reject/cove_t_nested_missing_schema.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_BAD_SCHEMA"),
+            &["§24", "§52", "§73", "§76"],
+        ),
+        cove_t_nested_missing_schema_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
+            "reject/cove_t_nested_mismatched_schema.cove",
+            "cove",
+            "reject",
+            Some("COVE_E_BAD_SCHEMA"),
+            &["§24", "§52", "§73", "§76"],
+        ),
+        cove_t_nested_mismatched_schema_file(),
+    );
+
+    write_fixture(
+        &root,
+        &mut entries,
+        fixture(
             "reject/cove_t_nested_list_bad_child_count.cove",
             "cove",
             "reject",
@@ -4133,6 +4269,62 @@ fn main() {
         aggregate_synopsis_unknown_kind_payload(),
     );
 
+    for (path, payload) in [
+        (
+            "reject/aggregate_synopsis_bad_payload_bounds.bin",
+            aggregate_synopsis_bad_payload_bounds(),
+        ),
+        (
+            "reject/aggregate_synopsis_bad_payload_checksum.bin",
+            aggregate_synopsis_bad_payload_checksum(),
+        ),
+        (
+            "reject/aggregate_synopsis_wrong_kind_payload_pairing.bin",
+            aggregate_synopsis_wrong_kind_payload_pairing(),
+        ),
+        (
+            "reject/aggregate_synopsis_unsorted_histogram_keys.bin",
+            aggregate_synopsis_unsorted_histogram_keys(),
+        ),
+        (
+            "reject/aggregate_synopsis_duplicate_histogram_keys.bin",
+            aggregate_synopsis_duplicate_histogram_keys(),
+        ),
+        (
+            "reject/aggregate_synopsis_count_sum_mismatch.bin",
+            aggregate_synopsis_count_sum_mismatch(),
+        ),
+        (
+            "reject/aggregate_synopsis_invalid_canonical_value.bin",
+            aggregate_synopsis_invalid_canonical_value(),
+        ),
+        (
+            "reject/aggregate_synopsis_approximate_marked_exact.bin",
+            aggregate_synopsis_approximate_marked_exact(),
+        ),
+        (
+            "reject/aggregate_synopsis_bad_hll_header.bin",
+            aggregate_synopsis_bad_hll_header(),
+        ),
+        (
+            "reject/aggregate_synopsis_bad_kll_header.bin",
+            aggregate_synopsis_bad_kll_header(),
+        ),
+    ] {
+        write_fixture(
+            &root,
+            &mut entries,
+            fixture(
+                path,
+                "aggregate_synopsis",
+                "reject",
+                Some("COVE_E_BAD_INDEX"),
+                &["§34", "§76"],
+            ),
+            payload,
+        );
+    }
+
     write_fixture(
         &root,
         &mut entries,
@@ -4624,7 +4816,7 @@ fn main() {
             "accept/suite_manifest_contract.json",
             json!({
                 "op": "manifest_sections_present",
-                "sections": ["§8", "§10", "§12", "§20", "§37", "§45", "§46", "§47", "§51", "§61", "§62", "§70.2", "§70.3", "§70.5", "§70.6", "§70.8", "§70.9", "§70.10", "§70.12", "§70.13", "§70.14", "§72.8", "§74", "§75", "§76", "§77", "§78", "§79"],
+                "sections": ["§8", "§10", "§12", "§20", "§37", "§45", "§46", "§47", "§51", "§61", "§62", "§70.2", "§70.3", "§70.5", "§70.6", "§70.8", "§70.9", "§70.10", "§70.12", "§70.13", "§70.14", "§72.8", "§74", "§75", "§76", "§77", "§78", "§79", "§80"],
                 "minimum_accept": 1,
                 "minimum_reject": 1,
             }),
@@ -4637,7 +4829,20 @@ fn main() {
                     "cargo fmt --check",
                     "cargo test --workspace",
                     "cargo test -p cove-convert-parquet",
+                    "cargo run -p cove-core --bin cove-profile -- inspect conformance/accept/cove_t_scan_table.cove > /dev/null",
+                    "cargo run -p cove-core --bin cove-canonicalise -- validate-payload --tag int64 --hex 2a00000000000000 > /dev/null",
+                    "cargo run -p cove-core --bin cove-verify-digest -- conformance/accept/cove_t_scan_table.cove > /dev/null",
+                    "cargo run -p cove-core --bin cove-build-covm -- /tmp/cove-release-gate.covm conformance/accept/cove_t_scan_table.cove > /dev/null",
+                    "cargo run -p cove-core --bin cove-build-covx -- /tmp/cove-release-gate.covx conformance/accept/cove_t_scan_table.cove > /dev/null",
+                    "cargo run -p cove-datafusion --bin cove-explain-pruning -- conformance/accept/cove_t_scan_table.cove > /dev/null",
+                    "cargo run -p cove-datafusion --bin cove-plan-cost -- --execute conformance/accept/cove_t_scan_table.cove > /dev/null",
+                    "cargo run -p cove-datafusion --bin cove-arrow-export -- conformance/accept/cove_t_scan_table.cove /tmp/cove-release-gate.arrow --report /tmp/cove-release-gate-arrow-export.json > /dev/null",
+                    "cargo run -p cove-convert-parquet --bin cove-conversion-report -- conformance/accept/parquet_primitives_valid.parquet > /dev/null",
+                    "cargo run -p cove-convert-parquet --bin cove-convert-arrow -- /tmp/cove-release-gate.arrow /tmp/cove-release-gate-arrow.cove > /dev/null",
+                    "cargo run -p cove-convert-parquet --bin cove-convert-orc -- --help > /dev/null 2>&1",
+                    "cargo run -p cove-map --bin cove-map-plan-keys -- --help > /dev/null 2>&1",
                     "cargo run -p cove-bench --bin cove-bench > /dev/null",
+                    "cargo run -p cove-fuzz --bin cove-fuzz -- smoke > /dev/null",
                     "cargo run -p cove-conformance --bin gen-corpus -- --check",
                     "cargo run -p cove-conformance --bin gen-capability-matrix -- --check",
                     "cargo run -p cove-conformance --bin cove-conformance -- conformance/"
@@ -4656,7 +4861,8 @@ fn main() {
                     "crates/cove-convert-parquet",
                     "crates/cove-conformance",
                     "crates/cove-map",
-                    "crates/cove-bench"
+                    "crates/cove-bench",
+                    "crates/cove-fuzz"
                 ],
             }),
         ),
@@ -4664,7 +4870,13 @@ fn main() {
         write_fixture(
             &root,
             &mut entries,
-            fixture(path, "suite_contract_case", "accept", None, &["§78", "§79"]),
+            fixture(
+                path,
+                "suite_contract_case",
+                "accept",
+                None,
+                &["§78", "§79", "§80.2", "§80.3A"],
+            ),
             suite_contract_fixture_bytes(value),
         );
     }
@@ -4948,15 +5160,13 @@ fn parquet_nullable_valid_file() -> Vec<u8> {
 }
 
 fn parquet_nested_unsupported_file() -> Vec<u8> {
-    let mut builder = ListBuilder::new(Int32Builder::new());
-    builder.values().append_value(1);
-    builder.values().append_value(2);
+    let mut builder = ListBuilder::new(Time32MillisecondBuilder::new());
+    builder.values().append_value(1_000);
+    builder.values().append_value(2_000);
     builder.append(true);
-    builder.append(true);
-    builder.values().append_value(3);
-    builder.append(true);
-    let batch =
-        RecordBatch::try_from_iter(vec![("tags", Arc::new(builder.finish()) as ArrayRef)]).unwrap();
+    builder.append(false);
+    let batch = RecordBatch::try_from_iter(vec![("times", Arc::new(builder.finish()) as ArrayRef)])
+        .unwrap();
     parquet_file_bytes(&batch)
 }
 
@@ -5136,6 +5346,171 @@ fn cove_with_unknown_required_feature() -> Vec<u8> {
     bytes
 }
 
+fn feature_scope_use_fixture(
+    path: &str,
+    expect: &str,
+    error_code: Option<&str>,
+    requested_profile: Option<u8>,
+    requested_operation: Option<OperationKindV2>,
+    needed_sections: &[u32],
+    needed_pages: &[(u32, u64)],
+) -> Value {
+    let mut entry = fixture(
+        path,
+        "feature_scope_use_case",
+        expect,
+        error_code,
+        &["§11.1", "§11.2", "§11.3", "§73"],
+    );
+    if let Some(profile) = requested_profile {
+        entry["requested_profile"] = json!(profile);
+    }
+    if let Some(operation) = requested_operation {
+        entry["requested_operation"] = json!(operation as u16);
+    }
+    if !needed_sections.is_empty() {
+        entry["needed_sections"] = json!(needed_sections);
+    }
+    if !needed_pages.is_empty() {
+        entry["needed_pages"] = json!(needed_pages
+            .iter()
+            .map(|(section_id, target)| json!([section_id, target]))
+            .collect::<Vec<_>>());
+    }
+    entry
+}
+
+const UNKNOWN_EXTENDED_FEATURE: u64 = 1;
+
+fn cove_with_operation_scoped_unknown_feature() -> Vec<u8> {
+    cove_with_scoped_unknown_feature(scoped_feature_entry(
+        FeatureScopeV2::OperationRequired,
+        PrimaryProfile::TableScan as u8,
+        OperationKindV2::CoveragePlanning,
+        0,
+        u64::MAX,
+    ))
+}
+
+fn cove_with_section_scoped_unknown_feature() -> Vec<u8> {
+    cove_with_scoped_unknown_feature(scoped_feature_entry(
+        FeatureScopeV2::SectionRequired,
+        PrimaryProfile::TableScan as u8,
+        OperationKindV2::None,
+        3,
+        u64::MAX,
+    ))
+}
+
+fn cove_with_page_scoped_unknown_feature() -> Vec<u8> {
+    cove_with_scoped_unknown_feature(scoped_feature_entry(
+        FeatureScopeV2::PageRequired,
+        PrimaryProfile::TableScan as u8,
+        OperationKindV2::None,
+        3,
+        cove_column_page_target_ref(11, 12),
+    ))
+}
+
+fn scoped_feature_entry(
+    scope: FeatureScopeV2,
+    profile: u8,
+    operation_kind: OperationKindV2,
+    section_id: u32,
+    target_local_ref: u64,
+) -> ProfileCapabilityEntryV2 {
+    ProfileCapabilityEntryV2 {
+        profile,
+        scope,
+        operation_kind,
+        global_feature_word_index: 1,
+        required_mask: UNKNOWN_EXTENDED_FEATURE,
+        optional_mask: 0,
+        section_id,
+        target_local_ref,
+        flags: 0,
+        reserved: 0,
+        checksum: 0,
+    }
+}
+
+fn cove_with_scoped_unknown_feature(entry: ProfileCapabilityEntryV2) -> Vec<u8> {
+    let required_features = FEATURE_TABLE_PROFILE | FEATURE_EXTENDED_FEATURE_SET;
+    let extended = ExtendedFeatureSetV2 {
+        header: ExtendedFeatureSetHeaderV2 {
+            word_count: 2,
+            required_word_count: 2,
+            optional_word_count: 1,
+            flags: 0,
+            checksum: 0,
+        },
+        required_feature_words: vec![required_features, UNKNOWN_EXTENDED_FEATURE],
+        optional_feature_words: vec![0],
+    }
+    .serialize()
+    .unwrap();
+    let matrix = ProfileCapabilityMatrixV2 {
+        header: ProfileCapabilityMatrixHeaderV2 {
+            magic: *b"PCM2",
+            version_major: 2,
+            header_len: ProfileCapabilityMatrixHeaderV2::LEN as u16,
+            entry_len: ProfileCapabilityEntryV2::LEN as u16,
+            reserved: 0,
+            entry_count: 1,
+            flags: 0,
+            entries_offset: ProfileCapabilityMatrixHeaderV2::LEN as u64,
+            entries_length: ProfileCapabilityEntryV2::LEN as u64,
+            checksum: 0,
+        },
+        entries: vec![entry],
+    }
+    .serialize()
+    .unwrap();
+    let mut writer = MinimalCoveWriter::new();
+    writer.required_features = required_features;
+    writer.sections.extend([
+        SectionPayload {
+            section_kind: SectionKind::ExtendedFeatureSet as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: extended,
+        },
+        SectionPayload {
+            section_kind: SectionKind::ProfileCapabilityMatrix as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: matrix,
+        },
+        SectionPayload {
+            section_kind: SectionKind::VendorExtension as u16,
+            profile: 0,
+            flags: 0,
+            item_count: 0,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: 0,
+            data: Vec::new(),
+        },
+    ]);
+    let mut bytes = writer.write().unwrap();
+    set_cove_scoped_feature_section_ids(&mut bytes, 1, 2);
+    bytes
+}
+
 fn write_v2_profile_fixtures(root: &PathBuf, entries: &mut Vec<Value>) {
     write_fixture(
         root,
@@ -5214,6 +5589,55 @@ fn write_v2_profile_fixtures(root: &PathBuf, entries: &mut Vec<Value>) {
             &["§20.9"],
         ),
         registered_encoding_envelope_bad_fallback_payload(),
+    );
+
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "layout/fast_metadata_index_valid.bin",
+            "fast_metadata_index",
+            "accept",
+            None,
+            &["§67.2"],
+        ),
+        fast_metadata_index_payload(),
+    );
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "layout/fast_metadata_index_duplicate_target.bin",
+            "fast_metadata_index",
+            "reject",
+            Some("COVE_E_BAD_LAYOUT_PLAN"),
+            &["§67.2"],
+        ),
+        fast_metadata_index_duplicate_payload(),
+    );
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "layout/page_cluster_directory_valid.bin",
+            "page_cluster_directory",
+            "accept",
+            None,
+            &["§67.3"],
+        ),
+        page_cluster_directory_payload(),
+    );
+    write_fixture(
+        root,
+        entries,
+        fixture(
+            "layout/page_cluster_directory_duplicate_id.bin",
+            "page_cluster_directory",
+            "reject",
+            Some("COVE_E_BAD_LAYOUT_PLAN"),
+            &["§67.3"],
+        ),
+        page_cluster_directory_duplicate_payload(),
     );
 
     write_fixture(
@@ -5696,6 +6120,20 @@ fn write_v2_profile_fixtures(root: &PathBuf, entries: &mut Vec<Value>) {
         ),
         index_only_capability_bad_aggregate_payload(),
     );
+    for case in covi_hardening_cases() {
+        write_fixture(
+            root,
+            entries,
+            fixture(
+                case.path,
+                "covi_validation_case",
+                case.expect,
+                case.error_code,
+                case.sections,
+            ),
+            case.payload,
+        );
+    }
 
     write_fixture(
         root,
@@ -5754,7 +6192,7 @@ fn write_v2_profile_fixtures(root: &PathBuf, entries: &mut Vec<Value>) {
             "cove",
             "reject",
             Some("COVE_E_UNKNOWN_REQUIRED_FEATURE"),
-            &["§11", "§77"],
+            &["§11", "§11.1", "§77"],
         ),
         cove_with_unknown_required_feature(),
     );
@@ -5766,9 +6204,96 @@ fn write_v2_profile_fixtures(root: &PathBuf, entries: &mut Vec<Value>) {
             "cove",
             "accept",
             None,
-            &["§11", "§67.5", "§73"],
+            &["§11", "§11.1", "§67.5", "§73"],
         ),
         cove_with_optional_layout_section(),
+    );
+    let scoped_operation = cove_with_operation_scoped_unknown_feature();
+    write_fixture(
+        root,
+        entries,
+        feature_scope_use_fixture(
+            "feature-scope/operation_scoped_unknown_ordinary_scan_accept.cove",
+            "accept",
+            None,
+            Some(PrimaryProfile::TableScan as u8),
+            Some(OperationKindV2::OrdinaryTableScan),
+            &[],
+            &[],
+        ),
+        scoped_operation.clone(),
+    );
+    write_fixture(
+        root,
+        entries,
+        feature_scope_use_fixture(
+            "feature-scope/operation_scoped_unknown_coverage_reject.cove",
+            "reject",
+            Some("COVE_E_UNKNOWN_REQUIRED_FEATURE"),
+            Some(PrimaryProfile::TableScan as u8),
+            Some(OperationKindV2::CoveragePlanning),
+            &[],
+            &[],
+        ),
+        scoped_operation,
+    );
+    let scoped_section = cove_with_section_scoped_unknown_feature();
+    write_fixture(
+        root,
+        entries,
+        feature_scope_use_fixture(
+            "feature-scope/section_scoped_unknown_unneeded_accept.cove",
+            "accept",
+            None,
+            Some(PrimaryProfile::TableScan as u8),
+            Some(OperationKindV2::OrdinaryTableScan),
+            &[99],
+            &[],
+        ),
+        scoped_section.clone(),
+    );
+    write_fixture(
+        root,
+        entries,
+        feature_scope_use_fixture(
+            "feature-scope/section_scoped_unknown_needed_reject.cove",
+            "reject",
+            Some("COVE_E_UNKNOWN_REQUIRED_FEATURE"),
+            Some(PrimaryProfile::TableScan as u8),
+            Some(OperationKindV2::OrdinaryTableScan),
+            &[3],
+            &[],
+        ),
+        scoped_section,
+    );
+    let scoped_page = cove_with_page_scoped_unknown_feature();
+    write_fixture(
+        root,
+        entries,
+        feature_scope_use_fixture(
+            "feature-scope/page_scoped_unknown_unneeded_accept.cove",
+            "accept",
+            None,
+            Some(PrimaryProfile::TableScan as u8),
+            Some(OperationKindV2::OrdinaryTableScan),
+            &[],
+            &[(3, cove_column_page_target_ref(11, 13))],
+        ),
+        scoped_page.clone(),
+    );
+    write_fixture(
+        root,
+        entries,
+        feature_scope_use_fixture(
+            "feature-scope/page_scoped_unknown_needed_reject.cove",
+            "reject",
+            Some("COVE_E_UNKNOWN_REQUIRED_FEATURE"),
+            Some(PrimaryProfile::TableScan as u8),
+            Some(OperationKindV2::OrdinaryTableScan),
+            &[],
+            &[(3, cove_column_page_target_ref(11, 12))],
+        ),
+        scoped_page,
     );
     write_fixture(
         root,
@@ -5899,6 +6424,18 @@ fn write_v2_profile_fixtures(root: &PathBuf, entries: &mut Vec<Value>) {
         root,
         entries,
         fixture(
+            "zerocopy/arrow_view_selected_materializes_compact.json",
+            "arrow_view_materialization_case",
+            "accept",
+            None,
+            &["§49", "§67.4"],
+        ),
+        arrow_view_materialization_case_payload(),
+    );
+    write_fixture(
+        root,
+        entries,
+        fixture(
             "sidecars/covi_sidecar_valid.covi",
             "covi",
             "accept",
@@ -6000,6 +6537,76 @@ fn codec_descriptor_payload() -> Vec<u8> {
     .unwrap()
 }
 
+fn stable_fsst_descriptor_payload() -> Vec<u8> {
+    CodecExtensionDescriptorV2 {
+        codec_id: 1,
+        namespace: "org.coveformat.codec".into(),
+        name: "fsst-utf8".into(),
+        version_major: 2,
+        version_minor: 0,
+        codec_family: 1,
+        logical_type_mask: u64::MAX,
+        physical_kind_mask: u64::MAX,
+        requirement: CodecRequirementV2::OptionalWithFallback,
+        fallback_policy: CodecFallbackPolicyV2::CoreEncodingPayloadPresent,
+        parameter_schema_kind: 0,
+        flags: 0,
+        specification_status: CodecSpecificationStatusV2::StableRegistered,
+        required_feature_bit: 0,
+        optional_feature_bit: FEATURE_REGISTERED_ENCODINGS,
+        spec_digest_algorithm: 1,
+        spec_digest: b"COVE-FSST-UTF8-V2-SPEC-DIGEST".to_vec(),
+        conformance_vector_ref: u32::MAX,
+        fallback_ref: 0,
+        private_payload_ref: u32::MAX,
+        checksum: 0,
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn cfs2_payload(values: &[&[u8]]) -> Vec<u8> {
+    let mut value_bytes = Vec::new();
+    let mut offsets = Vec::with_capacity(values.len() + 1);
+    offsets.push(0u32);
+    for value in values {
+        let next = offsets.last().copied().unwrap() + value.len() as u32;
+        offsets.push(next);
+        value_bytes.extend_from_slice(value);
+    }
+    let null_bitmap = vec![0u8; values.len().div_ceil(8)];
+    let offsets_len = offsets.len() * 4;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"CFS2");
+    out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(null_bitmap.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(offsets_len as u32).to_le_bytes());
+    out.extend_from_slice(&null_bitmap);
+    for offset in offsets {
+        out.extend_from_slice(&offset.to_le_bytes());
+    }
+    out.extend_from_slice(&value_bytes);
+    out
+}
+
+fn corrupt_registered_envelope_preserving_buffer_crc(bytes: &mut [u8]) {
+    let descriptor_offset = COLUMN_PAGE_PAYLOAD_HEADER_LEN + COVE_ENCODING_NODE_LEN;
+    let other_offset = u64::from_le_bytes(
+        bytes[descriptor_offset + 8..descriptor_offset + 16]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let other_length = u64::from_le_bytes(
+        bytes[descriptor_offset + 16..descriptor_offset + 24]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    bytes[other_offset] ^= 1;
+    let checksum = checksum::crc32c(&bytes[other_offset..other_offset + other_length]);
+    bytes[descriptor_offset + 24..descriptor_offset + 28].copy_from_slice(&checksum.to_le_bytes());
+    debug_assert_eq!(descriptor_offset + PAGE_BUFFER_DESCRIPTOR_LEN, other_offset);
+}
+
 fn registered_encoding_envelope() -> RegisteredEncodingEnvelopeV2 {
     RegisteredEncodingEnvelopeV2 {
         codec_id: 1,
@@ -6031,38 +6638,167 @@ fn registered_encoding_envelope_bad_fallback_payload() -> Vec<u8> {
     bytes
 }
 
-fn layout_plan_payload() -> Vec<u8> {
-    LayoutPlanV2 {
-        header: LayoutPlanHeaderV2 {
-            layout_id: 1,
-            node_count: 1,
-            root_node_id: 1,
+fn layout_fixture_table() -> TableEntry {
+    TableEntry {
+        table_id: 1,
+        namespace: "public".into(),
+        name: "events".into(),
+        row_count: 2048,
+        primary_sort_key_count: 0,
+        clustering_key_count: 0,
+        flags: 0,
+        columns: vec![ColumnEntry {
+            column_id: 1,
+            name: "id".into(),
+            logical: CoveLogicalType::Int64,
+            physical: CovePhysicalKind::NumCode,
+            nullable: false,
+            sort_order: 0,
+            collation_id: 0,
+            precision: 0,
+            scale: 0,
+            flags: 0,
+        }],
+    }
+}
+
+fn layout_fixture_segments() -> Vec<TableSegmentIndexEntryV1> {
+    vec![
+        TableSegmentIndexEntryV1 {
+            table_id: 1,
+            segment_id: 1,
+            row_start: 0,
+            row_count: 1024,
+            morsel_count: 4,
+            morsel_row_count: 256,
+            column_count: 1,
+            offset: 4096,
+            length: 8192,
+            stats_ref: 0,
             flags: 0,
             checksum: 0,
         },
-        nodes: vec![LayoutPlanNodeV2 {
-            node_id: 1,
-            parent_node_id: u32::MAX,
-            node_kind: 0,
+        TableSegmentIndexEntryV1 {
+            table_id: 1,
+            segment_id: 2,
+            row_start: 1024,
+            row_count: 1024,
+            morsel_count: 4,
+            morsel_row_count: 256,
+            column_count: 1,
+            offset: 12288,
+            length: 8192,
+            stats_ref: 0,
             flags: 0,
-            table_id: u32::MAX,
-            column_id: u32::MAX,
-            segment_id: u32::MAX,
-            first_morsel_id: 0,
-            morsel_count: 0,
-            row_start: 0,
-            row_count: 0,
-            section_id: 0,
-            cluster_id: 0,
-            first_child_index: 0,
-            child_count: 0,
-            stats_ref: u32::MAX,
-            split_ref: u32::MAX,
             checksum: 0,
-        }],
+        },
+    ]
+}
+
+fn layout_plan_payload() -> Vec<u8> {
+    let table = layout_fixture_table();
+    let segments = layout_fixture_segments();
+    let splits = build_default_scan_split_index(&table, &segments).unwrap();
+    build_default_layout_plan(&table, &segments, Some(&splits))
+        .unwrap()
+        .serialize()
+        .unwrap()
+}
+
+fn fast_metadata_entry() -> FastMetadataIndexEntryV2 {
+    FastMetadataIndexEntryV2 {
+        target_kind: 1,
+        flags: 0,
+        table_id: 1,
+        column_id: 1,
+        segment_id: 1,
+        morsel_id: 1,
+        section_id: 1,
+        local_id: 1,
+        offset: 128,
+        length: 64,
+        checksum_or_crc32c: 0,
+        reserved: 0,
+    }
+}
+
+fn fast_metadata_index_payload() -> Vec<u8> {
+    FastMetadataIndexV2 {
+        header: FastMetadataIndexHeaderV2 {
+            entry_count: 1,
+            entry_len: FastMetadataIndexEntryV2::LEN as u16,
+            index_kind: 0,
+            flags: 0,
+            entries_offset: FastMetadataIndexHeaderV2::LEN as u64,
+            entries_length: FastMetadataIndexEntryV2::LEN as u64,
+            checksum: 0,
+        },
+        entries: vec![fast_metadata_entry()],
     }
     .serialize()
     .unwrap()
+}
+
+fn fast_metadata_index_duplicate_payload() -> Vec<u8> {
+    let header = FastMetadataIndexHeaderV2 {
+        entry_count: 2,
+        entry_len: FastMetadataIndexEntryV2::LEN as u16,
+        index_kind: 0,
+        flags: 0,
+        entries_offset: FastMetadataIndexHeaderV2::LEN as u64,
+        entries_length: (2 * FastMetadataIndexEntryV2::LEN) as u64,
+        checksum: 0,
+    };
+    let entry = fast_metadata_entry().serialize().unwrap();
+    let mut out = header.serialize().unwrap().to_vec();
+    out.extend_from_slice(&entry);
+    out.extend_from_slice(&entry);
+    out
+}
+
+fn page_cluster_entry(cluster_id: u32) -> PageClusterEntryV2 {
+    PageClusterEntryV2 {
+        cluster_id,
+        section_id: 1,
+        offset: 256 + (u64::from(cluster_id) * 128),
+        length: 128,
+        table_id: 1,
+        segment_id: 1,
+        first_morsel_id: cluster_id - 1,
+        morsel_count: 1,
+        first_page_ref: cluster_id - 1,
+        page_count: 1,
+        preferred_read_alignment: 4096,
+        preferred_coalesce_distance: 65536,
+        flags: 0,
+        checksum: 0,
+    }
+}
+
+fn page_cluster_directory_payload() -> Vec<u8> {
+    PageClusterDirectoryV2 {
+        header: PageClusterDirectoryHeaderV2 {
+            cluster_count: 1,
+            flags: 0,
+            checksum: 0,
+        },
+        entries: vec![page_cluster_entry(1)],
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn page_cluster_directory_duplicate_payload() -> Vec<u8> {
+    let header = PageClusterDirectoryHeaderV2 {
+        cluster_count: 2,
+        flags: 0,
+        checksum: 0,
+    };
+    let entry = page_cluster_entry(1).serialize().unwrap();
+    let mut out = header.serialize().to_vec();
+    out.extend_from_slice(&entry);
+    out.extend_from_slice(&entry);
+    out
 }
 
 fn layout_root_node() -> LayoutPlanNodeV2 {
@@ -6119,37 +6855,11 @@ fn layout_plan_bad_child_range_payload() -> Vec<u8> {
     out
 }
 
-fn scan_split(split_id: u32) -> ScanSplitEntryV2 {
-    ScanSplitEntryV2 {
-        split_id,
-        table_id: 1,
-        row_start: u64::from(split_id - 1) * 1024,
-        row_count: 1024,
-        first_segment_id: split_id,
-        segment_count: 1,
-        first_morsel_id: 0,
-        morsel_count: 4,
-        first_cluster_id: split_id - 1,
-        cluster_count: 1,
-        stats_ref: u32::MAX,
-        estimated_uncompressed_bytes: 8192,
-        estimated_encoded_bytes: 2048,
-        flags: 0,
-        checksum: 0,
-    }
-}
-
 fn scan_split_index_payload() -> Vec<u8> {
-    ScanSplitIndexV2 {
-        header: ScanSplitIndexHeaderV2 {
-            split_count: 2,
-            flags: 0,
-            checksum: 0,
-        },
-        entries: vec![scan_split(1), scan_split(2)],
-    }
-    .serialize()
-    .unwrap()
+    build_default_scan_split_index(&layout_fixture_table(), &layout_fixture_segments())
+        .unwrap()
+        .serialize()
+        .unwrap()
 }
 
 fn scan_split_index_duplicate_payload() -> Vec<u8> {
@@ -6557,6 +7267,1255 @@ fn index_only_capability_bad_aggregate_payload() -> Vec<u8> {
     bytes
 }
 
+struct CoviHardeningCase {
+    path: &'static str,
+    expect: &'static str,
+    error_code: Option<&'static str>,
+    sections: &'static [&'static str],
+    payload: Vec<u8>,
+}
+
+fn covi_hardening_cases() -> Vec<CoviHardeningCase> {
+    let valid_lookup = covi_case_payload(
+        covi_row_range_artifact(),
+        "valid",
+        json!({"kind": "lookup_eq", "table_id": 1, "column_id": 10, "key": key_bytes(1)}),
+        json!({"expect_row_range_count": 1}),
+    );
+    let posting_reps = covi_case_payload(
+        covi_all_posting_representations_artifact(),
+        "valid",
+        json!({"kind": "validate"}),
+        json!({}),
+    );
+    let row_ordinals = covi_case_payload(
+        covi_row_ordinal_artifact(false),
+        "valid",
+        json!({"kind": "validate"}),
+        json!({}),
+    );
+    let index_only = covi_case_payload(
+        covi_index_only_artifact(IndexCapabilityExactnessV2::Exact),
+        "valid",
+        json!({"kind": "index_only", "table_id": 1, "column_id": 10, "aggregate_kind": "count"}),
+        json!({"expect_row_count": 5}),
+    );
+    let stale_digest = covi_case_payload_with_context(
+        covi_row_range_artifact(),
+        "stale_ignored",
+        json!({"kind": "validate"}),
+        json!({}),
+        json!({"file_digest": vec![0xEEu8; 32]}),
+    );
+    let bad_digest = covi_case_payload_with_context(
+        covi_row_range_artifact(),
+        "valid",
+        json!({"kind": "validate"}),
+        json!({}),
+        json!({"file_digest": vec![0xEEu8; 32]}),
+    );
+    let schema_stale = covi_case_payload_with_context(
+        covi_row_range_artifact_with_snapshot_refs(7, u32::MAX, u32::MAX),
+        "stale_ignored",
+        json!({"kind": "validate"}),
+        json!({}),
+        json!({"schema_fingerprint_ref": 8}),
+    );
+    let map_stale = covi_case_payload_with_context(
+        covi_row_range_artifact_with_snapshot_refs(u32::MAX, 3, u32::MAX),
+        "stale_ignored",
+        json!({"kind": "validate"}),
+        json!({}),
+        json!({"semantic_map_fingerprint_ref": 4}),
+    );
+    let visibility_stale = covi_case_payload_with_context(
+        covi_row_range_artifact_with_snapshot_refs(u32::MAX, u32::MAX, 5),
+        "stale_ignored",
+        json!({"kind": "validate"}),
+        json!({}),
+        json!({"external_visibility_ref": 6}),
+    );
+    vec![
+        CoviHardeningCase {
+            path: "covi/validation_row_range_lookup_valid.json",
+            expect: "accept",
+            error_code: None,
+            sections: &["§33.1"],
+            payload: valid_lookup,
+        },
+        CoviHardeningCase {
+            path: "covi/posting_representations_valid.json",
+            expect: "accept",
+            error_code: None,
+            sections: &["§33.1"],
+            payload: posting_reps,
+        },
+        CoviHardeningCase {
+            path: "covi/row_ordinal_sets_valid.json",
+            expect: "accept",
+            error_code: None,
+            sections: &["§33.1"],
+            payload: row_ordinals,
+        },
+        CoviHardeningCase {
+            path: "covi/index_only_count_valid.json",
+            expect: "accept",
+            error_code: None,
+            sections: &["§33.2"],
+            payload: index_only,
+        },
+        CoviHardeningCase {
+            path: "covi/stale_digest_ignored.json",
+            expect: "accept",
+            error_code: None,
+            sections: &["§33.1", "§74"],
+            payload: stale_digest,
+        },
+        CoviHardeningCase {
+            path: "covi/stale_schema_ignored.json",
+            expect: "accept",
+            error_code: None,
+            sections: &["§33.1", "§74"],
+            payload: schema_stale,
+        },
+        CoviHardeningCase {
+            path: "covi/stale_semantic_map_ignored.json",
+            expect: "accept",
+            error_code: None,
+            sections: &["§33.1", "§74"],
+            payload: map_stale,
+        },
+        CoviHardeningCase {
+            path: "covi/stale_visibility_ignored.json",
+            expect: "accept",
+            error_code: None,
+            sections: &["§33.1", "§74"],
+            payload: visibility_stale,
+        },
+        CoviHardeningCase {
+            path: "covi/bad_digest_reject.json",
+            expect: "reject",
+            error_code: Some("COVE_E_DIGEST_MISMATCH"),
+            sections: &["§33.1"],
+            payload: bad_digest,
+        },
+        CoviHardeningCase {
+            path: "covi/cik2_bad_key_data_checksum.json",
+            expect: "reject",
+            error_code: Some("COVE_E_CHECKSUM_MISMATCH"),
+            sections: &["§33.1"],
+            payload: covi_case_payload(
+                covi_bad_cik_checksum_artifact(),
+                "valid",
+                json!({"kind": "validate"}),
+                json!({}),
+            ),
+        },
+        CoviHardeningCase {
+            path: "covi/missing_block_ref_reject.json",
+            expect: "reject",
+            error_code: Some("COVE_E_BAD_COVI"),
+            sections: &["§33.1"],
+            payload: covi_case_payload(
+                covi_missing_block_ref_artifact(),
+                "valid",
+                json!({"kind": "validate"}),
+                json!({}),
+            ),
+        },
+        CoviHardeningCase {
+            path: "covi/wrong_block_root_reject.json",
+            expect: "reject",
+            error_code: Some("COVE_E_BAD_COVI"),
+            sections: &["§33.1"],
+            payload: covi_case_payload(
+                covi_wrong_block_root_artifact(),
+                "valid",
+                json!({"kind": "validate"}),
+                json!({}),
+            ),
+        },
+        CoviHardeningCase {
+            path: "covi/unsorted_entries_reject.json",
+            expect: "reject",
+            error_code: Some("COVE_E_BAD_COVI"),
+            sections: &["§33.1"],
+            payload: covi_case_payload(
+                covi_unsorted_entries_artifact(),
+                "valid",
+                json!({"kind": "validate"}),
+                json!({}),
+            ),
+        },
+        CoviHardeningCase {
+            path: "covi/duplicate_key_without_chain_reject.json",
+            expect: "reject",
+            error_code: Some("COVE_E_BAD_COVI"),
+            sections: &["§33.1"],
+            payload: covi_case_payload(
+                covi_duplicate_key_without_chain_artifact(),
+                "valid",
+                json!({"kind": "validate"}),
+                json!({}),
+            ),
+        },
+        CoviHardeningCase {
+            path: "covi/row_range_not_coalesced_reject.json",
+            expect: "reject",
+            error_code: Some("COVE_E_BAD_COVI"),
+            sections: &["§33.1"],
+            payload: covi_case_payload(
+                covi_bad_row_range_payload_artifact(),
+                "valid",
+                json!({"kind": "validate"}),
+                json!({}),
+            ),
+        },
+        CoviHardeningCase {
+            path: "covi/row_ordinal_high_bits_reject.json",
+            expect: "reject",
+            error_code: Some("COVE_E_BAD_COVI"),
+            sections: &["§33.1"],
+            payload: covi_case_payload(
+                covi_row_ordinal_artifact(true),
+                "valid",
+                json!({"kind": "validate"}),
+                json!({}),
+            ),
+        },
+        CoviHardeningCase {
+            path: "covi/byte_range_out_of_bounds_reject.json",
+            expect: "reject",
+            error_code: Some("COVE_E_BAD_COVI"),
+            sections: &["§33.1"],
+            payload: covi_case_payload(
+                covi_byte_range_out_of_bounds_artifact(),
+                "valid",
+                json!({"kind": "validate"}),
+                json!({}),
+            ),
+        },
+        CoviHardeningCase {
+            path: "covi/approximate_index_only_exact_reject.json",
+            expect: "reject",
+            error_code: Some("COVE_E_BAD_COVI"),
+            sections: &["§33.2"],
+            payload: covi_case_payload(
+                covi_index_only_artifact(IndexCapabilityExactnessV2::Approximate),
+                "valid",
+                json!({"kind": "index_only", "table_id": 1, "column_id": 10, "aggregate_kind": "count"}),
+                json!({}),
+            ),
+        },
+    ]
+}
+
+fn covi_case_payload(
+    covi: Vec<u8>,
+    expected_result: &str,
+    operation: Value,
+    extra: Value,
+) -> Vec<u8> {
+    covi_case_payload_with_context(covi, expected_result, operation, extra, json!({}))
+}
+
+fn covi_case_payload_with_context(
+    covi: Vec<u8>,
+    expected_result: &str,
+    operation: Value,
+    mut extra: Value,
+    context_extra: Value,
+) -> Vec<u8> {
+    let mut context = json!({
+        "file_id": covi_test_file_id(),
+        "file_len": covi_test_file_len(),
+        "footer_crc32c": covi_test_footer_crc32c(),
+        "dataset_id": covi_test_file_id(),
+        "allow_file_code_keys": true,
+        "file_digest_algorithm": DigestAlgorithm::Sha256 as u16,
+        "file_digest": covi_test_digest(),
+    });
+    merge_json_object(&mut context, context_extra);
+    let mut value = json!({
+        "covi": covi,
+        "context": context,
+        "expected_result": expected_result,
+        "operation": operation,
+    });
+    merge_json_object(&mut value, extra.take());
+    json_fixture_bytes(value)
+}
+
+fn merge_json_object(target: &mut Value, source: Value) {
+    let Some(source) = source.as_object() else {
+        return;
+    };
+    let target = target.as_object_mut().expect("target is object");
+    for (key, value) in source {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+fn covi_test_file_id() -> [u8; 16] {
+    [0x41; 16]
+}
+
+fn covi_test_snapshot_id() -> [u8; 16] {
+    [0x42; 16]
+}
+
+fn covi_test_file_len() -> u64 {
+    4096
+}
+
+fn covi_test_footer_crc32c() -> u32 {
+    0xA1B2_C3D4
+}
+
+fn covi_test_digest() -> Vec<u8> {
+    vec![0xA5; 32]
+}
+
+fn key_bytes(value: u8) -> Vec<u8> {
+    vec![value]
+}
+
+fn covi_row_range_artifact() -> Vec<u8> {
+    covi_row_range_artifact_with_snapshot_refs(u32::MAX, u32::MAX, u32::MAX)
+}
+
+fn covi_row_range_artifact_with_snapshot_refs(
+    schema_ref: u32,
+    semantic_map_ref: u32,
+    visibility_ref: u32,
+) -> Vec<u8> {
+    let postings = vec![posting_spec(
+        CoviPostingRepresentationV2::RowRangeList,
+        row_range_payload(&[CoviRowRangePostingV2 {
+            file_ref: 0,
+            table_id: 1,
+            segment_id: 2,
+            morsel_id: 3,
+            row_start: 4,
+            row_count: 2,
+            flags: 0,
+            checksum: 0,
+        }]),
+        1,
+        u32::MAX,
+    )];
+    covi_artifact_for_postings(
+        vec![key_bytes(1)],
+        postings,
+        Vec::new(),
+        None,
+        RootOverrides {
+            schema_ref,
+            semantic_map_ref,
+            visibility_ref,
+            ..RootOverrides::default()
+        },
+    )
+}
+
+fn covi_all_posting_representations_artifact() -> Vec<u8> {
+    let postings = vec![
+        posting_spec(
+            CoviPostingRepresentationV2::SortedFileRefs,
+            CoviFileRefPostingV2 {
+                file_ref: 0,
+                flags: 0,
+                checksum: 0,
+            }
+            .serialize()
+            .to_vec(),
+            1,
+            u32::MAX,
+        ),
+        posting_spec(
+            CoviPostingRepresentationV2::SortedSegmentRefs,
+            CoviSegmentRefPostingV2 {
+                file_ref: 0,
+                table_id: 1,
+                segment_id: 1,
+                flags: 0,
+                checksum: 0,
+            }
+            .serialize()
+            .to_vec(),
+            1,
+            u32::MAX,
+        ),
+        posting_spec(
+            CoviPostingRepresentationV2::SortedPageRefs,
+            CoviPageRefPostingV2 {
+                file_ref: 0,
+                table_id: 1,
+                segment_id: 1,
+                morsel_id: 1,
+                page_ref: 1,
+                flags: 0,
+                checksum: 0,
+            }
+            .serialize()
+            .to_vec(),
+            1,
+            u32::MAX,
+        ),
+        posting_spec(
+            CoviPostingRepresentationV2::SortedMorselRefs,
+            CoviMorselRefPostingV2 {
+                file_ref: 0,
+                table_id: 1,
+                segment_id: 1,
+                morsel_id: 1,
+                flags: 0,
+                checksum: 0,
+            }
+            .serialize()
+            .to_vec(),
+            1,
+            u32::MAX,
+        ),
+        posting_spec(
+            CoviPostingRepresentationV2::RowRangeList,
+            row_range_payload(&[CoviRowRangePostingV2 {
+                file_ref: 0,
+                table_id: 1,
+                segment_id: 1,
+                morsel_id: 1,
+                row_start: 10,
+                row_count: 2,
+                flags: 0,
+                checksum: 0,
+            }]),
+            1,
+            u32::MAX,
+        ),
+        posting_spec(
+            CoviPostingRepresentationV2::ByteRangeList,
+            CoviByteRangePostingV2 {
+                file_ref: 0,
+                section_id: 1,
+                offset: 16,
+                length: 8,
+                flags: 0,
+                checksum: 0,
+            }
+            .serialize()
+            .unwrap()
+            .to_vec(),
+            1,
+            u32::MAX,
+        ),
+        posting_spec(
+            CoviPostingRepresentationV2::ObjectPathRefs,
+            CoviObjectPathPostingV2 {
+                file_ref: 0,
+                object_type_id: 1,
+                path_ref: 1,
+                segment_id: 1,
+                row_start: 20,
+                row_count: 1,
+                flags: 0,
+                checksum: 0,
+            }
+            .serialize()
+            .unwrap()
+            .to_vec(),
+            1,
+            u32::MAX,
+        ),
+        posting_spec(
+            CoviPostingRepresentationV2::DimensionalBucketRefs,
+            CoviDimensionalBucketPostingV2 {
+                file_ref: 0,
+                table_id: 1,
+                segment_id: 1,
+                morsel_id: 1,
+                dimensional_bucket_ref: 1,
+                flags: 0,
+                checksum: 0,
+            }
+            .serialize()
+            .to_vec(),
+            1,
+            u32::MAX,
+        ),
+        posting_spec(
+            CoviPostingRepresentationV2::CoverageSetRef,
+            Vec::new(),
+            1,
+            1,
+        ),
+    ];
+    covi_artifact_for_postings(
+        (1..=postings.len() as u8).map(key_bytes).collect(),
+        postings,
+        Vec::new(),
+        None,
+        RootOverrides {
+            coverage_set_ref: 1,
+            ..RootOverrides::default()
+        },
+    )
+}
+
+fn covi_row_ordinal_artifact(invalid_high_bits: bool) -> Vec<u8> {
+    let row_payload = vec![0b0000_0111];
+    let row_set = CoviRowOrdinalSetHeaderV2 {
+        row_ordinal_set_ref: 0,
+        file_ref: 0,
+        table_id: 1,
+        segment_id: 1,
+        morsel_id: 1,
+        bitmap_kind: cove_index::CoviBitmapKindV2::DenseBitsetLsb0,
+        flags: 0,
+        reserved: 0,
+        universe_row_count: 5,
+        set_row_count: 3,
+        payload_offset: 0,
+        payload_length: row_payload.len() as u64,
+        checksum: 0,
+    };
+    let mut payload = row_payload;
+    let refs_offset = payload.len();
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    let postings = vec![CoviPostingsHeaderV2 {
+        postings_ref: 0,
+        index_root_id: 0,
+        representation: CoviPostingRepresentationV2::RowOrdinalBitmap,
+        target_granularity: CoverageGranularityV2::RowOrdinalSet as u8,
+        flags: 0,
+        item_count: 1,
+        payload_offset: refs_offset as u64,
+        payload_length: 4,
+        coverage_set_ref: u32::MAX,
+        checksum: 0,
+    }];
+    let block = CoviPostingsBlockV2 {
+        header: postings_header(0),
+        postings,
+        row_ordinal_sets: vec![row_set],
+        payload,
+    }
+    .serialize()
+    .unwrap();
+    let keys = vec![key_bytes(1)];
+    let (key_block, entries) = covi_key_and_entries(&keys, &[0], &[u32::MAX], &[u32::MAX], 0);
+    let entry_block = entry_block_payload(0, entries, u32::MAX);
+    let artifact = covi_artifact_from_blocks(
+        keys.len() as u64,
+        key_block,
+        entry_block,
+        block,
+        None,
+        RootOverrides::default(),
+    );
+    if invalid_high_bits {
+        mutate_covi_section_payload(artifact, 4, |payload| {
+            let bitset_offset = CoviPostingsBlockHeaderV2::LEN
+                + CoviPostingsHeaderV2::LEN
+                + CoviRowOrdinalSetHeaderV2::LEN;
+            payload[bitset_offset] |= 0b1000_0000;
+        })
+    } else {
+        artifact
+    }
+}
+
+fn covi_index_only_artifact(exactness: IndexCapabilityExactnessV2) -> Vec<u8> {
+    let aggregate = CoviAggregateAnswerBlockV2 {
+        header: CoviAggregateAnswerBlockHeaderV2 {
+            magic: CoviAggregateAnswerBlockHeaderV2::MAGIC,
+            version_major: 2,
+            version_minor: 0,
+            header_len: CoviAggregateAnswerBlockHeaderV2::LEN as u16,
+            aggregate_answer_len: CoviAggregateAnswerV2::LEN as u16,
+            aggregate_block_id: 0,
+            index_root_id: 0,
+            aggregate_answer_count: 1,
+            aggregate_answers_offset: CoviAggregateAnswerBlockHeaderV2::LEN as u64,
+            aggregate_payload_offset: 0,
+            aggregate_payload_length: 0,
+            flags: 0,
+            checksum: 0,
+        },
+        answers: vec![CoviAggregateAnswerV2 {
+            aggregate_answer_ref: 0,
+            index_root_id: 0,
+            aggregate_kind: 0,
+            exactness: exactness as u8,
+            null_semantics: 0,
+            flags: 0,
+            row_count: 5,
+            null_count: 0,
+            non_null_count: 5,
+            value_ref: u32::MAX,
+            predicate_form_ref: u32::MAX,
+            snapshot_validity_ref: 0,
+            checksum: 0,
+        }],
+        payload: Vec::new(),
+    }
+    .serialize()
+    .unwrap();
+    covi_artifact_for_postings(
+        vec![key_bytes(1)],
+        vec![posting_spec(
+            CoviPostingRepresentationV2::RowRangeList,
+            row_range_payload(&[CoviRowRangePostingV2 {
+                file_ref: 0,
+                table_id: 1,
+                segment_id: 1,
+                morsel_id: 1,
+                row_start: 0,
+                row_count: 5,
+                flags: 0,
+                checksum: 0,
+            }]),
+            1,
+            u32::MAX,
+        )],
+        Vec::new(),
+        Some(aggregate),
+        RootOverrides {
+            supports_index_only: true,
+            capability_exactness: exactness,
+            ..RootOverrides::default()
+        },
+    )
+}
+
+fn covi_bad_cik_checksum_artifact() -> Vec<u8> {
+    mutate_covi_section_payload(covi_row_range_artifact(), 2, |payload| {
+        let last = payload.len() - 1;
+        payload[last] ^= 1;
+    })
+}
+
+fn covi_missing_block_ref_artifact() -> Vec<u8> {
+    let mut overrides = RootOverrides::default();
+    overrides.key_section_id = 99;
+    covi_artifact_for_postings(
+        vec![key_bytes(1)],
+        vec![posting_spec(
+            CoviPostingRepresentationV2::RowRangeList,
+            row_range_payload(&[CoviRowRangePostingV2 {
+                file_ref: 0,
+                table_id: 1,
+                segment_id: 1,
+                morsel_id: 1,
+                row_start: 0,
+                row_count: 1,
+                flags: 0,
+                checksum: 0,
+            }]),
+            1,
+            u32::MAX,
+        )],
+        Vec::new(),
+        None,
+        overrides,
+    )
+}
+
+fn covi_wrong_block_root_artifact() -> Vec<u8> {
+    let (key_block, entries) =
+        covi_key_and_entries(&[key_bytes(1)], &[0], &[u32::MAX], &[u32::MAX], 7);
+    let entry_block = entry_block_payload(0, entries, u32::MAX);
+    let postings_block = postings_block_payload(vec![posting_spec(
+        CoviPostingRepresentationV2::RowRangeList,
+        row_range_payload(&[CoviRowRangePostingV2 {
+            file_ref: 0,
+            table_id: 1,
+            segment_id: 1,
+            morsel_id: 1,
+            row_start: 0,
+            row_count: 1,
+            flags: 0,
+            checksum: 0,
+        }]),
+        1,
+        u32::MAX,
+    )]);
+    covi_artifact_from_blocks(
+        1,
+        key_block,
+        entry_block,
+        postings_block,
+        None,
+        RootOverrides::default(),
+    )
+}
+
+fn covi_unsorted_entries_artifact() -> Vec<u8> {
+    covi_artifact_for_postings(
+        vec![key_bytes(2), key_bytes(1)],
+        vec![
+            posting_spec(
+                CoviPostingRepresentationV2::SortedFileRefs,
+                CoviFileRefPostingV2 {
+                    file_ref: 0,
+                    flags: 0,
+                    checksum: 0,
+                }
+                .serialize()
+                .to_vec(),
+                1,
+                u32::MAX,
+            ),
+            posting_spec(
+                CoviPostingRepresentationV2::SortedFileRefs,
+                CoviFileRefPostingV2 {
+                    file_ref: 0,
+                    flags: 0,
+                    checksum: 0,
+                }
+                .serialize()
+                .to_vec(),
+                1,
+                u32::MAX,
+            ),
+        ],
+        Vec::new(),
+        None,
+        RootOverrides::default(),
+    )
+}
+
+fn covi_duplicate_key_without_chain_artifact() -> Vec<u8> {
+    covi_artifact_for_postings(
+        vec![key_bytes(1), key_bytes(1)],
+        vec![
+            posting_spec(
+                CoviPostingRepresentationV2::SortedSegmentRefs,
+                CoviSegmentRefPostingV2 {
+                    file_ref: 0,
+                    table_id: 1,
+                    segment_id: 1,
+                    flags: 0,
+                    checksum: 0,
+                }
+                .serialize()
+                .to_vec(),
+                1,
+                u32::MAX,
+            ),
+            posting_spec(
+                CoviPostingRepresentationV2::SortedSegmentRefs,
+                CoviSegmentRefPostingV2 {
+                    file_ref: 0,
+                    table_id: 1,
+                    segment_id: 2,
+                    flags: 0,
+                    checksum: 0,
+                }
+                .serialize()
+                .to_vec(),
+                1,
+                u32::MAX,
+            ),
+        ],
+        Vec::new(),
+        None,
+        RootOverrides::default(),
+    )
+}
+
+fn covi_bad_row_range_payload_artifact() -> Vec<u8> {
+    let rows = row_range_payload(&[
+        CoviRowRangePostingV2 {
+            file_ref: 0,
+            table_id: 1,
+            segment_id: 1,
+            morsel_id: 1,
+            row_start: 0,
+            row_count: 2,
+            flags: 0,
+            checksum: 0,
+        },
+        CoviRowRangePostingV2 {
+            file_ref: 0,
+            table_id: 1,
+            segment_id: 1,
+            morsel_id: 1,
+            row_start: 4,
+            row_count: 2,
+            flags: 0,
+            checksum: 0,
+        },
+    ]);
+    let artifact = covi_artifact_for_postings(
+        vec![key_bytes(1)],
+        vec![posting_spec(
+            CoviPostingRepresentationV2::RowRangeList,
+            rows,
+            2,
+            u32::MAX,
+        )],
+        Vec::new(),
+        None,
+        RootOverrides::default(),
+    );
+    mutate_covi_section_payload(artifact, 4, |payload| {
+        let second_row =
+            CoviPostingsBlockHeaderV2::LEN + CoviPostingsHeaderV2::LEN + CoviRowRangePostingV2::LEN;
+        payload[second_row + 16..second_row + 24].copy_from_slice(&2u64.to_le_bytes());
+        payload[second_row + 36..second_row + 40].fill(0);
+        let crc = checksum::crc32c(&payload[second_row..second_row + CoviRowRangePostingV2::LEN]);
+        payload[second_row + 36..second_row + 40].copy_from_slice(&crc.to_le_bytes());
+    })
+}
+
+fn covi_byte_range_out_of_bounds_artifact() -> Vec<u8> {
+    covi_artifact_for_postings(
+        vec![key_bytes(1)],
+        vec![posting_spec(
+            CoviPostingRepresentationV2::ByteRangeList,
+            CoviByteRangePostingV2 {
+                file_ref: 0,
+                section_id: 1,
+                offset: covi_test_file_len() + 1,
+                length: 8,
+                flags: 0,
+                checksum: 0,
+            }
+            .serialize()
+            .unwrap()
+            .to_vec(),
+            1,
+            u32::MAX,
+        )],
+        Vec::new(),
+        None,
+        RootOverrides::default(),
+    )
+}
+
+#[derive(Clone)]
+struct PostingSpec {
+    representation: CoviPostingRepresentationV2,
+    payload: Vec<u8>,
+    item_count: u64,
+    coverage_set_ref: u32,
+}
+
+fn posting_spec(
+    representation: CoviPostingRepresentationV2,
+    payload: Vec<u8>,
+    item_count: u64,
+    coverage_set_ref: u32,
+) -> PostingSpec {
+    PostingSpec {
+        representation,
+        payload,
+        item_count,
+        coverage_set_ref,
+    }
+}
+
+#[derive(Clone)]
+struct RootOverrides {
+    key_section_id: u32,
+    coverage_set_ref: u32,
+    schema_ref: u32,
+    semantic_map_ref: u32,
+    visibility_ref: u32,
+    supports_index_only: bool,
+    capability_exactness: IndexCapabilityExactnessV2,
+}
+
+impl Default for RootOverrides {
+    fn default() -> Self {
+        Self {
+            key_section_id: 2,
+            coverage_set_ref: u32::MAX,
+            schema_ref: u32::MAX,
+            semantic_map_ref: u32::MAX,
+            visibility_ref: u32::MAX,
+            supports_index_only: false,
+            capability_exactness: IndexCapabilityExactnessV2::Exact,
+        }
+    }
+}
+
+fn covi_artifact_for_postings(
+    keys: Vec<Vec<u8>>,
+    postings: Vec<PostingSpec>,
+    _row_sets: Vec<CoviRowOrdinalSetHeaderV2>,
+    aggregate_block: Option<Vec<u8>>,
+    overrides: RootOverrides,
+) -> Vec<u8> {
+    let posting_refs = (0..postings.len() as u32).collect::<Vec<_>>();
+    let aggregate_refs = vec![aggregate_block.as_ref().map(|_| 0).unwrap_or(u32::MAX); keys.len()];
+    let duplicate_refs = vec![u32::MAX; keys.len()];
+    let (key_block, entries) =
+        covi_key_and_entries(&keys, &posting_refs, &aggregate_refs, &duplicate_refs, 0);
+    let entry_block = entry_block_payload(
+        0,
+        entries,
+        aggregate_block.as_ref().map(|_| 0).unwrap_or(u32::MAX),
+    );
+    let postings_block = postings_block_payload(postings);
+    covi_artifact_from_blocks(
+        keys.len() as u64,
+        key_block,
+        entry_block,
+        postings_block,
+        aggregate_block,
+        overrides,
+    )
+}
+
+fn covi_artifact_from_blocks(
+    distinct_count: u64,
+    key_block: Vec<u8>,
+    entry_block: Vec<u8>,
+    postings_block: Vec<u8>,
+    aggregate_block: Option<Vec<u8>>,
+    overrides: RootOverrides,
+) -> Vec<u8> {
+    let aggregate_section_id = aggregate_block.as_ref().map(|_| 5).unwrap_or(u32::MAX);
+    let referenced_file = CoviReferencedFileV2 {
+        file_ref: 0,
+        flags: 0,
+        file_id: covi_test_file_id(),
+        file_len: covi_test_file_len(),
+        footer_crc32c: covi_test_footer_crc32c(),
+        digest_algorithm: DigestAlgorithm::Sha256 as u16,
+        digest_len: 32,
+        digest_offset: 0,
+        uri_ref: u32::MAX,
+        schema_fingerprint_ref: overrides.schema_ref,
+        checksum: 0,
+    };
+    let snapshot = CoviSnapshotValidityV2 {
+        snapshot_validity_ref: 0,
+        dataset_id: covi_test_file_id(),
+        snapshot_id: covi_test_snapshot_id(),
+        schema_fingerprint_ref: overrides.schema_ref,
+        semantic_map_fingerprint_ref: overrides.semantic_map_ref,
+        external_visibility_ref: overrides.visibility_ref,
+        data_checksum_root_ref: u32::MAX,
+        valid_from_us: 0,
+        valid_until_us: i64::MAX,
+        flags: 0,
+        checksum: 0,
+    };
+    let root = CoviIndexRootV2 {
+        index_root_id: 0,
+        indexed_target_kind: CoviIndexedTargetKindV2::TableColumn,
+        index_kind: CoviIndexKindV2::Sorted,
+        coverage_granularity: CoverageGranularityV2::Morsel as u8,
+        proof_strength: CoverageProofStrengthV2::ExactConservative as u8,
+        exactness: CoverageExactnessV2::Exact as u8,
+        flags: 0,
+        table_id: 1,
+        column_id: 10,
+        object_type_id: u32::MAX,
+        property_id: u32::MAX,
+        path_ref: u32::MAX,
+        semantic_dimension_ref: u32::MAX,
+        logical_type: CoveLogicalType::Int64 as u16,
+        physical_kind: CovePhysicalKind::NumCode as u8,
+        key_encoding_kind: CoviKeyEncodingKindV2::CanonicalValueBytes as u8,
+        comparator_kind: CoviComparatorKindV2::CanonicalOrdering as u16,
+        collation_id: 0,
+        null_semantics: 0,
+        sort_order: 0,
+        value_count: distinct_count.max(5),
+        distinct_count,
+        null_count: 0,
+        min_key_ref: if distinct_count == 0 { u32::MAX } else { 0 },
+        max_key_ref: if distinct_count == 0 {
+            u32::MAX
+        } else {
+            distinct_count as u32 - 1
+        },
+        key_block_section_id: overrides.key_section_id,
+        entry_block_section_id: 3,
+        postings_block_section_id: 4,
+        aggregate_block_section_id: aggregate_section_id,
+        coverage_set_ref: overrides.coverage_set_ref,
+        capability_ref: 0,
+        snapshot_validity_ref: 0,
+        checksum: 0,
+    };
+    let capability = IndexCapabilityV2 {
+        capability_id: 0,
+        index_root_id: 0,
+        flags: 0,
+        supports_eq: 1,
+        supports_range: 1,
+        supports_membership: 0,
+        supports_prefix: 0,
+        supports_contains: 0,
+        supports_count: u8::from(overrides.supports_index_only),
+        supports_min: 0,
+        supports_max: 0,
+        supports_sum: 0,
+        supports_distinct_count: 0,
+        supports_join_coverage: 0,
+        supports_index_only: u8::from(overrides.supports_index_only),
+        exactness: overrides.capability_exactness,
+        proof_strength: CoverageProofStrengthV2::ExactConservative,
+        null_semantics: 0,
+        reserved: 0,
+        snapshot_validity_ref: 0,
+        coverage_provider_ref: u32::MAX,
+        checksum: 0,
+    };
+    let mut sections = vec![
+        CoviSectionPayloadV2 {
+            section_id: 1,
+            section_kind: CoviSectionKindV2::StringTable,
+            payload: covi_test_digest(),
+            item_count: 1,
+            required_features: 0,
+            optional_features: 0,
+        },
+        CoviSectionPayloadV2 {
+            section_id: 2,
+            section_kind: CoviSectionKindV2::KeyBlock,
+            payload: key_block,
+            item_count: distinct_count,
+            required_features: 0,
+            optional_features: 0,
+        },
+        CoviSectionPayloadV2 {
+            section_id: 3,
+            section_kind: CoviSectionKindV2::EntryBlock,
+            payload: entry_block,
+            item_count: distinct_count,
+            required_features: 0,
+            optional_features: 0,
+        },
+        CoviSectionPayloadV2 {
+            section_id: 4,
+            section_kind: CoviSectionKindV2::PostingsBlock,
+            payload: postings_block,
+            item_count: distinct_count,
+            required_features: 0,
+            optional_features: 0,
+        },
+    ];
+    if let Some(aggregate_block) = aggregate_block {
+        sections.push(CoviSectionPayloadV2 {
+            section_id: 5,
+            section_kind: CoviSectionKindV2::AggregateAnswerBlock,
+            payload: aggregate_block,
+            item_count: 1,
+            required_features: 0,
+            optional_features: 0,
+        });
+    }
+    CoviArtifactV2::serialize_with_sections(
+        covi_test_file_id(),
+        covi_test_snapshot_id(),
+        &[referenced_file],
+        &[snapshot],
+        &[root],
+        &[capability],
+        &sections,
+    )
+    .unwrap()
+}
+
+fn covi_key_and_entries(
+    keys: &[Vec<u8>],
+    posting_refs: &[u32],
+    aggregate_refs: &[u32],
+    duplicate_refs: &[u32],
+    key_root_id: u32,
+) -> (Vec<u8>, Vec<CoviIndexEntryV2>) {
+    let (key_block, key_refs) = covi_key_block(key_root_id, keys);
+    let entries = key_refs
+        .iter()
+        .enumerate()
+        .map(|(index, (offset, len))| {
+            entry(
+                index as u32,
+                *offset,
+                *len,
+                posting_refs.get(index).copied().unwrap_or(u32::MAX),
+                aggregate_refs.get(index).copied().unwrap_or(u32::MAX),
+                duplicate_refs.get(index).copied().unwrap_or(u32::MAX),
+            )
+        })
+        .collect();
+    (key_block, entries)
+}
+
+fn covi_key_block(root_id: u32, keys: &[Vec<u8>]) -> (Vec<u8>, Vec<(u64, u32)>) {
+    let mut key_data = Vec::new();
+    let mut refs = Vec::new();
+    for key in keys {
+        refs.push((key_data.len() as u64, key.len() as u32));
+        key_data.extend_from_slice(key);
+    }
+    let block = CoviKeyBlockV2 {
+        header: CoviKeyBlockHeaderV2 {
+            magic: CoviKeyBlockHeaderV2::MAGIC,
+            version_major: 2,
+            version_minor: 0,
+            header_len: CoviKeyBlockHeaderV2::LEN as u16,
+            reserved0: 0,
+            key_block_id: root_id,
+            index_root_id: root_id,
+            key_count: keys.len() as u64,
+            encoding_kind: CoviKeyEncodingKindV2::CanonicalValueBytes,
+            comparator_kind: CoviComparatorKindV2::CanonicalOrdering,
+            flags: 0,
+            key_data_offset: CoviKeyBlockHeaderV2::LEN as u64,
+            key_data_length: key_data.len() as u64,
+            checksum: 0,
+        },
+        key_data,
+    }
+    .serialize()
+    .unwrap();
+    (block, refs)
+}
+
+fn entry(
+    entry_ref: u32,
+    key_offset: u64,
+    key_length: u32,
+    postings_ref: u32,
+    aggregate_answer_ref: u32,
+    next_duplicate_ref: u32,
+) -> CoviIndexEntryV2 {
+    CoviIndexEntryV2 {
+        entry_ref,
+        index_root_id: 0,
+        entry_id: u64::from(entry_ref),
+        key_kind: CoviKeyEncodingKindV2::CanonicalValueBytes,
+        comparator_kind: CoviComparatorKindV2::CanonicalOrdering,
+        flags: 0,
+        key_offset,
+        key_length,
+        key_hash64: u64::from(entry_ref),
+        postings_ref,
+        coverage_set_ref: u32::MAX,
+        aggregate_answer_ref,
+        next_duplicate_ref,
+        checksum: 0,
+    }
+}
+
+fn entry_block_payload(
+    root_id: u32,
+    entries: Vec<CoviIndexEntryV2>,
+    aggregate_block_id: u32,
+) -> Vec<u8> {
+    CoviEntryBlockV2 {
+        header: CoviEntryBlockHeaderV2 {
+            magic: CoviEntryBlockHeaderV2::MAGIC,
+            version_major: 2,
+            version_minor: 0,
+            header_len: CoviEntryBlockHeaderV2::LEN as u16,
+            entry_len: CoviIndexEntryV2::LEN as u16,
+            entry_block_id: root_id,
+            index_root_id: 0,
+            entry_count: entries.len() as u32,
+            key_block_id: root_id,
+            postings_block_id: root_id,
+            aggregate_block_id,
+            entries_offset: CoviEntryBlockHeaderV2::LEN as u64,
+            entries_length: (entries.len() * CoviIndexEntryV2::LEN) as u64,
+            flags: 0,
+            checksum: 0,
+        },
+        entries,
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn postings_header(root_id: u32) -> CoviPostingsBlockHeaderV2 {
+    CoviPostingsBlockHeaderV2 {
+        magic: CoviPostingsBlockHeaderV2::MAGIC,
+        version_major: 2,
+        version_minor: 0,
+        header_len: CoviPostingsBlockHeaderV2::LEN as u16,
+        postings_header_len: CoviPostingsHeaderV2::LEN as u16,
+        postings_block_id: root_id,
+        index_root_id: 0,
+        postings_count: 0,
+        row_ordinal_set_count: 0,
+        postings_headers_offset: CoviPostingsBlockHeaderV2::LEN as u64,
+        row_ordinal_headers_offset: 0,
+        postings_payload_offset: 0,
+        postings_payload_length: 0,
+        flags: 0,
+        checksum: 0,
+    }
+}
+
+fn postings_block_payload(posting_specs: Vec<PostingSpec>) -> Vec<u8> {
+    let mut payload = Vec::new();
+    let mut postings = Vec::new();
+    for (index, spec) in posting_specs.into_iter().enumerate() {
+        let offset = payload.len() as u64;
+        let len = spec.payload.len() as u64;
+        payload.extend_from_slice(&spec.payload);
+        postings.push(CoviPostingsHeaderV2 {
+            postings_ref: index as u32,
+            index_root_id: 0,
+            representation: spec.representation,
+            target_granularity: CoverageGranularityV2::Morsel as u8,
+            flags: 0,
+            item_count: spec.item_count,
+            payload_offset: offset,
+            payload_length: len,
+            coverage_set_ref: spec.coverage_set_ref,
+            checksum: 0,
+        });
+    }
+    CoviPostingsBlockV2 {
+        header: postings_header(0),
+        postings,
+        row_ordinal_sets: Vec::new(),
+        payload,
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn row_range_payload(rows: &[CoviRowRangePostingV2]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for row in rows {
+        out.extend_from_slice(&row.serialize().unwrap());
+    }
+    out
+}
+
+fn mutate_covi_section_payload(
+    mut bytes: Vec<u8>,
+    section_id: u32,
+    mutate: impl FnOnce(&mut [u8]),
+) -> Vec<u8> {
+    let artifact = CoviArtifactV2::parse(&bytes).unwrap();
+    let (section_index, section) = artifact
+        .sections
+        .iter()
+        .enumerate()
+        .find(|(_, section)| section.section_id == section_id)
+        .unwrap();
+    let start = section.offset as usize;
+    let end = section.end_offset().unwrap() as usize;
+    mutate(&mut bytes[start..end]);
+    let crc = checksum::crc32c(&bytes[start..end]);
+    let entry_start =
+        artifact.header.section_directory_offset as usize + section_index * COVI_SECTION_ENTRY_LEN;
+    bytes[entry_start + 60..entry_start + 64].copy_from_slice(&crc.to_le_bytes());
+    bytes[entry_start + 64..entry_start + 68].fill(0);
+    let entry_crc = checksum::crc32c(&bytes[entry_start..entry_start + COVI_SECTION_ENTRY_LEN]);
+    bytes[entry_start + 64..entry_start + 68].copy_from_slice(&entry_crc.to_le_bytes());
+    bytes
+}
+
 fn cache_payload(under_inclusive: bool) -> Vec<u8> {
     let dataset_id = [0x11; 16];
     let snapshot_id = [0x22; 16];
@@ -6883,6 +8842,23 @@ fn zero_copy_compat_case_payload(case: ZeroCopyFixtureCase) -> Vec<u8> {
     }))
 }
 
+fn arrow_view_materialization_case_payload() -> Vec<u8> {
+    let selected_a = b"selected-visible-payload-alpha".as_ref();
+    let hidden = b"hidden-unselected-payload-beta".as_ref();
+    let selected_b = b"selected-visible-payload-gamma".as_ref();
+    encoding_fixture_bytes(json!({
+        "logical": "Utf8",
+        "physical": "VarBytes",
+        "encoding": "VarBytes",
+        "row_count": 3,
+        "payload": varbytes_payload(&[selected_a, hidden, selected_b]),
+        "selection": [0, 2],
+        "expect_type": "Utf8View",
+        "expect": ["selected-visible-payload-alpha", "selected-visible-payload-gamma"],
+        "expect_absent_in_buffers": ["hidden-unselected-payload-beta"]
+    }))
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SidecarValidityCase {
     Digest,
@@ -6968,6 +8944,18 @@ fn rewrite_cove_feature_bits(bytes: &mut [u8], required_features: u64, optional_
     bytes[tail_start + 60..tail_start + 64].fill(0);
     let postscript_crc = checksum::crc32c(&bytes[tail_start..tail_start + POSTSCRIPT_SIZE]);
     bytes[tail_start + 60..tail_start + 64].copy_from_slice(&postscript_crc.to_le_bytes());
+}
+
+fn set_cove_scoped_feature_section_ids(
+    bytes: &mut [u8],
+    feature_set_section_id: u32,
+    profile_capability_section_id: u32,
+) {
+    bytes[76..80].copy_from_slice(&feature_set_section_id.to_le_bytes());
+    bytes[80..84].copy_from_slice(&profile_capability_section_id.to_le_bytes());
+    bytes[156..160].fill(0);
+    let header_crc = checksum::crc32c(&bytes[..HEADER_SIZE]);
+    bytes[156..160].copy_from_slice(&header_crc.to_le_bytes());
 }
 
 fn collation_registry_payload(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -7491,23 +9479,34 @@ fn lookup_index_payload_for_entries(entries: &[(u64, &[RowRef])]) -> Vec<u8> {
 }
 
 fn aggregate_synopsis_payload(count: u64) -> Vec<u8> {
+    aggregate_count_entry(SynopsisKind::Count, count as u32, 0)
+        .serialize()
+        .to_vec()
+}
+
+fn aggregate_count_entry(kind: SynopsisKind, row_count: u32, null_count: u32) -> AggregateEntry {
     AggregateEntry {
         table_id: 1,
         segment_id: 0,
         morsel_id: u32::MAX,
         column_id: 1,
-        synopsis_kind: SynopsisKind::Count,
+        synopsis_kind: kind,
         key_kind: 0,
-        accuracy: SynopsisAccuracy::Exact,
+        accuracy: if matches!(
+            kind,
+            SynopsisKind::DistinctSketch | SynopsisKind::QuantileSketch
+        ) {
+            SynopsisAccuracy::Approximate
+        } else {
+            SynopsisAccuracy::Exact
+        },
         flags: 0,
-        row_count: count as u32,
-        null_count: 0,
+        row_count,
+        null_count,
         payload_offset: 0,
         payload_length: 0,
         checksum: 0,
     }
-    .serialize()
-    .to_vec()
 }
 
 fn aggregate_synopsis_unknown_kind_payload() -> Vec<u8> {
@@ -7517,6 +9516,249 @@ fn aggregate_synopsis_unknown_kind_payload() -> Vec<u8> {
     let crc = checksum::crc32c(&out);
     out[44..48].copy_from_slice(&crc.to_le_bytes());
     out
+}
+
+fn aggregate_synopsis_all_payloads() -> Vec<u8> {
+    let entries = vec![
+        aggregate_count_entry(SynopsisKind::Count, 3, 0),
+        aggregate_count_entry(SynopsisKind::MinMax, 3, 0),
+        aggregate_count_entry(SynopsisKind::Sum, 3, 0),
+        aggregate_count_entry(SynopsisKind::SumAndCount, 3, 0),
+        aggregate_count_entry(SynopsisKind::BoolTrueFalseCounts, 3, 0),
+        aggregate_count_entry(SynopsisKind::FileCodeHistogram, 3, 0),
+        aggregate_count_entry(SynopsisKind::NumCodeHistogram, 3, 0),
+        aggregate_count_entry(SynopsisKind::DistinctSketch, 3, 0),
+        aggregate_count_entry(SynopsisKind::QuantileSketch, 3, 0),
+        aggregate_count_entry(SynopsisKind::TopK, 3, 0),
+    ];
+    let payloads = vec![
+        AggregatePayloadV2::None,
+        AggregatePayloadV2::MinMax {
+            min: Some(aggregate_i64_value(1)),
+            max: Some(aggregate_i64_value(3)),
+        },
+        AggregatePayloadV2::Sum {
+            overflow_policy: NumericAggregateOverflowPolicy::CheckedExact,
+            sum: aggregate_i64_value(6),
+        },
+        AggregatePayloadV2::SumAndCount {
+            overflow_policy: NumericAggregateOverflowPolicy::CheckedExact,
+            non_null_count: 3,
+            sum: aggregate_i64_value(6),
+        },
+        AggregatePayloadV2::BoolTrueFalseCounts {
+            true_count: 2,
+            false_count: 1,
+        },
+        AggregatePayloadV2::FileCodeHistogram {
+            buckets: vec![
+                HistogramBucket { key: 1, count: 1 },
+                HistogramBucket { key: 2, count: 2 },
+            ],
+        },
+        AggregatePayloadV2::NumCodeHistogram {
+            buckets: vec![
+                HistogramBucket { key: 10, count: 1 },
+                HistogramBucket { key: 20, count: 2 },
+            ],
+        },
+        AggregatePayloadV2::DistinctSketch {
+            precision: DEFAULT_HLL_PRECISION,
+            registers: vec![0; 1usize << DEFAULT_HLL_PRECISION],
+        },
+        AggregatePayloadV2::QuantileSketch {
+            k: DEFAULT_KLL_K,
+            value_tag: ValueTag::Int64,
+            level_offsets: vec![0, 3],
+            values: vec![
+                1i64.to_le_bytes().to_vec(),
+                2i64.to_le_bytes().to_vec(),
+                3i64.to_le_bytes().to_vec(),
+            ],
+        },
+        AggregatePayloadV2::TopK {
+            k: 2,
+            entries: vec![
+                HistogramBucket { key: 2, count: 2 },
+                HistogramBucket { key: 1, count: 1 },
+            ],
+        },
+    ];
+    AggregateSynopsis::from_parts(entries, payloads)
+        .unwrap()
+        .serialize()
+}
+
+fn aggregate_i64_value(value: i64) -> TaggedCanonicalValue {
+    TaggedCanonicalValue {
+        value_tag: ValueTag::Int64,
+        payload: value.to_le_bytes().to_vec(),
+    }
+}
+
+fn aggregate_synopsis_bad_payload_bounds() -> Vec<u8> {
+    let mut out = aggregate_bool_synopsis();
+    out.pop();
+    out
+}
+
+fn aggregate_synopsis_bad_payload_checksum() -> Vec<u8> {
+    let mut out = aggregate_bool_synopsis();
+    let last = out.len() - 1;
+    out[last] ^= 0x40;
+    out
+}
+
+fn aggregate_synopsis_wrong_kind_payload_pairing() -> Vec<u8> {
+    let mut out = aggregate_bool_synopsis();
+    out[52] = SynopsisKind::TopK as u8;
+    fix_payload_checksum(&mut out, 48);
+    out
+}
+
+fn aggregate_synopsis_unsorted_histogram_keys() -> Vec<u8> {
+    let mut out = aggregate_filecode_histogram_synopsis();
+    let data = 48 + 28;
+    out[data..data + 8].copy_from_slice(&2u64.to_le_bytes());
+    out[data + 16..data + 24].copy_from_slice(&1u64.to_le_bytes());
+    fix_payload_checksum(&mut out, 48);
+    out
+}
+
+fn aggregate_synopsis_duplicate_histogram_keys() -> Vec<u8> {
+    let mut out = aggregate_filecode_histogram_synopsis();
+    let data = 48 + 28;
+    out[data + 16..data + 24].copy_from_slice(&1u64.to_le_bytes());
+    fix_payload_checksum(&mut out, 48);
+    out
+}
+
+fn aggregate_synopsis_count_sum_mismatch() -> Vec<u8> {
+    let mut out = aggregate_filecode_histogram_synopsis();
+    let data = 48 + 28;
+    out[data + 24..data + 32].copy_from_slice(&1u64.to_le_bytes());
+    fix_payload_checksum(&mut out, 48);
+    out
+}
+
+fn aggregate_synopsis_invalid_canonical_value() -> Vec<u8> {
+    let mut out = aggregate_minmax_synopsis();
+    let data = 48 + 28;
+    out[data + 4..data + 8].copy_from_slice(&7u32.to_le_bytes());
+    fix_payload_checksum(&mut out, 48);
+    out
+}
+
+fn aggregate_synopsis_approximate_marked_exact() -> Vec<u8> {
+    let mut out = aggregate_hll_synopsis();
+    out[18] = SynopsisAccuracy::Exact as u8;
+    fix_entry_checksum(&mut out, 0);
+    out
+}
+
+fn aggregate_synopsis_bad_hll_header() -> Vec<u8> {
+    let mut out = aggregate_hll_synopsis();
+    out[48 + 12..48 + 16].copy_from_slice(&3u32.to_le_bytes());
+    fix_payload_checksum(&mut out, 48);
+    out
+}
+
+fn aggregate_synopsis_bad_kll_header() -> Vec<u8> {
+    let mut out = aggregate_kll_synopsis();
+    let data = 48 + 28;
+    out[data + 8 + 4..data + 8 + 8].copy_from_slice(&2u32.to_le_bytes());
+    fix_payload_checksum(&mut out, 48);
+    out
+}
+
+fn aggregate_bool_synopsis() -> Vec<u8> {
+    AggregateSynopsis::from_parts(
+        vec![aggregate_count_entry(
+            SynopsisKind::BoolTrueFalseCounts,
+            3,
+            0,
+        )],
+        vec![AggregatePayloadV2::BoolTrueFalseCounts {
+            true_count: 2,
+            false_count: 1,
+        }],
+    )
+    .unwrap()
+    .serialize()
+}
+
+fn aggregate_minmax_synopsis() -> Vec<u8> {
+    AggregateSynopsis::from_parts(
+        vec![aggregate_count_entry(SynopsisKind::MinMax, 3, 0)],
+        vec![AggregatePayloadV2::MinMax {
+            min: Some(aggregate_i64_value(1)),
+            max: Some(aggregate_i64_value(3)),
+        }],
+    )
+    .unwrap()
+    .serialize()
+}
+
+fn aggregate_filecode_histogram_synopsis() -> Vec<u8> {
+    AggregateSynopsis::from_parts(
+        vec![aggregate_count_entry(SynopsisKind::FileCodeHistogram, 3, 0)],
+        vec![AggregatePayloadV2::FileCodeHistogram {
+            buckets: vec![
+                HistogramBucket { key: 1, count: 1 },
+                HistogramBucket { key: 2, count: 2 },
+            ],
+        }],
+    )
+    .unwrap()
+    .serialize()
+}
+
+fn aggregate_hll_synopsis() -> Vec<u8> {
+    AggregateSynopsis::from_parts(
+        vec![aggregate_count_entry(SynopsisKind::DistinctSketch, 3, 0)],
+        vec![AggregatePayloadV2::DistinctSketch {
+            precision: DEFAULT_HLL_PRECISION,
+            registers: vec![0; 1usize << DEFAULT_HLL_PRECISION],
+        }],
+    )
+    .unwrap()
+    .serialize()
+}
+
+fn aggregate_kll_synopsis() -> Vec<u8> {
+    AggregateSynopsis::from_parts(
+        vec![aggregate_count_entry(SynopsisKind::QuantileSketch, 3, 0)],
+        vec![AggregatePayloadV2::QuantileSketch {
+            k: DEFAULT_KLL_K,
+            value_tag: ValueTag::Int64,
+            level_offsets: vec![0, 3],
+            values: vec![
+                1i64.to_le_bytes().to_vec(),
+                2i64.to_le_bytes().to_vec(),
+                3i64.to_le_bytes().to_vec(),
+            ],
+        }],
+    )
+    .unwrap()
+    .serialize()
+}
+
+fn fix_entry_checksum(bytes: &mut [u8], entry_offset: usize) {
+    bytes[entry_offset + 44..entry_offset + 48].fill(0);
+    let crc = checksum::crc32c(&bytes[entry_offset..entry_offset + 48]);
+    bytes[entry_offset + 44..entry_offset + 48].copy_from_slice(&crc.to_le_bytes());
+}
+
+fn fix_payload_checksum(bytes: &mut [u8], payload_offset: usize) {
+    bytes[payload_offset + 24..payload_offset + 28].fill(0);
+    let data_len = u32::from_le_bytes(
+        bytes[payload_offset + 20..payload_offset + 24]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let payload_len = 28 + data_len;
+    let crc = checksum::crc32c(&bytes[payload_offset..payload_offset + payload_len]);
+    bytes[payload_offset + 24..payload_offset + 28].copy_from_slice(&crc.to_le_bytes());
 }
 
 fn composite_index_payload(key_column_count: u8) -> Vec<u8> {
@@ -8358,6 +10600,104 @@ fn temporal_segment_entry(
 fn cove_t_scan_table_file() -> Vec<u8> {
     let mut writer = ScanProfileCoveWriter::new(valid_table_catalog());
     writer.push_segment(ScanSegment::new(1, 0, 0, 10, 1));
+    writer.write().unwrap()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegisteredFixtureKind {
+    SupportedStable,
+    UnsupportedWithFallback,
+    UnsupportedNoFallback,
+    FallbackMismatch,
+    MalformedEnvelope,
+}
+
+fn cove_t_registered_codec_file(kind: RegisteredFixtureKind) -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 9,
+            namespace: "public".into(),
+            name: "registered_names".into(),
+            row_count: 3,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![ColumnEntry {
+                column_id: 1,
+                name: "name".into(),
+                logical: CoveLogicalType::Utf8,
+                physical: CovePhysicalKind::VarBytes,
+                nullable: false,
+                sort_order: 0,
+                collation_id: 0,
+                precision: 0,
+                scale: 0,
+                flags: 0,
+            }],
+        }],
+    };
+    let fallback_values = match kind {
+        RegisteredFixtureKind::FallbackMismatch => [&b"alpha"[..], &b"wrong"[..], &b"gamma"[..]],
+        _ => [&b"alpha"[..], &b"beta"[..], &b"gamma"[..]],
+    };
+    let fallback = (!matches!(kind, RegisteredFixtureKind::UnsupportedNoFallback)).then(|| {
+        ColumnPagePayloadV1::build_single_node(
+            3,
+            CoveEncodingKind::VarBytes,
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            None,
+            varbytes_payload(&fallback_values),
+        )
+        .unwrap()
+    });
+    let codec_id = match kind {
+        RegisteredFixtureKind::UnsupportedWithFallback
+        | RegisteredFixtureKind::UnsupportedNoFallback
+        | RegisteredFixtureKind::MalformedEnvelope => 9001,
+        RegisteredFixtureKind::SupportedStable | RegisteredFixtureKind::FallbackMismatch => 1,
+    };
+    let mut registered_payload = ColumnPagePayloadV1::build_registered_single_node(
+        3,
+        3,
+        CoveLogicalType::Utf8,
+        CovePhysicalKind::VarBytes,
+        codec_id,
+        2,
+        0,
+        cfs2_payload(&[&b"alpha"[..], &b"beta"[..], &b"gamma"[..]]),
+        fallback,
+    )
+    .unwrap();
+    if kind == RegisteredFixtureKind::MalformedEnvelope {
+        corrupt_registered_envelope_preserving_buffer_crc(&mut registered_payload);
+    }
+    let mut segment = ScanSegment::new(9, 0, 0, 3, 1);
+    segment.set_column_pages(
+        1,
+        vec![ScanPageSpec::new(3, registered_payload)
+            .with_encoding_root(CoveEncodingKind::RegisteredEncoding as u32)],
+    );
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    if matches!(
+        kind,
+        RegisteredFixtureKind::SupportedStable | RegisteredFixtureKind::FallbackMismatch
+    ) {
+        writer.push_extra_section(SectionPayload {
+            section_kind: SectionKind::CodecExtensionRegistry as u16,
+            profile: PrimaryProfile::CodecExtension as u8,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: FEATURE_REGISTERED_ENCODINGS,
+            data: stable_fsst_descriptor_payload(),
+        });
+    }
+    writer.push_segment(segment);
     writer.write().unwrap()
 }
 
@@ -10012,6 +12352,70 @@ fn rewrite_first_segment_page(
     panic!("generated COVE-T file did not contain TABLE_SEGMENT_DATA");
 }
 
+fn rewrite_first_section_payload(
+    mut bytes: Vec<u8>,
+    section_kind: SectionKind,
+    mutate: impl FnOnce(&mut [u8]),
+) -> Vec<u8> {
+    let mut postscript = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
+    let footer_start = postscript.footer.offset as usize;
+    let footer_header = CoveFooterHeaderV1::parse(&bytes[footer_start..]).unwrap();
+    let entries_start = footer_start + FOOTER_HEADER_SIZE;
+    for index in 0..footer_header.section_count as usize {
+        let entry_start = entries_start + index * SECTION_ENTRY_SIZE;
+        let mut section_entry =
+            CoveSectionEntryV1::parse(&bytes[entry_start..entry_start + SECTION_ENTRY_SIZE])
+                .unwrap();
+        if section_entry.section_kind != section_kind as u16 {
+            continue;
+        }
+        let start = section_entry.offset as usize;
+        let end = start + section_entry.length as usize;
+        mutate(&mut bytes[start..end]);
+        section_entry.crc32c = checksum::crc32c(&bytes[start..end]);
+        bytes[entry_start..entry_start + SECTION_ENTRY_SIZE]
+            .copy_from_slice(&section_entry.serialize());
+
+        let footer_end = footer_start + postscript.footer.length as usize;
+        postscript.footer.crc32c = checksum::crc32c(&bytes[footer_start..footer_end]);
+        let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
+        bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+        return bytes;
+    }
+    panic!("generated COVE file did not contain requested section");
+}
+
+fn rewrite_first_section_kind(mut bytes: Vec<u8>, from: SectionKind, to: SectionKind) -> Vec<u8> {
+    let mut postscript = CovePostscriptV1::parse_from_tail(&bytes).unwrap();
+    let footer_start = postscript.footer.offset as usize;
+    let footer_header = CoveFooterHeaderV1::parse(&bytes[footer_start..]).unwrap();
+    let entries_start = footer_start + FOOTER_HEADER_SIZE;
+    for index in 0..footer_header.section_count as usize {
+        let entry_start = entries_start + index * SECTION_ENTRY_SIZE;
+        let mut section_entry =
+            CoveSectionEntryV1::parse(&bytes[entry_start..entry_start + SECTION_ENTRY_SIZE])
+                .unwrap();
+        if section_entry.section_kind != from as u16 {
+            continue;
+        }
+        section_entry.section_kind = to as u16;
+        if to == SectionKind::VendorExtension {
+            section_entry.profile = PrimaryProfile::Mixed as u8;
+            section_entry.required_features = 0;
+            section_entry.optional_features = 0;
+        }
+        bytes[entry_start..entry_start + SECTION_ENTRY_SIZE]
+            .copy_from_slice(&section_entry.serialize());
+
+        let footer_end = footer_start + postscript.footer.length as usize;
+        postscript.footer.crc32c = checksum::crc32c(&bytes[footer_start..footer_end]);
+        let tail_start = bytes.len() - POSTSCRIPT_TOTAL_SIZE;
+        bytes[tail_start..].copy_from_slice(&postscript.serialize_tail());
+        return bytes;
+    }
+    panic!("generated COVE file did not contain requested section kind");
+}
+
 fn cove_t_local_codebook_lz4_file() -> Vec<u8> {
     let catalog = TableCatalog {
         flags: 0,
@@ -10092,18 +12496,309 @@ fn nested_column_cove_file(
     logical: CoveLogicalType,
     physical: CovePhysicalKind,
     row_count: u32,
+    nested_schema: NestedSchemaSectionV1,
     payload: Vec<u8>,
 ) -> Vec<u8> {
     let mut segment = ScanSegment::new(1, 0, 0, row_count, 1);
-    segment.set_column_pages(1, vec![ScanPageSpec::new(row_count, payload)]);
+    segment.set_column_pages(
+        1,
+        vec![ScanPageSpec::new(row_count, payload)
+            .with_encoding_root(CoveEncodingKind::Canonical as u32)],
+    );
     let mut writer = ScanProfileCoveWriter::new(nested_column_catalog(
         column_name,
         logical,
         physical,
         row_count,
     ));
+    writer.push_nested_schema(&nested_schema).unwrap();
     writer.push_segment(segment);
     writer.write().unwrap()
+}
+
+fn nested_encoding_node(
+    node_id: u16,
+    encoding_kind: CoveEncodingKind,
+    logical_type: CoveLogicalType,
+    physical_kind: CovePhysicalKind,
+    logical_len: u32,
+    child_count: u16,
+    buffer_count: u16,
+) -> CoveEncodingNodeV1 {
+    CoveEncodingNodeV1 {
+        node_id,
+        encoding_kind,
+        logical_type,
+        physical_kind,
+        flags: 0,
+        logical_len,
+        child_count,
+        buffer_count,
+        params_offset: 0,
+        params_length: 0,
+        stats_id: 0,
+        reserved: 0,
+    }
+}
+
+fn nested_numcode_values(values: &[i64]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn nested_varbytes_values(values: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for value in values {
+        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    out
+}
+
+fn list_nested_schema() -> NestedSchemaSectionV1 {
+    NestedSchemaSectionV1::new(vec![NestedSchemaEntryV1 {
+        table_id: 1,
+        column_id: 1,
+        root: NestedSchemaNodeV1 {
+            name: "tags".into(),
+            logical: CoveLogicalType::List,
+            physical: CovePhysicalKind::List,
+            nullable: false,
+            precision: 0,
+            scale: 0,
+            collation_id: 0,
+            flags: 0,
+            fixed_size_list_len: 0,
+            children: vec![NestedSchemaNodeV1::scalar(
+                "item",
+                CoveLogicalType::Int32,
+                CovePhysicalKind::NumCode,
+                false,
+            )],
+        },
+    }])
+}
+
+fn struct_nested_schema() -> NestedSchemaSectionV1 {
+    NestedSchemaSectionV1::new(vec![NestedSchemaEntryV1 {
+        table_id: 1,
+        column_id: 1,
+        root: NestedSchemaNodeV1 {
+            name: "address".into(),
+            logical: CoveLogicalType::Struct,
+            physical: CovePhysicalKind::Struct,
+            nullable: false,
+            precision: 0,
+            scale: 0,
+            collation_id: 0,
+            flags: 0,
+            fixed_size_list_len: 0,
+            children: vec![
+                NestedSchemaNodeV1::scalar(
+                    "name",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::VarBytes,
+                    false,
+                ),
+                NestedSchemaNodeV1::scalar(
+                    "score",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        },
+    }])
+}
+
+fn map_nested_schema() -> NestedSchemaSectionV1 {
+    NestedSchemaSectionV1::new(vec![NestedSchemaEntryV1 {
+        table_id: 1,
+        column_id: 1,
+        root: NestedSchemaNodeV1 {
+            name: "labels".into(),
+            logical: CoveLogicalType::Map,
+            physical: CovePhysicalKind::Map,
+            nullable: false,
+            precision: 0,
+            scale: 0,
+            collation_id: 0,
+            flags: 0,
+            fixed_size_list_len: 0,
+            children: vec![
+                NestedSchemaNodeV1::scalar(
+                    "key",
+                    CoveLogicalType::Utf8,
+                    CovePhysicalKind::VarBytes,
+                    false,
+                ),
+                NestedSchemaNodeV1::scalar(
+                    "value",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                ),
+            ],
+        },
+    }])
+}
+
+fn nested_list_payload(child_row_count: u32) -> Vec<u8> {
+    ColumnPagePayloadV1::build_tree(
+        3,
+        0,
+        vec![
+            nested_encoding_node(
+                0,
+                CoveEncodingKind::Canonical,
+                CoveLogicalType::List,
+                CovePhysicalKind::List,
+                3,
+                1,
+                1,
+            ),
+            nested_encoding_node(
+                1,
+                CoveEncodingKind::NumCode,
+                CoveLogicalType::Int32,
+                CovePhysicalKind::NumCode,
+                child_row_count,
+                0,
+                1,
+            ),
+        ],
+        vec![
+            (
+                PageBufferKind::ChildLayout,
+                ListLayoutPayload {
+                    layout: ListLayout {
+                        offsets: vec![0, 2, 2, 5],
+                    },
+                    child_row_count,
+                }
+                .encode(),
+            ),
+            (
+                PageBufferKind::Values,
+                nested_numcode_values(&[100, 101, 102, 103, 104][..child_row_count as usize]),
+            ),
+        ],
+    )
+    .unwrap()
+}
+
+fn nested_struct_payload(parent_null_handling_declared: bool) -> Vec<u8> {
+    ColumnPagePayloadV1::build_tree(
+        3,
+        0,
+        vec![
+            nested_encoding_node(
+                0,
+                CoveEncodingKind::Canonical,
+                CoveLogicalType::Struct,
+                CovePhysicalKind::Struct,
+                3,
+                2,
+                1,
+            ),
+            nested_encoding_node(
+                1,
+                CoveEncodingKind::VarBytes,
+                CoveLogicalType::Utf8,
+                CovePhysicalKind::VarBytes,
+                3,
+                0,
+                1,
+            ),
+            nested_encoding_node(
+                2,
+                CoveEncodingKind::NumCode,
+                CoveLogicalType::Int64,
+                CovePhysicalKind::NumCode,
+                3,
+                0,
+                1,
+            ),
+        ],
+        vec![
+            (
+                PageBufferKind::ChildLayout,
+                StructLayoutPayload {
+                    layout: StructLayout {
+                        field_row_counts: vec![3, 3],
+                    },
+                    parent_null_handling_declared,
+                }
+                .encode(),
+            ),
+            (
+                PageBufferKind::Values,
+                nested_varbytes_values(&["a", "b", "c"]),
+            ),
+            (PageBufferKind::Values, nested_numcode_values(&[1, 2, 3])),
+        ],
+    )
+    .unwrap()
+}
+
+fn nested_map_payload(canonical_keys: Vec<Vec<u8>>) -> Vec<u8> {
+    ColumnPagePayloadV1::build_tree(
+        2,
+        0,
+        vec![
+            nested_encoding_node(
+                0,
+                CoveEncodingKind::Canonical,
+                CoveLogicalType::Map,
+                CovePhysicalKind::Map,
+                2,
+                2,
+                1,
+            ),
+            nested_encoding_node(
+                1,
+                CoveEncodingKind::VarBytes,
+                CoveLogicalType::Utf8,
+                CovePhysicalKind::VarBytes,
+                3,
+                0,
+                1,
+            ),
+            nested_encoding_node(
+                2,
+                CoveEncodingKind::NumCode,
+                CoveLogicalType::Int64,
+                CovePhysicalKind::NumCode,
+                3,
+                0,
+                1,
+            ),
+        ],
+        vec![
+            (
+                PageBufferKind::ChildLayout,
+                MapLayoutPayload {
+                    layout: MapLayout {
+                        offsets: vec![0, 2, 3],
+                        key_row_count: 3,
+                        value_row_count: 3,
+                        keys_are_scalar: true,
+                        allow_duplicate_keys: false,
+                        canonical_keys,
+                    },
+                }
+                .encode(),
+            ),
+            (
+                PageBufferKind::Values,
+                nested_varbytes_values(&["env", "tier", "env"]),
+            ),
+            (PageBufferKind::Values, nested_numcode_values(&[10, 20, 30])),
+        ],
+    )
+    .unwrap()
 }
 
 fn cove_t_nested_list_valid_file() -> Vec<u8> {
@@ -10112,13 +12807,8 @@ fn cove_t_nested_list_valid_file() -> Vec<u8> {
         CoveLogicalType::List,
         CovePhysicalKind::List,
         3,
-        ListLayoutPayload {
-            layout: ListLayout {
-                offsets: vec![0, 2, 2, 5],
-            },
-            child_row_count: 5,
-        }
-        .encode(),
+        list_nested_schema(),
+        nested_list_payload(5),
     )
 }
 
@@ -10128,13 +12818,8 @@ fn cove_t_nested_struct_valid_file() -> Vec<u8> {
         CoveLogicalType::Struct,
         CovePhysicalKind::Struct,
         3,
-        StructLayoutPayload {
-            layout: StructLayout {
-                field_row_counts: vec![3, 3],
-            },
-            parent_null_handling_declared: true,
-        }
-        .encode(),
+        struct_nested_schema(),
+        nested_struct_payload(true),
     )
 }
 
@@ -10144,17 +12829,30 @@ fn cove_t_nested_map_valid_file() -> Vec<u8> {
         CoveLogicalType::Map,
         CovePhysicalKind::Map,
         2,
-        MapLayoutPayload {
-            layout: MapLayout {
-                offsets: vec![0, 2, 3],
-                key_row_count: 3,
-                value_row_count: 3,
-                keys_are_scalar: true,
-                allow_duplicate_keys: false,
-                canonical_keys: vec![b"env".to_vec(), b"tier".to_vec(), b"env".to_vec()],
-            },
-        }
-        .encode(),
+        map_nested_schema(),
+        nested_map_payload(vec![b"env".to_vec(), b"tier".to_vec(), b"env".to_vec()]),
+    )
+}
+
+fn cove_t_nested_missing_schema_file() -> Vec<u8> {
+    rewrite_first_section_kind(
+        cove_t_nested_list_valid_file(),
+        SectionKind::NestedSchema,
+        SectionKind::VendorExtension,
+    )
+}
+
+fn cove_t_nested_mismatched_schema_file() -> Vec<u8> {
+    rewrite_first_section_payload(
+        cove_t_nested_list_valid_file(),
+        SectionKind::NestedSchema,
+        |payload| {
+            let name = b"tags";
+            let logical_offset = 16 + 8 + 2 + name.len();
+            payload[logical_offset..logical_offset + 2]
+                .copy_from_slice(&(CoveLogicalType::Struct as u16).to_le_bytes());
+            payload[logical_offset + 2] = CovePhysicalKind::Struct as u8;
+        },
     )
 }
 
@@ -10164,13 +12862,8 @@ fn cove_t_nested_list_bad_child_count_file() -> Vec<u8> {
         CoveLogicalType::List,
         CovePhysicalKind::List,
         3,
-        ListLayoutPayload {
-            layout: ListLayout {
-                offsets: vec![0, 2, 2, 5],
-            },
-            child_row_count: 4,
-        }
-        .encode(),
+        list_nested_schema(),
+        nested_list_payload(4),
     )
 }
 
@@ -10180,13 +12873,8 @@ fn cove_t_nested_struct_missing_null_handling_file() -> Vec<u8> {
         CoveLogicalType::Struct,
         CovePhysicalKind::Struct,
         3,
-        StructLayoutPayload {
-            layout: StructLayout {
-                field_row_counts: vec![3, 3],
-            },
-            parent_null_handling_declared: false,
-        }
-        .encode(),
+        struct_nested_schema(),
+        nested_struct_payload(false),
     )
 }
 
@@ -10196,17 +12884,8 @@ fn cove_t_nested_map_duplicate_keys_file() -> Vec<u8> {
         CoveLogicalType::Map,
         CovePhysicalKind::Map,
         2,
-        MapLayoutPayload {
-            layout: MapLayout {
-                offsets: vec![0, 2, 3],
-                key_row_count: 3,
-                value_row_count: 3,
-                keys_are_scalar: true,
-                allow_duplicate_keys: false,
-                canonical_keys: vec![b"env".to_vec(), b"env".to_vec(), b"tier".to_vec()],
-            },
-        }
-        .encode(),
+        map_nested_schema(),
+        nested_map_payload(vec![b"env".to_vec(), b"env".to_vec(), b"tier".to_vec()]),
     )
 }
 

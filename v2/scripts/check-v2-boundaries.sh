@@ -2,7 +2,7 @@
 set -eu
 
 fail() {
-    echo "m0 boundary check failed: $*" >&2
+    echo "v2 boundary check failed: $*" >&2
     exit 1
 }
 

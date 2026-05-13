@@ -2,7 +2,7 @@
 name = "cove-validate"
 version = "0.1.0"
 edition = "2021"
-description = "CLI validator for Cove Format (COVE) v1.0 files"
+description = "CLI validator for Cove Format (COVE) v2.0 files"
 license = "MIT"
 
 [[bin]]

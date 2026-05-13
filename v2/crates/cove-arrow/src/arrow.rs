@@ -22,10 +22,10 @@ use arrow_array::{
         Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array,
-    DictionaryArray, FixedSizeBinaryArray, Float32Array, Float64Array, GenericByteArray,
-    Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, RecordBatch,
-    StringViewArray, StructArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt16Array,
-    UInt32Array, UInt64Array, UInt8Array,
+    DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Float64Array,
+    GenericByteArray, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray,
+    RecordBatch, StringViewArray, StructArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+    UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_buffer::{
     ArrowNativeType, BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer,
@@ -50,6 +50,8 @@ use crate::{
         sparse::{Sparse, SparsePayload},
         Encoding,
     },
+    nested_schema::NestedSchemaNodeV1,
+    page_payload::{PageBufferKind, PagePayloadTreeNode, RetainedColumnPagePayloadV1},
     validity::ValidityBitmap,
     wire, CoveError,
 };
@@ -371,6 +373,270 @@ pub fn arrow_export_node_to_array(node: &ArrowExportNode<'_>) -> Result<ArrayRef
                 .map_err(|err| CoveError::BadSection(format!("Arrow MapArray: {err}")))
         }
     }
+}
+
+pub fn nested_page_payload_to_arrow_array(
+    payload: &RetainedColumnPagePayloadV1,
+    schema: &NestedSchemaNodeV1,
+    selection: ArrowRowSelection<'_>,
+    dictionary: Option<&crate::dictionary::FileDictionary>,
+    options: ArrowExportOptions,
+) -> Result<ArrowExportResult<ArrayRef>, CoveError> {
+    let tree = payload.tree()?;
+    let mut report = ArrowExportReport::default();
+    let value = nested_tree_to_arrow_array(
+        payload,
+        &tree,
+        schema,
+        selection,
+        dictionary,
+        options,
+        &mut report,
+    )?;
+    Ok(ArrowExportResult { value, report })
+}
+
+fn nested_tree_to_arrow_array(
+    payload: &RetainedColumnPagePayloadV1,
+    tree: &PagePayloadTreeNode<'_>,
+    schema: &NestedSchemaNodeV1,
+    selection: ArrowRowSelection<'_>,
+    dictionary: Option<&crate::dictionary::FileDictionary>,
+    options: ArrowExportOptions,
+    report: &mut ArrowExportReport,
+) -> Result<ArrayRef, CoveError> {
+    if tree.node.logical_type != schema.logical || tree.node.physical_kind != schema.physical {
+        return Err(CoveError::PageCorrupt);
+    }
+    match schema.physical {
+        CovePhysicalKind::List => {
+            if tree.children.len() != 1 || schema.children.len() != 1 {
+                return Err(CoveError::PageCorrupt);
+            }
+            let layout_bytes =
+                retained_tree_buffer_bytes(payload, tree, PageBufferKind::ChildLayout)?
+                    .ok_or(CoveError::PageCorrupt)?;
+            let layout = ListLayoutPayload::parse(layout_bytes)?;
+            layout.validate()?;
+            let selected_rows = selection.to_rows(u64::from(tree.node.logical_len))?;
+            let mut offsets = Vec::with_capacity(selected_rows.len() + 1);
+            let mut child_rows = Vec::new();
+            offsets.push(0u32);
+            let mut next_offset = 0u32;
+            for row in &selected_rows {
+                let row = usize::try_from(*row).map_err(|_| CoveError::ArithOverflow)?;
+                let start = layout.layout.offsets[row] as usize;
+                let end = layout.layout.offsets[row + 1] as usize;
+                let len = end.checked_sub(start).ok_or(CoveError::ArithOverflow)?;
+                for child_row in start..end {
+                    child_rows
+                        .push(u32::try_from(child_row).map_err(|_| CoveError::ArithOverflow)?);
+                }
+                next_offset = next_offset
+                    .checked_add(u32::try_from(len).map_err(|_| CoveError::ArithOverflow)?)
+                    .ok_or(CoveError::ArithOverflow)?;
+                offsets.push(next_offset);
+            }
+            let child = nested_tree_to_arrow_array(
+                payload,
+                &tree.children[0],
+                &schema.children[0],
+                ArrowRowSelection::Rows(&child_rows),
+                dictionary,
+                options,
+                report,
+            )?;
+            let nulls = selected_arrow_null_buffer(
+                retained_node_validity(payload, tree)?,
+                u64::from(tree.node.logical_len),
+                selection,
+            )?;
+            let field = Arc::new(Field::new(
+                schema.children[0].name.clone(),
+                child.data_type().clone(),
+                schema.children[0].nullable,
+            ));
+            if schema.fixed_size_list_len == 0 {
+                ListArray::try_new(field, arrow_i32_offsets(&offsets)?, child, nulls)
+                    .map(|array| Arc::new(array) as ArrayRef)
+                    .map_err(|err| CoveError::BadSection(format!("Arrow ListArray: {err}")))
+            } else {
+                let width = i32::try_from(schema.fixed_size_list_len)
+                    .map_err(|_| CoveError::ArithOverflow)?;
+                FixedSizeListArray::try_new(field, width, child, nulls)
+                    .map(|array| Arc::new(array) as ArrayRef)
+                    .map_err(|err| {
+                        CoveError::BadSection(format!("Arrow FixedSizeListArray: {err}"))
+                    })
+            }
+        }
+        CovePhysicalKind::Struct => {
+            if tree.children.len() != schema.children.len() {
+                return Err(CoveError::PageCorrupt);
+            }
+            let layout_bytes =
+                retained_tree_buffer_bytes(payload, tree, PageBufferKind::ChildLayout)?
+                    .ok_or(CoveError::PageCorrupt)?;
+            let layout = StructLayoutPayload::parse(layout_bytes)?;
+            layout.validate(u64::from(tree.node.logical_len))?;
+            let mut fields = Vec::with_capacity(schema.children.len());
+            let mut arrays = Vec::with_capacity(schema.children.len());
+            for (child_tree, child_schema) in tree.children.iter().zip(&schema.children) {
+                let array = nested_tree_to_arrow_array(
+                    payload,
+                    child_tree,
+                    child_schema,
+                    selection,
+                    dictionary,
+                    options,
+                    report,
+                )?;
+                fields.push(Field::new(
+                    child_schema.name.clone(),
+                    array.data_type().clone(),
+                    child_schema.nullable,
+                ));
+                arrays.push(array);
+            }
+            let nulls = selected_arrow_null_buffer(
+                retained_node_validity(payload, tree)?,
+                u64::from(tree.node.logical_len),
+                selection,
+            )?;
+            StructArray::try_new(Fields::from(fields), arrays, nulls)
+                .map(|array| Arc::new(array) as ArrayRef)
+                .map_err(|err| CoveError::BadSection(format!("Arrow StructArray: {err}")))
+        }
+        CovePhysicalKind::Map => {
+            if tree.children.len() != 2 || schema.children.len() != 2 {
+                return Err(CoveError::PageCorrupt);
+            }
+            let layout_bytes =
+                retained_tree_buffer_bytes(payload, tree, PageBufferKind::ChildLayout)?
+                    .ok_or(CoveError::PageCorrupt)?;
+            let layout = MapLayoutPayload::parse(layout_bytes)?;
+            layout.validate()?;
+            let selected_rows = selection.to_rows(u64::from(tree.node.logical_len))?;
+            let mut offsets = Vec::with_capacity(selected_rows.len() + 1);
+            let mut child_rows = Vec::new();
+            offsets.push(0u32);
+            let mut next_offset = 0u32;
+            for row in &selected_rows {
+                let row = usize::try_from(*row).map_err(|_| CoveError::ArithOverflow)?;
+                let start = layout.layout.offsets[row] as usize;
+                let end = layout.layout.offsets[row + 1] as usize;
+                let len = end.checked_sub(start).ok_or(CoveError::ArithOverflow)?;
+                for child_row in start..end {
+                    child_rows
+                        .push(u32::try_from(child_row).map_err(|_| CoveError::ArithOverflow)?);
+                }
+                next_offset = next_offset
+                    .checked_add(u32::try_from(len).map_err(|_| CoveError::ArithOverflow)?)
+                    .ok_or(CoveError::ArithOverflow)?;
+                offsets.push(next_offset);
+            }
+            let keys = nested_tree_to_arrow_array(
+                payload,
+                &tree.children[0],
+                &schema.children[0],
+                ArrowRowSelection::Rows(&child_rows),
+                dictionary,
+                options,
+                report,
+            )?;
+            if keys.null_count() != 0 {
+                return Err(CoveError::PageCorrupt);
+            }
+            let values = nested_tree_to_arrow_array(
+                payload,
+                &tree.children[1],
+                &schema.children[1],
+                ArrowRowSelection::Rows(&child_rows),
+                dictionary,
+                options,
+                report,
+            )?;
+            let entry_fields = Fields::from(vec![
+                Field::new("key", keys.data_type().clone(), false),
+                Field::new(
+                    "value",
+                    values.data_type().clone(),
+                    schema.children[1].nullable,
+                ),
+            ]);
+            let entries = StructArray::try_new(entry_fields, vec![keys, values], None)
+                .map_err(|err| CoveError::BadSection(format!("Arrow Map entries: {err}")))?;
+            let nulls = selected_arrow_null_buffer(
+                retained_node_validity(payload, tree)?,
+                u64::from(tree.node.logical_len),
+                selection,
+            )?;
+            let entries_field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+            MapArray::try_new(
+                entries_field,
+                arrow_i32_offsets(&offsets)?,
+                entries,
+                nulls,
+                false,
+            )
+            .map(|array| Arc::new(array) as ArrayRef)
+            .map_err(|err| CoveError::BadSection(format!("Arrow MapArray: {err}")))
+        }
+        _ => {
+            let values = retained_tree_buffer_bytes(payload, tree, PageBufferKind::Values)?
+                .ok_or(CoveError::PageCorrupt)?;
+            let validity = retained_node_validity(payload, tree)?;
+            let array = EncodedArray::new(
+                tree.node.logical_type,
+                tree.node.physical_kind,
+                u64::from(tree.node.logical_len),
+                tree.node.encoding_kind,
+                validity,
+                values,
+                dictionary,
+            );
+            let result =
+                encoded_array_to_arrow_with_row_selection_options(&array, selection, options)?;
+            report.extend_with_field(&schema.name, result.report);
+            Ok(result.value)
+        }
+    }
+}
+
+fn retained_tree_buffer_bytes<'a>(
+    payload: &'a RetainedColumnPagePayloadV1,
+    tree: &PagePayloadTreeNode<'_>,
+    kind: PageBufferKind,
+) -> Result<Option<&'a [u8]>, CoveError> {
+    tree.buffer_of_kind(kind)?
+        .map(|descriptor| payload.buffer_bytes_for_descriptor(descriptor))
+        .transpose()
+}
+
+fn retained_node_validity<'a>(
+    payload: &'a RetainedColumnPagePayloadV1,
+    tree: &PagePayloadTreeNode<'_>,
+) -> Result<Option<ValidityBitmap<'a>>, CoveError> {
+    retained_tree_buffer_bytes(payload, tree, PageBufferKind::NullBitmap).map(|maybe| {
+        maybe.map(|bytes| ValidityBitmap::new(bytes, u64::from(tree.node.logical_len)))
+    })
+}
+
+fn selected_arrow_null_buffer(
+    validity: Option<ValidityBitmap<'_>>,
+    row_count: u64,
+    selection: ArrowRowSelection<'_>,
+) -> Result<Option<NullBuffer>, CoveError> {
+    let Some(validity) = validity else {
+        return Ok(None);
+    };
+    let selected_len = selection.selected_len(row_count)?;
+    let mut builder = ArrowValidityBuilder::new(selected_len)?;
+    selection.for_each_row(row_count, |row| {
+        builder.append(validity.is_valid(row as u64)?);
+        Ok(())
+    })?;
+    Ok(builder.finish())
 }
 
 /// Export layout-aware COVE columns as an Arrow [`RecordBatch`].
@@ -1816,6 +2082,16 @@ impl BytePayloadPlan {
         let mut validity_builder = has_nulls
             .then(|| ArrowValidityBuilder::new(selected_len))
             .transpose()?;
+        if data_owner.is_none() {
+            return self.materialize_view_selected_owned(
+                array,
+                selection,
+                &ranges,
+                has_nulls,
+                views,
+                validity_builder,
+            );
+        }
         selection.for_each_row(array.row_count, |row| {
             let row_u64 = u64::try_from(row).map_err(|_| CoveError::ArithOverflow)?;
             let is_null = has_nulls && array.is_null(row_u64)?;
@@ -1835,6 +2111,41 @@ impl BytePayloadPlan {
         Ok((
             ScalarBuffer::from(views),
             buffers,
+            validity_builder.and_then(ArrowValidityBuilder::finish),
+        ))
+    }
+
+    fn materialize_view_selected_owned(
+        &self,
+        array: &EncodedArray<'_>,
+        selection: ArrowRowSelection<'_>,
+        ranges: &[(usize, usize)],
+        has_nulls: bool,
+        mut views: Vec<u128>,
+        mut validity_builder: Option<ArrowValidityBuilder>,
+    ) -> Result<(ScalarBuffer<u128>, Vec<Buffer>, Option<NullBuffer>), CoveError> {
+        let mut values = Vec::with_capacity(array.data.len().min(views.capacity() * 16));
+        selection.for_each_row(array.row_count, |row| {
+            let row_u64 = u64::try_from(row).map_err(|_| CoveError::ArithOverflow)?;
+            let is_null = has_nulls && array.is_null(row_u64)?;
+            if let Some(builder) = &mut validity_builder {
+                builder.append(!is_null);
+            }
+            if is_null {
+                views.push(0u128);
+                return Ok(());
+            }
+            let (source_start, source_end) = ranges[row];
+            let target_start = values.len();
+            values.extend_from_slice(&array.data[source_start..source_end]);
+            let target_end = values.len();
+            views.push(byte_view_for_range(&values, target_start, target_end)?);
+            Ok(())
+        })?;
+
+        Ok((
+            ScalarBuffer::from(views),
+            vec![Buffer::from_vec(values)],
             validity_builder.and_then(ArrowValidityBuilder::finish),
         ))
     }
@@ -3888,6 +4199,93 @@ pub fn arrow_data_type_for_column_export_options(
     Ok(result)
 }
 
+pub fn arrow_data_type_for_nested_schema_node(
+    node: &NestedSchemaNodeV1,
+    options: ArrowExportOptions,
+) -> Result<ArrowExportResult<DataType>, CoveError> {
+    let mut report = ArrowExportReport::default();
+    let value = arrow_data_type_for_nested_schema_node_with_report(node, options, &mut report)?;
+    Ok(ArrowExportResult { value, report })
+}
+
+fn arrow_data_type_for_nested_schema_node_with_report(
+    node: &NestedSchemaNodeV1,
+    options: ArrowExportOptions,
+    report: &mut ArrowExportReport,
+) -> Result<DataType, CoveError> {
+    match node.physical {
+        CovePhysicalKind::List => {
+            if node.children.len() != 1 {
+                return Err(CoveError::BadSchema(
+                    "NestedSchema List node must have exactly one child".into(),
+                ));
+            }
+            let child = &node.children[0];
+            let child_type =
+                arrow_data_type_for_nested_schema_node_with_report(child, options, report)?;
+            let field = Arc::new(Field::new(child.name.clone(), child_type, child.nullable));
+            if node.fixed_size_list_len == 0 {
+                Ok(DataType::List(field))
+            } else {
+                Ok(DataType::FixedSizeList(
+                    field,
+                    i32::try_from(node.fixed_size_list_len)
+                        .map_err(|_| CoveError::ArithOverflow)?,
+                ))
+            }
+        }
+        CovePhysicalKind::Struct => {
+            let mut fields = Vec::with_capacity(node.children.len());
+            for child in &node.children {
+                let child_type =
+                    arrow_data_type_for_nested_schema_node_with_report(child, options, report)?;
+                fields.push(Field::new(child.name.clone(), child_type, child.nullable));
+            }
+            Ok(DataType::Struct(Fields::from(fields)))
+        }
+        CovePhysicalKind::Map => {
+            if node.children.len() != 2 {
+                return Err(CoveError::BadSchema(
+                    "NestedSchema Map node must have key and value children".into(),
+                ));
+            }
+            let key = &node.children[0];
+            let value = &node.children[1];
+            let key_type =
+                arrow_data_type_for_nested_schema_node_with_report(key, options, report)?;
+            let value_type =
+                arrow_data_type_for_nested_schema_node_with_report(value, options, report)?;
+            let entries = Fields::from(vec![
+                Field::new("key", key_type, false),
+                Field::new("value", value_type, value.nullable),
+            ]);
+            Ok(DataType::Map(
+                Arc::new(Field::new("entries", DataType::Struct(entries), false)),
+                false,
+            ))
+        }
+        _ => {
+            let scalar_options = if matches!(
+                node.logical,
+                CoveLogicalType::Decimal64 | CoveLogicalType::Decimal128
+            ) && node.precision != 0
+            {
+                ArrowExportOptions {
+                    decimal: Some(ArrowDecimalContext {
+                        precision: u8::try_from(node.precision)
+                            .map_err(|_| CoveError::ArithOverflow)?,
+                        scale: i8::try_from(node.scale).map_err(|_| CoveError::ArithOverflow)?,
+                    }),
+                    ..options
+                }
+            } else {
+                options
+            };
+            arrow_data_type_with_report(node.logical, &scalar_options, report)
+        }
+    }
+}
+
 fn arrow_data_type_with_report(
     logical: CoveLogicalType,
     options: &ArrowExportOptions,
@@ -4809,6 +5207,114 @@ mod tests {
     }
 
     #[test]
+    fn selected_utf8_view_without_owner_uses_compact_owned_buffer() {
+        let selected_a = "selected-visible-payload-alpha";
+        let hidden = "hidden-unselected-payload-beta";
+        let selected_b = "selected-visible-payload-gamma";
+        let mut values = Vec::new();
+        for value in [selected_a, hidden, selected_b] {
+            values.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            values.extend_from_slice(value.as_bytes());
+        }
+        let cove = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            3,
+            CoveEncodingKind::VarBytes,
+            None,
+            &values,
+            None,
+        );
+
+        let result = encoded_array_to_arrow_with_row_selection_options(
+            &cove,
+            ArrowRowSelection::Rows(&[0, 2]),
+            view_options(),
+        )
+        .unwrap();
+        let view = result
+            .value
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(view.value(0), selected_a);
+        assert_eq!(view.value(1), selected_b);
+        let backing = view_data_buffers(result.value.as_ref());
+        assert!(contains_subslice(&backing, selected_a.as_bytes()));
+        assert!(contains_subslice(&backing, selected_b.as_bytes()));
+        assert!(!contains_subslice(&backing, hidden.as_bytes()));
+    }
+
+    #[test]
+    fn selected_binary_view_without_owner_uses_compact_owned_buffer() {
+        let selected_a = b"selected-binary-payload-alpha".as_slice();
+        let hidden = b"hidden-binary-payload-beta".as_slice();
+        let selected_b = b"selected-binary-payload-gamma".as_slice();
+        let mut values = Vec::new();
+        for value in [selected_a, hidden, selected_b] {
+            values.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            values.extend_from_slice(value);
+        }
+        let cove = EncodedArray::new(
+            CoveLogicalType::Binary,
+            CovePhysicalKind::VarBytes,
+            3,
+            CoveEncodingKind::VarBytes,
+            None,
+            &values,
+            None,
+        );
+
+        let result = encoded_array_to_arrow_with_row_selection_options(
+            &cove,
+            ArrowRowSelection::Rows(&[0, 2]),
+            view_options(),
+        )
+        .unwrap();
+        let view = result
+            .value
+            .as_any()
+            .downcast_ref::<BinaryViewArray>()
+            .unwrap();
+        assert_eq!(view.value(0), selected_a);
+        assert_eq!(view.value(1), selected_b);
+        let backing = view_data_buffers(result.value.as_ref());
+        assert!(contains_subslice(&backing, selected_a));
+        assert!(contains_subslice(&backing, selected_b));
+        assert!(!contains_subslice(&backing, hidden));
+    }
+
+    #[test]
+    fn all_row_view_without_owner_returns_owned_view_array() {
+        let mut values = Vec::new();
+        values.extend_from_slice(&2u32.to_le_bytes());
+        values.extend_from_slice(b"hi");
+        let long_value = b"long-all-row-view-payload";
+        values.extend_from_slice(&(long_value.len() as u32).to_le_bytes());
+        values.extend_from_slice(long_value);
+        let cove = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            2,
+            CoveEncodingKind::VarBytes,
+            None,
+            &values,
+            None,
+        );
+
+        let result = encoded_array_to_arrow_with_options(&cove, view_options())
+            .unwrap()
+            .value;
+        let view = result.as_any().downcast_ref::<StringViewArray>().unwrap();
+        assert_eq!(view.value(0), "hi");
+        assert_eq!(view.value(1), "long-all-row-view-payload");
+        assert!(contains_subslice(
+            &view_data_buffers(result.as_ref()),
+            b"long-all-row-view-payload"
+        ));
+    }
+
+    #[test]
     fn view_export_schema_policy_is_opt_in() {
         assert_eq!(
             arrow_data_type_for_export_options(
@@ -4837,6 +5343,23 @@ mod tests {
                 .value,
             DataType::BinaryView
         );
+    }
+
+    fn view_data_buffers(array: &dyn Array) -> Vec<u8> {
+        array
+            .to_data()
+            .buffers()
+            .iter()
+            .skip(1)
+            .flat_map(|buffer| buffer.as_slice().iter().copied())
+            .collect()
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
     }
 
     #[test]

@@ -1,13 +1,13 @@
 //! Spec §52 — Nested data layouts (List, Struct, Map).
 //!
 //! These structures store **shape** only; element values live in child
-//! arrays. Validators here enforce the v1 invariants: list offsets must be
+//! arrays. Validators here enforce the v2 invariants: list offsets must be
 //! monotonically non-decreasing, struct field counts agree on row count,
 //! and map keys must be scalar with no duplicates *within a single map
 //! value* (Spec §17.6, §52.4).
 //!
 //! Map duplicate-key policy (Spec §52.4): duplicates inside one map value
-//! are an error in v1. Across map values, the same key may of course
+//! are an error in v2. Across map values, the same key may of course
 //! repeat.
 
 use std::collections::HashSet;

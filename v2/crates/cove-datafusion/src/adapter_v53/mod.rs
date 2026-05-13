@@ -14,9 +14,11 @@ pub mod filter;
 pub mod metadata;
 pub mod metrics;
 pub mod optimizer;
+pub mod physical_filter;
 pub mod statistics;
 pub mod stream;
 pub mod table_provider;
+pub mod writer;
 
 pub const VERSION: &str = "v53";
 

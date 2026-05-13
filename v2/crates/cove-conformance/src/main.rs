@@ -29,9 +29,16 @@ use std::{
     process,
 };
 
-use arrow_array::{Array, BinaryArray, BooleanArray, Int32Array, StringArray, UInt64Array};
+use arrow_array::{
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Int32Array, StringArray, StringViewArray,
+    UInt64Array,
+};
 use cove_arrow::{
-    arrow::{arrow_validity_to_cove_null, cove_null_to_arrow_validity, encoded_array_to_arrow},
+    arrow::{
+        arrow_validity_to_cove_null, cove_null_to_arrow_validity, encoded_array_to_arrow,
+        encoded_array_to_arrow_with_row_selection_options, ArrowExportOptions, ArrowRowSelection,
+        ArrowVarBytesExportPolicy,
+    },
     parquet::{
         convert_parquet_bytes, decode_materialized_page_values_with_nulls,
         ParquetConversionOptions, ParquetScalarValue,
@@ -48,7 +55,8 @@ use cove_core::{
     collation::CollationRegistry,
     compression::{column_page_payload, encode_page_payload, section_payload},
     constants::{
-        CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind, SectionKind,
+        CompressionCodec, CoveEncodingKind, CoveLogicalType, CovePhysicalKind, DigestAlgorithm,
+        SectionKind,
     },
     dictionary::FileDictionary,
     digest::DigestManifest,
@@ -73,7 +81,8 @@ use cove_core::{
         ExtensionIndexDescriptorV1, ExtensionLogicalTypeV1, ExtensionRegistry,
         ExtensionValidationContext,
     },
-    feature_binding::SectionFeatureBindingSectionV2,
+    feature_binding::{OperationKindV2, SectionFeatureBindingSectionV2},
+    feature_scope::FeatureUseRequestV2,
     index::{
         aggregate::AggregateSynopsis,
         bloom::BloomFilterIndex,
@@ -135,10 +144,17 @@ use cove_coverage::{
     can_use_proof_for_pruning, CoveragePlanCandidateV2, CoverageProofRecordV2,
     CoverageProviderDescriptorV2, CoverageSetV2, IntervalPredicateV2, PredicateNormalFormV2,
 };
-use cove_index::{CoviArtifactV2, IndexCapabilityV2, IndexOnlyCapabilityV2};
+use cove_index::{
+    execution::{
+        CoviAggregateKindV2, CoviIndexOnlyRequestV2, CoviLookupKeyV2, CoviLookupRequestV2,
+        CoviValidationContextV2, ValidatedCoviArtifactV2,
+    },
+    CoviArtifactV2, IndexCapabilityV2, IndexOnlyCapabilityV2,
+};
 use cove_layout::{
-    LayoutPlanV2, ScanSplitIndexV2, ZeroCopyBufferMapV2, ZeroCopyCompatibilityContext,
-    ZeroCopyCompatibilityV2, ZeroCopyMaterializationReasonV2,
+    FastMetadataIndexV2, LayoutPlanV2, PageClusterDirectoryV2, ScanSplitIndexV2,
+    ZeroCopyBufferMapV2, ZeroCopyCompatibilityContext, ZeroCopyCompatibilityV2,
+    ZeroCopyMaterializationReasonV2,
 };
 use cove_runtime::{
     unsupported_required_hints, validate_hints, RuntimeCompatibilityHintV2, RuntimeHintKindV2,
@@ -179,9 +195,13 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
         "covx" => CovxFile::parse(bytes).map(|_| ()),
         "covm" => CovmFile::parse(bytes).map(|_| ()),
         "covi" => CoviArtifactV2::parse(bytes).map(|_| ()),
+        "covi_validation_case" => validate_covi_validation_fixture(bytes),
         "cove_codec_descriptors" => CodecExtensionDescriptorV2::parse_many(bytes).map(|_| ()),
         "cove_codec_envelopes" => RegisteredEncodingEnvelopeV2::parse_many(bytes).map(|_| ()),
         "section_feature_binding" => SectionFeatureBindingSectionV2::parse(bytes).map(|_| ()),
+        "feature_scope_use_case" => validate_feature_scope_use_fixture(entry, bytes),
+        "fast_metadata_index" => FastMetadataIndexV2::parse(bytes).map(|_| ()),
+        "page_cluster_directory" => PageClusterDirectoryV2::parse(bytes).map(|_| ()),
         "cove_layout_plan" => LayoutPlanV2::parse(bytes).map(|_| ()),
         "cove_layout_scan_split" => ScanSplitIndexV2::parse(bytes).map(|_| ()),
         "zero_copy_map" => ZeroCopyBufferMapV2::parse(bytes).map(|_| ()),
@@ -208,6 +228,7 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
         "nested_case" => validate_nested_fixture(bytes),
         "arrow_bitmap_case" => validate_arrow_bitmap_fixture(bytes),
         "arrow_export_case" => validate_arrow_export_fixture(bytes),
+        "arrow_view_materialization_case" => validate_arrow_view_materialization_fixture(bytes),
         "parquet_conversion_case" => validate_parquet_conversion_fixture(entry, bytes),
         "error_surface_case" => validate_error_surface_fixture(bytes),
         "suite_contract_case" => validate_suite_contract_fixture(corpus, bytes),
@@ -263,6 +284,75 @@ fn validate_fixture(entry: &Entry, corpus: &Path, bytes: &[u8]) -> Result<(), Co
             "unknown conformance fixture kind {other}"
         ))),
     }
+}
+
+fn validate_feature_scope_use_fixture(entry: &Entry, bytes: &[u8]) -> Result<(), CoveError> {
+    let mut request = FeatureUseRequestV2::new();
+    if let Some(profile) = entry.raw.get("requested_profile").and_then(Value::as_u64) {
+        request.requested_profile = Some(u8::try_from(profile).map_err(|_| {
+            CoveError::BadSection("feature-scope fixture profile out of range".into())
+        })?);
+    }
+    if let Some(operation) = entry.raw.get("requested_operation").and_then(Value::as_u64) {
+        let operation = u16::try_from(operation).map_err(|_| {
+            CoveError::BadSection("feature-scope fixture operation out of range".into())
+        })?;
+        request.requested_operation =
+            Some(OperationKindV2::from_u16(operation).ok_or_else(|| {
+                CoveError::BadSection("feature-scope fixture operation is unknown".into())
+            })?);
+    }
+    if let Some(sections) = entry.raw.get("needed_sections").and_then(Value::as_array) {
+        for section in sections {
+            let section_id = section.as_u64().ok_or_else(|| {
+                CoveError::BadSection("feature-scope fixture section id is not numeric".into())
+            })?;
+            request
+                .needed_section_ids
+                .insert(u32::try_from(section_id).map_err(|_| {
+                    CoveError::BadSection("feature-scope fixture section id out of range".into())
+                })?);
+        }
+    }
+    if let Some(pages) = entry.raw.get("needed_pages").and_then(Value::as_array) {
+        for page in pages {
+            let pair = page.as_array().ok_or_else(|| {
+                CoveError::BadSection("feature-scope fixture page ref must be an array".into())
+            })?;
+            if pair.len() != 2 {
+                return Err(CoveError::BadSection(
+                    "feature-scope fixture page ref must have two values".into(),
+                ));
+            }
+            let section_id = pair[0].as_u64().ok_or_else(|| {
+                CoveError::BadSection("feature-scope fixture page section is not numeric".into())
+            })?;
+            let target = pair[1].as_u64().ok_or_else(|| {
+                CoveError::BadSection("feature-scope fixture page target is not numeric".into())
+            })?;
+            request
+                .needed_page_refs
+                .insert(cove_core::feature_scope::FeatureTargetRefV2::new(
+                    u32::try_from(section_id).map_err(|_| {
+                        CoveError::BadSection(
+                            "feature-scope fixture page section out of range".into(),
+                        )
+                    })?,
+                    target,
+                ));
+        }
+    }
+    reader::validate_bytes_for_feature_use(
+        bytes,
+        ValidationOptions {
+            semantic: true,
+            verify_digests: false,
+            allow_unknown_optional_extensions: true,
+            ..ValidationOptions::default()
+        },
+        request,
+    )
+    .map(|_| ())
 }
 
 fn validate_extension_registry_fixture(bytes: &[u8]) -> Result<(), CoveError> {
@@ -490,6 +580,186 @@ fn validate_sidecar_validity_fixture(bytes: &[u8]) -> Result<(), CoveError> {
         )));
     }
     Ok(())
+}
+
+fn validate_covi_validation_fixture(bytes: &[u8]) -> Result<(), CoveError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        CoveError::BadSection(format!("invalid COVI validation fixture json: {error}"))
+    })?;
+    let covi_bytes = json_byte_vec(&value, "covi")?;
+    let context_value = value
+        .get("context")
+        .ok_or_else(|| CoveError::BadSection("COVI fixture missing context".into()))?;
+    let mut context = CoviValidationContextV2::for_file(
+        json_uuid(context_value, "file_id")?,
+        json_u64(context_value, "file_len")?,
+        json_u64(context_value, "footer_crc32c")? as u32,
+    );
+    if let Some(dataset_id) = optional_uuid(context_value, "dataset_id")? {
+        context = context.with_dataset_id(dataset_id);
+    }
+    if let Some(snapshot_id) = optional_uuid(context_value, "snapshot_id")? {
+        context = context.with_snapshot_id(snapshot_id);
+    }
+    if let Some(value) = optional_u32(context_value, "schema_fingerprint_ref")? {
+        context = context.with_schema_fingerprint_ref(value);
+    }
+    if let Some(value) = optional_u32(context_value, "semantic_map_fingerprint_ref")? {
+        context = context.with_semantic_map_fingerprint_ref(value);
+    }
+    if let Some(value) = optional_u32(context_value, "external_visibility_ref")? {
+        context = context.with_external_visibility_ref(value);
+    }
+    if let Some(value) = context_value.get("now_us").and_then(Value::as_i64) {
+        context = context.with_now_us(value);
+    }
+    if context_value
+        .get("allow_file_code_keys")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        context = context.with_file_code_keys(true);
+    }
+    if let Some(digest) = context_value.get("file_digest") {
+        let algorithm = optional_u32(context_value, "file_digest_algorithm")?
+            .and_then(|value| DigestAlgorithm::from_u16(value as u16))
+            .ok_or_else(|| CoveError::BadSection("invalid file_digest_algorithm".into()))?;
+        let bytes: Vec<u8> = serde_json::from_value(digest.clone()).map_err(|error| {
+            CoveError::BadSection(format!("fixture field file_digest is not bytes: {error}"))
+        })?;
+        context = context.with_file_digest(algorithm, bytes);
+    }
+
+    let expected = value
+        .get("expected_result")
+        .and_then(Value::as_str)
+        .unwrap_or("valid");
+    let validated = match ValidatedCoviArtifactV2::parse_and_validate(&covi_bytes, context) {
+        Ok(validated) => {
+            if expected != "valid" {
+                return Err(CoveError::BadSection(format!(
+                    "COVI fixture expected {expected}, got valid"
+                )));
+            }
+            validated
+        }
+        Err(error) => {
+            if expected == "stale_ignored" {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
+    match value
+        .get("operation")
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("validate")
+    {
+        "validate" => Ok(()),
+        "lookup_eq" => {
+            let operation = value
+                .get("operation")
+                .ok_or_else(|| CoveError::BadSection("COVI fixture missing operation".into()))?;
+            let key = json_byte_vec(operation, "key")?;
+            let request = CoviLookupRequestV2::eq(
+                json_u64(operation, "table_id")? as u32,
+                json_u64(operation, "column_id")? as u32,
+                CoviLookupKeyV2::CanonicalValueBytes(key),
+            );
+            let candidates = validated.lookup(&request)?;
+            if let Some(expected_count) =
+                value.get("expect_row_range_count").and_then(Value::as_u64)
+            {
+                if candidates.row_ranges.len() as u64 != expected_count {
+                    return Err(CoveError::BadCovi);
+                }
+            }
+            Ok(())
+        }
+        "index_only" => {
+            let operation = value
+                .get("operation")
+                .ok_or_else(|| CoveError::BadSection("COVI fixture missing operation".into()))?;
+            let aggregate_kind = match operation
+                .get("aggregate_kind")
+                .and_then(Value::as_str)
+                .unwrap_or("count")
+            {
+                "count" => CoviAggregateKindV2::Count,
+                "min" => CoviAggregateKindV2::Min,
+                "max" => CoviAggregateKindV2::Max,
+                "exists" => CoviAggregateKindV2::Exists,
+                other => {
+                    return Err(CoveError::BadSection(format!(
+                        "unsupported aggregate_kind {other}"
+                    )));
+                }
+            };
+            let request = CoviIndexOnlyRequestV2 {
+                table_id: json_u64(operation, "table_id")? as u32,
+                column_id: optional_u32(operation, "column_id")?,
+                aggregate_kind,
+                predicate_form_ref: optional_u32(operation, "predicate_form_ref")?,
+                require_exact: operation
+                    .get("require_exact")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+            };
+            let answer = validated
+                .index_only_answer(&request)?
+                .ok_or(CoveError::BadCovi)?;
+            if let Some(expected_row_count) = value.get("expect_row_count").and_then(Value::as_u64)
+            {
+                if answer.row_count != expected_row_count {
+                    return Err(CoveError::BadCovi);
+                }
+            }
+            Ok(())
+        }
+        other => Err(CoveError::BadSection(format!(
+            "unsupported COVI validation operation {other}"
+        ))),
+    }
+}
+
+fn json_uuid(value: &Value, field: &str) -> Result<[u8; 16], CoveError> {
+    let bytes: Vec<u8> = serde_json::from_value(
+        value
+            .get(field)
+            .cloned()
+            .ok_or_else(|| CoveError::BadSection(format!("fixture missing {field}")))?,
+    )
+    .map_err(|error| {
+        CoveError::BadSection(format!("fixture field {field} is not bytes: {error}"))
+    })?;
+    bytes
+        .try_into()
+        .map_err(|_| CoveError::BadSection(format!("fixture field {field} must be 16 bytes")))
+}
+
+fn optional_uuid(value: &Value, field: &str) -> Result<Option<[u8; 16]>, CoveError> {
+    if value.get(field).is_none() {
+        return Ok(None);
+    }
+    json_uuid(value, field).map(Some)
+}
+
+fn json_u64(value: &Value, field: &str) -> Result<u64, CoveError> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CoveError::BadSection(format!("fixture missing integer {field}")))
+}
+
+fn optional_u32(value: &Value, field: &str) -> Result<Option<u32>, CoveError> {
+    let Some(raw) = value.get(field).and_then(Value::as_u64) else {
+        return Ok(None);
+    };
+    u32::try_from(raw)
+        .map(Some)
+        .map_err(|_| CoveError::BadSection(format!("fixture field {field} exceeds u32")))
 }
 
 fn validate_visibility_safety_fixture(bytes: &[u8]) -> Result<(), CoveError> {
@@ -1422,6 +1692,55 @@ fn validate_arrow_export_fixture(bytes: &[u8]) -> Result<(), CoveError> {
     Ok(())
 }
 
+fn validate_arrow_view_materialization_fixture(bytes: &[u8]) -> Result<(), CoveError> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|err| CoveError::BadSection(format!("invalid arrow view fixture json: {err}")))?;
+    let fixture = fixture_encoded_array(&value)?;
+    let array = fixture.as_array();
+    let rows = parse_fixture_u32_vector(value.get("selection"), "selection")?;
+    let mut options = ArrowExportOptions::default();
+    options.varbytes_policy = ArrowVarBytesExportPolicy::View;
+    let arrow = encoded_array_to_arrow_with_row_selection_options(
+        &array,
+        ArrowRowSelection::Rows(&rows),
+        options,
+    )?
+    .value;
+    let expected_type = value
+        .get("expect_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoveError::BadSection("arrow view fixture missing expect_type".into()))?;
+    let actual_type = format!("{:?}", arrow.data_type());
+    if actual_type != expected_type {
+        return Err(CoveError::BadSection(format!(
+            "arrow view data type mismatch: expected {expected_type}, got {actual_type}"
+        )));
+    }
+    let expected = value
+        .get("expect")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CoveError::BadSection("arrow view fixture missing expect".into()))?;
+    let actual = arrow_array_to_json(expected_type, arrow.as_ref())?;
+    if actual != *expected {
+        return Err(CoveError::BadSection(format!(
+            "arrow view fixture mismatch: expected {expected:?}, got {actual:?}"
+        )));
+    }
+    let backing = arrow_view_data_buffers(arrow.as_ref());
+    for value in parse_fixture_string_vector(
+        value.get("expect_absent_in_buffers"),
+        "expect_absent_in_buffers",
+    )? {
+        let needle = value.as_bytes();
+        if !needle.is_empty() && backing.windows(needle.len()).any(|window| window == needle) {
+            return Err(CoveError::BadSection(format!(
+                "arrow view fixture found excluded bytes in backing buffer: {value}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 struct EncodedArrayFixture {
     logical: CoveLogicalType,
     physical: CovePhysicalKind,
@@ -1512,7 +1831,7 @@ fn array_value_to_json(
 fn bytes_value_to_json(logical: CoveLogicalType, bytes: &[u8]) -> Result<Value, CoveError> {
     match logical {
         CoveLogicalType::Utf8 | CoveLogicalType::Json => Ok(json!(std::str::from_utf8(bytes)
-            .map_err(|err| CoveError::BadSection(format!("invalid UTF-8 value: {err}")))?)),
+            .map_err(|err| { CoveError::BadSection(format!("invalid UTF-8 value: {err}")) })?)),
         CoveLogicalType::Binary | CoveLogicalType::Uuid => Ok(json!(hex_encode(bytes))),
         _ => Ok(json!(hex_encode(bytes))),
     }
@@ -1578,8 +1897,32 @@ fn arrow_array_to_json(expected_type: &str, array: &dyn Array) -> Result<Vec<Val
                 })
                 .collect())
         }
+        "Utf8View" => {
+            let values = downcast_arrow_array::<StringViewArray>(array, expected_type)?;
+            Ok((0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        Value::Null
+                    } else {
+                        json!(values.value(row))
+                    }
+                })
+                .collect())
+        }
         "Binary" => {
             let values = downcast_arrow_array::<BinaryArray>(array, expected_type)?;
+            Ok((0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        Value::Null
+                    } else {
+                        json!(hex_encode(values.value(row)))
+                    }
+                })
+                .collect())
+        }
+        "BinaryView" => {
+            let values = downcast_arrow_array::<BinaryViewArray>(array, expected_type)?;
             Ok((0..values.len())
                 .map(|row| {
                     if values.is_null(row) {
@@ -1594,6 +1937,16 @@ fn arrow_array_to_json(expected_type: &str, array: &dyn Array) -> Result<Vec<Val
             "unsupported arrow export fixture type {other}"
         ))),
     }
+}
+
+fn arrow_view_data_buffers(array: &dyn Array) -> Vec<u8> {
+    array
+        .to_data()
+        .buffers()
+        .iter()
+        .skip(1)
+        .flat_map(|buffer| buffer.as_slice().iter().copied())
+        .collect()
 }
 
 fn downcast_arrow_array<'a, T: 'static>(
@@ -1667,7 +2020,7 @@ fn validate_arrow_bitmap_fixture(bytes: &[u8]) -> Result<(), CoveError> {
         other => {
             return Err(CoveError::BadSection(format!(
                 "unsupported arrow fixture op {other}"
-            )))
+            )));
         }
     };
 
@@ -2146,7 +2499,7 @@ fn validate_page_codec_fixture(bytes: &[u8]) -> Result<(), CoveError> {
         other => {
             return Err(CoveError::BadSection(format!(
                 "page_codec fixture has unknown codec {other:?}"
-            )))
+            )));
         }
     };
     let payload = value
@@ -2477,7 +2830,7 @@ fn parse_zone_stat_flags(value: Option<&Value>) -> Result<ZoneStatFlags, CoveErr
             other => {
                 return Err(CoveError::BadSection(format!(
                     "unsupported pruning zone_stats flag {other}"
-                )))
+                )));
             }
         }
     }
@@ -2756,12 +3109,12 @@ fn parse_pruning_stat_scalar(value: &Value, field: &str) -> Result<StatScalar, C
         StatKind::None | StatKind::FixedBytes => {
             return Err(CoveError::BadSection(format!(
                 "{field} uses unsupported pruning stat kind {kind_name}"
-            )))
+            )));
         }
         _ => {
             return Err(CoveError::BadSection(format!(
                 "{field} uses future pruning stat kind {kind_name}"
-            )))
+            )));
         }
     };
 

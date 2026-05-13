@@ -1,6 +1,6 @@
-//! Cove Format (COVE) v1.0 — Logical/physical type compatibility and NumCode helpers.
+//! Cove Format (COVE) v2.0 — Logical/physical type compatibility and NumCode helpers.
 //!
-//! Corresponds to Sections 18–19 of the COVE v1.0 specification.
+//! Corresponds to Sections 18–19 of the COVE v2.0 specification.
 
 use crate::{
     constants::{CoveLogicalType, CovePhysicalKind},

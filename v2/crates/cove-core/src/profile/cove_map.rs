@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — COVE-MAP embedded-section reference schema.
+//! Cove Format (COVE) v2.0 — COVE-MAP embedded-section reference schema.
 //!
 //! Spec §70 fixes the COVE-MAP validation boundary but leaves exact reusable
 //! mapping-definition payload bodies to a companion schema specification or a
