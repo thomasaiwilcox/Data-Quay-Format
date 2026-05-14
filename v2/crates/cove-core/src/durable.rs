@@ -7,16 +7,18 @@
 //!    (`<final>.cove.tmp.<unique>`).
 //! 2. Calls `fsync` on the temporary file.
 //! 3. Renames atomically over the final path.
-//! 4. Calls `fsync` on the parent directory so the rename is durable.
+//! 4. Calls `fsync` on the parent directory so the rename is durable. On
+//!    Windows, the rename uses `MoveFileExW` with write-through semantics
+//!    because Rust does not expose Unix-style parent-directory fsync there.
 //!
 //! The COVE specification permits readers to assume that any file at the final
 //! path is structurally complete; partial writes are confined to the `.tmp.`
 //! suffix. This module provides a portable helper that implements the
 //! protocol on top of `std::fs`.
 //!
-//! Parent directory fsync is fallible and is part of the success condition:
-//! callers must not treat the final path as durably published unless this
-//! module returns `Ok`.
+//! Parent directory fsync, or the Windows write-through rename, is fallible and
+//! is part of the success condition: callers must not treat the final path as
+//! durably published unless this module returns `Ok`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -27,6 +29,48 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::CoveError;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(not(windows))]
+fn open_parent_dir_for_sync(path: &Path) -> Result<File, CoveError> {
+    Ok(File::open(path)?)
+}
+
+#[cfg(windows)]
+fn rename_durable(from: &Path, to: &Path) -> Result<(), CoveError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
+
+    unsafe extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let ok = unsafe {
+        MoveFileExW(
+            from_wide.as_ptr(),
+            to_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_durable(from: &Path, to: &Path) -> Result<(), CoveError> {
+    fs::rename(from, to)?;
+    Ok(())
+}
 
 /// Compute the temporary path used by the durable-replace protocol.
 pub fn temp_path_for(final_path: &Path) -> PathBuf {
@@ -67,7 +111,7 @@ where
         let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         write(&mut file)?;
         file.sync_all()?;
-        fs::rename(&tmp, final_path)?;
+        rename_durable(&tmp, final_path)?;
         let parent = final_path.parent().ok_or_else(|| {
             CoveError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -77,7 +121,7 @@ where
                 ),
             ))
         })?;
-        File::open(parent)?.sync_all()?;
+        StdDurableReplaceBackend::sync_parent_path(parent)?;
         Ok(())
     })();
 
@@ -98,6 +142,19 @@ trait DurableReplaceBackend {
 
 struct StdDurableReplaceBackend;
 
+impl StdDurableReplaceBackend {
+    #[cfg(windows)]
+    fn sync_parent_path(_parent: &Path) -> Result<(), CoveError> {
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn sync_parent_path(parent: &Path) -> Result<(), CoveError> {
+        open_parent_dir_for_sync(parent)?.sync_all()?;
+        Ok(())
+    }
+}
+
 impl DurableReplaceBackend for StdDurableReplaceBackend {
     fn write_new_file(&mut self, path: &Path, bytes: &[u8]) -> Result<(), CoveError> {
         let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -106,13 +163,16 @@ impl DurableReplaceBackend for StdDurableReplaceBackend {
     }
 
     fn sync_file(&mut self, path: &Path) -> Result<(), CoveError> {
-        File::open(path)?.sync_all()?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()?;
         Ok(())
     }
 
     fn rename(&mut self, from: &Path, to: &Path) -> Result<(), CoveError> {
-        fs::rename(from, to)?;
-        Ok(())
+        rename_durable(from, to)
     }
 
     fn remove_file(&mut self, path: &Path) -> Result<(), CoveError> {
@@ -130,8 +190,7 @@ impl DurableReplaceBackend for StdDurableReplaceBackend {
                 ),
             ))
         })?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        Self::sync_parent_path(parent)
     }
 }
 
@@ -290,6 +349,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn parent_sync_open_failures_are_reported() {
         let path = Path::new("/definitely-missing-parent-for-cove-tests/output.cove");
