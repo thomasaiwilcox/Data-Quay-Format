@@ -1036,7 +1036,7 @@ fn word_bytes_len(word_count: u32) -> Result<usize, CoveError> {
 }
 
 fn read_words(bytes: &[u8]) -> Result<Vec<u64>, CoveError> {
-    if bytes.len() % 8 != 0 {
+    if !bytes.len().is_multiple_of(8) {
         return Err(CoveError::BadSection(
             "feature word byte length is not a multiple of 8".into(),
         ));

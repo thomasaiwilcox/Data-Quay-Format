@@ -451,7 +451,7 @@ fn composite_tuple_has_match(
 ) -> Option<bool> {
     let key_width = index.key_columns.len().checked_mul(8)?;
     let entry_width = key_width.checked_add(8)?;
-    if entry_width == 8 || index.entries.len() % entry_width != 0 {
+    if entry_width == 8 || !index.entries.len().is_multiple_of(entry_width) {
         return None;
     }
     for entry in index.entries.chunks_exact(entry_width) {
@@ -545,10 +545,10 @@ fn filter_prunes_morsel(
             for file_code in file_codes {
                 let explained =
                     explain_file_code_equality(*file_code, zone, domain, exact_set).final_outcome;
-                if explained != PredicateZoneOutcome::NoMatch {
-                    if !bloom_excludes_file_code(state, column.column_id, *file_code, bloom)? {
-                        return Ok(false);
-                    }
+                if explained != PredicateZoneOutcome::NoMatch
+                    && !bloom_excludes_file_code(state, column.column_id, *file_code, bloom)?
+                {
+                    return Ok(false);
                 }
             }
             Ok(true)

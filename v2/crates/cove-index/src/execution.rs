@@ -940,6 +940,7 @@ fn validate_snapshot(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_root_blocks(
     root: &CoviIndexRootV2,
     referenced_files: &[CoviReferencedFileV2],
@@ -1292,14 +1293,14 @@ fn parse_fixed_payload<T>(
     width: usize,
     parse: impl Fn(&[u8]) -> Result<T, CoveError>,
 ) -> Result<Vec<T>, CoveError> {
-    if payload.len() % width != 0 {
+    if !payload.len().is_multiple_of(width) {
         return Err(CoveError::BadCovi);
     }
     payload.chunks_exact(width).map(parse).collect()
 }
 
 fn parse_u32_refs(payload: &[u8]) -> Result<Vec<u32>, CoveError> {
-    if payload.len() % 4 != 0 {
+    if !payload.len().is_multiple_of(4) {
         return Err(CoveError::BadCovi);
     }
     Ok(payload

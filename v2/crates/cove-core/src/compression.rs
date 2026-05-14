@@ -136,11 +136,7 @@ fn payload_from_raw<'a>(
     }
 }
 
-fn payload_raw_bytes<'a>(
-    file_data: &'a [u8],
-    offset: u64,
-    length: u64,
-) -> Result<&'a [u8], CoveError> {
+fn payload_raw_bytes(file_data: &[u8], offset: u64, length: u64) -> Result<&[u8], CoveError> {
     let end = offset.checked_add(length).ok_or(CoveError::ArithOverflow)?;
     if end as usize > file_data.len() {
         return Err(CoveError::OffsetRange);

@@ -241,7 +241,7 @@ pub(super) fn selected_rows_for_morsel(
         let payload = match materialize_page_payload(
             segment_bytes,
             column,
-            &page,
+            page,
             state.pruning().codec_descriptors.as_slice(),
             state
                 .mounted()
@@ -277,7 +277,7 @@ pub(super) fn selected_rows_for_morsel(
         } else {
             state.mounted().dictionary.as_ref()
         };
-        let array = encoded_array_for_page(&payload, &page, dictionary)?;
+        let array = encoded_array_for_page(&payload, page, dictionary)?;
         let applied = match try_apply_raw_predicate_to_selection(
             predicate,
             &array,
@@ -512,7 +512,7 @@ async fn read_page_wire<R: CoveRangeReader + ?Sized>(
     let end = start
         .checked_add(page.page_length)
         .ok_or_else(|| CoveError::ArithOverflow)?;
-    let ranges = vec![start..end];
+    let ranges = std::iter::once(start..end).collect::<Vec<_>>();
     let hints = vec![state.range_cluster_hint(segment_ref.segment_id, page.morsel_id, start, end)];
     let coalesced_plan =
         build_layout_aware_coalesced_range_plan(&ranges, &hints, state.range_coalescing())?;

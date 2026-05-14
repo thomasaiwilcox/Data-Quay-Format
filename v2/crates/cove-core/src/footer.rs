@@ -343,7 +343,7 @@ impl CoveFooter {
         })
     }
 
-    /// Compute the CRC32C of the footer bytes as produced by [`serialize`].
+    /// Compute the CRC32C of the footer bytes as produced by [`Self::serialize`].
     ///
     /// Use this to fill the `crc32c` field of the postscript's footer spec.
     pub fn compute_crc(&self) -> u32 {

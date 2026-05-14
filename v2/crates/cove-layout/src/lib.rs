@@ -1668,10 +1668,7 @@ pub fn build_default_layout_plan(
     Ok(plan)
 }
 
-fn section_by_id<'a>(
-    footer: &'a CoveFooter,
-    section_id: u32,
-) -> Result<&'a CoveSectionEntryV1, CoveError> {
+fn section_by_id(footer: &CoveFooter, section_id: u32) -> Result<&CoveSectionEntryV1, CoveError> {
     if section_id == 0 {
         return Err(CoveError::BadLayoutPlan);
     }
@@ -1849,11 +1846,11 @@ fn validate_layout_node_authority(
     Ok(())
 }
 
-fn segment_by_id<'a>(
-    segments: &'a [TableSegmentIndexEntryV1],
+fn segment_by_id(
+    segments: &[TableSegmentIndexEntryV1],
     table_id: u32,
     segment_id: u32,
-) -> Result<&'a TableSegmentIndexEntryV1, CoveError> {
+) -> Result<&TableSegmentIndexEntryV1, CoveError> {
     segments
         .iter()
         .find(|segment| segment.table_id == table_id && segment.segment_id == segment_id)

@@ -768,10 +768,12 @@ fn validate_cove_t_cross_sections(
             table,
             payload,
             bytes,
-            dictionary,
-            zone_stats,
-            codec_descriptors,
-            nested_schema,
+            SegmentValidationRefs {
+                dictionary,
+                zone_stats,
+                codec_descriptors,
+                nested_schema,
+            },
         )?;
     }
     for table in &catalog.tables {
@@ -785,14 +787,19 @@ fn validate_cove_t_cross_sections(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct SegmentValidationRefs<'a, 'data> {
+    dictionary: Option<&'a FileDictionaryView<'data>>,
+    zone_stats: &'a [ZoneStatsEntry],
+    codec_descriptors: &'a [CodecExtensionDescriptorV2],
+    nested_schema: Option<&'a NestedSchemaSectionV1>,
+}
+
 fn validate_segment_against_catalog(
     table: &TableEntry,
     segment: &TableSegmentPayloadV1,
     segment_bytes: &[u8],
-    dictionary: Option<&FileDictionaryView<'_>>,
-    zone_stats: &[ZoneStatsEntry],
-    codec_descriptors: &[CodecExtensionDescriptorV2],
-    nested_schema: Option<&NestedSchemaSectionV1>,
+    refs: SegmentValidationRefs<'_, '_>,
 ) -> Result<(), CoveError> {
     if segment.header.table_id != table.table_id {
         return Err(CoveError::SegmentCorrupt);
@@ -821,16 +828,7 @@ fn validate_segment_against_catalog(
         {
             return Err(CoveError::PageCorrupt);
         }
-        validate_column_pages_against_catalog(
-            column,
-            column_dir,
-            segment,
-            segment_bytes,
-            dictionary,
-            zone_stats,
-            codec_descriptors,
-            nested_schema,
-        )?;
+        validate_column_pages_against_catalog(column, column_dir, segment, segment_bytes, refs)?;
     }
     Ok(())
 }
@@ -840,10 +838,7 @@ fn validate_column_pages_against_catalog(
     column_dir: &TableColumnDirectoryEntryV1,
     segment: &TableSegmentPayloadV1,
     segment_bytes: &[u8],
-    dictionary: Option<&FileDictionaryView<'_>>,
-    zone_stats: &[ZoneStatsEntry],
-    codec_descriptors: &[CodecExtensionDescriptorV2],
-    nested_schema: Option<&NestedSchemaSectionV1>,
+    refs: SegmentValidationRefs<'_, '_>,
 ) -> Result<(), CoveError> {
     let page_index_start =
         usize::try_from(column_dir.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
@@ -871,10 +866,11 @@ fn validate_column_pages_against_catalog(
             column_id: column.column_id,
             logical_type: column.logical,
             physical_kind: column.physical,
-            dictionary,
-            zone_stats: Some(zone_stats),
-            codec_descriptors,
-            nested_schema: nested_schema
+            dictionary: refs.dictionary,
+            zone_stats: Some(refs.zone_stats),
+            codec_descriptors: refs.codec_descriptors,
+            nested_schema: refs
+                .nested_schema
                 .and_then(|schema| schema.entry(segment.header.table_id, column.column_id))
                 .map(|entry| &entry.root),
         };

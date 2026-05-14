@@ -90,8 +90,7 @@ pub(super) fn lookup_selection_for_morsel(
                         {
                             continue;
                         }
-                        let row_index = usize::try_from(row.row_in_morsel)
-                            .map_err(|_| CoveError::ArithOverflow)?;
+                        let row_index = usize::from(row.row_in_morsel);
                         if row_index >= scratch.filter_mask.len {
                             stats.index_fallbacks += 1;
                             return Ok(false);

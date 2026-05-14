@@ -434,7 +434,7 @@ impl RegisteredEncodingEnvelopeV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCodecExtension);
         }
         bytes
@@ -682,7 +682,7 @@ pub fn logical_page_to_column_payload(
     dictionary_len: Option<u32>,
 ) -> Result<ColumnPagePayloadV1, CoveError> {
     let row_count = u32::try_from(page.values.len()).map_err(|_| CoveError::ArithOverflow)?;
-    let mut null_bitmap = vec![0u8; (page.values.len() + 7) / 8];
+    let mut null_bitmap = vec![0u8; page.values.len().div_ceil(8)];
     let mut null_count = 0usize;
     let mut values = Vec::new();
     for (index, value) in page.values.iter().enumerate() {
@@ -885,7 +885,7 @@ fn decode_row_bytes(expected_magic: &[u8; 4], bytes: &[u8]) -> Result<LogicalPag
     let row_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let null_bitmap_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     let offsets_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-    if null_bitmap_len != (row_count + 7) / 8 || offsets_len != (row_count + 1) * 4 {
+    if null_bitmap_len != row_count.div_ceil(8) || offsets_len != (row_count + 1) * 4 {
         return Err(CoveError::BadCodecExtension);
     }
     let bitmap_start = 16usize;
@@ -917,7 +917,7 @@ fn decode_row_bytes(expected_magic: &[u8; 4], bytes: &[u8]) -> Result<LogicalPag
         let is_null = (null_bitmap[index >> 3] & (1 << (index & 7))) != 0;
         values.push((!is_null).then(|| payload[start..end].to_vec()));
     }
-    if row_count % 8 != 0 && !null_bitmap.is_empty() {
+    if !row_count.is_multiple_of(8) && !null_bitmap.is_empty() {
         let unused_mask = !((1u8 << (row_count % 8)) - 1);
         if null_bitmap[null_bitmap.len() - 1] & unused_mask != 0 {
             return Err(CoveError::BadCodecExtension);

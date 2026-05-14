@@ -216,7 +216,7 @@ impl PredicateNormalFormV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCoverage);
         }
         let mut ids = BTreeSet::new();
@@ -268,7 +268,7 @@ impl PredicateNormalFormWithPayloadV2 {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        if bytes.len() % PredicateNormalFormV2::LEN == 0 {
+        if bytes.len().is_multiple_of(PredicateNormalFormV2::LEN) {
             let forms = PredicateNormalFormV2::parse_many(bytes)?;
             if forms.iter().all(|form| form.payload_length == 0) {
                 return Ok(forms
@@ -287,7 +287,9 @@ impl PredicateNormalFormWithPayloadV2 {
         } else {
             first.payload_offset as usize
         };
-        if table_end == 0 || table_end > bytes.len() || table_end % PredicateNormalFormV2::LEN != 0
+        if table_end == 0
+            || table_end > bytes.len()
+            || !table_end.is_multiple_of(PredicateNormalFormV2::LEN)
         {
             return Err(CoveError::BadCoverage);
         }
@@ -1006,7 +1008,7 @@ impl IntervalPredicateV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCoverage);
         }
         bytes.chunks_exact(Self::LEN).map(Self::parse).collect()
@@ -1305,7 +1307,7 @@ impl CoveragePlanCandidateV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCoverage);
         }
         let mut ids = BTreeSet::new();
@@ -1425,7 +1427,7 @@ impl CoverageProofRecordV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCoverage);
         }
         let mut ids = BTreeSet::new();
@@ -1595,7 +1597,7 @@ impl CoverageProviderDescriptorV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCoverage);
         }
         let mut providers = Vec::new();

@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use std::{
     env, fs,
     io::{self, BufRead, Write},
@@ -905,7 +907,7 @@ impl ParquetCompareFixture {
                     SessionConfig::new().with_target_partitions(target_partitions),
                 )
             })
-            .unwrap_or_else(SessionContext::new);
+            .unwrap_or_default();
         register_cove_file_with_options(&ctx, "events_cove", &events_cove, cove_options.clone())
             .expect("register events_cove");
         register_cove_file_with_options(&ctx, "items_cove", &items_cove, cove_options.clone())

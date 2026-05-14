@@ -152,6 +152,7 @@ pub fn apply_policy(
 }
 
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 mod tests {
     use super::*;
 

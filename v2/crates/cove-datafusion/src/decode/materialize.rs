@@ -36,7 +36,7 @@ pub(super) fn arrow_encoded_columns_for_payloads<'name, 'array, 'data>(
                 None
             };
             DecodedArrowColumn {
-                name: *name,
+                name,
                 array,
                 payload: Some(payload),
                 nested_schema,
@@ -499,7 +499,7 @@ fn materialize_stats_only_page(
             .ok_or(CoveError::ArithOverflow)?
             / 8;
         let mut bitmap = vec![0xff; bitmap_len];
-        if page.row_count % 8 != 0 && !bitmap.is_empty() {
+        if !page.row_count.is_multiple_of(8) && !bitmap.is_empty() {
             let valid_bits = page.row_count % 8;
             bitmap[bitmap_len - 1] = (1u8 << valid_bits) - 1;
         }

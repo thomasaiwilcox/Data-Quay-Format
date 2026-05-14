@@ -148,7 +148,7 @@ impl AggregateSynopsis {
                 entries: vec![first],
             });
         }
-        if bytes.len() % AGGREGATE_SYNOPSIS_ENTRY_LEN != 0 {
+        if !bytes.len().is_multiple_of(AGGREGATE_SYNOPSIS_ENTRY_LEN) {
             return Err(CoveError::BadIndex);
         }
         let mut entries = Vec::with_capacity(bytes.len() / AGGREGATE_SYNOPSIS_ENTRY_LEN);

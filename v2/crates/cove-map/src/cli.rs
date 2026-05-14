@@ -278,6 +278,7 @@ fn parse_output_format_and_positionals(
     Ok((output, format, positional))
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_project_cove_o_args(
     args: impl Iterator<Item = String>,
 ) -> Result<
@@ -338,6 +339,7 @@ fn parse_project_cove_o_args(
     Ok((positional.remove(0), mapping, output, format, projection_id))
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_output_format_projection_and_positionals(
     args: impl Iterator<Item = String>,
 ) -> Result<(Option<PathBuf>, OutputFormat, Option<String>, Vec<PathBuf>), String> {

@@ -349,7 +349,7 @@ fn hex_decode(raw: &str) -> Result<Vec<u8>, String> {
 
 fn hex_decode_cove(raw: &str) -> Result<Vec<u8>, CoveError> {
     let raw = raw.strip_prefix("0x").unwrap_or(raw);
-    if raw.len() % 2 != 0 {
+    if !raw.len().is_multiple_of(2) {
         return Err(CoveError::BadSection("hex input has odd length".into()));
     }
     let mut out = Vec::with_capacity(raw.len() / 2);

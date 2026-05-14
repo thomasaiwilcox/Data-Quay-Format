@@ -37,18 +37,16 @@ pub struct RowRange {
     pub len: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum RowVisibility {
+    #[default]
     All,
     VisibleRanges(Vec<RowRange>),
     DeletedRanges(Vec<RowRange>),
-    DeletedBitmap { row_count: u64, bits: Vec<u64> },
-}
-
-impl Default for RowVisibility {
-    fn default() -> Self {
-        Self::All
-    }
+    DeletedBitmap {
+        row_count: u64,
+        bits: Vec<u64>,
+    },
 }
 
 impl RowVisibility {

@@ -170,10 +170,13 @@ fn input_identities(inputs: &[PathBuf]) -> Result<Vec<InputIdentity>, CoveError>
             "expected at least one COVE input".into(),
         ));
     }
-    inputs.iter().map(input_identity).collect()
+    inputs
+        .iter()
+        .map(|path| input_identity(path.as_path()))
+        .collect()
 }
 
-fn input_identity(path: &PathBuf) -> Result<InputIdentity, CoveError> {
+fn input_identity(path: &Path) -> Result<InputIdentity, CoveError> {
     let bytes = fs::read(path)?;
     let report = validate_bytes_with_options(
         &bytes,
@@ -186,7 +189,7 @@ fn input_identity(path: &PathBuf) -> Result<InputIdentity, CoveError> {
     let digest = compute_digest(DigestAlgorithm::Sha256, &bytes)?;
     let (row_count, segment_count) = table_shape(&bytes, &report.validated.footer)?;
     Ok(InputIdentity {
-        path: path.clone(),
+        path: path.to_path_buf(),
         file_id: report.validated.header.file_id,
         file_len: bytes.len() as u64,
         footer_crc32c: report.validated.postscript.footer.crc32c,

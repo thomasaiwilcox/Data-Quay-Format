@@ -45,21 +45,11 @@ impl Default for CsvReadOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConversionOptions {
     pub source_format: Option<SourceFormat>,
     pub cove: ParquetConversionOptions,
     pub csv: CsvReadOptions,
-}
-
-impl Default for ConversionOptions {
-    fn default() -> Self {
-        Self {
-            source_format: None,
-            cove: ParquetConversionOptions::default(),
-            csv: CsvReadOptions::default(),
-        }
-    }
 }
 
 pub fn convert_file_to_cove(

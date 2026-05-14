@@ -31,7 +31,7 @@ impl BitPackedPayload {
             return Err(CoveError::BufferTooShort);
         }
         let need_bits = (row_count as u64) * (bpv as u64);
-        let need_bytes = ((need_bits + 7) / 8) as usize;
+        let need_bytes = need_bits.div_ceil(8) as usize;
         if byte_len < need_bytes {
             return Err(CoveError::PageCorrupt);
         }
@@ -63,7 +63,7 @@ impl BitPackedPayload {
             (1u64 << bits_per_value) - 1
         };
         let total_bits = values.len() as u64 * bits_per_value as u64;
-        let mut bits = vec![0u8; ((total_bits + 7) / 8) as usize];
+        let mut bits = vec![0u8; total_bits.div_ceil(8) as usize];
         let mut bit_pos: u64 = 0;
         for v in values {
             if v & !mask != 0 {

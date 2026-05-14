@@ -17,7 +17,7 @@
 
 //! ORC Bloom filter decoding and evaluation.
 //!
-//! This follows the ORC v1 spec (https://orc.apache.org/specification/ORCv1/):
+//! This follows the ORC v1 spec (<https://orc.apache.org/specification/ORCv1/>):
 //! - Stream kinds `BLOOM_FILTER` / `BLOOM_FILTER_UTF8` provide per-row-group filters.
 //! - Values are hashed to a 64-bit base hash (ORC's Murmur3 hash64),
 //!   split into two 32-bit hashes, and combined with `hash1 + i*hash2`

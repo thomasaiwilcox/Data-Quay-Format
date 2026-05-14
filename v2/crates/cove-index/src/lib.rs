@@ -242,7 +242,7 @@ impl CoviSectionEntryV2 {
             return Err(CoveError::BufferTooShort);
         }
         let section_kind =
-            CoviSectionKindV2::from_u16(read_u16(bytes, 4)?).ok_or_else(|| CoveError::BadCovi)?;
+            CoviSectionKindV2::from_u16(read_u16(bytes, 4)?).ok_or(CoveError::BadCovi)?;
         let entry = Self {
             section_id: read_u32(bytes, 0)?,
             section_kind,
@@ -398,7 +398,7 @@ impl IndexCapabilityV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCovi);
         }
         let mut ids = BTreeSet::new();
@@ -504,7 +504,7 @@ impl IndexOnlyCapabilityV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCovi);
         }
         let mut ids = BTreeSet::new();
@@ -1247,7 +1247,7 @@ impl CoviIndexEntryV2 {
 }
 
 pub fn parse_covi_index_entries(bytes: &[u8]) -> Result<Vec<CoviIndexEntryV2>, CoveError> {
-    if bytes.len() % CoviIndexEntryV2::LEN != 0 {
+    if !bytes.len().is_multiple_of(CoviIndexEntryV2::LEN) {
         return Err(CoveError::BadCovi);
     }
     let entries = bytes
@@ -1500,7 +1500,8 @@ impl CoviPostingsHeaderV2 {
 
     pub fn validate(&self) -> Result<(), CoveError> {
         if let Some(width) = self.representation.fixed_payload_len() {
-            let expected = (self.item_count as u64)
+            let expected = self
+                .item_count
                 .checked_mul(width as u64)
                 .ok_or(CoveError::ArithOverflow)?;
             if self.payload_length != expected {
@@ -2004,7 +2005,7 @@ impl CoviRowOrdinalSetHeaderV2 {
 pub fn parse_covi_row_range_postings(
     bytes: &[u8],
 ) -> Result<Vec<CoviRowRangePostingV2>, CoveError> {
-    if bytes.len() % CoviRowRangePostingV2::LEN != 0 {
+    if !bytes.len().is_multiple_of(CoviRowRangePostingV2::LEN) {
         return Err(CoveError::BadCovi);
     }
     let rows = bytes
@@ -2025,7 +2026,7 @@ where
     F: Fn(&[u8]) -> Result<T, CoveError>,
     K: Ord,
 {
-    if bytes.len() % item_len != 0 {
+    if !bytes.len().is_multiple_of(item_len) {
         return Err(CoveError::BadCovi);
     }
     let items = bytes
@@ -2190,7 +2191,7 @@ fn validate_row_ordinal_refs(
     payload: &[u8],
     row_ordinal_sets: &[CoviRowOrdinalSetHeaderV2],
 ) -> Result<(), CoveError> {
-    if payload.len() % 4 != 0 {
+    if !payload.len().is_multiple_of(4) {
         return Err(CoveError::BadCovi);
     }
     let mut previous: Option<u32> = None;
@@ -2227,12 +2228,12 @@ fn validate_row_ordinal_set_payload(
 ) -> Result<(), CoveError> {
     match row_set.bitmap_kind {
         CoviBitmapKindV2::DenseBitsetLsb0 => {
-            let expected = usize::try_from((row_set.universe_row_count + 7) / 8)
+            let expected = usize::try_from(row_set.universe_row_count.div_ceil(8))
                 .map_err(|_| CoveError::ArithOverflow)?;
             if payload.len() != expected {
                 return Err(CoveError::BadCovi);
             }
-            if row_set.universe_row_count % 8 != 0 && !payload.is_empty() {
+            if !row_set.universe_row_count.is_multiple_of(8) && !payload.is_empty() {
                 let used_bits = (row_set.universe_row_count % 8) as u8;
                 let high_mask = !((1u8 << used_bits) - 1);
                 if payload[payload.len() - 1] & high_mask != 0 {
@@ -3345,7 +3346,7 @@ where
     F: Fn(&[u8]) -> Result<T, CoveError>,
     Id: Fn(&T) -> u32,
 {
-    if bytes.len() % item_len != 0 {
+    if !bytes.len().is_multiple_of(item_len) {
         return Err(CoveError::BadCovi);
     }
     let mut out = Vec::new();

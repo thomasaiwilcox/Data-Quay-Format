@@ -3,6 +3,8 @@
 //! M0 provides the crate boundary, pinned dependency surface, and module tree.
 //! Query planning and execution behavior land in later milestones.
 
+#![allow(clippy::items_after_test_module, clippy::too_many_arguments)]
+
 pub mod adapter_v53;
 pub mod bootstrap;
 pub mod dataset_state;

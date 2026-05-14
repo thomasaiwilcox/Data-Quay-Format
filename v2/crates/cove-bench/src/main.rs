@@ -704,6 +704,7 @@ fn run_events_cases(corpus: &Path) -> Result<Vec<Value>, String> {
     Ok(cases)
 }
 
+#[allow(clippy::vec_init_then_push)]
 fn run_spec_gap_cases(path: &Path) -> Result<Vec<Value>, String> {
     let mut cases = Vec::new();
     cases.push(run_query_case(

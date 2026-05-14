@@ -785,6 +785,7 @@ fn association_validity_value(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn materialize_associations(
     file: &CovemapFile,
     context: &MappingContext,
@@ -1457,7 +1458,7 @@ fn temporal_segment_payload(
             .filter(|row| {
                 row.properties
                     .get(&property.property_id)
-                    .map_or(true, |value| value.value.is_null())
+                    .is_none_or(|value| value.value.is_null())
             })
             .count() as u32;
         let page = ColumnPageIndexEntryV1 {
@@ -1512,7 +1513,7 @@ fn build_property_page_payload(
     dictionary: Option<&FileDictionaryEncoding>,
 ) -> Result<Vec<u8>, String> {
     let row_count = u32::try_from(rows.len()).map_err(|_| "too many rows".to_string())?;
-    let mut null_bitmap = vec![0u8; (rows.len() + 7) / 8];
+    let mut null_bitmap = vec![0u8; rows.len().div_ceil(8)];
     let mut values = Vec::new();
     let mut null_count = 0usize;
     for (row_index, row) in rows.iter().enumerate() {

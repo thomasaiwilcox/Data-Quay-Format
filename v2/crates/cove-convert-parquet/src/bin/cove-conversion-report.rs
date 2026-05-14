@@ -1,4 +1,9 @@
-use std::{env, fs, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    sync::Arc,
+};
 
 use arrow_csv::WriterBuilder as CsvWriterBuilder;
 use arrow_ipc::writer::FileWriter as IpcFileWriter;
@@ -96,6 +101,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_args(
     args: Vec<String>,
 ) -> Result<
@@ -240,7 +246,7 @@ fn parse_delimiter(raw: &str) -> Result<u8, String> {
     }
 }
 
-fn detect_source_format(input: &PathBuf) -> Result<SourceFormat, String> {
+fn detect_source_format(input: &Path) -> Result<SourceFormat, String> {
     match input
         .extension()
         .and_then(|extension| extension.to_str())
@@ -256,7 +262,7 @@ fn detect_source_format(input: &PathBuf) -> Result<SourceFormat, String> {
 }
 
 fn conversion_options(
-    input: &PathBuf,
+    input: &Path,
     fallback: &str,
     source_bytes: &[u8],
 ) -> Result<ParquetConversionOptions, String> {
@@ -284,7 +290,7 @@ fn validate_report_result(result: &ParquetConversionResult) -> Result<(), String
 }
 
 fn cove_to_source_report(
-    input: &PathBuf,
+    input: &Path,
     target_format: TargetFormat,
     options: &ReverseOptions,
 ) -> Result<String, String> {
@@ -292,7 +298,7 @@ fn cove_to_source_report(
     let validated = reader::validate_bytes(&bytes)
         .map_err(|err| format!("cannot validate COVE source {}: {err}", input.display()))?;
     let target_format = if target_format == TargetFormat::Unspecified {
-        infer_target_format(options.output.as_ref())
+        infer_target_format(options.output.as_deref())
     } else {
         target_format
     };
@@ -361,7 +367,7 @@ struct ReverseExportReport {
     notes: Vec<String>,
 }
 
-fn infer_target_format(output: Option<&PathBuf>) -> TargetFormat {
+fn infer_target_format(output: Option<&Path>) -> TargetFormat {
     match output
         .and_then(|path| path.extension())
         .and_then(|extension| extension.to_str())
@@ -377,7 +383,7 @@ fn infer_target_format(output: Option<&PathBuf>) -> TargetFormat {
 }
 
 fn export_cove_t(
-    input: &PathBuf,
+    input: &Path,
     target_format: TargetFormat,
     options: &ReverseOptions,
 ) -> Result<ReverseExportReport, String> {

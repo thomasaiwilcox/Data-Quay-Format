@@ -394,7 +394,7 @@ fn validate_tree_null_bitmap(
     if bytes.len() != expected_len {
         return Err(CoveError::PageCorrupt);
     }
-    if row_count % 8 != 0 && expected_len != 0 {
+    if !row_count.is_multiple_of(8) && expected_len != 0 {
         let valid_bits = row_count % 8;
         let mask = (1u8 << valid_bits) - 1;
         if bytes[expected_len - 1] & !mask != 0 {
@@ -613,11 +613,10 @@ fn validate_i64_values(
         return Err(CoveError::PageCorrupt);
     }
     match physical_kind {
-        CovePhysicalKind::Boolean => {
-            if values.iter().any(|value| !matches!(value, 0 | 1)) {
-                return Err(CoveError::PageCorrupt);
-            }
+        CovePhysicalKind::Boolean if values.iter().any(|value| !matches!(*value, 0 | 1)) => {
+            return Err(CoveError::PageCorrupt);
         }
+        CovePhysicalKind::Boolean => {}
         CovePhysicalKind::FileCode => {
             if let Some(dictionary) = dictionary {
                 for value in &values {

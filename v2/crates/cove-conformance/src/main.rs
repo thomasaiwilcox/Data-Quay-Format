@@ -1096,8 +1096,7 @@ fn validate_cove_map_convert_fixture(corpus: &Path, bytes: &[u8]) -> Result<(), 
                 allow_unknown_optional_extensions: true,
                 ..ValidationOptions::default()
             },
-        )
-        .map_err(|err| err)?;
+        )?;
         if value
             .get("expect_semantic_map_optional")
             .and_then(Value::as_bool)
@@ -1804,8 +1803,10 @@ fn validate_arrow_view_materialization_fixture(bytes: &[u8]) -> Result<(), CoveE
     let fixture = fixture_encoded_array(&value)?;
     let array = fixture.as_array();
     let rows = parse_fixture_u32_vector(value.get("selection"), "selection")?;
-    let mut options = ArrowExportOptions::default();
-    options.varbytes_policy = ArrowVarBytesExportPolicy::View;
+    let options = ArrowExportOptions {
+        varbytes_policy: ArrowVarBytesExportPolicy::View,
+        ..ArrowExportOptions::default()
+    };
     let arrow = encoded_array_to_arrow_with_row_selection_options(
         &array,
         ArrowRowSelection::Rows(&rows),
@@ -3418,7 +3419,7 @@ fn evaluate_pruning_predicate(
             let operand = predicate
                 .get("operand")
                 .ok_or_else(|| CoveError::BadSection("not predicate missing operand".into()))?;
-            Ok(evaluate_pruning_predicate(operand, columns)?.not())
+            Ok(!evaluate_pruning_predicate(operand, columns)?)
         }
         "bloom_membership" => {
             let column = pruning_column(columns, predicate_column_id(predicate)?);

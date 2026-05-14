@@ -106,9 +106,7 @@ impl CoveObjectReadOptions {
         if self.requested_property_ids.is_empty() && self.requested_property_names.is_empty() {
             return true;
         }
-        self.requested_property_ids
-            .iter()
-            .any(|id| *id == property.property_id)
+        self.requested_property_ids.contains(&property.property_id)
             || self
                 .requested_property_names
                 .iter()

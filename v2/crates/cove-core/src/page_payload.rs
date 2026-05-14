@@ -498,6 +498,7 @@ impl ColumnPagePayloadV1 {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn build_registered_single_node(
         row_count: u32,
         non_null_count: u32,

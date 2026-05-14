@@ -58,7 +58,7 @@ impl PredicateZoneOutcome {
     }
 
     /// Negation: WHERE-context, where UNKNOWN remains UNKNOWN (Spec §29.2).
-    pub fn not(self) -> Self {
+    pub fn negate(self) -> Self {
         use PredicateZoneOutcome::*;
         match self {
             AllMatch => NoMatch,
@@ -66,6 +66,14 @@ impl PredicateZoneOutcome {
             SomeMatch => SomeMatch,
             Unknown => Unknown,
         }
+    }
+}
+
+impl std::ops::Not for PredicateZoneOutcome {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        self.negate()
     }
 }
 
@@ -96,10 +104,10 @@ mod tests {
 
     #[test]
     fn spec_29_not_truth_table() {
-        assert_eq!(AllMatch.not(), NoMatch);
-        assert_eq!(NoMatch.not(), AllMatch);
-        assert_eq!(SomeMatch.not(), SomeMatch);
-        assert_eq!(Unknown.not(), Unknown);
+        assert_eq!(!AllMatch, NoMatch);
+        assert_eq!(!NoMatch, AllMatch);
+        assert_eq!(!SomeMatch, SomeMatch);
+        assert_eq!(!Unknown, Unknown);
     }
 
     #[test]

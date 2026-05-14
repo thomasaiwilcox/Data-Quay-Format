@@ -1575,9 +1575,7 @@ fn filter_pushdown_classifies_supported_numeric_exact_and_null_inexact() {
             TableProviderFilterPushDown::Exact
         ]
     );
-    assert!(support
-        .iter()
-        .any(|use_kind| *use_kind == TableProviderFilterPushDown::Exact));
+    assert!(support.contains(&TableProviderFilterPushDown::Exact));
     fs::remove_file(path).unwrap();
 }
 

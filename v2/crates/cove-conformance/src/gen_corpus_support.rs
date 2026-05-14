@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::Path};
 
 use cove_core::{constants::DigestAlgorithm, digest::compute_digest, reader};
 use serde_json::{json, Value};
@@ -46,7 +46,7 @@ pub(crate) fn with_expect_can_skip(mut value: Value, expected: bool) -> Value {
 }
 
 pub(crate) fn write_fixture(
-    root: &PathBuf,
+    root: &Path,
     entries: &mut Vec<Value>,
     mut entry: Value,
     bytes: Vec<u8>,
@@ -70,7 +70,7 @@ pub(crate) fn write_fixture(
     entries.push(entry);
 }
 
-pub(crate) fn write_auxiliary_file(root: &PathBuf, path: &str, bytes: &[u8]) {
+pub(crate) fn write_auxiliary_file(root: &Path, path: &str, bytes: &[u8]) {
     let full_path = root.join(path);
     if check_mode() {
         let existing = fs::read(&full_path).unwrap_or_else(|err| {

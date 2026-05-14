@@ -407,7 +407,9 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
             &plan,
         ) {
             stats.morsels_considered += 1;
-            let row_start = u64::from(segment.header.row_start)
+            let row_start = segment
+                .header
+                .row_start
                 .checked_add(u64::from(morsel.first_row_in_segment))
                 .ok_or(CoveError::ArithOverflow)?;
             if state.file(0)?.visibility().morsel_all_hidden(
@@ -490,7 +492,7 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
                 let payload = materialize_page_payload(
                     segment_bytes,
                     column,
-                    &page,
+                    page,
                     state.page_payload_validation_policy(),
                 )?;
                 stats.pages_decoded += usize::from(page.page_length != 0);
@@ -666,7 +668,8 @@ async fn decode_scan_with_reader_to_sink_cached<
             &plan,
         ) {
             stats.morsels_considered += 1;
-            let row_start = u64::from(segment_ref.row_start)
+            let row_start = segment_ref
+                .row_start
                 .checked_add(u64::from(morsel.first_row_in_segment))
                 .ok_or(CoveError::ArithOverflow)?;
             if state.file(0)?.visibility().morsel_all_hidden(
@@ -895,7 +898,8 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
         for task in &tasks[task_start..task_end] {
             stats.morsels_considered += 1;
             let morsel = segment.morsel(task.morsel_id)?;
-            let row_start = u64::from(segment_ref.row_start)
+            let row_start = segment_ref
+                .row_start
                 .checked_add(u64::from(morsel.first_row_in_segment))
                 .ok_or(CoveError::ArithOverflow)?;
             if state.file(0)?.visibility().morsel_all_hidden(

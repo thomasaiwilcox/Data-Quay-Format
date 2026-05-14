@@ -1214,7 +1214,7 @@ fn projection_physical_payload(
     column: &ProjectedColumn,
     physical: CovePhysicalKind,
 ) -> Result<(Vec<u8>, u32), String> {
-    let mut null_bitmap = vec![0u8; (table.rows.len() + 7) / 8];
+    let mut null_bitmap = vec![0u8; table.rows.len().div_ceil(8)];
     let mut values = Vec::new();
     let mut null_count = 0u32;
     for (row_index, row) in table.rows.iter().enumerate() {
@@ -1431,7 +1431,7 @@ fn build_nested_payload_node(
             })
         }
         _ => {
-            let mut null_bitmap = vec![0u8; (values.len() + 7) / 8];
+            let mut null_bitmap = vec![0u8; values.len().div_ceil(8)];
             let mut null_count = 0usize;
             let mut encoded_values = Vec::new();
             for (index, value) in values.iter().enumerate() {

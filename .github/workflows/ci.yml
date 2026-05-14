@@ -65,6 +65,7 @@ jobs:
 
       - name: Verify lockfile
         run: cargo metadata --locked --format-version 1 > /dev/null
+        shell: bash
         working-directory: ${{ matrix.workspace }}
 
       - name: Cache Cargo
@@ -104,6 +105,7 @@ jobs:
 
       - name: Verify lockfile
         run: cargo metadata --locked --format-version 1 > /dev/null
+        shell: bash
         working-directory: ${{ matrix.workspace }}
 
       - name: Cache Cargo
@@ -137,6 +139,7 @@ jobs:
 
       - name: Verify lockfile
         run: cargo metadata --locked --format-version 1 > /dev/null
+        shell: bash
         working-directory: ${{ matrix.workspace }}
 
       - name: Cache Cargo
@@ -174,6 +177,7 @@ jobs:
 
       - name: Verify lockfile
         run: cargo metadata --locked --format-version 1 > /dev/null
+        shell: bash
         working-directory: ${{ matrix.workspace }}
 
       - name: Cache Cargo

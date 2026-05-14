@@ -791,6 +791,7 @@ fn aggregate_answer_block(
     .serialize()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_aggregate_answer(
     answers: &mut Vec<CoviAggregateAnswerV2>,
     payload: &mut Vec<u8>,

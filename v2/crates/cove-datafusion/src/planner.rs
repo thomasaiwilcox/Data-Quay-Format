@@ -51,7 +51,7 @@ pub enum PredicateLiteral {
 impl PredicateLiteral {
     pub fn normalized(self) -> Self {
         match self {
-            Self::Float64(value) if value == 0.0 => Self::Float64(0.0),
+            Self::Float64(0.0) => Self::Float64(0.0),
             _ => self,
         }
     }

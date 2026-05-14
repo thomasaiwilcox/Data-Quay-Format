@@ -770,6 +770,7 @@ struct ParserOutcome {
     detail: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_parser_once(
     campaign: &'static str,
     case: &str,
@@ -1063,19 +1064,11 @@ impl ParserKind {
             Self::ExtensionIndexDescriptor => ExtensionIndexDescriptorV1::parse(bytes)
                 .and_then(|descriptor| {
                     descriptor.validate()?;
-                    if descriptor.can_skip_data() {
-                        Ok(())
-                    } else {
-                        Ok(())
-                    }
+                    Ok(())
                 })
                 .map_err(to_string),
-            Self::PagePayload(entry) => column_page_payload(bytes, &entry)
-                .map(|payload| {
-                    if payload.len() == entry.uncompressed_length as usize {
-                        ()
-                    }
-                })
+            Self::PagePayload(entry) => column_page_payload(bytes, entry)
+                .map(|_| ())
                 .map_err(to_string),
         }
     }

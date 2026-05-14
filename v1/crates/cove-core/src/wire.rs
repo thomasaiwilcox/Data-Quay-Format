@@ -77,11 +77,7 @@ pub fn zigzag_decode_i64(value: u64) -> i64 {
 }
 
 /// Reads a bounded range from `bytes` using checked offset arithmetic.
-pub fn read_range_checked<'a>(
-    bytes: &'a [u8],
-    offset: usize,
-    len: usize,
-) -> Result<&'a [u8], CoveError> {
+pub fn read_range_checked(bytes: &[u8], offset: usize, len: usize) -> Result<&[u8], CoveError> {
     let end = offset.checked_add(len).ok_or(CoveError::ArithOverflow)?;
     if end > bytes.len() {
         return Err(CoveError::OffsetRange);

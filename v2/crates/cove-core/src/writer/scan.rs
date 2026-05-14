@@ -458,7 +458,7 @@ fn encode_scan_page_payload(
         // INVARIANT: a writer-created non-elided mixed/null page must carry an
         // exact §27 null bitmap prefix; counts and tail bits are part of the
         // decode contract, not optional metadata.
-        if spec.row_count % 8 != 0 && validity_len != 0 {
+        if !spec.row_count.is_multiple_of(8) && validity_len != 0 {
             let valid_bits = spec.row_count % 8;
             let mask = (1u8 << valid_bits) - 1;
             if bitmap[validity_len - 1] & !mask != 0 {

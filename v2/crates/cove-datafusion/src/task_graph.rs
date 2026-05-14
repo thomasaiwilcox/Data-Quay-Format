@@ -153,7 +153,8 @@ fn maybe_push_task(
     fallback_tasks: Option<&mut Vec<ScanTask>>,
 ) -> Result<(), CoveError> {
     graph.morsels_considered += 1;
-    let row_start = u64::from(segment.row_start)
+    let row_start = segment
+        .row_start
         .checked_add(
             u64::from(morsel_id)
                 .checked_mul(u64::from(segment.morsel_row_count))
@@ -249,7 +250,8 @@ fn build_lookup_rowref_task_graph(
                 if row_in_morsel >= row_count {
                     return Ok(None);
                 }
-                let row_start = u64::from(segment.row_start)
+                let row_start = segment
+                    .row_start
                     .checked_add(
                         u64::from(row.morsel_id)
                             .checked_mul(u64::from(segment.morsel_row_count))

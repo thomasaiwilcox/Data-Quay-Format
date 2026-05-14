@@ -1704,6 +1704,21 @@ fn build_zone_stats_entry(
     )))
 }
 
+type FileCodeDomainStats = (u32, u32, u32, u32, bool);
+type ScalarZoneStats = (StatKind, Vec<u8>, Vec<u8>, u32, u32, ZoneStatFlags);
+type AggregateSumPayloads = (AggregatePayloadV2, AggregatePayloadV2);
+type AggregateHistogramPayload = (SynopsisKind, AggregatePayloadV2);
+type NativeNestedConvertedColumn = (ColumnEntry, SourceColumnKind, Vec<String>, NestedColumnData);
+type ScalarMapping = (
+    CoveLogicalType,
+    CovePhysicalKind,
+    SourceColumnKind,
+    MaterializedValues,
+    u16,
+    i16,
+);
+
+#[allow(clippy::too_many_arguments)]
 fn zone_entry(
     column: &ConvertedColumn,
     row_count: usize,
@@ -1736,7 +1751,7 @@ fn filecode_domain_stats(
     column: &ConvertedColumn,
     start: usize,
     len: usize,
-) -> Result<Option<(u32, u32, u32, u32, bool)>, CoveError> {
+) -> Result<Option<FileCodeDomainStats>, CoveError> {
     let MaterializedValues::FileCode(values) = &column.values else {
         return Ok(None);
     };
@@ -1776,7 +1791,7 @@ fn scalar_min_max_stats(
     column: &ConvertedColumn,
     start: usize,
     len: usize,
-) -> Result<Option<(StatKind, Vec<u8>, Vec<u8>, u32, u32, ZoneStatFlags)>, CoveError> {
+) -> Result<Option<ScalarZoneStats>, CoveError> {
     let rows = column.non_null_indices(start, len)?;
     if rows.is_empty() {
         return Ok(None);
@@ -1829,7 +1844,7 @@ fn numcode_min_max_stats(
     logical: CoveLogicalType,
     source_kind: SourceColumnKind,
     rows: &[usize],
-) -> Result<Option<(StatKind, Vec<u8>, Vec<u8>, u32, u32, ZoneStatFlags)>, CoveError> {
+) -> Result<Option<ScalarZoneStats>, CoveError> {
     let slice = rows.iter().map(|row| values[*row]).collect::<Vec<_>>();
     match logical {
         CoveLogicalType::Int8
@@ -2018,12 +2033,12 @@ fn build_acceleration_artifacts(
             && (unique_keys.len() <= 4096 || unique_keys.len().saturating_mul(2) <= row_count);
         let declared_lookup = point_lookup.contains(&column.entry.name);
 
-        if should_emit_exact_set(options.acceleration_policy, declared_lookup, low_or_medium)
-            && key_kind.is_some()
-        {
-            artifacts
-                .exact_sets
-                .push(build_exact_set(column, &unique_keys, key_kind.unwrap())?);
+        if let Some(kind) = key_kind {
+            if should_emit_exact_set(options.acceleration_policy, declared_lookup, low_or_medium) {
+                artifacts
+                    .exact_sets
+                    .push(build_exact_set(column, &unique_keys, kind)?);
+            }
         }
         if declared_lookup {
             if let Some(kind) = key_kind {
@@ -2482,7 +2497,7 @@ fn aggregate_sum_payloads(
     column: &ConvertedColumn,
     non_null_rows: &[usize],
     non_null_count: u32,
-) -> Result<Option<(AggregatePayloadV2, AggregatePayloadV2)>, CoveError> {
+) -> Result<Option<AggregateSumPayloads>, CoveError> {
     let Some(sum) = checked_numeric_sum(column, non_null_rows)? else {
         return Ok(None);
     };
@@ -2586,7 +2601,7 @@ fn aggregate_bool_counts_payload(
 fn aggregate_histogram_payload(
     column: &ConvertedColumn,
     non_null_rows: &[usize],
-) -> Result<Option<(SynopsisKind, AggregatePayloadV2)>, CoveError> {
+) -> Result<Option<AggregateHistogramPayload>, CoveError> {
     let Some(kind) = column.key_kind() else {
         return Ok(None);
     };
@@ -3325,7 +3340,7 @@ fn reorder_clone<T: Clone>(values: &mut Vec<T>, order: &[usize]) {
 fn native_nested_converted_column(
     column_id: u32,
     field: &arrow_schema::Field,
-) -> Result<Option<(ColumnEntry, SourceColumnKind, Vec<String>, NestedColumnData)>, CoveError> {
+) -> Result<Option<NativeNestedConvertedColumn>, CoveError> {
     if !is_nested_arrow_type(field.data_type()) {
         return Ok(None);
     }
@@ -3505,6 +3520,7 @@ fn nested_data_from_field(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn nested_schema_node(
     name: &str,
     logical: CoveLogicalType,
@@ -3556,19 +3572,7 @@ fn scalar_nested_data_from_field(
     }))
 }
 
-fn scalar_mapping_for_data_type(
-    data_type: &DataType,
-) -> Result<
-    Option<(
-        CoveLogicalType,
-        CovePhysicalKind,
-        SourceColumnKind,
-        MaterializedValues,
-        u16,
-        i16,
-    )>,
-    CoveError,
-> {
+fn scalar_mapping_for_data_type(data_type: &DataType) -> Result<Option<ScalarMapping>, CoveError> {
     Ok(Some(match data_type {
         DataType::Boolean => (
             CoveLogicalType::Bool,

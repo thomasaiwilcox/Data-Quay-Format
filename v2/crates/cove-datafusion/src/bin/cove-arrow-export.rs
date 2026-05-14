@@ -73,6 +73,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
 fn parse_args(
     args: Vec<String>,
 ) -> Result<

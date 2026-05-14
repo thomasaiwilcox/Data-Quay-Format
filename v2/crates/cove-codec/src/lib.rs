@@ -177,7 +177,7 @@ fn stable_spec_digest(codec: StableRegisteredCodec) -> Vec<u8> {
 
 fn encode_row_bytes(magic: &[u8; 4], page: &LogicalPage) -> Result<Vec<u8>, CoveError> {
     let row_count = u32::try_from(page.values.len()).map_err(|_| CoveError::ArithOverflow)?;
-    let null_bitmap_len = (page.values.len() + 7) / 8;
+    let null_bitmap_len = page.values.len().div_ceil(8);
     let offsets_len = page
         .values
         .len()
@@ -228,7 +228,7 @@ fn decode_row_bytes(expected_magic: &[u8; 4], bytes: &[u8]) -> Result<LogicalPag
     let row_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let null_bitmap_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
     let offsets_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-    if null_bitmap_len != (row_count + 7) / 8 || offsets_len != (row_count + 1) * 4 {
+    if null_bitmap_len != row_count.div_ceil(8) || offsets_len != (row_count + 1) * 4 {
         return Err(CoveError::BadCodecExtension);
     }
     let bitmap_start = 16usize;
@@ -260,7 +260,7 @@ fn decode_row_bytes(expected_magic: &[u8; 4], bytes: &[u8]) -> Result<LogicalPag
         let is_null = (null_bitmap[index >> 3] & (1 << (index & 7))) != 0;
         values.push((!is_null).then(|| payload[start..end].to_vec()));
     }
-    if row_count % 8 != 0 && !null_bitmap.is_empty() {
+    if !row_count.is_multiple_of(8) && !null_bitmap.is_empty() {
         let unused_mask = !((1u8 << (row_count % 8)) - 1);
         if null_bitmap[null_bitmap.len() - 1] & unused_mask != 0 {
             return Err(CoveError::BadCodecExtension);

@@ -101,7 +101,7 @@ impl ComparisonOp {
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
-    /// Column comparison: column <op> literal
+    /// Column comparison: column operator literal
     Comparison {
         /// Column name to compare
         column: String,
@@ -129,7 +129,7 @@ pub enum Predicate {
 }
 
 impl Predicate {
-    /// Create a comparison predicate: column <op> value
+    /// Create a comparison predicate: column operator value
     pub fn comparison(column: &str, op: ComparisonOp, value: ScalarValue) -> Self {
         Self::Comparison {
             column: column.to_string(),

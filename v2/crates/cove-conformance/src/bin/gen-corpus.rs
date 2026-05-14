@@ -7,7 +7,13 @@
 #[path = "../gen_corpus_support.rs"]
 mod gen_corpus_support;
 
-use std::{collections::BTreeSet, fs, io::Cursor, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::Cursor,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use arrow_array::{
     builder::{ListBuilder, Time32MillisecondBuilder},
@@ -5348,6 +5354,7 @@ fn profile_cove_file(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compressed_profile_cove_file(
     required_features: u64,
     optional_features: u64,
@@ -5555,7 +5562,7 @@ fn cove_with_scoped_unknown_feature(entry: ProfileCapabilityEntryV2) -> Vec<u8> 
     bytes
 }
 
-fn write_v2_profile_fixtures(root: &PathBuf, entries: &mut Vec<Value>) {
+fn write_v2_profile_fixtures(root: &Path, entries: &mut Vec<Value>) {
     write_fixture(
         root,
         entries,
@@ -7939,8 +7946,10 @@ fn covi_bad_cik_checksum_artifact() -> Vec<u8> {
 }
 
 fn covi_missing_block_ref_artifact() -> Vec<u8> {
-    let mut overrides = RootOverrides::default();
-    overrides.key_section_id = 99;
+    let overrides = RootOverrides {
+        key_section_id: 99,
+        ..RootOverrides::default()
+    };
     covi_artifact_for_postings(
         vec![key_bytes(1)],
         vec![posting_spec(
@@ -9441,7 +9450,7 @@ fn bloom_index_payload(filter_count: u32, byte_len: u32) -> Vec<u8> {
         checksum: 0,
     };
     let mut out = header.serialize().to_vec();
-    out.extend(std::iter::repeat(0u8).take(byte_len as usize));
+    out.extend(std::iter::repeat_n(0u8, byte_len as usize));
     out
 }
 
@@ -9470,7 +9479,7 @@ fn inverted_index_payload(keys: &[u64]) -> Vec<u8> {
         };
         out.extend_from_slice(&entry.serialize());
     }
-    out.extend(std::iter::repeat(0xff).take(keys.len().max(1)));
+    out.extend(std::iter::repeat_n(0xff, keys.len().max(1)));
     out
 }
 
@@ -11055,7 +11064,7 @@ fn cove_t_payload_elision_missing_feature_file() -> Vec<u8> {
     )
 }
 
-fn write_cove_map_execution_cases(root: &PathBuf, entries: &mut Vec<Value>) {
+fn write_cove_map_execution_cases(root: &Path, entries: &mut Vec<Value>) {
     let map_path = "accept/cove_map_execution.covemap";
     let source_path = "accept/people.csv";
     write_fixture(

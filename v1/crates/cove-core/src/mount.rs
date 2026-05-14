@@ -782,6 +782,7 @@ fn validate_covm_sidecar(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn referenced_file_matches(
     file_id: [u8; 16],
     file_len: u64,

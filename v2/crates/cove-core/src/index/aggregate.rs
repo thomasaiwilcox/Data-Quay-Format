@@ -124,9 +124,10 @@ pub struct AggregatePayloadHeader {
     pub checksum: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AggregatePayloadV2 {
+    #[default]
     None,
     MinMax {
         min: Option<TaggedCanonicalValue>,
@@ -165,12 +166,6 @@ pub enum AggregatePayloadV2 {
         k: u32,
         entries: Vec<HistogramBucket>,
     },
-}
-
-impl Default for AggregatePayloadV2 {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl AggregatePayloadV2 {
@@ -278,6 +273,7 @@ pub struct AggregateEntry {
 }
 
 impl AggregateEntry {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         table_id: u32,
         segment_id: u32,
@@ -562,9 +558,7 @@ pub fn kll_compactors_from_values(
             levels.push(Vec::new());
         }
         levels[level_index + 1].extend(promoted);
-        if level_index > 0 {
-            level_index -= 1;
-        }
+        level_index = level_index.saturating_sub(1);
     }
 
     let mut offsets = Vec::with_capacity(levels.len() + 1);
