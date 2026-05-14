@@ -24,7 +24,7 @@ fn apply_overlay_to_rows(
         let row = selected_rows[read];
         let absolute = morsel_row_start
             .checked_add(u64::from(row))
-            .ok_or(CoveError::ArithOverflow)?;
+            .ok_or_else(|| CoveError::ArithOverflow)?;
         if visibility.is_row_visible(absolute, state.table().row_count)? {
             selected_rows[write] = row;
             write += 1;
@@ -88,7 +88,7 @@ fn apply_covi_candidates_to_selection(
     let mut candidate_rows = Vec::new();
     let morsel_end = morsel_row_start
         .checked_add(u64::from(row_count))
-        .ok_or(CoveError::ArithOverflow)?;
+        .ok_or_else(|| CoveError::ArithOverflow)?;
     for candidate in candidates {
         if candidate.segment_id != segment_id || candidate.morsel_id != morsel_id {
             continue;
@@ -96,7 +96,7 @@ fn apply_covi_candidates_to_selection(
         let candidate_end = candidate
             .row_start
             .checked_add(candidate.row_count)
-            .ok_or(CoveError::ArithOverflow)?;
+            .ok_or_else(|| CoveError::ArithOverflow)?;
         let start = candidate.row_start.max(morsel_row_start);
         let end = candidate_end.min(morsel_end);
         if start >= end {
@@ -107,7 +107,7 @@ fn apply_covi_candidates_to_selection(
                 u32::try_from(
                     absolute
                         .checked_sub(morsel_row_start)
-                        .ok_or(CoveError::ArithOverflow)?,
+                        .ok_or_else(|| CoveError::ArithOverflow)?,
                 )
                 .map_err(|_| CoveError::ArithOverflow)?,
             );
@@ -164,7 +164,7 @@ pub(super) fn selected_rows_for_morsel(
             segment_ref
                 .row_start
                 .checked_add(u64::from(morsel.first_row_in_segment))
-                .ok_or(CoveError::ArithOverflow)?,
+                .ok_or_else(|| CoveError::ArithOverflow)?,
             morsel.row_count,
             scratch,
             stats,
@@ -190,26 +190,29 @@ pub(super) fn selected_rows_for_morsel(
         scratch.selection = Selection::None;
         return Ok(());
     }
-    scratch.selection = Selection::from_mask(&scratch.selected_mask, &mut scratch.selected_rows)?;
-    apply_covi_candidates_to_selection(
-        plan,
-        segment_id,
-        morsel_id,
-        segment_ref
-            .row_start
-            .checked_add(u64::from(morsel.first_row_in_segment))
-            .ok_or(CoveError::ArithOverflow)?,
-        morsel.row_count,
-        scratch,
-        stats,
-    )?;
-    if scratch.selection.is_empty() {
-        return Ok(());
-    }
-    scratch.selection.write_rows(&mut scratch.selected_rows)?;
-    scratch.selected_mask.fill_none(morsel.row_count as usize);
-    for row in &scratch.selected_rows {
-        scratch.selected_mask.set(*row as usize);
+    if plan.covi_candidates.is_some() {
+        scratch.selection =
+            Selection::from_mask(&scratch.selected_mask, &mut scratch.selected_rows)?;
+        apply_covi_candidates_to_selection(
+            plan,
+            segment_id,
+            morsel_id,
+            segment_ref
+                .row_start
+                .checked_add(u64::from(morsel.first_row_in_segment))
+                .ok_or_else(|| CoveError::ArithOverflow)?,
+            morsel.row_count,
+            scratch,
+            stats,
+        )?;
+        if scratch.selection.is_empty() {
+            return Ok(());
+        }
+        scratch.selection.write_rows(&mut scratch.selected_rows)?;
+        scratch.selected_mask.fill_none(morsel.row_count as usize);
+        for row in &scratch.selected_rows {
+            scratch.selected_mask.set(*row as usize);
+        }
     }
     for filter in &plan.filters {
         let Some(predicate) = &filter.predicate else {
@@ -268,7 +271,7 @@ pub(super) fn selected_rows_for_morsel(
         stats.data_bytes_read = stats
             .data_bytes_read
             .checked_add(usize::try_from(page.page_length).map_err(|_| CoveError::OffsetRange)?)
-            .ok_or(CoveError::ArithOverflow)?;
+            .ok_or_else(|| CoveError::ArithOverflow)?;
         let dictionary = if matches!(predicate, CovePredicate::FileCodeIn { .. }) {
             None
         } else {
@@ -339,7 +342,7 @@ pub(super) async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Size
             segment_ref
                 .row_start
                 .checked_add(u64::from(morsel.first_row_in_segment))
-                .ok_or(CoveError::ArithOverflow)?,
+                .ok_or_else(|| CoveError::ArithOverflow)?,
             morsel.row_count,
             scratch,
             stats,
@@ -365,26 +368,29 @@ pub(super) async fn selected_rows_for_morsel_metadata<R: CoveRangeReader + ?Size
         scratch.selection = Selection::None;
         return Ok(());
     }
-    scratch.selection = Selection::from_mask(&scratch.selected_mask, &mut scratch.selected_rows)?;
-    apply_covi_candidates_to_selection(
-        plan,
-        segment_ref.segment_id,
-        morsel_id,
-        segment_ref
-            .row_start
-            .checked_add(u64::from(morsel.first_row_in_segment))
-            .ok_or(CoveError::ArithOverflow)?,
-        morsel.row_count,
-        scratch,
-        stats,
-    )?;
-    if scratch.selection.is_empty() {
-        return Ok(());
-    }
-    scratch.selection.write_rows(&mut scratch.selected_rows)?;
-    scratch.selected_mask.fill_none(morsel.row_count as usize);
-    for row in &scratch.selected_rows {
-        scratch.selected_mask.set(*row as usize);
+    if plan.covi_candidates.is_some() {
+        scratch.selection =
+            Selection::from_mask(&scratch.selected_mask, &mut scratch.selected_rows)?;
+        apply_covi_candidates_to_selection(
+            plan,
+            segment_ref.segment_id,
+            morsel_id,
+            segment_ref
+                .row_start
+                .checked_add(u64::from(morsel.first_row_in_segment))
+                .ok_or_else(|| CoveError::ArithOverflow)?,
+            morsel.row_count,
+            scratch,
+            stats,
+        )?;
+        if scratch.selection.is_empty() {
+            return Ok(());
+        }
+        scratch.selection.write_rows(&mut scratch.selected_rows)?;
+        scratch.selected_mask.fill_none(morsel.row_count as usize);
+        for row in &scratch.selected_rows {
+            scratch.selected_mask.set(*row as usize);
+        }
     }
     for filter in &plan.filters {
         let Some(predicate) = &filter.predicate else {
@@ -502,10 +508,10 @@ async fn read_page_wire<R: CoveRangeReader + ?Sized>(
     let start = segment_ref
         .offset
         .checked_add(page.page_offset)
-        .ok_or(CoveError::ArithOverflow)?;
+        .ok_or_else(|| CoveError::ArithOverflow)?;
     let end = start
         .checked_add(page.page_length)
-        .ok_or(CoveError::ArithOverflow)?;
+        .ok_or_else(|| CoveError::ArithOverflow)?;
     let ranges = vec![start..end];
     let hints = vec![state.range_cluster_hint(segment_ref.segment_id, page.morsel_id, start, end)];
     let coalesced_plan =
@@ -516,11 +522,11 @@ async fn read_page_wire<R: CoveRangeReader + ?Sized>(
     stats.range_bytes_requested = stats
         .range_bytes_requested
         .checked_add(range_stats.coalesced_bytes)
-        .ok_or(CoveError::ArithOverflow)?;
+        .ok_or_else(|| CoveError::ArithOverflow)?;
     stats.range_bytes_used = stats
         .range_bytes_used
         .checked_add(range_stats.original_bytes)
-        .ok_or(CoveError::ArithOverflow)?;
+        .ok_or_else(|| CoveError::ArithOverflow)?;
     if range_stats.coalesced_ranges < range_stats.original_ranges {
         stats.coalesced_range_requests += range_stats.coalesced_ranges;
     }
@@ -528,7 +534,7 @@ async fn read_page_wire<R: CoveRangeReader + ?Sized>(
     stats.data_bytes_read = stats
         .data_bytes_read
         .checked_add(wires.iter().map(RetainedBytes::len).sum::<usize>())
-        .ok_or(CoveError::ArithOverflow)?;
+        .ok_or_else(|| CoveError::ArithOverflow)?;
     Ok(wires.pop())
 }
 

@@ -198,7 +198,7 @@ pub(super) fn apply_predicate_to_selection(
             let index = word_index
                 .checked_mul(64)
                 .and_then(|base| base.checked_add(bit))
-                .ok_or(CoveError::ArithOverflow)?;
+                .ok_or_else(|| CoveError::ArithOverflow)?;
             if index >= selected.len {
                 break;
             }
@@ -298,7 +298,7 @@ fn try_apply_numcode_predicate_to_selection(
             let index = word_index
                 .checked_mul(64)
                 .and_then(|base| base.checked_add(bit))
-                .ok_or(CoveError::ArithOverflow)?;
+                .ok_or_else(|| CoveError::ArithOverflow)?;
             if index >= selected.len {
                 break;
             }
@@ -350,13 +350,17 @@ fn try_apply_varbytes_eq_predicate_to_selection(
     let data = array.data;
     let mut offset = 0usize;
     for row in 0..row_count {
-        let header_end = offset.checked_add(4).ok_or(CoveError::ArithOverflow)?;
+        let header_end = offset
+            .checked_add(4)
+            .ok_or_else(|| CoveError::ArithOverflow)?;
         if header_end > data.len() {
             return Err(CoveError::OffsetRange);
         }
         let len = u32::from_le_bytes(data[offset..header_end].try_into().unwrap()) as usize;
         offset = header_end;
-        let end = offset.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| CoveError::ArithOverflow)?;
         if end > data.len() {
             return Err(CoveError::OffsetRange);
         }
@@ -507,7 +511,7 @@ fn raw_file_code_at(array: &EncodedArray<'_>, row: u64) -> Result<Option<u32>, C
     let offset = usize::try_from(row)
         .map_err(|_| CoveError::ArithOverflow)?
         .checked_mul(4)
-        .ok_or(CoveError::ArithOverflow)?;
+        .ok_or_else(|| CoveError::ArithOverflow)?;
     let bytes = wire::read_range_checked(array.data, offset, 4)?;
     Ok(Some(u32::from_le_bytes(bytes.try_into().unwrap())))
 }
@@ -516,7 +520,7 @@ fn raw_numcode_at(array: &EncodedArray<'_>, row: u64) -> Result<u64, CoveError> 
     let offset = usize::try_from(row)
         .map_err(|_| CoveError::ArithOverflow)?
         .checked_mul(8)
-        .ok_or(CoveError::ArithOverflow)?;
+        .ok_or_else(|| CoveError::ArithOverflow)?;
     let bytes = wire::read_range_checked(array.data, offset, 8)?;
     Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
 }

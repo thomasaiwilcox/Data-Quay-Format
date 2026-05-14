@@ -626,7 +626,7 @@ impl Stream for CoveRecordBatchStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let metrics = this.metrics.clone();
+        let metrics = &this.metrics;
 
         match &mut this.inner {
             CoveRecordBatchStreamInner::Streaming {
