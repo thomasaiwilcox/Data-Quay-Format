@@ -156,6 +156,7 @@ use cove_layout::{
     ZeroCopyBufferMapV2, ZeroCopyCompatibilityContext, ZeroCopyCompatibilityV2,
     ZeroCopyMaterializationReasonV2,
 };
+use cove_map::ProjectionFormat;
 use cove_runtime::{
     unsupported_required_hints, validate_hints, RuntimeCompatibilityHintV2, RuntimeHintKindV2,
 };
@@ -1202,6 +1203,83 @@ fn validate_cove_map_project_fixture(corpus: &Path, bytes: &[u8]) -> Result<(), 
     if let Some(expected) = value.get("expected_projection") {
         validate_expected_json_fields(&projected, expected)?;
     }
+    if let Some(outputs) = value
+        .get("expected_projection_outputs")
+        .and_then(Value::as_array)
+    {
+        for output in outputs {
+            validate_projection_output_fixture(&map, &sources, output)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_projection_output_fixture(
+    map: &Path,
+    sources: &[PathBuf],
+    output: &Value,
+) -> Result<(), CoveError> {
+    let format = output
+        .get("format")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoveError::BadSection("projection output fixture missing format".into()))?;
+    let projection_id = output.get("projection_id").and_then(Value::as_str);
+    let format = match format {
+        "json" => ProjectionFormat::Json,
+        "cove-o" => ProjectionFormat::CoveO,
+        "arrow" => ProjectionFormat::Arrow,
+        "cove-t" => ProjectionFormat::CoveT,
+        "sql" => ProjectionFormat::Sql,
+        _ => return Err(CoveError::MapInvalid),
+    };
+    let bytes = cove_map::projected_output_from_paths(map, sources, format, projection_id)
+        .map_err(|_| CoveError::MapInvalid)?;
+    if bytes.is_empty() {
+        return Err(CoveError::MapEvidenceInvalid);
+    }
+    match format {
+        ProjectionFormat::Json => {
+            let _: Value = serde_json::from_slice(&bytes).map_err(|_| CoveError::MapInvalid)?;
+        }
+        ProjectionFormat::CoveO => {
+            reader::validate_bytes_with_options(
+                &bytes,
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+            )?;
+        }
+        ProjectionFormat::Arrow => {
+            if !bytes.starts_with(b"ARROW1") || !bytes.ends_with(b"ARROW1") {
+                return Err(CoveError::MapEvidenceInvalid);
+            }
+        }
+        ProjectionFormat::CoveT => {
+            let report = reader::validate_bytes_with_options(
+                &bytes,
+                ValidationOptions {
+                    semantic: true,
+                    verify_digests: false,
+                    allow_unknown_optional_extensions: true,
+                    ..ValidationOptions::default()
+                },
+            )?;
+            if !report.validated.footer.sections.iter().any(|entry| {
+                SectionKind::from_u16(entry.section_kind) == Some(SectionKind::TableCatalog)
+            }) {
+                return Err(CoveError::MapEvidenceInvalid);
+            }
+        }
+        ProjectionFormat::Sql => {
+            let sql = std::str::from_utf8(&bytes).map_err(|_| CoveError::MapInvalid)?;
+            if !sql.contains("CREATE TABLE") || !sql.contains("INSERT INTO") {
+                return Err(CoveError::MapEvidenceInvalid);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1263,6 +1341,7 @@ fn validate_suite_contract_fixture(corpus: &Path, bytes: &[u8]) -> Result<(), Co
         "manifest_sections_present" => validate_suite_manifest_contract(corpus, &value),
         "release_gate_contains" => validate_release_gate_contract(corpus, &value),
         "workspace_members_present" => validate_workspace_contract(corpus, &value),
+        "governance_docs_present" => validate_governance_docs_contract(corpus, &value),
         other => Err(CoveError::BadSection(format!(
             "unsupported suite-contract op {other}"
         ))),
@@ -1374,6 +1453,33 @@ fn validate_workspace_contract(corpus: &Path, value: &Value) -> Result<(), CoveE
         if !cargo_toml.contains(&needle) {
             return Err(CoveError::BadSection(format!(
                 "workspace manifest missing required member {member}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_governance_docs_contract(corpus: &Path, value: &Value) -> Result<(), CoveError> {
+    let repo_root = corpus.parent().ok_or_else(|| {
+        CoveError::BadSection("cannot locate repository root from conformance corpus".into())
+    })?;
+    let docs = parse_fixture_string_vector(value.get("docs"), "docs")?;
+    let mut combined = String::new();
+    for doc in docs {
+        let path = repo_root.join(&doc);
+        let contents = std::fs::read_to_string(&path).map_err(|error| {
+            CoveError::BadSection(format!(
+                "cannot read governance doc {}: {error}",
+                path.display()
+            ))
+        })?;
+        combined.push_str(&contents);
+        combined.push('\n');
+    }
+    for needle in parse_fixture_string_vector(value.get("needles"), "needles")? {
+        if !combined.contains(&needle) {
+            return Err(CoveError::BadSection(format!(
+                "governance docs missing required text: {needle}"
             )));
         }
     }

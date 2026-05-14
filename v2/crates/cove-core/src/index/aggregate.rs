@@ -412,14 +412,17 @@ impl AggregateSynopsis {
                 payloads.push(AggregatePayloadV2::None);
                 continue;
             }
-            let start =
-                usize::try_from(entry.payload_offset).map_err(|_| CoveError::OffsetRange)?;
-            let len = usize::try_from(entry.payload_length).map_err(|_| CoveError::OffsetRange)?;
+            let start = usize::try_from(entry.payload_offset).map_err(aggregate_payload_error)?;
+            let len = usize::try_from(entry.payload_length).map_err(aggregate_payload_error)?;
             if start < table_len {
                 return Err(CoveError::BadIndex);
             }
-            checked_region(bytes, entry.payload_offset, entry.payload_length)?;
-            payloads.push(parse_payload(entry, &bytes[start..start + len])?);
+            checked_region(bytes, entry.payload_offset, entry.payload_length)
+                .map_err(aggregate_payload_error)?;
+            payloads.push(
+                parse_payload(entry, &bytes[start..start + len])
+                    .map_err(aggregate_payload_error)?,
+            );
         }
 
         let synopsis = Self { entries, payloads };
@@ -476,6 +479,10 @@ impl AggregateSynopsis {
         }
         Ok(())
     }
+}
+
+fn aggregate_payload_error<T>(_err: T) -> CoveError {
+    CoveError::BadIndex
 }
 
 pub fn hll_registers_from_hashes(
@@ -1298,6 +1305,13 @@ mod tests {
         TaggedCanonicalValue::new(ValueTag::Int64, value.to_le_bytes().to_vec()).unwrap()
     }
 
+    fn refresh_payload_crc(bytes: &mut [u8], payload_start: usize) {
+        let crc_offset = payload_start + 24;
+        bytes[crc_offset..crc_offset + 4].fill(0);
+        let crc = checksum::crc32c(&bytes[payload_start..]);
+        bytes[crc_offset..crc_offset + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+
     #[test]
     fn round_trip_count_synopsis() {
         let bytes = count_entry(SynopsisKind::Count, 12345, 0)
@@ -1414,10 +1428,25 @@ mod tests {
         let mut bytes = synopsis.serialize();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
-        assert_eq!(
-            AggregateSynopsis::parse(&bytes),
-            Err(CoveError::ChecksumMismatch)
-        );
+        assert_eq!(AggregateSynopsis::parse(&bytes), Err(CoveError::BadIndex));
+    }
+
+    #[test]
+    fn rejects_invalid_canonical_payload_as_bad_index() {
+        let synopsis = AggregateSynopsis::from_parts(
+            vec![count_entry(SynopsisKind::Sum, 1, 0)],
+            vec![AggregatePayloadV2::Sum {
+                overflow_policy: NumericAggregateOverflowPolicy::CheckedExact,
+                sum: int_value(1),
+            }],
+        )
+        .unwrap();
+        let mut bytes = synopsis.serialize();
+        let payload_start = AGGREGATE_SYNOPSIS_ENTRY_LEN;
+        let sum_value_len_offset = payload_start + AGGREGATE_PAYLOAD_HEADER_LEN + 2;
+        bytes[sum_value_len_offset..sum_value_len_offset + 4].copy_from_slice(&4u32.to_le_bytes());
+        refresh_payload_crc(&mut bytes, payload_start);
+        assert_eq!(AggregateSynopsis::parse(&bytes), Err(CoveError::BadIndex));
     }
 
     #[test]

@@ -50,7 +50,7 @@ impl CoveFileFormat {
     }
 
     pub fn options(&self) -> CoveTableOptions {
-        self.options
+        self.options.clone()
     }
 
     pub fn cache(&self) -> Arc<CoveMetadataCache> {
@@ -70,7 +70,7 @@ impl CoveFileFormat {
             object.location.to_string(),
             object.size,
             &reader,
-            self.options,
+            self.options.clone(),
             Some(self.cache.as_ref()),
         )
         .await
@@ -196,7 +196,7 @@ impl FileFormat for CoveFileFormat {
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
         Arc::new(CoveFileSource::new(
             table_schema,
-            self.options,
+            self.options.clone(),
             Arc::clone(&self.cache),
         ))
     }
@@ -263,9 +263,13 @@ fn parse_format_options(format_options: &HashMap<String, String>) -> Result<Cove
     let mut options = CoveTableOptions::default();
     let mut range_max_gap = options.range_coalescing().max_gap;
     let mut range_max_span = options.range_coalescing().max_span;
+    let mut selected_table_id = None;
+    let mut selected_table_name = None;
+    let mut selected_table_namespace = None;
     for (key, value) in format_options {
         let key = key.trim().to_ascii_lowercase();
-        let value = value.trim().to_ascii_lowercase();
+        let raw_value = value.trim();
+        let value = raw_value.to_ascii_lowercase();
         match key.as_str() {
             "cove.filter_residual_policy" | "filter_residual_policy" => {
                 options = options.with_filter_residual_policy(match value.as_str() {
@@ -365,6 +369,21 @@ fn parse_format_options(format_options: &HashMap<String, String>) -> Result<Cove
                 options = options
                     .with_target_morsels_per_partition(parse_usize_option(&key, value.as_str())?);
             }
+            "cove.table_id" | "table_id" => {
+                selected_table_id = Some(parse_u32_option(&key, value.as_str())?);
+            }
+            "cove.table_name" | "table_name" => {
+                if raw_value.is_empty() {
+                    return invalid_option_value(&key, raw_value);
+                }
+                selected_table_name = Some(raw_value.to_string());
+            }
+            "cove.table_namespace" | "table_namespace" => {
+                if raw_value.is_empty() {
+                    return invalid_option_value(&key, raw_value);
+                }
+                selected_table_namespace = Some(raw_value.to_string());
+            }
             _ => {
                 return Err(DataFusionError::Plan(format!(
                     "COVE DataFusion v2 does not support SQL format option: {key}"
@@ -372,7 +391,37 @@ fn parse_format_options(format_options: &HashMap<String, String>) -> Result<Cove
             }
         }
     }
+    match (selected_table_id, selected_table_name) {
+        (Some(table_id), None) => {
+            options = options.with_table_id(table_id);
+        }
+        (None, Some(name)) => {
+            options = options.with_table_name(selected_table_namespace, name);
+        }
+        (Some(_), Some(_)) => {
+            return Err(DataFusionError::Plan(
+                "COVE DataFusion SQL format options cannot set both cove.table_id and cove.table_name"
+                    .into(),
+            ));
+        }
+        (None, None) => {
+            if selected_table_namespace.is_some() {
+                return Err(DataFusionError::Plan(
+                    "COVE DataFusion SQL format option cove.table_namespace requires cove.table_name"
+                        .into(),
+                ));
+            }
+        }
+    }
     Ok(options)
+}
+
+fn parse_u32_option(key: &str, value: &str) -> Result<u32> {
+    value.parse::<u32>().map_err(|_| {
+        DataFusionError::Plan(format!(
+            "invalid COVE SQL format option value for {key}: {value}"
+        ))
+    })
 }
 
 fn parse_u64_option(key: &str, value: &str) -> Result<u64> {

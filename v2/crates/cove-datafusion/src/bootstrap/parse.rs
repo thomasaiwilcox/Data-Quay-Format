@@ -530,14 +530,8 @@ pub(super) async fn parse_feature_scope_table<R: CoveRangeReader + ?Sized>(
         }
         None => None,
     };
-    let mut section_binding = None;
+    let mut section_bindings = Vec::<SectionFeatureBindingSectionV2>::new();
     for entry in find_sections(footer, SectionKind::SectionFeatureBinding) {
-        if section_binding.is_some() {
-            return Err(CoveError::BadSection(
-                "multiple SECTION_FEATURE_BINDING sections are not supported by the v2 reference validator"
-                    .into(),
-            ));
-        }
         let Some(extended) = extended.as_ref() else {
             return Err(CoveError::BadSection(
                 "SECTION_FEATURE_BINDING requires EXTENDED_FEATURE_SET".into(),
@@ -546,7 +540,7 @@ pub(super) async fn parse_feature_scope_table<R: CoveRangeReader + ?Sized>(
         let payload = read_section_payload(reader, entry).await?;
         let parsed = SectionFeatureBindingSectionV2::parse(&payload)?;
         extended.validate_binding_horizon(&parsed)?;
-        section_binding = Some(parsed);
+        section_bindings.push(parsed);
     }
     if let Some(matrix) = profile_matrix.as_ref() {
         for entry in &matrix.entries {
@@ -567,12 +561,12 @@ pub(super) async fn parse_feature_scope_table<R: CoveRangeReader + ?Sized>(
             }
         }
     }
-    let table = FeatureScopeTable::build(
+    let table = FeatureScopeTable::build_many(
         header,
         footer,
         extended.as_ref(),
         profile_matrix.as_ref(),
-        section_binding.as_ref(),
+        &section_bindings,
     )?;
     table.reject_file_required_unknowns()?;
     Ok(table)

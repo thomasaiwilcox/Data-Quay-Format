@@ -637,14 +637,13 @@ fn coverage_atom_prunes_morsel(
     morsel_id: u32,
     atom: &CoveragePredicateAtom,
 ) -> CoveragePlanDecision {
-    if state.file_count() != 1 {
-        return CoveragePlanDecision::Unknown;
-    }
     let Ok(file) = state.file(0) else {
         return CoveragePlanDecision::Unknown;
     };
-    if !file.visibility().is_all() {
-        return CoveragePlanDecision::Unknown;
+    match morsel_visibility_decision(state, file.visibility(), segment_id, morsel_id) {
+        CoveragePlanDecision::Pruned => return CoveragePlanDecision::Pruned,
+        CoveragePlanDecision::Included => {}
+        CoveragePlanDecision::Unknown => return CoveragePlanDecision::Unknown,
     }
     if !state
         .pruning()
@@ -720,6 +719,50 @@ fn coverage_atom_prunes_morsel(
         CoveragePlanDecision::Included
     } else {
         CoveragePlanDecision::Unknown
+    }
+}
+
+fn morsel_visibility_decision(
+    state: &DatasetState,
+    visibility: &crate::overlay::RowVisibility,
+    segment_id: u32,
+    morsel_id: u32,
+) -> CoveragePlanDecision {
+    if visibility.is_all() {
+        return CoveragePlanDecision::Included;
+    }
+    let Some(segment) = state
+        .segments()
+        .iter()
+        .find(|segment| segment.segment_id == segment_id)
+    else {
+        return CoveragePlanDecision::Unknown;
+    };
+    if segment.morsel_row_count == 0 || morsel_id >= segment.morsel_count {
+        return CoveragePlanDecision::Unknown;
+    }
+    let first_row_in_segment = u64::from(morsel_id) * u64::from(segment.morsel_row_count);
+    let remaining = u64::from(segment.row_count).saturating_sub(first_row_in_segment);
+    if remaining == 0 {
+        return CoveragePlanDecision::Unknown;
+    }
+    let row_count = remaining.min(u64::from(segment.morsel_row_count));
+    let Ok(row_count) = u32::try_from(row_count) else {
+        return CoveragePlanDecision::Unknown;
+    };
+    let Ok(absolute_start) = segment
+        .row_start
+        .checked_add(first_row_in_segment)
+        .ok_or(CoveError::ArithOverflow)
+    else {
+        return CoveragePlanDecision::Unknown;
+    };
+    let total_rows = state.table().row_count;
+    match visibility.hidden_rows_in_range(absolute_start, row_count, total_rows) {
+        Ok(hidden) if hidden == row_count => CoveragePlanDecision::Pruned,
+        Ok(0) => CoveragePlanDecision::Included,
+        Ok(_) => CoveragePlanDecision::Unknown,
+        Err(_) => CoveragePlanDecision::Unknown,
     }
 }
 

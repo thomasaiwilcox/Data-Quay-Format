@@ -1460,6 +1460,7 @@ mod tests {
         assert_eq!(options.local_file_read_policy(), LocalFileReadPolicy::Mmap);
         assert_eq!(
             options
+                .clone()
                 .with_strict_arrow_string_validation()
                 .arrow_export_options()
                 .string_validation_policy,

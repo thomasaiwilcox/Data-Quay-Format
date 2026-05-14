@@ -101,6 +101,8 @@ pub enum ParquetClusteringPolicy {
 pub struct ParquetConversionOptions {
     pub table_name: String,
     pub namespace: String,
+    pub source_identifier: Option<String>,
+    pub source_digest: Option<String>,
     pub morsel_row_count: u32,
     pub segment_row_count: u32,
     pub page_compression: CompressionCodec,
@@ -129,6 +131,8 @@ impl Default for ParquetConversionOptions {
         Self {
             table_name: "parquet_import".into(),
             namespace: "interop".into(),
+            source_identifier: None,
+            source_digest: None,
             morsel_row_count: 4096,
             segment_row_count: u32::MAX,
             page_compression: CompressionCodec::None,
@@ -217,6 +221,15 @@ pub struct ParquetColumnReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParquetConversionReport {
     pub source_format: String,
+    pub source_identifier: String,
+    pub source_digest: String,
+    pub conversion_policy_version: String,
+    pub timestamp_policy: String,
+    pub timezone_policy: String,
+    pub decimal_policy: String,
+    pub collation_policy: String,
+    pub canonicalization_policy: String,
+    pub row_reordering_policy: String,
     pub table_name: String,
     pub namespace: String,
     pub row_count: u64,
@@ -241,6 +254,15 @@ impl ParquetConversionReport {
     pub fn to_json_value(&self) -> Value {
         json!({
             "source_format": self.source_format,
+            "source_identifier": self.source_identifier,
+            "source_digest": self.source_digest,
+            "conversion_policy_version": self.conversion_policy_version,
+            "timestamp_policy": self.timestamp_policy,
+            "timezone_policy": self.timezone_policy,
+            "decimal_policy": self.decimal_policy,
+            "collation_policy": self.collation_policy,
+            "canonicalization_policy": self.canonicalization_policy,
+            "row_reordering_policy": self.row_reordering_policy,
             "table_name": self.table_name,
             "namespace": self.namespace,
             "row_count": self.row_count,

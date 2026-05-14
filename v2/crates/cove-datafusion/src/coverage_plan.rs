@@ -14,8 +14,8 @@ use cove_coverage::{
 use crate::{
     dataset_state::DatasetState,
     planner::{
-        CovePredicate, FilterPlan, NullPredicateKind, NumericPredicateOp, PredicateLiteral,
-        ScanPlan,
+        CovePredicate, CovePredicateExpr, FilterPlan, NullPredicateKind, NumericPredicateOp,
+        PredicateLiteral, ScanPlan,
     },
 };
 
@@ -122,9 +122,16 @@ impl CoveragePlanningIndex {
     pub fn attach_to_filters(&self, filters: &mut [FilterPlan]) -> Option<CoveragePredicateExpr> {
         let mut conjuncts = Vec::new();
         for filter in filters {
-            let Some(atom) = self.atom_for_filter(filter) else {
+            let Some(expr) = self.expr_for_filter(filter) else {
                 continue;
             };
+            conjuncts.push(expr);
+        }
+        CoveragePredicateExpr::and(conjuncts)
+    }
+
+    fn expr_for_filter(&self, filter: &mut FilterPlan) -> Option<CoveragePredicateExpr> {
+        if let Some(atom) = self.atom_for_filter(filter) {
             if self.cache.enabled() {
                 if atom.cache_coverage_set_refs.is_empty() {
                     self.cache.record_miss();
@@ -133,13 +140,50 @@ impl CoveragePlanningIndex {
                 }
             }
             filter.coverage_predicate_form_ref = Some(atom.predicate_form_ref);
-            conjuncts.push(CoveragePredicateExpr::atom(atom));
+            return Some(CoveragePredicateExpr::atom(atom));
         }
-        CoveragePredicateExpr::and(conjuncts)
+        let expr = filter.predicate_expr.as_ref()?;
+        self.coverage_expr_for_predicate_expr(expr)
+    }
+
+    fn coverage_expr_for_predicate_expr(
+        &self,
+        expr: &CovePredicateExpr,
+    ) -> Option<CoveragePredicateExpr> {
+        match expr {
+            CovePredicateExpr::Atom(predicate) => self.atom_for_predicate(predicate).map(|atom| {
+                if self.cache.enabled() {
+                    if atom.cache_coverage_set_refs.is_empty() {
+                        self.cache.record_miss();
+                    } else {
+                        self.cache.record_hit();
+                    }
+                }
+                CoveragePredicateExpr::atom(atom)
+            }),
+            CovePredicateExpr::And(children) => {
+                let children = children
+                    .iter()
+                    .map(|child| self.coverage_expr_for_predicate_expr(child))
+                    .collect::<Option<Vec<_>>>()?;
+                CoveragePredicateExpr::and(children)
+            }
+            CovePredicateExpr::Or(children) => {
+                let children = children
+                    .iter()
+                    .map(|child| self.coverage_expr_for_predicate_expr(child))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(CoveragePredicateExpr::Or(children))
+            }
+        }
     }
 
     pub fn atom_for_filter(&self, filter: &FilterPlan) -> Option<CoveragePredicateAtom> {
         let predicate = filter.predicate.as_ref()?;
+        self.atom_for_predicate(predicate)
+    }
+
+    pub fn atom_for_predicate(&self, predicate: &CovePredicate) -> Option<CoveragePredicateAtom> {
         self.forms
             .iter()
             .find(|form| form.matches(predicate))

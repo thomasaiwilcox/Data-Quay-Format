@@ -23,7 +23,7 @@ pub struct LogicalPhysicalOptions {
 ///
 /// | Physical kind | Allowed logical types |
 /// |---------------|-----------------------|
-/// | `FileCode`    | any non-container type (Null … Json, plus Uuid, Decimal128) |
+/// | `FileCode`    | any logical type encoded through the file dictionary |
 /// | `NumCode`     | Bool, Int8–64, UInt8–64, Float32/64, Decimal64, DateDays, TimestampMicros/Nanos |
 /// | `Boolean`     | Bool |
 /// | `FixedBytes`  | Uuid, Decimal128 |
@@ -48,13 +48,10 @@ pub fn validate_logical_physical_pair_with_options(
     options: LogicalPhysicalOptions,
 ) -> Result<(), CoveError> {
     let ok = match physical {
-        // FileCode accepts any scalar / variable-length / special type; the
-        // dictionary maps it to a canonical logical value.  Container types
-        // (List/Struct/Map) cannot be represented as flat dictionary codes.
-        CovePhysicalKind::FileCode => !matches!(
-            logical,
-            CoveLogicalType::List | CoveLogicalType::Struct | CoveLogicalType::Map
-        ),
+        // FileCode accepts every logical type; the dictionary maps each code
+        // to a canonical logical value, including nested List/Struct/Map
+        // payloads.
+        CovePhysicalKind::FileCode => true,
 
         // NumCode is restricted to numeric/temporal types only. Bool requires
         // an explicit numeric declaration carried by the owning column/property.
@@ -314,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn filecode_accepts_scalar_types() {
+    fn filecode_accepts_dictionary_types() {
         let allowed = [
             CoveLogicalType::Null,
             CoveLogicalType::Bool,
@@ -330,26 +327,14 @@ mod tests {
             CoveLogicalType::Binary,
             CoveLogicalType::Json,
             CoveLogicalType::Uuid,
+            CoveLogicalType::List,
+            CoveLogicalType::Struct,
+            CoveLogicalType::Map,
         ];
         for &lt in &allowed {
             assert!(
                 validate_logical_physical_pair(lt, CovePhysicalKind::FileCode).is_ok(),
                 "expected FileCode to accept {lt:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn filecode_rejects_container_types() {
-        for &lt in &[
-            CoveLogicalType::List,
-            CoveLogicalType::Struct,
-            CoveLogicalType::Map,
-        ] {
-            assert_eq!(
-                validate_logical_physical_pair(lt, CovePhysicalKind::FileCode),
-                Err(CoveError::BadLogicalPhysicalPair),
-                "expected FileCode to reject {lt:?}"
             );
         }
     }

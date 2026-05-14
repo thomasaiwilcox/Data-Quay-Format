@@ -101,6 +101,7 @@ convert [--format json|cove-o] [-o output] <mapping.covemap> <source.csv|source.
 explain <mapping.covemap> <goid|assertion-id>\n  \
 diff <left.covemap> <right.covemap>\n  \
 project [-o output.json] <mapping.covemap> <source.csv|source.jsonl>...\n  \
+project-cove-o [--mapping mapping.covemap] [-o output.json] <object.cove>\n  \
 test <fixture.json>"
     );
 }

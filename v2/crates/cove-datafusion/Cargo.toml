@@ -23,8 +23,10 @@ cove-core = { path = "../cove-core" }
 cove-index = { path = "../cove-index", optional = true }
 cove-layout = { path = "../cove-layout" }
 arrow-array = "58"
+arrow-cast = "58"
 arrow-ipc = "58"
 arrow-json = "58"
+arrow-select = "58"
 arrow-schema = "58"
 async-trait = "0.1"
 datafusion = { version = "53.1.0", default-features = false, features = ["sql"] }

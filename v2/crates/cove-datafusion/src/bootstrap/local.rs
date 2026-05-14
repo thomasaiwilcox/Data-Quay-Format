@@ -18,7 +18,7 @@ use crate::{
         ordinary_table_scan_feature_use_request, CoverageCacheMetadata, DatasetBootstrapStats,
         DatasetState, FileIdentity,
     },
-    options::{CoveTableOptions, CoverageCacheDiscovery},
+    options::{select_table, CoveTableOptions, CoverageCacheDiscovery},
     range_reader::{CoveRangeReader, LocalFileRangeReader},
 };
 
@@ -71,18 +71,7 @@ pub fn bootstrap_bytes_with_options(
     bytes: Vec<u8>,
     options: CoveTableOptions,
 ) -> Result<Arc<DatasetState>, CoveError> {
-    DatasetState::from_bytes_with_options(
-        source,
-        bytes,
-        options.arrow_export_options(),
-        options.execution_code_policy(),
-        options.page_payload_validation_policy(),
-        options.local_file_read_policy(),
-        options.target_morsels_per_partition(),
-        options.range_coalescing(),
-        options.dynamic_filters_enabled(),
-    )
-    .map(Arc::new)
+    DatasetState::from_bytes_with_table_options(source, bytes, options).map(Arc::new)
 }
 
 #[cfg(feature = "covi")]
@@ -145,6 +134,7 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
         file_id: header.file_id,
         file_len,
         footer_crc32c: postscript.footer.crc32c,
+        table_selection: options.table_selection().cloned(),
     };
     if let Some(cache) = cache {
         if let Some(cached) = cache.get(&provisional_key) {
@@ -153,13 +143,7 @@ pub async fn bootstrap_range_reader_with_options<R: CoveRangeReader + ?Sized>(
     }
 
     let table_catalog = parse_table_catalog(reader, &footer).await?;
-    if table_catalog.tables.len() != 1 {
-        return Err(CoveError::BadSchema(format!(
-            "COVE DataFusion v2 adapter supports exactly one table per file, found {}",
-            table_catalog.tables.len()
-        )));
-    }
-    let table = table_catalog.tables[0].clone();
+    let table = select_table(&table_catalog, options.table_selection())?;
     let dictionary = parse_dictionary(reader, &footer).await?;
     let engine_metadata = parse_engine_metadata(reader, &footer).await?;
     let segment_index = parse_segment_index(reader, &footer).await?;
@@ -208,7 +192,7 @@ pub(super) async fn bootstrap_local_path_with_options(
         path.display().to_string(),
         file_len,
         &reader,
-        options,
+        options.clone(),
         None,
     )
     .await?;

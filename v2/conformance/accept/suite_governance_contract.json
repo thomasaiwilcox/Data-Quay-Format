@@ -1,0 +1,20 @@
+{
+  "docs": [
+    "docs/governance/semantic-versioning.md",
+    "docs/governance/feature-bit-registry.md",
+    "docs/governance/section-kind-registry.md",
+    "docs/governance/encoding-kind-registry.md",
+    "docs/governance/extension-proposal-process.md",
+    "docs/governance/conformance-levels.md",
+    "docs/governance/security-privacy-model.md",
+    "docs/governance/benchmark-methodology.md",
+    "docs/governance/name-trademark-guidance.md"
+  ],
+  "needles": [
+    "COVE v2.0",
+    "feature-scope",
+    "extension fallback",
+    "cargo run -p cove-conformance --bin cove-conformance -- conformance/"
+  ],
+  "op": "governance_docs_present"
+}

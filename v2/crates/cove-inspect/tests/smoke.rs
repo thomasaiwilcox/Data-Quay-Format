@@ -84,6 +84,48 @@ fn inspect_reports_table_and_segment_summary() {
 }
 
 #[test]
+fn inspect_json_reports_decoded_summary_groups() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cove-inspect"))
+        .args(["--json", "--sections", "stats,indexes,execution,optional"])
+        .arg(accept_fixture("cove_e_profile_bundle_valid.cove"))
+        .output()
+        .expect("run cove-inspect --json");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("inspect JSON output");
+    assert!(json["execution"]["descriptor_summaries"].is_array());
+    assert!(json["execution"]["registry_summaries"].is_array());
+    assert!(json["indexes"]["mounted_scan_index_summaries"].is_array());
+    assert!(json["optional"]["ignored_optional_section_summaries"].is_array());
+}
+
+#[test]
+fn inspect_json_reports_zone_stats_details() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cove-inspect"))
+        .args(["--json", "--sections", "stats"])
+        .arg(accept_fixture("cove_t_zone_stats_valid.cove"))
+        .output()
+        .expect("run cove-inspect --json");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("inspect JSON output");
+    assert!(json["stats"]["zone_stats_section_ids"].is_array());
+    assert!(json["stats"]["zone_stats"].is_array());
+}
+
+#[test]
 fn inspect_reports_standalone_covemap_artifact() {
     let output = Command::new(env!("CARGO_BIN_EXE_cove-inspect"))
         .arg(accept_fixture("covemap_valid.covemap"))

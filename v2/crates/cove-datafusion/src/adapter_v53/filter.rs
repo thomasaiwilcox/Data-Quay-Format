@@ -122,12 +122,19 @@ fn lower_scalar(value: &ScalarValue) -> Option<LowerLiteral> {
         ScalarValue::UInt64(Some(value)) => Some(LowerLiteral::UInt64(*value)),
         ScalarValue::Float32(Some(value)) => Some(LowerLiteral::Float64(f64::from(*value))),
         ScalarValue::Float64(Some(value)) => Some(LowerLiteral::Float64(*value)),
+        ScalarValue::Decimal32(Some(value), _, _) => Some(LowerLiteral::Int128(i128::from(*value))),
+        ScalarValue::Decimal64(Some(value), _, _) => Some(LowerLiteral::Int128(i128::from(*value))),
+        ScalarValue::Decimal128(Some(value), _, _) => Some(LowerLiteral::Int128(*value)),
         ScalarValue::Date32(Some(value)) => Some(LowerLiteral::Int64(i64::from(*value))),
         ScalarValue::TimestampMicrosecond(Some(value), None) => Some(LowerLiteral::Int64(*value)),
         ScalarValue::TimestampNanosecond(Some(value), None) => Some(LowerLiteral::Int64(*value)),
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
         | ScalarValue::LargeUtf8(Some(value)) => Some(LowerLiteral::Utf8(value.clone())),
+        ScalarValue::Binary(Some(value))
+        | ScalarValue::BinaryView(Some(value))
+        | ScalarValue::LargeBinary(Some(value))
+        | ScalarValue::FixedSizeBinary(_, Some(value)) => Some(LowerLiteral::Binary(value.clone())),
         ScalarValue::Dictionary(_, value) => lower_scalar(value),
         _ if value.is_null() => Some(LowerLiteral::Null),
         _ => None,

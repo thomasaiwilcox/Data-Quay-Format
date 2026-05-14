@@ -128,10 +128,12 @@ defines I/O hints, COVE-L layout plans, scan split indexes, page cluster
 directories, and object-store range planning.
 
 This should be treated as a cost model, not a universal benchmark claim. The
-local benchmark report does not measure S3 or other remote object stores.
-Actual request and transfer savings depend on dataset layout, predicate
-selectivity, projected columns, object-store behavior, and whether the optional
-layout/index metadata is present and valid.
+release-gated benchmark uses a deterministic offline object-store harness that
+records object GETs, range GETs, bytes requested/returned, cold/warm cache
+state, and coalescing decisions without requiring S3 or MinIO. Live service
+performance remains environment-specific and depends on dataset layout,
+predicate selectivity, projected columns, object-store behavior, and whether
+the optional layout/index metadata is present and valid.
 
 ## v2 Standards Suite Highlights
 

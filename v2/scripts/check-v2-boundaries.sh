@@ -29,6 +29,6 @@ if grep -RInE '^[[:space:]]*datafusion[[:space:]]*=' Cargo.toml crates/*/Cargo.t
     fail "DataFusion dependency must be isolated to cove-datafusion"
 fi
 
-if grep -RInE 'datafusion::|use[[:space:]]+datafusion' crates/*/src | grep -vE '^crates/cove-datafusion/src/(adapter_v53/|register\.rs:)'; then
+if grep -RInE '(^|[^[:alnum:]_])datafusion::|use[[:space:]]+datafusion(::|[[:space:]])' crates/*/src | grep -vE '^crates/cove-datafusion/src/(adapter_v53/|register\.rs:)'; then
     fail "DataFusion imports must stay in cove-datafusion adapter_v53 or register"
 fi

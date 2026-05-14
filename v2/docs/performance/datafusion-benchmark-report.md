@@ -129,7 +129,7 @@ The benchmark includes default COVE and Parquet tracks, plus explicit opt-in Fil
 - Some tracks had Criterion warnings that 100 samples could not complete within the default target time. Those results are still recorded, but the confidence interval should be checked before making narrow claims.
 - Some M7 tracks show wide confidence intervals and outliers. Treat those as directional until repeated on a controlled machine.
 - The `ci` benchmark profile is synthetic and intentionally small enough to run in PR/release gates. The `standard` and `publication` profiles increase row counts but remain deterministic generated corpora, not real customer datasets.
-- Object-store cold scans are represented by report fields and disclosure metadata in this first public corpus, but the local harness does not yet drive a remote object-store service.
+- Object-store cold/warm coverage uses the deterministic offline object-store harness in `cove-bench`, so release gates record object GETs, range GETs, bytes requested/returned, cold/warm cache state, and coalescing decisions without requiring S3 or MinIO.
 - FileCode dictionary output is opt-in. It is currently retained for correctness and engine-integration testing, not enabled as the default performance path.
 - The production-safe FileCode dictionary fix may trade speed for correctness when a file dictionary contains entries from multiple logical domains.
 

@@ -31,10 +31,45 @@ use cove_coverage::{CoverageExactnessV2, CoverageGranularityV2, CoverageProofStr
 
 #[derive(Debug, Clone, Default)]
 pub struct CoviBuildOptions {
+    pub target: CoviBuildTarget,
     pub table_id: Option<u32>,
     pub column_ids: Vec<u32>,
     pub all_columns: bool,
     pub include_index_only_counts: bool,
+    pub include_index_only_min_max: bool,
+    pub include_index_only_distinct_count: bool,
+    pub include_index_only_exists: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CoviBuildTarget {
+    #[default]
+    TableColumn,
+    ObjectProperty {
+        object_type_id: u32,
+        property_id: u32,
+    },
+    ObjectPath {
+        object_type_id: u32,
+        path_ref: u32,
+    },
+    SemanticDimension {
+        semantic_dimension_ref: u32,
+    },
+    DimensionalTuple {
+        semantic_dimension_ref: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndexedTargetMetadata {
+    indexed_target_kind: CoviIndexedTargetKindV2,
+    table_id: u32,
+    column_id: u32,
+    object_type_id: u32,
+    property_id: u32,
+    path_ref: u32,
+    semantic_dimension_ref: u32,
 }
 
 pub fn build_covi_from_cove_bytes(
@@ -129,25 +164,30 @@ pub fn build_covi_from_cove_bytes(
         let entry_section_id = key_section_id + 1;
         let postings_section_id = key_section_id + 2;
         let aggregate_section_id = key_section_id + 3;
-        let aggregate_block_section_id = if options.include_index_only_counts {
+        let include_aggregate_block = options.include_index_only_counts
+            || options.include_index_only_min_max
+            || options.include_index_only_distinct_count
+            || options.include_index_only_exists;
+        let aggregate_block_section_id = if include_aggregate_block {
             aggregate_section_id
         } else {
             u32::MAX
         };
+        let target = indexed_target_metadata(options.target, table.table_id, column.column_id);
         roots.push(CoviIndexRootV2 {
             index_root_id: root_id,
-            indexed_target_kind: CoviIndexedTargetKindV2::TableColumn,
+            indexed_target_kind: target.indexed_target_kind,
             index_kind: CoviIndexKindV2::Sorted,
             coverage_granularity: CoverageGranularityV2::Morsel as u8,
             proof_strength: CoverageProofStrengthV2::ExactConservative as u8,
             exactness: CoverageExactnessV2::Exact as u8,
             flags: 0,
-            table_id: table.table_id,
-            column_id: column.column_id,
-            object_type_id: u32::MAX,
-            property_id: u32::MAX,
-            path_ref: u32::MAX,
-            semantic_dimension_ref: u32::MAX,
+            table_id: target.table_id,
+            column_id: target.column_id,
+            object_type_id: target.object_type_id,
+            property_id: target.property_id,
+            path_ref: target.path_ref,
+            semantic_dimension_ref: target.semantic_dimension_ref,
             logical_type: column.logical as u16,
             physical_kind: column.physical as u8,
             key_encoding_kind: built_index.key_encoding_kind as u8,
@@ -175,16 +215,18 @@ pub fn build_covi_from_cove_bytes(
             flags: 0,
             supports_eq: 1,
             supports_range: u8::from(built_index.supports_range),
-            supports_membership: 0,
+            supports_membership: 1,
             supports_prefix: 0,
             supports_contains: 0,
-            supports_count: u8::from(options.include_index_only_counts),
-            supports_min: 0,
-            supports_max: 0,
+            supports_count: u8::from(
+                options.include_index_only_counts || options.include_index_only_exists,
+            ),
+            supports_min: u8::from(options.include_index_only_min_max),
+            supports_max: u8::from(options.include_index_only_min_max),
             supports_sum: 0,
-            supports_distinct_count: 0,
+            supports_distinct_count: u8::from(options.include_index_only_distinct_count),
             supports_join_coverage: 0,
-            supports_index_only: u8::from(options.include_index_only_counts),
+            supports_index_only: u8::from(include_aggregate_block),
             exactness: IndexCapabilityExactnessV2::Exact,
             proof_strength: CoverageProofStrengthV2::ExactConservative,
             null_semantics: 0,
@@ -219,9 +261,16 @@ pub fn build_covi_from_cove_bytes(
                 optional_features: 0,
             },
         ]);
-        if options.include_index_only_counts {
-            let aggregate_block =
-                count_aggregate_block(root_id, table.row_count, built_index.null_count)?;
+        if include_aggregate_block {
+            let aggregate_block = aggregate_answer_block(
+                root_id,
+                table.row_count,
+                built_index.null_count,
+                built_index.distinct_count,
+                options,
+                built_index.min_key.as_deref(),
+                built_index.max_key.as_deref(),
+            )?;
             section_payloads.push(CoviSectionPayloadV2 {
                 section_id: aggregate_section_id,
                 section_kind: CoviSectionKindV2::AggregateAnswerBlock,
@@ -244,6 +293,70 @@ pub fn build_covi_from_cove_bytes(
     )?;
     CoviArtifactV2::parse(&bytes)?;
     Ok(bytes)
+}
+
+fn indexed_target_metadata(
+    target: CoviBuildTarget,
+    table_id: u32,
+    column_id: u32,
+) -> IndexedTargetMetadata {
+    match target {
+        CoviBuildTarget::TableColumn => IndexedTargetMetadata {
+            indexed_target_kind: CoviIndexedTargetKindV2::TableColumn,
+            table_id,
+            column_id,
+            object_type_id: u32::MAX,
+            property_id: u32::MAX,
+            path_ref: u32::MAX,
+            semantic_dimension_ref: u32::MAX,
+        },
+        CoviBuildTarget::ObjectProperty {
+            object_type_id,
+            property_id,
+        } => IndexedTargetMetadata {
+            indexed_target_kind: CoviIndexedTargetKindV2::ObjectProperty,
+            table_id: u32::MAX,
+            column_id: u32::MAX,
+            object_type_id,
+            property_id,
+            path_ref: u32::MAX,
+            semantic_dimension_ref: u32::MAX,
+        },
+        CoviBuildTarget::ObjectPath {
+            object_type_id,
+            path_ref,
+        } => IndexedTargetMetadata {
+            indexed_target_kind: CoviIndexedTargetKindV2::ObjectPath,
+            table_id: u32::MAX,
+            column_id: u32::MAX,
+            object_type_id,
+            property_id: u32::MAX,
+            path_ref,
+            semantic_dimension_ref: u32::MAX,
+        },
+        CoviBuildTarget::SemanticDimension {
+            semantic_dimension_ref,
+        } => IndexedTargetMetadata {
+            indexed_target_kind: CoviIndexedTargetKindV2::SemanticDimension,
+            table_id: u32::MAX,
+            column_id: u32::MAX,
+            object_type_id: u32::MAX,
+            property_id: u32::MAX,
+            path_ref: u32::MAX,
+            semantic_dimension_ref,
+        },
+        CoviBuildTarget::DimensionalTuple {
+            semantic_dimension_ref,
+        } => IndexedTargetMetadata {
+            indexed_target_kind: CoviIndexedTargetKindV2::DimensionalTuple,
+            table_id: u32::MAX,
+            column_id: u32::MAX,
+            object_type_id: u32::MAX,
+            property_id: u32::MAX,
+            path_ref: u32::MAX,
+            semantic_dimension_ref,
+        },
+    }
 }
 
 fn selected_columns<'a>(
@@ -288,6 +401,8 @@ struct BuiltColumnIndex {
     null_count: u64,
     min_key_ref: u32,
     max_key_ref: u32,
+    min_key: Option<Vec<u8>>,
+    max_key: Option<Vec<u8>>,
 }
 
 fn build_column_index(
@@ -445,6 +560,8 @@ fn build_blocks_from_keys(
     aggregate_block_id: Option<u32>,
 ) -> Result<BuiltColumnIndex, CoveError> {
     let distinct_count = u64::try_from(keys.len()).map_err(|_| CoveError::ArithOverflow)?;
+    let min_key = keys.keys().next().cloned();
+    let max_key = keys.keys().next_back().cloned();
     let mut key_data = Vec::new();
     let mut entries = Vec::new();
     let mut postings = Vec::new();
@@ -575,17 +692,83 @@ fn build_blocks_from_keys(
         null_count,
         min_key_ref: if distinct_count == 0 { u32::MAX } else { 0 },
         max_key_ref,
+        min_key,
+        max_key,
     })
 }
 
-fn count_aggregate_block(
+fn aggregate_answer_block(
     root_id: u32,
     row_count: u64,
     null_count: u64,
+    distinct_count: u64,
+    options: &CoviBuildOptions,
+    min_key: Option<&[u8]>,
+    max_key: Option<&[u8]>,
 ) -> Result<Vec<u8>, CoveError> {
     let non_null_count = row_count
         .checked_sub(null_count)
         .ok_or(CoveError::ArithOverflow)?;
+    let mut answers = Vec::new();
+    let mut payload = Vec::new();
+    if options.include_index_only_counts {
+        push_aggregate_answer(
+            &mut answers,
+            &mut payload,
+            root_id,
+            CoviAggregateKindV2::Count,
+            row_count,
+            null_count,
+            non_null_count,
+            None,
+        )?;
+    }
+    if options.include_index_only_exists {
+        push_aggregate_answer(
+            &mut answers,
+            &mut payload,
+            root_id,
+            CoviAggregateKindV2::Exists,
+            row_count,
+            null_count,
+            non_null_count,
+            None,
+        )?;
+    }
+    if options.include_index_only_min_max {
+        push_aggregate_answer(
+            &mut answers,
+            &mut payload,
+            root_id,
+            CoviAggregateKindV2::Min,
+            row_count,
+            null_count,
+            non_null_count,
+            min_key,
+        )?;
+        push_aggregate_answer(
+            &mut answers,
+            &mut payload,
+            root_id,
+            CoviAggregateKindV2::Max,
+            row_count,
+            null_count,
+            non_null_count,
+            max_key,
+        )?;
+    }
+    if options.include_index_only_distinct_count {
+        push_aggregate_answer(
+            &mut answers,
+            &mut payload,
+            root_id,
+            CoviAggregateKindV2::DistinctCount,
+            distinct_count,
+            0,
+            distinct_count,
+            None,
+        )?;
+    }
     CoviAggregateAnswerBlockV2 {
         header: CoviAggregateAnswerBlockHeaderV2 {
             magic: CoviAggregateAnswerBlockHeaderV2::MAGIC,
@@ -595,31 +778,52 @@ fn count_aggregate_block(
             aggregate_answer_len: CoviAggregateAnswerV2::LEN as u16,
             aggregate_block_id: root_id,
             index_root_id: root_id,
-            aggregate_answer_count: 1,
+            aggregate_answer_count: answers.len() as u32,
             aggregate_answers_offset: CoviAggregateAnswerBlockHeaderV2::LEN as u64,
             aggregate_payload_offset: 0,
-            aggregate_payload_length: 0,
+            aggregate_payload_length: payload.len() as u64,
             flags: 0,
             checksum: 0,
         },
-        answers: vec![CoviAggregateAnswerV2 {
-            aggregate_answer_ref: 0,
-            index_root_id: root_id,
-            aggregate_kind: CoviAggregateKindV2::Count as u16,
-            exactness: IndexCapabilityExactnessV2::Exact as u8,
-            null_semantics: 0,
-            flags: 0,
-            row_count,
-            null_count,
-            non_null_count,
-            value_ref: u32::MAX,
-            predicate_form_ref: u32::MAX,
-            snapshot_validity_ref: 0,
-            checksum: 0,
-        }],
-        payload: Vec::new(),
+        answers,
+        payload,
     }
     .serialize()
+}
+
+fn push_aggregate_answer(
+    answers: &mut Vec<CoviAggregateAnswerV2>,
+    payload: &mut Vec<u8>,
+    root_id: u32,
+    aggregate_kind: CoviAggregateKindV2,
+    row_count: u64,
+    null_count: u64,
+    non_null_count: u64,
+    value: Option<&[u8]>,
+) -> Result<(), CoveError> {
+    let value_ref = if let Some(value) = value {
+        let offset = u32::try_from(payload.len()).map_err(|_| CoveError::ArithOverflow)?;
+        payload.extend_from_slice(value);
+        offset
+    } else {
+        u32::MAX
+    };
+    answers.push(CoviAggregateAnswerV2 {
+        aggregate_answer_ref: u32::try_from(answers.len()).map_err(|_| CoveError::ArithOverflow)?,
+        index_root_id: root_id,
+        aggregate_kind: aggregate_kind as u16,
+        exactness: IndexCapabilityExactnessV2::Exact as u8,
+        null_semantics: 0,
+        flags: 0,
+        row_count,
+        null_count,
+        non_null_count,
+        value_ref,
+        predicate_form_ref: u32::MAX,
+        snapshot_validity_ref: 0,
+        checksum: 0,
+    });
+    Ok(())
 }
 
 fn append_row_range(

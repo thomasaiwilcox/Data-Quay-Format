@@ -308,6 +308,9 @@ fn validate_covemap_file(data: &[u8], semantic: bool, verify_digests: bool) -> b
             println!("  file_len        : {} bytes", data.len());
             println!("  mapping_version : {}", file.mapping_version);
             println!("  section_count   : {}", file.sections.len());
+            for warning in file.compatibility_warnings() {
+                eprintln!("  [WARN] {warning}");
+            }
             if verify_digests {
                 eprintln!(
                     "  [NOTE] --verify-digests is not applicable to COVEMAP artifacts (skipped)"

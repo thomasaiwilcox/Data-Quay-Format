@@ -37,6 +37,7 @@ pub enum FilterOp {
     Lte,
     Gt,
     Gte,
+    In,
     IsNull,
     IsNotNull,
 }
@@ -439,6 +440,32 @@ fn build_filter_plan(state: &DatasetState, filter: &FilterDsl) -> Result<FilterP
             NullPredicateKind::IsNotNull,
             display,
         )),
+        FilterOp::In if column.physical == CovePhysicalKind::FileCode => {
+            let raw_values = filter.value.as_deref().unwrap_or_default();
+            let mut canonical_values = Vec::new();
+            let mut file_codes = Vec::new();
+            for value in raw_values
+                .split('|')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let canonical = canonical_literal(column.logical, value)?;
+                for file_ordinal in 0..state.file_count() {
+                    if let Some(file_code) =
+                        state.file_code_for_canonical(file_ordinal, &canonical)?
+                    {
+                        file_codes.push(file_code);
+                    }
+                }
+                canonical_values.push(canonical);
+            }
+            Ok(FilterPlan::pruning_file_code_in_with_canonical(
+                column_index,
+                file_codes,
+                canonical_values,
+                display,
+            ))
+        }
         FilterOp::Eq if column.physical == CovePhysicalKind::FileCode => {
             let value = filter.value.as_deref().unwrap_or_default();
             let canonical = canonical_literal(column.logical, value)?;
@@ -485,10 +512,11 @@ fn parse_filter_op(raw: &str) -> Result<FilterOp, CoveError> {
         "lte" => Ok(FilterOp::Lte),
         "gt" => Ok(FilterOp::Gt),
         "gte" => Ok(FilterOp::Gte),
+        "in" => Ok(FilterOp::In),
         "is-null" => Ok(FilterOp::IsNull),
         "is-not-null" => Ok(FilterOp::IsNotNull),
         _ => Err(CoveError::BadSchema(format!(
-            "unsupported filter op {raw:?}; expected eq|lt|lte|gt|gte|is-null|is-not-null"
+            "unsupported filter op {raw:?}; expected eq|in|lt|lte|gt|gte|is-null|is-not-null"
         ))),
     }
 }
@@ -533,6 +561,10 @@ fn filter_display(column_name: &str, filter: &FilterDsl) -> String {
     match filter.op {
         FilterOp::IsNull => format!("{column_name} IS NULL"),
         FilterOp::IsNotNull => format!("{column_name} IS NOT NULL"),
+        FilterOp::In => format!(
+            "{column_name} IN ({})",
+            filter.value.as_deref().unwrap_or("")
+        ),
         FilterOp::Eq => format!("{column_name} = {}", filter.value.as_deref().unwrap_or("")),
         FilterOp::Lt => format!("{column_name} < {}", filter.value.as_deref().unwrap_or("")),
         FilterOp::Lte => format!("{column_name} <= {}", filter.value.as_deref().unwrap_or("")),

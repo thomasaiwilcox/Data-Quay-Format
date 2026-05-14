@@ -21,6 +21,7 @@ use super::{
     segment::{mounted_from_metadata, parse_segment_index, validate_table_segments},
     *,
 };
+use crate::options::{select_table, CoveTableOptions, CoveTableSelection};
 
 impl DatasetState {
     /// Build single-file state from already-loaded bytes.
@@ -41,8 +42,31 @@ impl DatasetState {
         )
     }
 
+    /// Build single-file state from already-loaded bytes and full table
+    /// registration options, including optional multi-table selection.
+    pub fn from_bytes_with_table_options(
+        source: impl Into<Arc<str>>,
+        bytes: Vec<u8>,
+        options: CoveTableOptions,
+    ) -> Result<Self, CoveError> {
+        Self::from_bytes_with_selected_table(
+            source,
+            bytes,
+            options.arrow_export_options(),
+            options.execution_code_policy(),
+            options.page_payload_validation_policy(),
+            options.local_file_read_policy(),
+            options.target_morsels_per_partition(),
+            options.range_coalescing(),
+            options.dynamic_filters_enabled(),
+            options.table_selection().cloned(),
+        )
+    }
+
     /// Build single-file state from already-loaded bytes and explicit Arrow
-    /// export options.
+    /// export options. This compatibility entrypoint keeps the original
+    /// single-table behavior; use [`Self::from_bytes_with_table_options`] for
+    /// selected-table reads from multi-table files.
     pub fn from_bytes_with_options(
         source: impl Into<Arc<str>>,
         bytes: Vec<u8>,
@@ -53,6 +77,32 @@ impl DatasetState {
         target_morsels_per_partition: usize,
         range_coalescing: RangeCoalescingOptions,
         dynamic_filters_enabled: bool,
+    ) -> Result<Self, CoveError> {
+        Self::from_bytes_with_selected_table(
+            source,
+            bytes,
+            arrow_export_options,
+            execution_code_policy,
+            page_payload_validation_policy,
+            local_file_read_policy,
+            target_morsels_per_partition,
+            range_coalescing,
+            dynamic_filters_enabled,
+            None,
+        )
+    }
+
+    fn from_bytes_with_selected_table(
+        source: impl Into<Arc<str>>,
+        bytes: Vec<u8>,
+        arrow_export_options: ArrowExportOptions,
+        execution_code_policy: ExecutionCodePolicy,
+        page_payload_validation_policy: PagePayloadValidationPolicy,
+        local_file_read_policy: LocalFileReadPolicy,
+        target_morsels_per_partition: usize,
+        range_coalescing: RangeCoalescingOptions,
+        dynamic_filters_enabled: bool,
+        table_selection: Option<CoveTableSelection>,
     ) -> Result<Self, CoveError> {
         let source = source.into();
         let postscript = CovePostscriptV1::parse_from_tail(&bytes)?;
@@ -75,13 +125,7 @@ impl DatasetState {
                 "COVE DataFusion native path requires a COVE-T table catalog".into(),
             )
         })?;
-        if table_catalog.tables.len() != 1 {
-            return Err(CoveError::BadSchema(format!(
-                "COVE DataFusion native path supports exactly one table per file, found {}",
-                table_catalog.tables.len()
-            )));
-        }
-        let table = table_catalog.tables[0].clone();
+        let table = select_table(table_catalog, table_selection.as_ref())?;
         let schema = Arc::new(schema_for_table(
             &table,
             mounted.dictionary.is_some(),

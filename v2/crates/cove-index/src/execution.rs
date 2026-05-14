@@ -4,10 +4,13 @@ use cove_core::{constants::DigestAlgorithm, CoveError};
 use cove_coverage::CoverageProofStrengthV2;
 
 use crate::{
-    CoviAggregateAnswerBlockV2, CoviAggregateAnswerV2, CoviArtifactV2, CoviEntryBlockV2,
-    CoviIndexEntryV2, CoviIndexKindV2, CoviIndexRootV2, CoviKeyBlockV2, CoviKeyEncodingKindV2,
+    CoviAggregateAnswerBlockV2, CoviAggregateAnswerV2, CoviArtifactV2, CoviByteRangePostingV2,
+    CoviDimensionalBucketPostingV2, CoviEntryBlockV2, CoviFileRefPostingV2, CoviIndexEntryV2,
+    CoviIndexKindV2, CoviIndexRootV2, CoviIndexedTargetKindV2, CoviKeyBlockV2,
+    CoviKeyEncodingKindV2, CoviMorselRefPostingV2, CoviObjectPathPostingV2, CoviPageRefPostingV2,
     CoviPostingRepresentationV2, CoviPostingsBlockV2, CoviReferencedFileV2, CoviRowRangePostingV2,
-    CoviSectionKindV2, CoviSnapshotValidityV2, IndexCapabilityExactnessV2, IndexCapabilityV2,
+    CoviSectionKindV2, CoviSegmentRefPostingV2, CoviSnapshotValidityV2, IndexCapabilityExactnessV2,
+    IndexCapabilityV2,
 };
 
 const ABSENT_U32: u32 = u32::MAX;
@@ -113,6 +116,7 @@ pub enum CoviLookupOpV2 {
         lower_inclusive: bool,
         upper_inclusive: bool,
     },
+    Membership,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,13 +149,37 @@ impl CoviLookupKeyV2 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoviLookupTargetV2 {
+    TableColumn {
+        table_id: u32,
+        column_id: u32,
+    },
+    ObjectProperty {
+        object_type_id: u32,
+        property_id: u32,
+    },
+    ObjectPath {
+        object_type_id: u32,
+        path_ref: u32,
+    },
+    SemanticDimension {
+        semantic_dimension_ref: u32,
+    },
+    DimensionalTuple {
+        semantic_dimension_ref: u32,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoviLookupRequestV2 {
     pub table_id: u32,
     pub column_id: u32,
+    pub target: CoviLookupTargetV2,
     pub op: CoviLookupOpV2,
     pub lower_key: CoviLookupKeyV2,
     pub upper_key: Option<CoviLookupKeyV2>,
+    pub membership_keys: Vec<CoviLookupKeyV2>,
     pub require_exact: bool,
 }
 
@@ -160,11 +188,141 @@ impl CoviLookupRequestV2 {
         Self {
             table_id,
             column_id,
+            target: CoviLookupTargetV2::TableColumn {
+                table_id,
+                column_id,
+            },
             op: CoviLookupOpV2::Eq,
             lower_key: key,
             upper_key: None,
+            membership_keys: Vec::new(),
             require_exact: true,
         }
+    }
+
+    pub fn eq_target(target: CoviLookupTargetV2, key: CoviLookupKeyV2) -> Self {
+        let (table_id, column_id) = match target {
+            CoviLookupTargetV2::TableColumn {
+                table_id,
+                column_id,
+            } => (table_id, column_id),
+            _ => (ABSENT_U32, ABSENT_U32),
+        };
+        Self {
+            table_id,
+            column_id,
+            target,
+            op: CoviLookupOpV2::Eq,
+            lower_key: key,
+            upper_key: None,
+            membership_keys: Vec::new(),
+            require_exact: true,
+        }
+    }
+
+    pub fn membership(
+        table_id: u32,
+        column_id: u32,
+        keys: impl IntoIterator<Item = CoviLookupKeyV2>,
+    ) -> Self {
+        Self::membership_target(
+            CoviLookupTargetV2::TableColumn {
+                table_id,
+                column_id,
+            },
+            keys,
+        )
+    }
+
+    pub fn membership_target(
+        target: CoviLookupTargetV2,
+        keys: impl IntoIterator<Item = CoviLookupKeyV2>,
+    ) -> Self {
+        let mut keys = keys.into_iter().collect::<Vec<_>>();
+        let lower_key = keys
+            .first()
+            .cloned()
+            .unwrap_or_else(|| CoviLookupKeyV2::CanonicalValueBytes(Vec::new()));
+        if !keys.is_empty() {
+            keys.remove(0);
+        }
+        let (table_id, column_id) = match target {
+            CoviLookupTargetV2::TableColumn {
+                table_id,
+                column_id,
+            } => (table_id, column_id),
+            _ => (ABSENT_U32, ABSENT_U32),
+        };
+        Self {
+            table_id,
+            column_id,
+            target,
+            op: CoviLookupOpV2::Membership,
+            lower_key,
+            upper_key: None,
+            membership_keys: keys,
+            require_exact: true,
+        }
+    }
+
+    pub fn table_column_membership(
+        table_id: u32,
+        column_id: u32,
+        keys: impl IntoIterator<Item = CoviLookupKeyV2>,
+    ) -> Self {
+        Self::membership(table_id, column_id, keys)
+    }
+
+    pub fn object_property_membership(
+        object_type_id: u32,
+        property_id: u32,
+        keys: impl IntoIterator<Item = CoviLookupKeyV2>,
+    ) -> Self {
+        Self::membership_target(
+            CoviLookupTargetV2::ObjectProperty {
+                object_type_id,
+                property_id,
+            },
+            keys,
+        )
+    }
+
+    pub fn object_path_membership(
+        object_type_id: u32,
+        path_ref: u32,
+        keys: impl IntoIterator<Item = CoviLookupKeyV2>,
+    ) -> Self {
+        Self::membership_target(
+            CoviLookupTargetV2::ObjectPath {
+                object_type_id,
+                path_ref,
+            },
+            keys,
+        )
+    }
+
+    pub fn semantic_dimension_membership(
+        semantic_dimension_ref: u32,
+        keys: impl IntoIterator<Item = CoviLookupKeyV2>,
+    ) -> Self {
+        Self::membership_target(
+            CoviLookupTargetV2::SemanticDimension {
+                semantic_dimension_ref,
+            },
+            keys,
+        )
+    }
+
+    pub fn dimensional_tuple_membership(
+        semantic_dimension_ref: u32,
+        keys: impl IntoIterator<Item = CoviLookupKeyV2>,
+    ) -> Self {
+        Self::membership_target(
+            CoviLookupTargetV2::DimensionalTuple {
+                semantic_dimension_ref,
+            },
+            keys,
+        )
     }
 }
 
@@ -173,11 +331,27 @@ pub struct CoviCandidateSetV2 {
     pub exactness: IndexCapabilityExactnessV2,
     pub proof_strength: CoverageProofStrengthV2,
     pub row_ranges: Vec<CoviRowRangePostingV2>,
+    pub byte_ranges: Vec<CoviByteRangePostingV2>,
+    pub object_paths: Vec<CoviObjectPathPostingV2>,
+    pub dimensional_buckets: Vec<CoviDimensionalBucketPostingV2>,
+    pub row_ordinal_set_refs: Vec<u32>,
+    pub file_refs: Vec<CoviFileRefPostingV2>,
+    pub segment_refs: Vec<CoviSegmentRefPostingV2>,
+    pub morsel_refs: Vec<CoviMorselRefPostingV2>,
+    pub page_refs: Vec<CoviPageRefPostingV2>,
 }
 
 impl CoviCandidateSetV2 {
     pub fn is_empty(&self) -> bool {
         self.row_ranges.is_empty()
+            && self.byte_ranges.is_empty()
+            && self.object_paths.is_empty()
+            && self.dimensional_buckets.is_empty()
+            && self.row_ordinal_set_refs.is_empty()
+            && self.file_refs.is_empty()
+            && self.segment_refs.is_empty()
+            && self.morsel_refs.is_empty()
+            && self.page_refs.is_empty()
     }
 }
 
@@ -188,6 +362,8 @@ pub enum CoviAggregateKindV2 {
     Min = 1,
     Max = 2,
     Exists = 3,
+    DistinctCount = 4,
+    Membership = 5,
 }
 
 impl CoviAggregateKindV2 {
@@ -197,6 +373,8 @@ impl CoviAggregateKindV2 {
             1 => Some(Self::Min),
             2 => Some(Self::Max),
             3 => Some(Self::Exists),
+            4 => Some(Self::DistinctCount),
+            5 => Some(Self::Membership),
             _ => None,
         }
     }
@@ -218,6 +396,15 @@ pub struct CoviIndexOnlyAnswerV2 {
     pub null_count: u64,
     pub non_null_count: u64,
     pub value: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoviMembershipAnswerV2 {
+    pub exactness: IndexCapabilityExactnessV2,
+    pub proof_strength: CoverageProofStrengthV2,
+    pub requested_key_count: usize,
+    pub present_key_count: usize,
+    pub present_keys: Vec<Vec<u8>>,
 }
 
 impl ValidatedCoviArtifactV2 {
@@ -378,7 +565,16 @@ impl ValidatedCoviArtifactV2 {
             CoviLookupOpV2::Range { .. } if capability.supports_range == 0 => {
                 return Err(CoveError::BadCovi)
             }
+            CoviLookupOpV2::Membership if capability.supports_membership == 0 => {
+                return Err(CoveError::BadCovi)
+            }
             _ => {}
+        }
+        if matches!(request.op, CoviLookupOpV2::Membership)
+            && request.membership_keys.is_empty()
+            && matches!(&request.lower_key, CoviLookupKeyV2::CanonicalValueBytes(bytes) if bytes.is_empty())
+        {
+            return Err(CoveError::BadCovi);
         }
 
         let key_block = self
@@ -395,7 +591,16 @@ impl ValidatedCoviArtifactV2 {
             .ok_or(CoveError::BadCovi)?;
         let lower = request.lower_key.key_bytes();
         let upper = request.upper_key.as_ref().map(CoviLookupKeyV2::key_bytes);
+        let membership_keys = membership_key_bytes(request);
         let mut rows = Vec::new();
+        let mut byte_ranges = Vec::new();
+        let mut object_paths = Vec::new();
+        let mut dimensional_buckets = Vec::new();
+        let mut row_ordinal_set_refs = Vec::new();
+        let mut file_refs = Vec::new();
+        let mut segment_refs = Vec::new();
+        let mut morsel_refs = Vec::new();
+        let mut page_refs = Vec::new();
         for entry in &entry_block.entries {
             if entry.index_root_id != root.index_root_id {
                 continue;
@@ -406,24 +611,158 @@ impl ValidatedCoviArtifactV2 {
                     return Err(CoveError::BadCovi);
                 }
             }
-            if !key_matches(&request.op, key, &lower, upper.as_deref()) {
+            if !key_matches(&request.op, key, &lower, upper.as_deref(), &membership_keys) {
                 continue;
             }
             let posting = postings_block
                 .postings
                 .get(entry.postings_ref as usize)
                 .ok_or(CoveError::BadCovi)?;
-            if posting.representation != CoviPostingRepresentationV2::RowRangeList {
-                return Err(CoveError::BadCovi);
-            }
             let payload = postings_block.posting_payload(posting)?;
-            rows.extend(crate::parse_covi_row_range_postings(payload)?);
+            match posting.representation {
+                CoviPostingRepresentationV2::RowRangeList => {
+                    rows.extend(crate::parse_covi_row_range_postings(payload)?);
+                }
+                CoviPostingRepresentationV2::ByteRangeList => {
+                    byte_ranges.extend(parse_fixed_payload(
+                        payload,
+                        CoviByteRangePostingV2::LEN,
+                        CoviByteRangePostingV2::parse,
+                    )?);
+                }
+                CoviPostingRepresentationV2::ObjectPathRefs => {
+                    object_paths.extend(parse_fixed_payload(
+                        payload,
+                        CoviObjectPathPostingV2::LEN,
+                        CoviObjectPathPostingV2::parse,
+                    )?);
+                }
+                CoviPostingRepresentationV2::DimensionalBucketRefs => {
+                    dimensional_buckets.extend(parse_fixed_payload(
+                        payload,
+                        CoviDimensionalBucketPostingV2::LEN,
+                        CoviDimensionalBucketPostingV2::parse,
+                    )?);
+                }
+                CoviPostingRepresentationV2::RowOrdinalBitmap
+                | CoviPostingRepresentationV2::RowOrdinalDeltaVarint => {
+                    row_ordinal_set_refs.extend(parse_u32_refs(payload)?);
+                }
+                CoviPostingRepresentationV2::SortedFileRefs => {
+                    file_refs.extend(parse_fixed_payload(
+                        payload,
+                        CoviFileRefPostingV2::LEN,
+                        CoviFileRefPostingV2::parse,
+                    )?);
+                }
+                CoviPostingRepresentationV2::SortedSegmentRefs => {
+                    segment_refs.extend(parse_fixed_payload(
+                        payload,
+                        CoviSegmentRefPostingV2::LEN,
+                        CoviSegmentRefPostingV2::parse,
+                    )?);
+                }
+                CoviPostingRepresentationV2::SortedMorselRefs => {
+                    morsel_refs.extend(parse_fixed_payload(
+                        payload,
+                        CoviMorselRefPostingV2::LEN,
+                        CoviMorselRefPostingV2::parse,
+                    )?);
+                }
+                CoviPostingRepresentationV2::SortedPageRefs => {
+                    page_refs.extend(parse_fixed_payload(
+                        payload,
+                        CoviPageRefPostingV2::LEN,
+                        CoviPageRefPostingV2::parse,
+                    )?);
+                }
+                CoviPostingRepresentationV2::CoverageSetRef
+                | CoviPostingRepresentationV2::Extension => return Err(CoveError::BadCovi),
+            }
         }
         normalize_row_ranges(&mut rows)?;
+        byte_ranges.sort();
+        byte_ranges.dedup();
+        object_paths.sort();
+        object_paths.dedup();
+        dimensional_buckets.sort();
+        dimensional_buckets.dedup();
+        row_ordinal_set_refs.sort_unstable();
+        row_ordinal_set_refs.dedup();
+        file_refs.sort();
+        file_refs.dedup();
+        segment_refs.sort();
+        segment_refs.dedup();
+        morsel_refs.sort();
+        morsel_refs.dedup();
+        page_refs.sort();
+        page_refs.dedup();
         Ok(CoviCandidateSetV2 {
             exactness: capability.exactness,
             proof_strength: capability.proof_strength,
             row_ranges: rows,
+            byte_ranges,
+            object_paths,
+            dimensional_buckets,
+            row_ordinal_set_refs,
+            file_refs,
+            segment_refs,
+            morsel_refs,
+            page_refs,
+        })
+    }
+
+    pub fn exact_membership_answer(
+        &self,
+        request: &CoviLookupRequestV2,
+    ) -> Result<CoviMembershipAnswerV2, CoveError> {
+        if request.op != CoviLookupOpV2::Membership || !request.require_exact {
+            return Err(CoveError::BadCovi);
+        }
+        let root = self.lookup_root(request)?;
+        let capability = self
+            .capabilities
+            .get(&root.index_root_id)
+            .ok_or(CoveError::BadCovi)?;
+        if capability.exactness != IndexCapabilityExactnessV2::Exact
+            || capability.supports_membership == 0
+        {
+            return Err(CoveError::BadCovi);
+        }
+        let key_block = self
+            .key_blocks
+            .get(&root.key_block_section_id)
+            .ok_or(CoveError::BadCovi)?;
+        let entry_block = self
+            .entry_blocks
+            .get(&root.entry_block_section_id)
+            .ok_or(CoveError::BadCovi)?;
+        let requested = membership_key_bytes(request);
+        if requested.is_empty() {
+            return Err(CoveError::BadCovi);
+        }
+        let requested_set = requested
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut present = Vec::new();
+        for entry in &entry_block.entries {
+            if entry.index_root_id != root.index_root_id {
+                continue;
+            }
+            let key = key_bytes_for_entry(key_block, entry)?;
+            if requested_set.contains(key) {
+                present.push(key.to_vec());
+            }
+        }
+        present.sort();
+        present.dedup();
+        Ok(CoviMembershipAnswerV2 {
+            exactness: capability.exactness,
+            proof_strength: capability.proof_strength,
+            requested_key_count: requested.len(),
+            present_key_count: present.len(),
+            present_keys: present,
         })
     }
 
@@ -475,8 +814,49 @@ impl ValidatedCoviArtifactV2 {
     fn lookup_root(&self, request: &CoviLookupRequestV2) -> Result<&CoviIndexRootV2, CoveError> {
         self.roots
             .values()
-            .find(|root| root.table_id == request.table_id && root.column_id == request.column_id)
+            .find(|root| root_matches_target(root, request.target))
             .ok_or(CoveError::BadCovi)
+    }
+}
+
+fn root_matches_target(root: &CoviIndexRootV2, target: CoviLookupTargetV2) -> bool {
+    match target {
+        CoviLookupTargetV2::TableColumn {
+            table_id,
+            column_id,
+        } => {
+            root.indexed_target_kind == CoviIndexedTargetKindV2::TableColumn
+                && root.table_id == table_id
+                && root.column_id == column_id
+        }
+        CoviLookupTargetV2::ObjectProperty {
+            object_type_id,
+            property_id,
+        } => {
+            root.indexed_target_kind == CoviIndexedTargetKindV2::ObjectProperty
+                && root.object_type_id == object_type_id
+                && root.property_id == property_id
+        }
+        CoviLookupTargetV2::ObjectPath {
+            object_type_id,
+            path_ref,
+        } => {
+            root.indexed_target_kind == CoviIndexedTargetKindV2::ObjectPath
+                && root.object_type_id == object_type_id
+                && root.path_ref == path_ref
+        }
+        CoviLookupTargetV2::SemanticDimension {
+            semantic_dimension_ref,
+        } => {
+            root.indexed_target_kind == CoviIndexedTargetKindV2::SemanticDimension
+                && root.semantic_dimension_ref == semantic_dimension_ref
+        }
+        CoviLookupTargetV2::DimensionalTuple {
+            semantic_dimension_ref,
+        } => {
+            root.indexed_target_kind == CoviIndexedTargetKindV2::DimensionalTuple
+                && root.semantic_dimension_ref == semantic_dimension_ref
+        }
     }
 }
 
@@ -818,9 +1198,35 @@ fn key_bytes_for_entry<'a>(
     Ok(&key_block.key_data[start..end])
 }
 
-fn key_matches(op: &CoviLookupOpV2, key: &[u8], lower: &[u8], upper: Option<&[u8]>) -> bool {
+fn membership_key_bytes(request: &CoviLookupRequestV2) -> Vec<Vec<u8>> {
+    let mut keys = Vec::with_capacity(1 + request.membership_keys.len());
+    let lower = request.lower_key.key_bytes();
+    if !matches!(request.op, CoviLookupOpV2::Membership)
+        || !matches!(&request.lower_key, CoviLookupKeyV2::CanonicalValueBytes(bytes) if bytes.is_empty())
+    {
+        keys.push(lower);
+    }
+    keys.extend(
+        request
+            .membership_keys
+            .iter()
+            .map(CoviLookupKeyV2::key_bytes),
+    );
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn key_matches(
+    op: &CoviLookupOpV2,
+    key: &[u8],
+    lower: &[u8],
+    upper: Option<&[u8]>,
+    membership_keys: &[Vec<u8>],
+) -> bool {
     match op {
         CoviLookupOpV2::Eq => key == lower,
+        CoviLookupOpV2::Membership => membership_keys.iter().any(|candidate| candidate == key),
         CoviLookupOpV2::Range {
             lower_inclusive,
             upper_inclusive,
@@ -881,6 +1287,27 @@ fn normalize_row_ranges(rows: &mut Vec<CoviRowRangePostingV2>) -> Result<(), Cov
     Ok(())
 }
 
+fn parse_fixed_payload<T>(
+    payload: &[u8],
+    width: usize,
+    parse: impl Fn(&[u8]) -> Result<T, CoveError>,
+) -> Result<Vec<T>, CoveError> {
+    if payload.len() % width != 0 {
+        return Err(CoveError::BadCovi);
+    }
+    payload.chunks_exact(width).map(parse).collect()
+}
+
+fn parse_u32_refs(payload: &[u8]) -> Result<Vec<u32>, CoveError> {
+    if payload.len() % 4 != 0 {
+        return Err(CoveError::BadCovi);
+    }
+    Ok(payload
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect())
+}
+
 fn answer_to_public(
     answer: &CoviAggregateAnswerV2,
     block: &CoviAggregateAnswerBlockV2,
@@ -892,7 +1319,17 @@ fn answer_to_public(
         if start > block.payload.len() {
             return Err(CoveError::OffsetRange);
         }
-        Some(block.payload[start..].to_vec())
+        let end = block
+            .answers
+            .iter()
+            .filter_map(|candidate| {
+                (candidate.value_ref != ABSENT_U32)
+                    .then_some(candidate.value_ref as usize)
+                    .filter(|offset| *offset > start)
+            })
+            .min()
+            .unwrap_or(block.payload.len());
+        Some(block.payload[start..end].to_vec())
     };
     Ok(CoviIndexOnlyAnswerV2 {
         aggregate_kind: CoviAggregateKindV2::from_u16(answer.aggregate_kind)
@@ -902,4 +1339,60 @@ fn answer_to_public(
         non_null_count: answer.non_null_count,
         value,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn membership_request_preserves_typed_target_and_keys() {
+        let request = CoviLookupRequestV2::object_property_membership(
+            7,
+            9,
+            [
+                CoviLookupKeyV2::CanonicalValueBytes(b"alpha".to_vec()),
+                CoviLookupKeyV2::CanonicalValueBytes(b"beta".to_vec()),
+            ],
+        );
+        assert_eq!(
+            request.target,
+            CoviLookupTargetV2::ObjectProperty {
+                object_type_id: 7,
+                property_id: 9
+            }
+        );
+        assert_eq!(request.op, CoviLookupOpV2::Membership);
+        assert_eq!(
+            membership_key_bytes(&request),
+            vec![b"alpha".to_vec(), b"beta".to_vec()]
+        );
+    }
+
+    #[test]
+    fn membership_key_match_checks_any_requested_key() {
+        let request = CoviLookupRequestV2::membership(
+            1,
+            2,
+            [
+                CoviLookupKeyV2::CanonicalValueBytes(b"a".to_vec()),
+                CoviLookupKeyV2::CanonicalValueBytes(b"c".to_vec()),
+            ],
+        );
+        let keys = membership_key_bytes(&request);
+        assert!(key_matches(
+            &CoviLookupOpV2::Membership,
+            b"c",
+            b"a",
+            None,
+            &keys
+        ));
+        assert!(!key_matches(
+            &CoviLookupOpV2::Membership,
+            b"b",
+            b"a",
+            None,
+            &keys
+        ));
+    }
 }

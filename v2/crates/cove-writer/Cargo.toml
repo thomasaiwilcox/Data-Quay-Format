@@ -1,0 +1,9 @@
+[package]
+name = "cove-writer"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight writer facade for the Cove Format (COVE)"
+license = "MIT"
+
+[dependencies]
+cove-core = { path = "../cove-core" }

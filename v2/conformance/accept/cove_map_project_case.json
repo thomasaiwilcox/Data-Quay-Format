@@ -44,6 +44,16 @@
     "mapping_id": "people-map",
     "mapping_version": "2026.05"
   },
+  "expected_projection_outputs": [
+    {
+      "format": "arrow",
+      "projection_id": "person_projection"
+    },
+    {
+      "format": "cove-t",
+      "projection_id": "person_projection"
+    }
+  ],
   "mapping": "accept/cove_map_execution.covemap",
   "sources": [
     "accept/people.csv"

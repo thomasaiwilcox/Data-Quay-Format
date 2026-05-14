@@ -34,6 +34,15 @@ pub(crate) enum Command {
         map: PathBuf,
         sources: Vec<PathBuf>,
         output: Option<PathBuf>,
+        format: ProjectionFormat,
+        projection_id: Option<String>,
+    },
+    ProjectCoveO {
+        object: PathBuf,
+        mapping: Option<PathBuf>,
+        output: Option<PathBuf>,
+        format: ProjectionFormat,
+        projection_id: Option<String>,
     },
     Test {
         fixture: PathBuf,
@@ -44,6 +53,9 @@ pub(crate) enum Command {
 pub(crate) enum OutputFormat {
     Json,
     CoveO,
+    Arrow,
+    CoveT,
+    Sql,
 }
 
 pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
@@ -91,6 +103,9 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                         format!("cannot durably publish {}: {err}", output.display())
                     })?;
                 }
+                OutputFormat::Arrow | OutputFormat::CoveT | OutputFormat::Sql => {
+                    return Err("convert supports --format json or cove-o only".into())
+                }
             }
         }
         Command::Explain { map, id } => {
@@ -106,12 +121,35 @@ pub fn run_cli(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             map,
             sources,
             output,
+            format,
+            projection_id,
         } => {
             let file = parse_map(&map)?;
             let inputs = read_source_inputs(&sources)?;
             validate_source_inputs(&file, &inputs.states)?;
-            let projected = project_rows_with_source_states(&file, &inputs.rows, &inputs.states)?;
-            write_or_print(output, &projected)?;
+            let projected = project_rows_with_source_states_output(
+                &file,
+                &inputs.rows,
+                &inputs.states,
+                format,
+                projection_id.as_deref(),
+            )?;
+            write_projection_output(output, format, &projected)?;
+        }
+        Command::ProjectCoveO {
+            object,
+            mapping,
+            output,
+            format,
+            projection_id,
+        } => {
+            let projected = project_cove_o_path_output(
+                &object,
+                mapping.as_deref(),
+                format,
+                projection_id.as_deref(),
+            )?;
+            write_projection_output(output, format, &projected)?;
         }
         Command::Test { fixture } => run_fixture_path(&fixture)?,
     }
@@ -167,10 +205,8 @@ pub(crate) fn parse_args(
             right: one_path(&mut args, "diff <left.covemap> <right.covemap>")?,
         },
         "project" => {
-            let (output, format, positional) = parse_output_format_and_positionals(args)?;
-            if format != OutputFormat::Json {
-                return Err("project currently supports --format json only".into());
-            }
+            let (output, format, projection_id, positional) =
+                parse_output_format_projection_and_positionals(args)?;
             let mut positional = positional.into_iter();
             let map = positional
                 .next()
@@ -179,6 +215,18 @@ pub(crate) fn parse_args(
                 map,
                 sources: positional.collect(),
                 output,
+                format: project_format(format)?,
+                projection_id,
+            }
+        }
+        "project-cove-o" => {
+            let (object, mapping, output, format, projection_id) = parse_project_cove_o_args(args)?;
+            Command::ProjectCoveO {
+                object,
+                mapping,
+                output,
+                format,
+                projection_id,
             }
         }
         "test" => Command::Test {
@@ -216,7 +264,10 @@ fn parse_output_format_and_positionals(
             format = match raw.as_str() {
                 "json" => OutputFormat::Json,
                 "cove-o" => OutputFormat::CoveO,
-                _ => return Err("--format must be one of: json, cove-o".into()),
+                "arrow" => OutputFormat::Arrow,
+                "cove-t" => OutputFormat::CoveT,
+                "sql" => OutputFormat::Sql,
+                _ => return Err("--format must be one of: json, cove-o, arrow, cove-t, sql".into()),
             };
         } else if arg.starts_with('-') {
             return Err(format!("unknown option {arg}"));
@@ -225,4 +276,139 @@ fn parse_output_format_and_positionals(
         }
     }
     Ok((output, format, positional))
+}
+
+fn parse_project_cove_o_args(
+    args: impl Iterator<Item = String>,
+) -> Result<
+    (
+        PathBuf,
+        Option<PathBuf>,
+        Option<PathBuf>,
+        ProjectionFormat,
+        Option<String>,
+    ),
+    String,
+> {
+    let mut output = None;
+    let mut mapping = None;
+    let mut format = ProjectionFormat::Json;
+    let mut projection_id = None;
+    let mut positional = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--output" || arg == "-o" {
+            output = Some(
+                args.next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| format!("{arg} requires a path"))?,
+            );
+        } else if arg == "--mapping" {
+            mapping = Some(
+                args.next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| "--mapping requires a path".to_string())?,
+            );
+        } else if arg == "--format" {
+            let raw = args.next().ok_or_else(|| {
+                "--format requires json, cove-o, arrow, cove-t, or sql".to_string()
+            })?;
+            format = match raw.as_str() {
+                "json" => ProjectionFormat::Json,
+                "arrow" => ProjectionFormat::Arrow,
+                "cove-t" => ProjectionFormat::CoveT,
+                "sql" => ProjectionFormat::Sql,
+                "cove-o" => ProjectionFormat::CoveO,
+                _ => return Err("--format must be one of: json, cove-o, arrow, cove-t, sql".into()),
+            };
+        } else if arg == "--projection-id" {
+            projection_id = Some(
+                args.next()
+                    .ok_or_else(|| "--projection-id requires an id".to_string())?,
+            );
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown option {arg}"));
+        } else {
+            positional.push(PathBuf::from(arg));
+        }
+    }
+    if positional.len() != 1 {
+        return Err("project-cove-o requires exactly one <object.cove>".into());
+    }
+    Ok((positional.remove(0), mapping, output, format, projection_id))
+}
+
+fn parse_output_format_projection_and_positionals(
+    args: impl Iterator<Item = String>,
+) -> Result<(Option<PathBuf>, OutputFormat, Option<String>, Vec<PathBuf>), String> {
+    let mut output = None;
+    let mut format = OutputFormat::Json;
+    let mut projection_id = None;
+    let mut positional = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--output" || arg == "-o" {
+            output = Some(
+                args.next()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| format!("{arg} requires a path"))?,
+            );
+        } else if arg == "--format" {
+            let raw = args.next().ok_or_else(|| {
+                "--format requires json, cove-o, arrow, cove-t, or sql".to_string()
+            })?;
+            format = match raw.as_str() {
+                "json" => OutputFormat::Json,
+                "arrow" => OutputFormat::Arrow,
+                "cove-t" => OutputFormat::CoveT,
+                "sql" => OutputFormat::Sql,
+                "cove-o" => OutputFormat::CoveO,
+                _ => return Err("--format must be one of: json, cove-o, arrow, cove-t, sql".into()),
+            };
+        } else if arg == "--projection-id" {
+            projection_id = Some(
+                args.next()
+                    .ok_or_else(|| "--projection-id requires an id".to_string())?,
+            );
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown option {arg}"));
+        } else {
+            positional.push(PathBuf::from(arg));
+        }
+    }
+    Ok((output, format, projection_id, positional))
+}
+
+fn project_format(format: OutputFormat) -> Result<ProjectionFormat, String> {
+    match format {
+        OutputFormat::Json => Ok(ProjectionFormat::Json),
+        OutputFormat::CoveO => Ok(ProjectionFormat::CoveO),
+        OutputFormat::Arrow => Ok(ProjectionFormat::Arrow),
+        OutputFormat::CoveT => Ok(ProjectionFormat::CoveT),
+        OutputFormat::Sql => Ok(ProjectionFormat::Sql),
+    }
+}
+
+fn write_projection_output(
+    output: Option<PathBuf>,
+    format: ProjectionFormat,
+    bytes: &[u8],
+) -> Result<(), String> {
+    match output {
+        Some(path) => durable::durable_replace(&path, bytes)
+            .map(|_| ())
+            .map_err(|err| format!("cannot durably publish {}: {err}", path.display())),
+        None if matches!(format, ProjectionFormat::Json | ProjectionFormat::Sql) => {
+            println!(
+                "{}",
+                std::str::from_utf8(bytes)
+                    .map_err(|err| format!("projection JSON is not UTF-8: {err}"))?
+            );
+            Ok(())
+        }
+        None => Err(format!(
+            "project --format {} requires --output <path>",
+            format.as_str()
+        )),
+    }
 }

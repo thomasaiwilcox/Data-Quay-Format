@@ -8,10 +8,14 @@ license = "MIT"
 [dependencies]
 cove-arrow = { path = "../cove-arrow" }
 cove-core = { path = "../cove-core" }
+cove-datafusion = { path = "../cove-datafusion" }
+arrow-csv = "58"
 arrow-ipc = "58"
 arrow-array = "58"
 arrow-schema = "58"
+bytes = "1"
 orc-rust = "0.8"
+parquet = { version = "58", default-features = false, features = ["arrow"] }
 serde_json = "1"
 
 [[bin]]
@@ -27,9 +31,12 @@ name = "cove-convert-orc"
 path = "src/bin/cove-convert-orc.rs"
 
 [[bin]]
+name = "cove-convert-csv"
+path = "src/bin/cove-convert-csv.rs"
+
+[[bin]]
 name = "cove-conversion-report"
 path = "src/bin/cove-conversion-report.rs"
 
 [dev-dependencies]
 arrow-array = "58"
-parquet = { version = "58", default-features = false, features = ["arrow"] }

@@ -43,7 +43,7 @@ pub async fn bootstrap_overlay_snapshot_with_options_async(
             continue;
         }
         let path = overlay_uri_to_path(overlay_file.uri.as_ref());
-        let state = bootstrap_local_path_with_options(&path, options).await?;
+        let state = bootstrap_local_path_with_options(&path, options.clone()).await?;
         validate_overlay_identity(
             overlay_file.expected_identity.as_ref(),
             state.as_ref(),

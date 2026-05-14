@@ -82,7 +82,10 @@ use cove_coverage::{
 #[cfg(feature = "covm")]
 use cove_datafusion::register::{cove_table_from_covm_path, register_cove_covm};
 use cove_datafusion::{
-    bootstrap::{bootstrap_bytes, bootstrap_local_file, bootstrap_local_file_async},
+    bootstrap::{
+        bootstrap_bytes, bootstrap_bytes_with_options, bootstrap_local_file,
+        bootstrap_local_file_async, bootstrap_range_reader_with_options, CoveMetadataCache,
+    },
     decode::{decode_local_dataset_scan_tasks, decode_scan},
     expr_lowering::{lower_filter, LowerExpr, LowerLiteral, LowerOperator},
     overlay::{CoveOverlaySnapshot, OverlayFile, OverlayFileIdentity, RowRange, RowVisibility},
@@ -90,7 +93,7 @@ use cove_datafusion::{
         plan_scan, CovePredicate, FilterPlan, NullPredicateKind, NumericPredicateOp,
         PredicateLiteral,
     },
-    range_reader::{coalesced_range_count, RangeCoalescingOptions},
+    range_reader::{coalesced_range_count, MemoryRangeReader, RangeCoalescingOptions},
     register::{
         cove_table_from_path, cove_table_from_path_async, register_cove_file,
         register_cove_file_async, register_cove_file_format, register_cove_file_with_options,
@@ -937,8 +940,120 @@ async fn listing_registration_rejects_multiple_tables_in_one_file() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("exactly one table"), "{err}");
+    assert!(
+        err.contains("requires cove.table_id or cove.table_name"),
+        "{err}"
+    );
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn listing_registration_selects_table_from_multi_table_file() {
+    let dir = make_temp_dir("listing_multi_table_selected");
+    fs::write(dir.join("selected.cove"), multiple_tables_file()).unwrap();
+    let ctx = SessionContext::new();
+    register_cove_listing_table_with_options(
+        &ctx,
+        "selected",
+        dir.to_str().unwrap(),
+        CoveTableOptions::default().with_table_name(Some("public".into()), "second".into()),
+    )
+    .await
+    .unwrap();
+
+    let batches = ctx
+        .sql("SELECT COUNT(*) AS n FROM selected")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = ["+---+", "| n |", "+---+", "| 0 |", "+---+"];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn byte_bootstrap_selects_table_from_multi_table_file() {
+    let bytes = multiple_tables_file();
+    let state = bootstrap_bytes_with_options(
+        "memory://multi",
+        bytes.clone(),
+        CoveTableOptions::default().with_table_id(2),
+    )
+    .unwrap();
+    assert_eq!(state.table().table_id, 2);
+    assert_eq!(state.table().name, "second");
+
+    let state = bootstrap_bytes_with_options(
+        "memory://multi",
+        bytes,
+        CoveTableOptions::default().with_table_name(Some("public".into()), "first".into()),
+    )
+    .unwrap();
+    assert_eq!(state.table().table_id, 1);
+}
+
+#[test]
+fn byte_bootstrap_rejects_unselected_missing_and_ambiguous_tables() {
+    let err = bootstrap_bytes("memory://multi", multiple_tables_file())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("requires cove.table_id or cove.table_name"),
+        "{err}"
+    );
+
+    let err = bootstrap_bytes_with_options(
+        "memory://multi",
+        multiple_tables_file(),
+        CoveTableOptions::default().with_table_id(99),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("selected table_id 99 not found"), "{err}");
+
+    let err = bootstrap_bytes_with_options(
+        "memory://ambiguous",
+        ambiguous_table_names_file(),
+        CoveTableOptions::default().with_table_name(None, "events".into()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("selected table name events is ambiguous"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn metadata_cache_scopes_entries_by_selected_table() {
+    let bytes = multiple_tables_file();
+    let reader = MemoryRangeReader::new(bytes.clone());
+    let cache = CoveMetadataCache::default();
+
+    let first = bootstrap_range_reader_with_options(
+        "memory://multi-table-cache",
+        bytes.len() as u64,
+        &reader,
+        CoveTableOptions::default().with_table_id(1),
+        Some(&cache),
+    )
+    .await
+    .unwrap();
+    let second = bootstrap_range_reader_with_options(
+        "memory://multi-table-cache",
+        bytes.len() as u64,
+        &reader,
+        CoveTableOptions::default().with_table_id(2),
+        Some(&cache),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(first.table().table_id, 1);
+    assert_eq!(second.table().table_id, 2);
+    assert!(!Arc::ptr_eq(&first, &second));
 }
 
 #[tokio::test]
@@ -4034,6 +4149,47 @@ fn multiple_tables_file() -> Vec<u8> {
                 table_id: 2,
                 namespace: "public".into(),
                 name: "second".into(),
+                row_count: 0,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                )],
+            },
+        ],
+    };
+    ScanProfileCoveWriter::new(catalog).write().unwrap()
+}
+
+fn ambiguous_table_names_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![
+            TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 0,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                )],
+            },
+            TableEntry {
+                table_id: 2,
+                namespace: "archive".into(),
+                name: "events".into(),
                 row_count: 0,
                 primary_sort_key_count: 0,
                 clustering_key_count: 0,

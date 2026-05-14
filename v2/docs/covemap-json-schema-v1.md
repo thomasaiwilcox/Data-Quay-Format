@@ -154,6 +154,11 @@ Required for executable projections:
 - `columns`
 - `output_modes`
 
+Executable projection `output_modes` are `json`, `arrow`, `cove-t`, and
+`sql`. `cove-o` is accepted only as a schema declaration: table-to-object
+projection semantics are not defined by the v2 reference executor, so
+`cove-map project --format cove-o` fails closed with a precise error.
+
 Supported row grains:
 
 - `one_row_per_object`
@@ -176,6 +181,12 @@ Projection columns use:
 - `logical_type`: optional declared output type.
 - `conflict_policy`: optional, defaults to `canonical_value`.
 - `missing_policy`: optional, defaults to `null`.
+
+Missing `logical_type` defaults to `utf8`. Executable projections support
+scalar output types only: bool, signed and unsigned integer widths, float32/64,
+date days, timestamp micros/nanos, decimal64/128, utf8, binary, json, and uuid.
+Nested list/struct/map output declarations remain schema-only and are rejected
+by executable projection output paths.
 
 Supported `temporal_mode` values are `latest_committed`, `full_history`,
 `valid_time`, `observed_time`, and `commit_order`. Supported

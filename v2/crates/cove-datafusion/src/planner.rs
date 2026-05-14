@@ -127,11 +127,25 @@ pub enum CovePredicate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CovePredicateExpr {
+    Atom(CovePredicate),
+    And(Vec<CovePredicateExpr>),
+    Or(Vec<CovePredicateExpr>),
+}
+
+impl CovePredicateExpr {
+    pub fn atom(predicate: CovePredicate) -> Self {
+        Self::Atom(predicate)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterPlan {
     pub use_kind: CoveFilterUse,
     pub predicate_columns: Vec<usize>,
     pub display: String,
     pub predicate: Option<CovePredicate>,
+    pub predicate_expr: Option<CovePredicateExpr>,
     pub coverage_predicate_form_ref: Option<u32>,
 }
 
@@ -144,6 +158,22 @@ impl FilterPlan {
             predicate_columns: Vec::new(),
             display: display.into(),
             predicate: None,
+            predicate_expr: None,
+            coverage_predicate_form_ref: None,
+        }
+    }
+
+    pub fn pruning_expr(
+        predicate_columns: Vec<usize>,
+        expr: CovePredicateExpr,
+        display: impl Into<String>,
+    ) -> Self {
+        Self {
+            use_kind: CoveFilterUse::PruningOnly,
+            predicate_columns,
+            display: display.into(),
+            predicate: None,
+            predicate_expr: Some(expr),
             coverage_predicate_form_ref: None,
         }
     }
@@ -158,6 +188,10 @@ impl FilterPlan {
             predicate_columns: vec![column_index],
             display: display.into(),
             predicate: Some(CovePredicate::Null { column_index, kind }),
+            predicate_expr: Some(CovePredicateExpr::atom(CovePredicate::Null {
+                column_index,
+                kind,
+            })),
             coverage_predicate_form_ref: None,
         }
     }
@@ -177,6 +211,11 @@ impl FilterPlan {
                 op,
                 literal: literal.normalized(),
             }),
+            predicate_expr: Some(CovePredicateExpr::atom(CovePredicate::Numeric {
+                column_index,
+                op,
+                literal: literal.normalized(),
+            })),
             coverage_predicate_form_ref: None,
         }
     }
@@ -199,15 +238,17 @@ impl FilterPlan {
         file_codes.dedup();
         canonical_values.sort();
         canonical_values.dedup();
+        let predicate = CovePredicate::FileCodeIn {
+            column_index,
+            file_codes,
+            canonical_values,
+        };
         Self {
             use_kind: CoveFilterUse::PruningOnly,
             predicate_columns: vec![column_index],
             display: display.into(),
-            predicate: Some(CovePredicate::FileCodeIn {
-                column_index,
-                file_codes,
-                canonical_values,
-            }),
+            predicate: Some(predicate.clone()),
+            predicate_expr: Some(CovePredicateExpr::atom(predicate)),
             coverage_predicate_form_ref: None,
         }
     }
@@ -217,14 +258,16 @@ impl FilterPlan {
         literal: Vec<u8>,
         display: impl Into<String>,
     ) -> Self {
+        let predicate = CovePredicate::VarBytesEq {
+            column_index,
+            literal,
+        };
         Self {
             use_kind: CoveFilterUse::PruningOnly,
             predicate_columns: vec![column_index],
             display: display.into(),
-            predicate: Some(CovePredicate::VarBytesEq {
-                column_index,
-                literal,
-            }),
+            predicate: Some(predicate.clone()),
+            predicate_expr: Some(CovePredicateExpr::atom(predicate)),
             coverage_predicate_form_ref: None,
         }
     }
@@ -330,33 +373,37 @@ pub(crate) fn covi_candidates_for_filters(
         };
         let column = &state.table().columns[column_index];
         let mut rows = Vec::new();
-        let mut attempted = false;
-        for key in keys {
-            attempted = true;
-            let request = CoviLookupRequestV2::eq(
+        let request = if keys.len() == 1 {
+            CoviLookupRequestV2::eq(
                 state.table().table_id,
                 column.column_id,
-                CoviLookupKeyV2::CanonicalValueBytes(key),
-            );
-            let Ok(candidates) = covi.lookup(&request) else {
-                continue;
-            };
-            rows.extend(
-                candidates
-                    .row_ranges
-                    .into_iter()
-                    .map(|range| ScanCandidateRowRange {
-                        segment_id: range.segment_id,
-                        morsel_id: range.morsel_id,
-                        row_start: range.row_start,
-                        row_count: range.row_count,
-                    }),
-            );
-        }
-        if attempted {
-            normalize_scan_candidate_ranges(&mut rows).ok()?;
-            return Some(rows);
-        }
+                CoviLookupKeyV2::CanonicalValueBytes(keys[0].clone()),
+            )
+        } else {
+            CoviLookupRequestV2::membership(
+                state.table().table_id,
+                column.column_id,
+                keys.into_iter()
+                    .map(CoviLookupKeyV2::CanonicalValueBytes)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let Ok(candidates) = covi.lookup(&request) else {
+            continue;
+        };
+        rows.extend(
+            candidates
+                .row_ranges
+                .into_iter()
+                .map(|range| ScanCandidateRowRange {
+                    segment_id: range.segment_id,
+                    morsel_id: range.morsel_id,
+                    row_start: range.row_start,
+                    row_count: range.row_count,
+                }),
+        );
+        normalize_scan_candidate_ranges(&mut rows).ok()?;
+        return Some(rows);
     }
     None
 }

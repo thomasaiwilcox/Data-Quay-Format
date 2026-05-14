@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use cove_core::{checksum, CoveError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u16)]
 pub enum RuntimeHintKindV2 {
     CodecRegistry = 0,
@@ -43,6 +43,212 @@ pub struct RuntimeCompatibilityHintV2 {
     pub version_minor: u16,
     pub payload_ref: u32,
     pub checksum: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RuntimeCapability {
+    pub kind: RuntimeHintKindV2,
+    pub namespace: String,
+    pub name: String,
+    pub version_major: u16,
+    pub version_minor: u16,
+}
+
+impl RuntimeCapability {
+    pub fn new(
+        kind: RuntimeHintKindV2,
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+        version_major: u16,
+        version_minor: u16,
+    ) -> Self {
+        Self {
+            kind,
+            namespace: namespace.into(),
+            name: name.into(),
+            version_major,
+            version_minor,
+        }
+    }
+
+    fn matches_hint(&self, hint: &RuntimeCompatibilityHintV2) -> bool {
+        self.kind == hint.hint_kind
+            && self.namespace == hint.namespace
+            && self.name == hint.name
+            && self.version_major == hint.version_major
+            && self.version_minor == hint.version_minor
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeCapabilityRegistry {
+    capabilities: BTreeSet<RuntimeCapability>,
+}
+
+impl RuntimeCapabilityRegistry {
+    pub fn register(&mut self, capability: RuntimeCapability) -> Result<(), CoveError> {
+        if capability.namespace.is_empty() || capability.name.is_empty() {
+            return Err(CoveError::RuntimeHintUnsupported);
+        }
+        self.capabilities.insert(capability);
+        Ok(())
+    }
+
+    pub fn supports(
+        &self,
+        kind: RuntimeHintKindV2,
+        namespace: &str,
+        name: &str,
+        version_major: u16,
+        version_minor: u16,
+    ) -> bool {
+        self.capabilities.contains(&RuntimeCapability::new(
+            kind,
+            namespace,
+            name,
+            version_major,
+            version_minor,
+        ))
+    }
+
+    pub fn supports_hint(&self, hint: &RuntimeCompatibilityHintV2) -> bool {
+        self.capabilities
+            .iter()
+            .any(|capability| capability.matches_hint(hint))
+    }
+
+    pub fn capabilities(&self) -> impl Iterator<Item = &RuntimeCapability> {
+        self.capabilities.iter()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodecRegistry(RuntimeCapabilityRegistry);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LayoutPlanRegistry(RuntimeCapabilityRegistry);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PredicateKernelRegistry(RuntimeCapabilityRegistry);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MappingFunctionRegistry(RuntimeCapabilityRegistry);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EngineProfileRuntimeRegistry(RuntimeCapabilityRegistry);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FfiAdapterRegistry(RuntimeCapabilityRegistry);
+
+macro_rules! runtime_registry_impl {
+    ($ty:ty, $kind:expr) => {
+        impl $ty {
+            pub fn register(
+                &mut self,
+                namespace: impl Into<String>,
+                name: impl Into<String>,
+                version_major: u16,
+                version_minor: u16,
+            ) -> Result<(), CoveError> {
+                self.0.register(RuntimeCapability::new(
+                    $kind,
+                    namespace,
+                    name,
+                    version_major,
+                    version_minor,
+                ))
+            }
+
+            pub fn supports(
+                &self,
+                namespace: &str,
+                name: &str,
+                version_major: u16,
+                version_minor: u16,
+            ) -> bool {
+                self.0
+                    .supports($kind, namespace, name, version_major, version_minor)
+            }
+
+            pub fn capabilities(&self) -> impl Iterator<Item = &RuntimeCapability> {
+                self.0.capabilities()
+            }
+        }
+    };
+}
+
+runtime_registry_impl!(CodecRegistry, RuntimeHintKindV2::CodecRegistry);
+runtime_registry_impl!(LayoutPlanRegistry, RuntimeHintKindV2::LayoutRegistry);
+runtime_registry_impl!(PredicateKernelRegistry, RuntimeHintKindV2::PredicateKernel);
+runtime_registry_impl!(MappingFunctionRegistry, RuntimeHintKindV2::LanguageBinding);
+runtime_registry_impl!(
+    EngineProfileRuntimeRegistry,
+    RuntimeHintKindV2::EngineAdapter
+);
+runtime_registry_impl!(FfiAdapterRegistry, RuntimeHintKindV2::FfiSurface);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeSession {
+    pub codecs: CodecRegistry,
+    pub layout_plans: LayoutPlanRegistry,
+    pub predicate_kernels: PredicateKernelRegistry,
+    pub mapping_functions: MappingFunctionRegistry,
+    pub engine_profiles: EngineProfileRuntimeRegistry,
+    pub ffi_adapters: FfiAdapterRegistry,
+}
+
+impl RuntimeSession {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn default_builtins() -> Self {
+        let mut session = Self::empty();
+        session
+            .codecs
+            .register("org.cove", "core-codecs", 1, 0)
+            .expect("builtin runtime capability is valid");
+        session
+            .layout_plans
+            .register("org.cove", "scan-plan-v1", 1, 0)
+            .expect("builtin runtime capability is valid");
+        session
+            .predicate_kernels
+            .register("org.cove", "metadata-pruning", 1, 0)
+            .expect("builtin runtime capability is valid");
+        session
+            .mapping_functions
+            .register("org.cove", "filecode-canonical", 1, 0)
+            .expect("builtin runtime capability is valid");
+        session
+            .engine_profiles
+            .register("org.cove", "datafusion", 1, 0)
+            .expect("builtin runtime capability is valid");
+        session
+    }
+
+    pub fn supports_hint(&self, hint: &RuntimeCompatibilityHintV2) -> bool {
+        match hint.hint_kind {
+            RuntimeHintKindV2::CodecRegistry => self.codecs.0.supports_hint(hint),
+            RuntimeHintKindV2::LayoutRegistry => self.layout_plans.0.supports_hint(hint),
+            RuntimeHintKindV2::PredicateKernel => self.predicate_kernels.0.supports_hint(hint),
+            RuntimeHintKindV2::EngineAdapter => self.engine_profiles.0.supports_hint(hint),
+            RuntimeHintKindV2::FfiSurface => self.ffi_adapters.0.supports_hint(hint),
+            RuntimeHintKindV2::LanguageBinding | RuntimeHintKindV2::WasmOrExternalKernelPackage => {
+                self.mapping_functions.0.supports_hint(hint)
+            }
+        }
+    }
+
+    pub fn unsupported_required_hints<'a>(
+        &self,
+        hints: &'a [RuntimeCompatibilityHintV2],
+    ) -> Vec<&'a RuntimeCompatibilityHintV2> {
+        hints
+            .iter()
+            .filter(|hint| hint.required && !self.supports_hint(hint))
+            .collect()
+    }
 }
 
 impl RuntimeCompatibilityHintV2 {
@@ -272,5 +478,33 @@ mod tests {
             )],
         );
         assert!(supported.is_empty());
+    }
+
+    #[test]
+    fn runtime_session_discovers_default_builtins() {
+        let session = RuntimeSession::default_builtins();
+        assert!(session
+            .engine_profiles
+            .supports("org.cove", "datafusion", 1, 0));
+        assert!(session
+            .predicate_kernels
+            .supports("org.cove", "metadata-pruning", 1, 0));
+    }
+
+    #[test]
+    fn runtime_session_reports_unsupported_required_hints() {
+        let mut required = hint(7);
+        required.name = "datafusion".into();
+        let mut missing = hint(8);
+        missing.hint_kind = RuntimeHintKindV2::PredicateKernel;
+        missing.name = "missing-kernel".into();
+        let optional = RuntimeCompatibilityHintV2 {
+            required: false,
+            ..missing.clone()
+        };
+        let hints = vec![required, missing, optional];
+        let unsupported = RuntimeSession::default_builtins().unsupported_required_hints(&hints);
+        assert_eq!(unsupported.len(), 1);
+        assert_eq!(unsupported[0].hint_id, 8);
     }
 }

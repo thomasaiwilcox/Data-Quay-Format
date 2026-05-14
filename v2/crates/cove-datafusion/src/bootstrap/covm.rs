@@ -49,18 +49,18 @@ pub async fn bootstrap_covm_local_file_with_options_async(
 
     for entry in &covm.files {
         let cove_path = resolve_covm_uri(manifest_dir, &entry.uri)?;
-        let state = bootstrap_local_path_with_options(&cove_path, options).await?;
+        let state = bootstrap_local_path_with_options(&cove_path, options.clone()).await?;
         stats.files_validated += 1;
-        match validate_covm_entry(entry, state.as_ref(), &cove_path, options) {
+        match validate_covm_entry(entry, state.as_ref(), &cove_path, options.clone()) {
             CovmEntryFreshness::Fresh => {}
             CovmEntryFreshness::Stale => stats.covm_entries_stale += 1,
             CovmEntryFreshness::DigestFallback => stats.manifest_fallbacks += 1,
         }
 
         let mut file = state.files()[0].clone();
-        validate_covx_for_file(&cove_path, &file, options, &mut stats)?;
+        validate_covx_for_file(&cove_path, &file, options.clone(), &mut stats)?;
         #[cfg(feature = "covi")]
-        let covi = validate_covi_for_file(&cove_path, &file, options, &mut stats);
+        let covi = validate_covi_for_file(&cove_path, &file, options.clone(), &mut stats);
         file = FileMetadata::new(
             file.identity().clone(),
             None,

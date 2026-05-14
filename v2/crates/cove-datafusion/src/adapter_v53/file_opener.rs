@@ -83,7 +83,7 @@ impl FileOpener for CoveFileOpener {
         }
         let object_store = Arc::clone(&self.object_store);
         let table_schema = self.table_schema.clone();
-        let options = self.options;
+        let options = self.options.clone();
         let cache = Arc::clone(&self.cache);
         let projection = self.projection.clone();
         let output_projection = self.output_projection.clone();

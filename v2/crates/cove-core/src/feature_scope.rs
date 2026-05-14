@@ -547,14 +547,33 @@ impl FeatureScopeTable {
         profile_matrix: Option<&ProfileCapabilityMatrixV2>,
         section_binding: Option<&SectionFeatureBindingSectionV2>,
     ) -> Result<Self, CoveError> {
+        match section_binding {
+            Some(binding) => Self::build_many(
+                header,
+                footer,
+                extended,
+                profile_matrix,
+                std::slice::from_ref(binding),
+            ),
+            None => Self::build_many(header, footer, extended, profile_matrix, &[]),
+        }
+    }
+
+    pub fn build_many(
+        header: &CoveHeaderV1,
+        footer: &CoveFooter,
+        extended: Option<&ExtendedFeatureSetV2>,
+        profile_matrix: Option<&ProfileCapabilityMatrixV2>,
+        section_bindings: &[SectionFeatureBindingSectionV2],
+    ) -> Result<Self, CoveError> {
         validate_scoped_metadata_references(
             header,
             footer,
             extended,
             profile_matrix,
-            section_binding,
+            section_bindings,
         )?;
-        let scoped_required = scoped_required_masks(profile_matrix, section_binding)?;
+        let scoped_required = scoped_required_masks(profile_matrix, section_bindings)?;
         let mut entries = Vec::new();
         entries.push(FeatureScopeEntry {
             scope: FeatureScopeV2::FileRequired,
@@ -629,7 +648,7 @@ impl FeatureScopeTable {
                 optional_mask: entry.optional_mask,
             }));
         }
-        if let Some(binding) = section_binding {
+        for binding in section_bindings {
             for item in &binding.bindings {
                 for idx in 0..item.required_word_count {
                     let local = item
@@ -778,7 +797,7 @@ fn validate_scoped_metadata_references(
     footer: &CoveFooter,
     extended: Option<&ExtendedFeatureSetV2>,
     profile_matrix: Option<&ProfileCapabilityMatrixV2>,
-    section_binding: Option<&SectionFeatureBindingSectionV2>,
+    section_bindings: &[SectionFeatureBindingSectionV2],
 ) -> Result<(), CoveError> {
     if let Some(matrix) = profile_matrix {
         for entry in &matrix.entries {
@@ -804,7 +823,7 @@ fn validate_scoped_metadata_references(
             )?;
         }
     }
-    if let Some(binding) = section_binding {
+    for binding in section_bindings {
         for item in &binding.bindings {
             if item.scope == FeatureScopeV2::AdvisoryOnly && item.required_word_count != 0 {
                 return Err(CoveError::BadSection(
@@ -951,7 +970,7 @@ fn validate_feature_word_reference(
 
 fn scoped_required_masks(
     profile_matrix: Option<&ProfileCapabilityMatrixV2>,
-    section_binding: Option<&SectionFeatureBindingSectionV2>,
+    section_bindings: &[SectionFeatureBindingSectionV2],
 ) -> Result<std::collections::BTreeMap<u32, u64>, CoveError> {
     let mut scoped = std::collections::BTreeMap::<u32, u64>::new();
     if let Some(matrix) = profile_matrix {
@@ -961,7 +980,7 @@ fn scoped_required_masks(
             }
         }
     }
-    if let Some(binding) = section_binding {
+    for binding in section_bindings {
         for item in &binding.bindings {
             if item.scope == FeatureScopeV2::FileRequired {
                 continue;

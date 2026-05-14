@@ -312,13 +312,29 @@ where
         plan.push(ConversionStep::EmitOptionalCovmCovx);
     }
     validate_plan(&plan)?;
+    let source_format = source_format.into();
 
     Ok(ParquetConversionResult {
         cove_bytes,
         covx_bytes: sidecars.covx_bytes,
         covm_bytes: sidecars.covm_bytes,
         report: ParquetConversionReport {
-            source_format: source_format.into(),
+            source_format: source_format.clone(),
+            source_identifier: options
+                .source_identifier
+                .clone()
+                .unwrap_or_else(|| source_format.clone()),
+            source_digest: options
+                .source_digest
+                .clone()
+                .unwrap_or_else(|| source_schema_fingerprint.clone()),
+            conversion_policy_version: "cove-reference-v2.0".into(),
+            timestamp_policy: "preserve-logical-timestamps".into(),
+            timezone_policy: "preserve-source-timezone-metadata-or-naive".into(),
+            decimal_policy: "preserve-precision-scale-or-lossless-canonical".into(),
+            collation_policy: "preserve-source-collation-or-bytewise".into(),
+            canonicalization_policy: "cove-canonical-v2".into(),
+            row_reordering_policy: "preserve-source-order".into(),
             table_name: options.table_name.clone(),
             namespace: options.namespace.clone(),
             row_count,

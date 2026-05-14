@@ -326,7 +326,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-index models, parses, validates, and serializes `IndexCapabilityV2` and `IndexOnlyCapabilityV2`; COVI execution validates aggregate-answer refs, snapshot exactness, and rejects approximate answers for exact index-only requests; DataFusion can use validated exact answers and candidate pruning when the optional `covi` feature is enabled",
+            notes: "cove-index models, parses, validates, and serializes `IndexCapabilityV2` and `IndexOnlyCapabilityV2`; COVI execution validates aggregate-answer refs, snapshot exactness, exact membership lookups over key blocks, and rejects approximate answers for exact index-only requests; DataFusion uses validated exact count/min/max/count-distinct answers and exact membership/IN pruning when the optional `covi` feature is enabled",
         },
         Row {
             section: "§34",
@@ -407,7 +407,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "profile/cove_h.rs parses hints; mount.rs exposes Harbor-specific mount_cove_h_file that reuses or rebuilds FileCode-to-Harbor maps; corpus covers hint parsing plus mount map rebuild/reuse",
+            notes: "profile/cove_h.rs parses hints and exposes repo-local lease/code-map SPI traits with deterministic mock resolvers; mount.rs exposes Harbor-specific mount_cove_h_file that reuses or rebuilds FileCode-to-Harbor maps; corpus covers hint parsing plus mount map rebuild/reuse",
         },
         Row {
             section: "§45",
@@ -452,7 +452,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "interop/lakehouse.rs parses descriptive hints and visibility overlay references, with guard helpers for physical pruning, candidate filtering, and visible exactness/aggregate restrictions; full external catalog filtering remains out of scope",
+            notes: "interop/lakehouse.rs parses descriptive hints and visibility overlay references, with guard helpers plus a repo-local LakehouseVisibilityProvider JSON fixture adapter for physical pruning, candidate filtering, and visible exactness/aggregate restrictions; production Iceberg/Delta/Hudi clients remain out of scope",
         },
         Row {
             section: "§51",
@@ -461,7 +461,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "interop/parquet.rs plus cove-convert-parquet CLI convert primitive/temporal/utf8/binary batches into COVE-T scan-profile files with machine-readable reports; supported List/Struct/Map Arrow/Parquet shapes now emit native NestedSchema/page trees, while unsupported nested child shapes remain explicit JSON fallbacks; parquet_conversion_case corpus covers primitive, nullable, and fallback accept cases",
+            notes: "interop/parquet.rs plus shared Parquet/Arrow IPC/ORC conversion CLIs convert primitive/temporal/utf8/binary batches into COVE-T scan-profile files with machine-readable reports and common stats/acceleration/aggregate/COVX/COVM options; COVE-T reverse reports write Arrow IPC, CSV, Parquet, and ORC outputs; supported List/Struct/Map Arrow/Parquet shapes emit native NestedSchema/page trees, while unsupported nested child shapes remain explicit JSON fallbacks; parquet_conversion_case corpus covers primitive, nullable, and fallback accept cases",
         },
         Row {
             section: "§52",
@@ -533,7 +533,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "profile/cove_o.rs parses temporal property column directories, page indexes, and payload metadata; cove_map_convert_case validates generated COVE-O property pages and association readback metadata",
+            notes: "profile/cove_o.rs parses temporal property column directories, page indexes, payload metadata, dictionary-backed FileCode values including canonical nested list/struct/map readback, requested-property readback filters, and exact stats-only constants; cove_map_convert_case validates generated COVE-O property pages and association/readback metadata",
         },
         Row {
             section: "§62",
@@ -641,7 +641,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "cove-runtime parses and serializes runtime compatibility hints, validates uniqueness and required-operation matching, and gates runtime/ binary plus operation fixtures",
+            notes: "cove-runtime parses and serializes runtime compatibility hints, exposes RuntimeSession registries for codecs, layouts, predicate kernels, mapping functions, engine profiles, and FFI adapters, validates uniqueness and required-operation matching, and gates runtime/ binary plus operation fixtures",
         },
         Row {
             section: "§68",
@@ -740,7 +740,7 @@ fn rows() -> Vec<Row> {
             parsed: "yes",
             validated: "yes",
             written: "yes",
-            notes: "profile/cove_map.rs expanded ProjectionCatalog schema plus cove_map_project_case corpus executing cove-map library projection over generated mapping/source fixtures; legacy projection previews fail closed",
+            notes: "profile/cove_map.rs expanded ProjectionCatalog schema plus cove_map_project_case corpus executing cove-map library projection over generated mapping/source fixtures; cove-map materializes declared typed JSON, Arrow IPC, COVE-T, SQL, and COVE-O projection outputs through executable paths with projection-id selection; COVE-O nested projection properties are logical List/Struct/Map values backed by FileCode dictionaries; legacy projection previews fail closed",
         },
         Row {
             section: "§70.12",
@@ -848,7 +848,7 @@ fn rows() -> Vec<Row> {
             parsed: "n/a",
             validated: "yes",
             written: "yes",
-            notes: "suite_contract_case corpus, CLI smoke tests including cove-convert-parquet, release-gate bench/conformance/fuzz smoke, and deterministic robustness harness",
+            notes: "suite_contract_case corpus verifies the release-gate script contract; direct execution is enforced by scripts/release-gates.sh, including bench/conformance/fuzz smoke and deterministic robustness harness",
         },
         Row {
             section: "§80.2",
@@ -857,7 +857,7 @@ fn rows() -> Vec<Row> {
             parsed: "n/a",
             validated: "yes",
             written: "yes",
-            notes: "release gates exercise pruning/cost/export utilities, conversion reports, Arrow conversion, digest/canonical/profile tools, COVM/COVX builders, and COVE-MAP wrapper binaries",
+            notes: "suite fixtures verify the release-gate command surface, while scripts/release-gates.sh directly executes pruning/cost/export utilities, conversion reports, Arrow conversion, digest/canonical/profile tools, COVM/COVX builders, and COVE-MAP wrapper binaries",
         },
         Row {
             section: "§80.3A",

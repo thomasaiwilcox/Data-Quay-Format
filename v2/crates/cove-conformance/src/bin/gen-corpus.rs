@@ -24,8 +24,8 @@ use cove_codec::{
 use cove_core::{
     artifact::{
         covemap::{
-            CovemapFile, CovemapHeaderV1, CovemapPostscriptV1, CovemapSection,
-            CovemapSectionEntryV1, COVEMAP_HEADER_LEN, COVEMAP_POSTSCRIPT_LEN,
+            CovemapFile, CovemapHeaderV1, CovemapPayloadEncodingV2, CovemapPostscriptV1,
+            CovemapSection, CovemapSectionEntryV1, COVEMAP_HEADER_LEN, COVEMAP_POSTSCRIPT_LEN,
             COVEMAP_POSTSCRIPT_TAIL_SIZE,
         },
         covm::{CovmFile, CovmFileEntryV1, CovmHeaderV1, CovmPostscriptV1},
@@ -4830,6 +4830,8 @@ fn main() {
                     "cargo test --workspace",
                     "cargo test -p cove-convert-parquet",
                     "cargo run -p cove-core --bin cove-profile -- inspect conformance/accept/cove_t_scan_table.cove > /dev/null",
+                    "cargo run -p cove-core --bin cove-profile -- generate --kind engine-registry --out /tmp/cove-release-gate-engine-registry.bin > /dev/null",
+                    "cargo run -p cove-core --bin cove-profile -- validate-section /tmp/cove-release-gate-engine-registry.bin --kind engine-registry > /dev/null",
                     "cargo run -p cove-core --bin cove-canonicalise -- validate-payload --tag int64 --hex 2a00000000000000 > /dev/null",
                     "cargo run -p cove-core --bin cove-verify-digest -- conformance/accept/cove_t_scan_table.cove > /dev/null",
                     "cargo run -p cove-core --bin cove-build-covm -- /tmp/cove-release-gate.covm conformance/accept/cove_t_scan_table.cove > /dev/null",
@@ -4839,12 +4841,40 @@ fn main() {
                     "cargo run -p cove-datafusion --bin cove-arrow-export -- conformance/accept/cove_t_scan_table.cove /tmp/cove-release-gate.arrow --report /tmp/cove-release-gate-arrow-export.json > /dev/null",
                     "cargo run -p cove-convert-parquet --bin cove-conversion-report -- conformance/accept/parquet_primitives_valid.parquet > /dev/null",
                     "cargo run -p cove-convert-parquet --bin cove-convert-arrow -- /tmp/cove-release-gate.arrow /tmp/cove-release-gate-arrow.cove > /dev/null",
+                    "cargo run -p cove-convert-parquet --bin cove-conversion-report -- --direction cove-to-source --target-format orc --output /tmp/cove-release-gate-reverse.orc conformance/accept/cove_t_scan_table.cove > /dev/null",
+                    "cargo run -p cove-convert-parquet --bin cove-convert-orc -- /tmp/cove-release-gate-reverse.orc /tmp/cove-release-gate-reverse-orc.cove > /dev/null",
                     "cargo run -p cove-convert-parquet --bin cove-convert-orc -- --help > /dev/null 2>&1",
                     "cargo run -p cove-map --bin cove-map-plan-keys -- --help > /dev/null 2>&1",
-                    "cargo run -p cove-bench --bin cove-bench > /dev/null",
+                    "cargo run -p cove-bench --bin cove-bench -- check > /dev/null",
+                    "grep -R \"COVE v2.0\" docs/governance > /dev/null",
+                    "grep -R \"feature-scope\" docs/governance > /dev/null",
+                    "grep -R \"extension fallback\" docs/governance > /dev/null",
                     "cargo run -p cove-fuzz --bin cove-fuzz -- smoke > /dev/null",
                     "cargo run -p cove-conformance --bin gen-corpus -- --check",
                     "cargo run -p cove-conformance --bin gen-capability-matrix -- --check",
+                    "cargo run -p cove-conformance --bin cove-conformance -- conformance/"
+                ],
+            }),
+        ),
+        (
+            "accept/suite_governance_contract.json",
+            json!({
+                "op": "governance_docs_present",
+                "docs": [
+                    "docs/governance/semantic-versioning.md",
+                    "docs/governance/feature-bit-registry.md",
+                    "docs/governance/section-kind-registry.md",
+                    "docs/governance/encoding-kind-registry.md",
+                    "docs/governance/extension-proposal-process.md",
+                    "docs/governance/conformance-levels.md",
+                    "docs/governance/security-privacy-model.md",
+                    "docs/governance/benchmark-methodology.md",
+                    "docs/governance/name-trademark-guidance.md"
+                ],
+                "needles": [
+                    "COVE v2.0",
+                    "feature-scope",
+                    "extension fallback",
                     "cargo run -p cove-conformance --bin cove-conformance -- conformance/"
                 ],
             }),
@@ -4942,6 +4972,20 @@ fn page_codec_fixture_bytes(value: Value) -> Vec<u8> {
 
 fn map_payload_bytes(value: Value) -> Vec<u8> {
     json_fixture_bytes(value)
+}
+
+fn covemap_payload_value(section_kind: SectionKind, mut value: Value) -> Value {
+    if let Value::Object(object) = &mut value {
+        object.insert(
+            "schema_id".to_string(),
+            Value::String("org.coveformat.covemap.v2".to_string()),
+        );
+        object.insert(
+            "section_id".to_string(),
+            Value::Number((section_kind as u16).into()),
+        );
+    }
+    value
 }
 
 fn extension_registry_entry(
@@ -11272,6 +11316,10 @@ fn write_cove_map_execution_cases(root: &PathBuf, entries: &mut Vec<Value>) {
                 "mapping_id": projected["mapping_id"],
                 "mapping_version": projected["mapping_version"],
             },
+            "expected_projection_outputs": [
+                {"format": "arrow", "projection_id": "person_projection"},
+                {"format": "cove-t", "projection_id": "person_projection"}
+            ],
             "expected_projected_rows": projected["rows"],
         })),
     );
@@ -11546,7 +11594,7 @@ fn cove_map_execution_sections() -> Vec<CovemapSection> {
                             {"name": "name", "value": "name", "logical_type": "utf8"},
                             {"name": "membership_count", "value": "count(association(member_of))", "logical_type": "uint64"}
                         ],
-                        "output_modes": ["json", "cove-o"]
+                        "output_modes": ["json", "arrow", "cove-t", "cove-o"]
                     },
                     {
                         "projection_id": "membership_projection",
@@ -11836,7 +11884,7 @@ fn cove_map_projection_missing_policy_file() -> Vec<u8> {
 }
 
 fn covemap_section(section_kind: SectionKind, value: Value) -> CovemapSection {
-    let payload = map_payload_bytes(value);
+    let payload = map_payload_bytes(covemap_payload_value(section_kind, value));
     CovemapSection {
         entry: CovemapSectionEntryV1 {
             section_id: section_kind as u32,
@@ -11844,6 +11892,7 @@ fn covemap_section(section_kind: SectionKind, value: Value) -> CovemapSection {
             length: payload.len() as u64,
             uncompressed_length: payload.len() as u64,
             compression: 0,
+            payload_encoding: CovemapPayloadEncodingV2::CoveMapJsonV2 as u8,
             required: true,
             reserved: 0,
             checksum: 0,
@@ -12299,7 +12348,7 @@ fn map_section(section_kind: SectionKind, item_count: u64, value: Value) -> Sect
         alignment_log2: 0,
         required_features: FEATURE_SEMANTIC_MAP,
         optional_features: 0,
-        data: map_payload_bytes(value),
+        data: map_payload_bytes(covemap_payload_value(section_kind, value)),
     }
 }
 
@@ -13237,21 +13286,25 @@ fn valid_covemap_file() -> Vec<u8> {
                     length: 0,
                     uncompressed_length: 0,
                     compression: CompressionCodec::None as u8,
+                    payload_encoding: CovemapPayloadEncodingV2::CoveMapJsonV2 as u8,
                     required: true,
                     reserved: 0,
                     checksum: 0,
                 },
-                payload: map_payload_bytes(json!({
-                    "mapping_id": "m1",
-                    "mapping_version": "example/v1",
-                    "sources": [{
-                        "source_id": "crm",
-                        "schema_fingerprint": "schema:v1",
-                        "snapshot_digest": "digest:v1",
-                        "row_identity_rules": ["crm.pk"],
-                        "replay_claimed": true
-                    }]
-                })),
+                payload: map_payload_bytes(covemap_payload_value(
+                    SectionKind::MapSourceCatalog,
+                    json!({
+                        "mapping_id": "m1",
+                        "mapping_version": "example/v1",
+                        "sources": [{
+                            "source_id": "crm",
+                            "schema_fingerprint": "schema:v1",
+                            "snapshot_digest": "digest:v1",
+                            "row_identity_rules": ["crm.pk"],
+                            "replay_claimed": true
+                        }]
+                    }),
+                )),
             },
             CovemapSection {
                 entry: CovemapSectionEntryV1 {
@@ -13260,20 +13313,24 @@ fn valid_covemap_file() -> Vec<u8> {
                     length: 0,
                     uncompressed_length: 0,
                     compression: CompressionCodec::None as u8,
+                    payload_encoding: CovemapPayloadEncodingV2::CoveMapJsonV2 as u8,
                     required: false,
                     reserved: 0,
                     checksum: 0,
                 },
-                payload: map_payload_bytes(json!({
-                    "mapping_id": "m1",
-                    "mapping_version": "example/v1",
-                    "functions": [{
-                        "function_id": "trim_lower",
-                        "version": "v1",
-                        "deterministic": true,
-                        "dependency": "pure"
-                    }]
-                })),
+                payload: map_payload_bytes(covemap_payload_value(
+                    SectionKind::MapFunctionRegistry,
+                    json!({
+                        "mapping_id": "m1",
+                        "mapping_version": "example/v1",
+                        "functions": [{
+                            "function_id": "trim_lower",
+                            "version": "v1",
+                            "deterministic": true,
+                            "dependency": "pure"
+                        }]
+                    }),
+                )),
             },
         ],
         postscript: CovemapPostscriptV1 {

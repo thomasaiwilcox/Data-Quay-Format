@@ -7,7 +7,13 @@ license = "MIT"
 autobins = false
 
 [dependencies]
+arrow-array = "58"
+arrow-ipc = "58"
+arrow-json = "58"
+arrow-schema = "58"
 cove-core = { path = "../cove-core" }
+icu_casemap = { version = "2.2", features = ["compiled_data"] }
+icu_normalizer = "2.2"
 serde_json = "1"
 sha2 = "0.10"
 

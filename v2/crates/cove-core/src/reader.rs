@@ -52,7 +52,7 @@ struct ScopedFeatureMetadata {
     #[allow(dead_code)]
     profile_matrix: Option<ProfileCapabilityMatrixV2>,
     #[allow(dead_code)]
-    section_binding: Option<SectionFeatureBindingSectionV2>,
+    section_bindings: Vec<SectionFeatureBindingSectionV2>,
     scope_table: FeatureScopeTable,
 }
 
@@ -223,18 +223,12 @@ fn parse_scoped_feature_metadata(
         })
         .transpose()?;
 
-    let mut section_binding: Option<SectionFeatureBindingSectionV2> = None;
+    let mut section_bindings = Vec::<SectionFeatureBindingSectionV2>::new();
     for entry in footer
         .sections
         .iter()
         .filter(|entry| entry.section_kind == SectionKind::SectionFeatureBinding as u16)
     {
-        if section_binding.is_some() {
-            return Err(CoveError::BadSection(
-                "multiple SECTION_FEATURE_BINDING sections are not supported by the v2 reference validator"
-                    .into(),
-            ));
-        }
         let payload = compression::section_payload(data, entry)?;
         let parsed = SectionFeatureBindingSectionV2::parse(&payload)?;
         let Some(extended) = extended.as_ref() else {
@@ -243,7 +237,7 @@ fn parse_scoped_feature_metadata(
             ));
         };
         extended.validate_binding_horizon(&parsed)?;
-        section_binding = Some(parsed);
+        section_bindings.push(parsed);
     }
 
     if let Some(matrix) = profile_matrix.as_ref() {
@@ -266,17 +260,17 @@ fn parse_scoped_feature_metadata(
         }
     }
 
-    let scope_table = FeatureScopeTable::build(
+    let scope_table = FeatureScopeTable::build_many(
         header,
         footer,
         extended.as_ref(),
         profile_matrix.as_ref(),
-        section_binding.as_ref(),
+        &section_bindings,
     )?;
     Ok(ScopedFeatureMetadata {
         extended,
         profile_matrix,
-        section_binding,
+        section_bindings,
         scope_table,
     })
 }

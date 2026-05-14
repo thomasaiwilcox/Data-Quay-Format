@@ -4,6 +4,8 @@
 //! tenant + code-space scope, epoch tracking, mount cache hints, and a hard
 //! invariant that on-disk COVE FileCodes are NEVER Harbor EngineCodes.
 
+use std::collections::BTreeMap;
+
 use crate::{checksum, CoveError};
 
 pub const HARBOR_MOUNT_HINTS_LEN: usize = 44;
@@ -35,6 +37,102 @@ impl HarborMount {
     pub fn is_engine_code(&self, code: u64) -> bool {
         // Harbor reserves the high 16 bits for the tenant id.
         ((code >> 48) & 0xFFFF) == (self.tenant_id & 0xFFFF)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarborLeaseEpochRequest {
+    pub tenant_id: u64,
+    pub code_space: u64,
+    pub requested_epoch: u64,
+}
+
+pub trait HarborLeaseEpochValidator {
+    fn validate_lease_epoch(&self, request: &HarborLeaseEpochRequest) -> Result<(), CoveError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarborCodeMapRequest {
+    pub file_id: [u8; 16],
+    pub table_id: u32,
+    pub tenant_id: u64,
+    pub code_space: u64,
+    pub lease_epoch: u64,
+    pub dictionary_crc32c: u32,
+    pub filecode_count: usize,
+}
+
+pub trait HarborCodeMapResolver {
+    fn resolve_code_map(&self, request: &HarborCodeMapRequest) -> Result<Vec<u64>, CoveError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct HarborCodeMapKey {
+    file_id: [u8; 16],
+    table_id: u32,
+    tenant_id: u64,
+    code_space: u64,
+    lease_epoch: u64,
+    dictionary_crc32c: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MockHarborResolver {
+    leases: BTreeMap<(u64, u64), u64>,
+    maps: BTreeMap<HarborCodeMapKey, Vec<u64>>,
+}
+
+impl MockHarborResolver {
+    pub fn with_lease(mut self, tenant_id: u64, code_space: u64, epoch: u64) -> Self {
+        self.leases.insert((tenant_id, code_space), epoch);
+        self
+    }
+
+    pub fn with_code_map(mut self, request: &HarborCodeMapRequest, codes: Vec<u64>) -> Self {
+        self.maps.insert(
+            HarborCodeMapKey {
+                file_id: request.file_id,
+                table_id: request.table_id,
+                tenant_id: request.tenant_id,
+                code_space: request.code_space,
+                lease_epoch: request.lease_epoch,
+                dictionary_crc32c: request.dictionary_crc32c,
+            },
+            codes,
+        );
+        self
+    }
+}
+
+impl HarborLeaseEpochValidator for MockHarborResolver {
+    fn validate_lease_epoch(&self, request: &HarborLeaseEpochRequest) -> Result<(), CoveError> {
+        match self.leases.get(&(request.tenant_id, request.code_space)) {
+            Some(epoch) if *epoch == request.requested_epoch => Ok(()),
+            _ => Err(CoveError::HarborMountLease),
+        }
+    }
+}
+
+impl HarborCodeMapResolver for MockHarborResolver {
+    fn resolve_code_map(&self, request: &HarborCodeMapRequest) -> Result<Vec<u64>, CoveError> {
+        self.validate_lease_epoch(&HarborLeaseEpochRequest {
+            tenant_id: request.tenant_id,
+            code_space: request.code_space,
+            requested_epoch: request.lease_epoch,
+        })?;
+        let key = HarborCodeMapKey {
+            file_id: request.file_id,
+            table_id: request.table_id,
+            tenant_id: request.tenant_id,
+            code_space: request.code_space,
+            lease_epoch: request.lease_epoch,
+            dictionary_crc32c: request.dictionary_crc32c,
+        };
+        let codes = self.maps.get(&key).ok_or(CoveError::HarborMountLease)?;
+        if codes.len() != request.filecode_count {
+            return Err(CoveError::ExecutionCodeMap);
+        }
+        Ok(codes.clone())
     }
 }
 
@@ -183,6 +281,40 @@ mod tests {
         assert_eq!(
             HarborMountHintsV1::parse(&bytes),
             Err(CoveError::ReservedNotZero)
+        );
+    }
+
+    #[test]
+    fn mock_harbor_resolver_rejects_lease_mismatch() {
+        let resolver = MockHarborResolver::default().with_lease(7, 11, 3);
+        let request = HarborLeaseEpochRequest {
+            tenant_id: 7,
+            code_space: 11,
+            requested_epoch: 4,
+        };
+        assert_eq!(
+            resolver.validate_lease_epoch(&request),
+            Err(CoveError::HarborMountLease)
+        );
+    }
+
+    #[test]
+    fn mock_harbor_resolver_returns_deterministic_code_map() {
+        let request = HarborCodeMapRequest {
+            file_id: [9; 16],
+            table_id: 5,
+            tenant_id: 7,
+            code_space: 11,
+            lease_epoch: 3,
+            dictionary_crc32c: 0xAABB_CCDD,
+            filecode_count: 3,
+        };
+        let resolver = MockHarborResolver::default()
+            .with_lease(7, 11, 3)
+            .with_code_map(&request, vec![10, 11, 12]);
+        assert_eq!(
+            resolver.resolve_code_map(&request).unwrap(),
+            vec![10, 11, 12]
         );
     }
 }

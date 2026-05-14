@@ -80,7 +80,7 @@ impl FileSource for CoveFileSource {
         Ok(Arc::new(CoveFileOpener::new(
             object_store,
             self.table_schema.clone(),
-            self.options,
+            self.options.clone(),
             Arc::clone(&self.cache),
             self.scan_projection.clone(),
             self.output_projection.clone(),

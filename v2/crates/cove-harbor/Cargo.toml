@@ -1,0 +1,10 @@
+[package]
+name = "cove-harbor"
+version = "0.1.0"
+edition = "2021"
+description = "Reference COVE-H Harbor mount profile facade"
+license = "MIT"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+cove-engine = { path = "../cove-engine" }

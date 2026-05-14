@@ -10,4 +10,6 @@ name = "cove-dump"
 path = "src/main.rs"
 
 [dependencies]
+cove-datafusion = { path = "../cove-datafusion" }
 cove-core = { path = "../cove-core" }
+arrow-json = "58"

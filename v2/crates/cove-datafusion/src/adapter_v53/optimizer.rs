@@ -13,7 +13,9 @@ use datafusion::{
 };
 
 #[cfg(feature = "covi")]
-use crate::metadata_aggregate::exact_covi_unfiltered_min_max;
+use crate::metadata_aggregate::{
+    exact_covi_unfiltered_distinct_counts, exact_covi_unfiltered_min_max,
+};
 use crate::{
     adapter_v53::{
         filter::classify_filter, metadata::CoveMetadataTableProvider,
@@ -135,6 +137,21 @@ fn metadata_aggregate_plan(
 
         #[cfg(feature = "covi")]
         if filters.is_empty() {
+            let distinct_requests = aggregate
+                .aggr_expr
+                .iter()
+                .map(|expr| count_distinct_column_index(expr, provider))
+                .collect::<Option<Vec<_>>>();
+            if let Some(distinct_requests) = distinct_requests {
+                if !distinct_requests.is_empty() {
+                    return exact_covi_unfiltered_distinct_counts(
+                        provider.state(),
+                        &distinct_requests,
+                    )
+                    .map_err(crate::adapter_v53::cove_to_datafusion);
+                }
+            }
+
             let min_max_requests = aggregate
                 .aggr_expr
                 .iter()
@@ -447,6 +464,29 @@ fn count_column_index(expr: &Expr, provider: &CoveTableProvider) -> Option<Optio
             .iter()
             .position(|candidate| candidate.name == column.name)
             .map(Some),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "covi")]
+fn count_distinct_column_index(expr: &Expr, provider: &CoveTableProvider) -> Option<usize> {
+    let Expr::AggregateFunction(func) = expr else {
+        return None;
+    };
+    if !func.func.name().eq_ignore_ascii_case("count")
+        || !func.params.distinct
+        || func.params.filter.is_some()
+        || !func.params.order_by.is_empty()
+    {
+        return None;
+    }
+    match func.params.args.as_slice() {
+        [Expr::Column(column)] => provider
+            .state()
+            .table()
+            .columns
+            .iter()
+            .position(|candidate| candidate.name == column.name),
         _ => None,
     }
 }

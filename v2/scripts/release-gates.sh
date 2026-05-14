@@ -26,6 +26,16 @@ cargo run -p cove-core --bin cove-profile -- validate-section conformance/accept
 cargo run -p cove-core --bin cove-profile -- validate-section conformance/accept/cove_e_execution_scope_valid.bin --kind execution-scope > /dev/null
 cargo run -p cove-core --bin cove-profile -- validate-section conformance/accept/cove_e_code_space_valid.bin --kind code-space > /dev/null
 cargo run -p cove-core --bin cove-profile -- validate-section conformance/accept/cove_e_mount_policy_valid.bin --kind mount-policy > /dev/null
+cargo run -p cove-core --bin cove-profile -- generate --kind execution-code --out /tmp/cove-release-gate-execution-code.bin > /dev/null
+cargo run -p cove-core --bin cove-profile -- validate-section /tmp/cove-release-gate-execution-code.bin --kind execution-code > /dev/null
+cargo run -p cove-core --bin cove-profile -- generate --kind execution-scope --out /tmp/cove-release-gate-execution-scope.bin > /dev/null
+cargo run -p cove-core --bin cove-profile -- validate-section /tmp/cove-release-gate-execution-scope.bin --kind execution-scope > /dev/null
+cargo run -p cove-core --bin cove-profile -- generate --kind code-space --out /tmp/cove-release-gate-code-space.bin > /dev/null
+cargo run -p cove-core --bin cove-profile -- validate-section /tmp/cove-release-gate-code-space.bin --kind code-space > /dev/null
+cargo run -p cove-core --bin cove-profile -- generate --kind mount-policy --out /tmp/cove-release-gate-mount-policy.bin > /dev/null
+cargo run -p cove-core --bin cove-profile -- validate-section /tmp/cove-release-gate-mount-policy.bin --kind mount-policy > /dev/null
+cargo run -p cove-core --bin cove-profile -- generate --kind engine-registry --out /tmp/cove-release-gate-engine-registry.bin > /dev/null
+cargo run -p cove-core --bin cove-profile -- validate-section /tmp/cove-release-gate-engine-registry.bin --kind engine-registry > /dev/null
 cargo run -p cove-core --bin cove-canonicalise -- validate-payload --tag int64 --hex 2a00000000000000 > /dev/null
 cargo run -p cove-core --bin cove-canonicalise -- encode-json --logical utf8 --value '"red"' > /dev/null
 cargo run -p cove-core --bin cove-canonicalise -- check-domain conformance/accept/cove_t_zone_stats_valid.cove > /dev/null
@@ -39,6 +49,13 @@ cargo run -p cove-convert-parquet --bin cove-convert-parquet -- conformance/acce
 cargo run -p cove-convert-parquet --bin cove-conversion-report -- conformance/accept/parquet_primitives_valid.parquet > /dev/null
 cargo run -p cove-datafusion --bin cove-arrow-export -- conformance/accept/cove_t_scan_table.cove /tmp/cove-release-gate.arrow --report /tmp/cove-release-gate-arrow-export.json > /dev/null
 cargo run -p cove-convert-parquet --bin cove-convert-arrow -- /tmp/cove-release-gate.arrow /tmp/cove-release-gate-arrow.cove > /dev/null
+printf 'id,name\n1,Ada\n2,Linus\n' > /tmp/cove-release-gate.csv
+cargo run -p cove-convert-parquet --bin cove-convert-csv -- /tmp/cove-release-gate.csv /tmp/cove-release-gate-csv.cove --report /tmp/cove-release-gate-csv-report.json > /dev/null
+cargo run -p cove-convert-parquet --bin cove-conversion-report -- --direction cove-to-source --target-format arrow --output /tmp/cove-release-gate-reverse.arrow conformance/accept/cove_t_scan_table.cove > /dev/null
+cargo run -p cove-convert-parquet --bin cove-conversion-report -- --direction cove-to-source --target-format csv --output /tmp/cove-release-gate-reverse.csv conformance/accept/cove_t_scan_table.cove > /dev/null
+cargo run -p cove-convert-parquet --bin cove-conversion-report -- --direction cove-to-source --target-format parquet --output /tmp/cove-release-gate-reverse.parquet conformance/accept/cove_t_scan_table.cove > /dev/null
+cargo run -p cove-convert-parquet --bin cove-conversion-report -- --direction cove-to-source --target-format orc --output /tmp/cove-release-gate-reverse.orc conformance/accept/cove_t_scan_table.cove > /dev/null
+cargo run -p cove-convert-parquet --bin cove-convert-orc -- /tmp/cove-release-gate-reverse.orc /tmp/cove-release-gate-reverse-orc.cove > /dev/null
 cargo run -p cove-convert-parquet --bin cove-convert-orc -- --help > /dev/null 2>&1
 cargo run -p cove-map --bin cove-map-validate -- --help > /dev/null 2>&1
 cargo run -p cove-map --bin cove-map-preview -- --help > /dev/null 2>&1
@@ -49,7 +66,20 @@ cargo run -p cove-map --bin cove-map-test -- --help > /dev/null 2>&1
 cargo run -p cove-map --bin cove-map-plan-keys -- --help > /dev/null 2>&1
 cargo run -p cove-map --bin cove-map-project -- --help > /dev/null 2>&1
 cargo test -p cove-convert-parquet
-cargo run -p cove-bench --bin cove-bench > /dev/null
+cargo run -p cove-bench --bin cove-bench -- check > /dev/null
+test -f docs/governance/semantic-versioning.md
+test -f docs/governance/feature-bit-registry.md
+test -f docs/governance/section-kind-registry.md
+test -f docs/governance/encoding-kind-registry.md
+test -f docs/governance/extension-proposal-process.md
+test -f docs/governance/conformance-levels.md
+test -f docs/governance/security-privacy-model.md
+test -f docs/governance/benchmark-methodology.md
+test -f docs/governance/name-trademark-guidance.md
+grep -R "COVE v2.0" docs/governance > /dev/null
+grep -R "feature-scope" docs/governance > /dev/null
+grep -R "extension fallback" docs/governance > /dev/null
+grep -R "cargo run -p cove-conformance --bin cove-conformance -- conformance/" docs/governance > /dev/null
 cargo run -p cove-fuzz --bin cove-fuzz -- smoke > /dev/null
 cargo run -p cove-conformance --bin gen-corpus -- --check
 cargo run -p cove-conformance --bin gen-capability-matrix -- --check

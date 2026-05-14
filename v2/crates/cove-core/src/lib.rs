@@ -118,3 +118,7 @@ pub mod writer;
 pub mod zone_stats;
 
 pub use error::CoveError;
+pub use profile::cove_o::{
+    read_object_surface_from_bytes, CoveAssociationMetadata, CoveObjectPropertyValue,
+    CoveObjectRecord, CoveObjectSurface,
+};

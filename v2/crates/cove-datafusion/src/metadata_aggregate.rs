@@ -33,6 +33,7 @@ pub enum MetadataAggregateProofKind {
     FileCodeHistogramCount,
     FileCodeHistogramGroupCount,
     CoviIndexOnlyCount,
+    CoviIndexOnlyDistinctCount,
     CoviIndexOnlyValue,
     AggregateSynopsisValue,
 }
@@ -507,6 +508,33 @@ pub fn exact_covi_unfiltered_min_max(
         proof: MetadataAggregateProof {
             kind: MetadataAggregateProofKind::CoviIndexOnlyValue,
             reason: "exact COVE-I index-only min/max answer".into(),
+            dictionary_group_labels_decoded: 0,
+        },
+    }))
+}
+
+#[cfg(feature = "covi")]
+pub fn exact_covi_unfiltered_distinct_counts(
+    state: &DatasetState,
+    column_indexes: &[usize],
+) -> Result<Option<MetadataAggregatePlan>, CoveError> {
+    let mut counts = Vec::with_capacity(column_indexes.len());
+    for column_index in column_indexes {
+        let Some(answer) = exact_covi_unfiltered_answer(
+            state,
+            Some(*column_index),
+            CoviAggregateKindV2::DistinctCount,
+        )?
+        else {
+            return Ok(None);
+        };
+        counts.push(answer.row_count);
+    }
+    Ok(Some(MetadataAggregatePlan::ScalarCounts {
+        counts,
+        proof: MetadataAggregateProof {
+            kind: MetadataAggregateProofKind::CoviIndexOnlyDistinctCount,
+            reason: "exact COVE-I index-only COUNT DISTINCT answer".into(),
             dictionary_group_labels_decoded: 0,
         },
     }))
