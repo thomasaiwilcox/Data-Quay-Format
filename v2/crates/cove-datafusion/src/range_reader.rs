@@ -676,7 +676,7 @@ fn read_file_exact_at_uninit(
     offset: u64,
     bytes: &mut [MaybeUninit<u8>],
 ) -> Result<(), CoveError> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{ErrorKind, Read, Seek, SeekFrom};
 
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(offset))?;
@@ -686,8 +686,11 @@ fn read_file_exact_at_uninit(
     // implementations must not read from the destination buffer.
     let initialized =
         unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u8>(), bytes.len()) };
-    file.read_exact(initialized)?;
-    Ok(())
+    match file.read_exact(initialized) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => Err(CoveError::BufferTooShort),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn range_len(range: &Range<u64>) -> Result<usize, CoveError> {
