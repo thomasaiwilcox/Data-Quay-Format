@@ -148,7 +148,7 @@ optional = true
 default-features = false
 
 [dependencies.snafu]
-version = "0.8"
+version = "0.9"
 
 [dependencies.snap]
 version = "1.1"
