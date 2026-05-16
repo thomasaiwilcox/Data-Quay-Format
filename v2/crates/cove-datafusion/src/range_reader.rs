@@ -664,8 +664,8 @@ fn read_file_exact_at_uninit(
         offset = offset
             .checked_add(u64::try_from(read).map_err(|_| CoveError::ArithOverflow)?)
             .ok_or(CoveError::ArithOverflow)?;
-        let tmp = bytes;
-        bytes = &mut tmp[read..];
+        let (_, rest) = bytes.split_at_mut(read);
+        bytes = rest;
     }
     Ok(())
 }
@@ -693,8 +693,8 @@ fn read_file_exact_at_uninit(
         offset = offset
             .checked_add(u64::try_from(read).map_err(|_| CoveError::ArithOverflow)?)
             .ok_or(CoveError::ArithOverflow)?;
-        let tmp = bytes;
-        bytes = &mut tmp[read..];
+        let (_, rest) = bytes.split_at_mut(read);
+        bytes = rest;
     }
     Ok(())
 }
