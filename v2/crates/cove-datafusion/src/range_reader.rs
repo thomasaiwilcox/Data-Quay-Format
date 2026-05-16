@@ -670,7 +670,36 @@ fn read_file_exact_at_uninit(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn read_file_exact_at_uninit(
+    file: &File,
+    mut offset: u64,
+    mut bytes: &mut [MaybeUninit<u8>],
+) -> Result<(), CoveError> {
+    use std::os::windows::fs::FileExt;
+
+    while !bytes.is_empty() {
+        // INVARIANT: the OS positioned read initializes at most `bytes.len()`
+        // bytes in the supplied memory and never reads from the destination.
+        // SAFETY: `MaybeUninit<u8>` and `u8` have compatible layout, and the
+        // returned byte count is used to advance the uninitialized tail before
+        // the caller publishes the vector length.
+        let initialized =
+            unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u8>(), bytes.len()) };
+        let read = file.seek_read(initialized, offset)?;
+        if read == 0 {
+            return Err(CoveError::BufferTooShort);
+        }
+        offset = offset
+            .checked_add(u64::try_from(read).map_err(|_| CoveError::ArithOverflow)?)
+            .ok_or(CoveError::ArithOverflow)?;
+        let tmp = bytes;
+        bytes = &mut tmp[read..];
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn read_file_exact_at_uninit(
     file: &File,
     offset: u64,
