@@ -1,0 +1,11 @@
+[package]
+name = "cove-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight engine facade for COVE runtime and DataFusion integration"
+license = "MIT"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+cove-datafusion = { path = "../cove-datafusion" }
+cove-runtime = { path = "../cove-runtime" }

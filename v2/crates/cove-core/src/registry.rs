@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — spec registries used by validators and tools.
+//! Cove Format (COVE) v2.0 — spec registries used by validators and tools.
 //!
 //! This module is the first piece of the implementation ledger described by the
 //! reference plan: feature bits (Spec §11), section kinds (Spec §14), writer
@@ -616,6 +616,15 @@ pub const SECTION_REGISTRY: &[SectionInfo] = &[
         description: "Trust-chain metadata.",
     },
     SectionInfo {
+        kind: SectionKind::NestedSchema,
+        id: 47,
+        wire_name: "NESTED_SCHEMA",
+        profiles: &[PrimaryProfile::TableScan],
+        required_feature: Some(FEATURE_NESTED_COLUMNS),
+        spec_section: "Spec §52",
+        description: "Authoritative recursive child schema metadata for native COVE-T nested columns.",
+    },
+    SectionInfo {
         kind: SectionKind::HarborMountHints,
         id: 50,
         wire_name: "HARBOR_MOUNT_HINTS",
@@ -1156,7 +1165,7 @@ pub const COMPATIBILITY_REGISTRY: &[CompatibilityRuleInfo] = &[
     CompatibilityRuleInfo {
         key: "supported_major_version",
         spec_section: "Spec §77.1",
-        rule: "COVE v1 readers support version_major = 1.",
+        rule: "COVE v2 readers support version_major = 2.",
         examples: &[],
     },
     CompatibilityRuleInfo {
@@ -1246,7 +1255,7 @@ mod tests {
             assert_eq!(SectionKind::from_u16(info.id), Some(info.kind));
             assert_eq!(info.kind as u16, info.id);
         }
-        assert_eq!(SECTION_REGISTRY.len(), 43);
+        assert_eq!(SECTION_REGISTRY.len(), 44);
         let exact_set = section_info(SectionKind::ExactSetIndex).unwrap();
         assert!(exact_set.profiles.contains(&PrimaryProfile::TableScan));
         assert!(exact_set

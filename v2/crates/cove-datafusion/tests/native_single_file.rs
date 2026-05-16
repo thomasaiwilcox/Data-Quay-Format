@@ -8,7 +8,13 @@ use std::{
     },
 };
 
+use arrow_array::{
+    builder::{Int32Builder, ListBuilder},
+    ArrayRef as ArrowArrayRef, RecordBatch as ArrowRecordBatch,
+};
 use async_trait::async_trait;
+use cove_arrow::parquet::{convert_arrow_record_batches, ParquetConversionOptions};
+use cove_cache::{CoveCoverageCacheHeaderV2, CoverageCacheEntryV2, CoverageCacheV2};
 #[cfg(all(feature = "covm", feature = "covx"))]
 use cove_core::artifact::covx::{CovxFile, CovxHeaderV1, CovxPostscriptV1, CovxReferencedFileV1};
 #[cfg(feature = "covm")]
@@ -17,12 +23,25 @@ use cove_core::{
     constants::DigestAlgorithm,
 };
 use cove_core::{
+    canonical::CanonicalValue,
+    checksum,
+    codec::{
+        CodecExtensionDescriptorV2, CodecFallbackPolicyV2, CodecRequirementV2,
+        CodecSpecificationStatusV2, LogicalPage, ABSENT_REF,
+    },
     constants::{
         CoveEncodingKind, CoveLogicalType, CovePhysicalKind, PrimaryProfile, SectionKind,
-        StorageClass, ValueTag, FEATURE_ENGINE_PROFILE, FEATURE_REDACTIONS,
+        StorageClass, ValueTag, FEATURE_ENGINE_PROFILE, FEATURE_EXTENDED_FEATURE_SET,
+        FEATURE_REDACTIONS, FEATURE_REGISTERED_ENCODINGS, FEATURE_TABLE_PROFILE,
     },
     dictionary::{FileDictionary, FileDictionaryHeaderV1, FileDictionaryIndexEntryV1},
     domain::ColumnDomain,
+    feature_binding::{FeatureScopeV2, OperationKindV2},
+    feature_scope::{
+        cove_column_page_target_ref, ExtendedFeatureSetHeaderV2, ExtendedFeatureSetV2,
+        ProfileCapabilityEntryV2, ProfileCapabilityMatrixHeaderV2, ProfileCapabilityMatrixV2,
+    },
+    header::HEADER_SIZE,
     index::{
         aggregate::{AggregateEntry, AggregateSynopsis, SynopsisAccuracy, SynopsisKind},
         composite::{
@@ -38,6 +57,7 @@ use cove_core::{
         },
         topn::{TopNDirection, TopNSummary, TOPN_ZONE_SUMMARY_LEN},
     },
+    page_payload::ColumnPagePayloadV1,
     profile::cove_e::{
         EngineMountPolicyV1, EngineProfileEntryV1, EngineProfileRegistry,
         ExecutionCodeCanonicality, ExecutionCodeComparisonScope, ExecutionCodeDescriptorV1,
@@ -50,11 +70,22 @@ use cove_core::{
     wire,
     writer::{ScanPageSpec, ScanProfileCoveWriter, ScanSegment, SectionPayload},
     zone_stats::{ZoneStatFlags, ZoneStats, ZoneStatsEntry, ZoneStatsSection},
+    CoveError,
+};
+use cove_coverage::{
+    coverage_set_payload_checksum, CoverageExactnessV2, CoverageGranularityV2, CoverageProofKindV2,
+    CoverageProofRecordV2, CoverageProofStrengthV2, CoverageProviderDescriptorV2,
+    CoverageSetEntryV2, CoverageSetHeaderV2, CoverageSetV2, PredicateAstNodeV2,
+    PredicateAstOperandRefV2, PredicateAstPayloadHeaderV2, PredicateFormKindV2, PredicateLiteralV2,
+    PredicateNormalFormV2, PredicateNullPolicyV2, PredicateOpV2, PredicateOperandKindV2,
 };
 #[cfg(feature = "covm")]
 use cove_datafusion::register::{cove_table_from_covm_path, register_cove_covm};
 use cove_datafusion::{
-    bootstrap::{bootstrap_bytes, bootstrap_local_file, bootstrap_local_file_async},
+    bootstrap::{
+        bootstrap_bytes, bootstrap_bytes_with_options, bootstrap_local_file,
+        bootstrap_local_file_async, bootstrap_range_reader_with_options, CoveMetadataCache,
+    },
     decode::{decode_local_dataset_scan_tasks, decode_scan},
     expr_lowering::{lower_filter, LowerExpr, LowerLiteral, LowerOperator},
     overlay::{CoveOverlaySnapshot, OverlayFile, OverlayFileIdentity, RowRange, RowVisibility},
@@ -62,12 +93,13 @@ use cove_datafusion::{
         plan_scan, CovePredicate, FilterPlan, NullPredicateKind, NumericPredicateOp,
         PredicateLiteral,
     },
-    range_reader::{coalesced_range_count, RangeCoalescingOptions},
+    range_reader::{coalesced_range_count, MemoryRangeReader, RangeCoalescingOptions},
     register::{
         cove_table_from_path, cove_table_from_path_async, register_cove_file,
         register_cove_file_async, register_cove_file_format, register_cove_file_with_options,
         register_cove_listing_table, register_cove_listing_table_with_options,
         register_cove_overlay_snapshot, CoveTableOptions, ExecutionCodePolicy,
+        FilterResidualPolicy,
     },
     task_graph::build_task_graph,
 };
@@ -78,7 +110,8 @@ use datafusion::object_store::{
 use datafusion::{
     arrow::{
         array::{
-            Array, BinaryArray, BinaryViewArray, DictionaryArray, StringArray, StringViewArray,
+            Array, BinaryArray, BinaryViewArray, DictionaryArray, Int32Array, ListArray,
+            StringArray, StringViewArray,
         },
         datatypes::UInt32Type,
         util::pretty::pretty_format_batches,
@@ -86,7 +119,7 @@ use datafusion::{
     assert_batches_eq,
     catalog::TableProvider,
     common::{stats::Precision, Column, ScalarValue},
-    logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown},
+    logical_expr::{Between, BinaryExpr, Expr, Operator, TableProviderFilterPushDown},
     physical_plan::{execution_plan::collect as collect_physical_plan, ExecutionPlan},
     prelude::SessionContext,
 };
@@ -94,6 +127,7 @@ use futures::stream::BoxStream;
 use url::Url;
 
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(0);
+const UNKNOWN_SCOPED_FEATURE: u64 = 1;
 
 async fn collect_sql_with_cove_metric(
     ctx: &SessionContext,
@@ -143,6 +177,66 @@ async fn select_star_reads_single_file_multi_segment() {
         "| 2  | beta  | false  |",
         "| 3  | gamma | true   |",
         "+----+-------+--------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn registered_utf8_page_scans_through_stable_decoder() {
+    let path = write_temp_cove(
+        "registered_utf8_supported",
+        registered_names_file(true, true),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "names", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT name FROM names")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+-------+",
+        "| name  |",
+        "+-------+",
+        "| alpha |",
+        "| beta  |",
+        "| gamma |",
+        "+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn registered_utf8_page_scans_through_core_fallback_without_descriptor() {
+    let path = write_temp_cove(
+        "registered_utf8_fallback",
+        registered_names_file(false, true),
+    );
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "names", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT name FROM names")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+-------+",
+        "| name  |",
+        "+-------+",
+        "| alpha |",
+        "| beta  |",
+        "| gamma |",
+        "+-------+",
     ];
     assert_batches_eq!(expected, &batches);
     fs::remove_file(path).unwrap();
@@ -225,6 +319,52 @@ async fn native_arrow_export_path_metrics_are_recorded() {
     assert_eq!(varbytes_rows, 3);
     assert_eq!(plainfixed_rows, 3);
     assert_eq!(fallback_rows, 0);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn native_nested_list_column_projects_as_arrow_list() {
+    let mut builder = ListBuilder::new(Int32Builder::new());
+    builder.values().append_value(1);
+    builder.values().append_value(2);
+    builder.append(true);
+    builder.append(false);
+    builder.values().append_value(3);
+    builder.append(true);
+    let batch = ArrowRecordBatch::try_from_iter(vec![(
+        "tags",
+        Arc::new(builder.finish()) as ArrowArrayRef,
+    )])
+    .unwrap();
+    let result = convert_arrow_record_batches(
+        "arrow-test",
+        "test:native-nested-list".into(),
+        batch.schema(),
+        vec![batch],
+        &ParquetConversionOptions::default(),
+    )
+    .unwrap();
+    let path = write_temp_cove("native_nested_list", result.cove_bytes);
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT tags FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let array = batches[0].column(0);
+    let list = array.as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(list.value_offsets(), &[0, 2, 2, 3]);
+    assert!(!list.is_null(0));
+    assert!(list.is_null(1));
+    assert!(!list.is_null(2));
+    let values = list.values().as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(values.values(), &[1, 2, 3]);
+
     fs::remove_file(path).unwrap();
 }
 
@@ -318,6 +458,69 @@ async fn async_bootstrap_and_registration_match_sync_helpers() {
     assert_batches_eq!(expected, &async_batches);
 
     fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn scoped_operation_required_feature_does_not_block_unrelated_scan() {
+    let state = bootstrap_bytes(
+        "feature_scope_unrelated_operation",
+        primitive_events_file_with_scoped_feature(scoped_feature_entry(
+            FeatureScopeV2::OperationRequired,
+            OperationKindV2::CoveragePlanning,
+            0,
+            u64::MAX,
+        )),
+    )
+    .unwrap();
+    let plan = plan_scan(&state, None, Vec::new()).unwrap();
+    let decoded = decode_scan(&state, &plan).unwrap();
+    assert_eq!(
+        decoded
+            .batches
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn scoped_operation_required_feature_rejects_matching_scan() {
+    let path = write_temp_cove(
+        "feature_scope_matching_operation",
+        primitive_events_file_with_scoped_feature(scoped_feature_entry(
+            FeatureScopeV2::OperationRequired,
+            OperationKindV2::OrdinaryTableScan,
+            0,
+            u64::MAX,
+        )),
+    );
+
+    assert!(matches!(
+        bootstrap_local_file(&path),
+        Err(CoveError::UnknownRequiredFeature(UNKNOWN_SCOPED_FEATURE))
+    ));
+
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn scoped_page_required_feature_rejects_exact_page_decode() {
+    let state = bootstrap_bytes(
+        "feature_scope_page_decode",
+        primitive_events_file_with_scoped_feature(scoped_feature_entry(
+            FeatureScopeV2::PageRequired,
+            OperationKindV2::None,
+            5,
+            cove_column_page_target_ref(1, 0),
+        )),
+    )
+    .unwrap();
+    let plan = plan_scan(&state, None, Vec::new()).unwrap();
+    assert!(matches!(
+        decode_scan(&state, &plan),
+        Err(CoveError::UnknownRequiredFeature(UNKNOWN_SCOPED_FEATURE))
+    ));
 }
 
 #[tokio::test]
@@ -557,7 +760,45 @@ async fn sql_external_table_stored_as_cove_works_after_format_registration() {
 }
 
 #[tokio::test]
-async fn sql_external_table_rejects_cove_format_options() {
+async fn sql_external_table_accepts_cove_format_options() {
+    let dir = make_temp_dir("sql_external_options");
+    fs::write(dir.join("part1.cove"), primitive_events_file()).unwrap();
+
+    let ctx = SessionContext::new();
+    register_cove_file_format(&ctx).unwrap();
+    ctx.sql(&format!(
+        "CREATE EXTERNAL TABLE events STORED AS COVE LOCATION '{}' OPTIONS (\
+         'cove.filter_residual_policy' 'preserve_all', \
+         'cove.arrow_output' 'standard', \
+         'cove.arrow_string_validation' 'strict_or_cached_proof', \
+         'cove.page_payload_validation' 'trusted', \
+         'cove.local_file_read' 'mmap', \
+         'cove.range_coalescing_max_gap' '64', \
+         'cove.range_coalescing_max_span' '4096', \
+         'cove.covx_discovery' 'disabled', \
+         'cove.covi_discovery' 'disabled', \
+         'cove.coverage_cache' 'disabled', \
+         'cove.execution_code_policy' 'opportunistic', \
+         'cove.target_morsels_per_partition' '4')",
+        dir.display()
+    ))
+    .await
+    .unwrap();
+
+    let batches = ctx
+        .sql("SELECT COUNT(*) AS rows FROM events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = ["+------+", "| rows |", "+------+", "| 3    |", "+------+"];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn sql_external_table_rejects_unknown_cove_format_options() {
     let dir = make_temp_dir("sql_external_options");
     fs::write(dir.join("part1.cove"), primitive_events_file()).unwrap();
 
@@ -573,10 +814,98 @@ async fn sql_external_table_rejects_cove_format_options() {
         .to_string();
 
     assert!(
-        err.contains("COVE DataFusion M2 does not support SQL format options"),
+        err.contains("COVE DataFusion v2 does not support SQL format option"),
         "{err}"
     );
     assert!(err.contains("cove.foo"), "{err}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn copy_to_cove_writes_readable_bounded_file() {
+    let dir = make_temp_dir("copy_to_cove");
+    let path = dir.join("out.cove");
+    let ctx = SessionContext::new();
+    register_cove_file_format(&ctx).unwrap();
+    ctx.sql(&format!(
+        "COPY (\
+         SELECT CAST(1 AS BIGINT) AS id, CAST('alpha' AS VARCHAR) AS name \
+         UNION ALL \
+         SELECT CAST(2 AS BIGINT) AS id, CAST('beta' AS VARCHAR) AS name\
+         ) TO '{}' STORED AS COVE",
+        path.display()
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let read_ctx = SessionContext::new();
+    register_cove_file(&read_ctx, "written", &path).unwrap();
+    let batches = read_ctx
+        .sql("SELECT id, name FROM written ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = [
+        "+----+-------+",
+        "| id | name  |",
+        "+----+-------+",
+        "| 1  | alpha |",
+        "| 2  | beta  |",
+        "+----+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn sql_external_table_appends_partition_columns() {
+    let dir = make_temp_dir("sql_external_partitions");
+    let partition = dir.join("year=2026");
+    fs::create_dir_all(&partition).unwrap();
+    fs::write(partition.join("part1.cove"), primitive_events_file()).unwrap();
+
+    let ctx = SessionContext::new();
+    register_cove_file_format(&ctx).unwrap();
+    ctx.sql(&format!(
+        "CREATE EXTERNAL TABLE events(id BIGINT, name VARCHAR, active BOOLEAN) \
+         STORED AS COVE PARTITIONED BY (year INT) LOCATION '{}'",
+        dir.display()
+    ))
+    .await
+    .unwrap();
+
+    let batches = ctx
+        .sql("SELECT year, name FROM events WHERE year = 2026 ORDER BY name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = [
+        "+------+-------+",
+        "| year | name  |",
+        "+------+-------+",
+        "| 2026 | alpha |",
+        "| 2026 | beta  |",
+        "| 2026 | gamma |",
+        "+------+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+
+    let partition_only = ctx
+        .sql("SELECT year FROM events WHERE year = 2026 LIMIT 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = ["+------+", "| year |", "+------+", "| 2026 |", "+------+"];
+    assert_batches_eq!(expected, &partition_only);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -611,8 +940,120 @@ async fn listing_registration_rejects_multiple_tables_in_one_file() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("exactly one table"), "{err}");
+    assert!(
+        err.contains("requires cove.table_id or cove.table_name"),
+        "{err}"
+    );
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn listing_registration_selects_table_from_multi_table_file() {
+    let dir = make_temp_dir("listing_multi_table_selected");
+    fs::write(dir.join("selected.cove"), multiple_tables_file()).unwrap();
+    let ctx = SessionContext::new();
+    register_cove_listing_table_with_options(
+        &ctx,
+        "selected",
+        dir.to_str().unwrap(),
+        CoveTableOptions::default().with_table_name(Some("public".into()), "second".into()),
+    )
+    .await
+    .unwrap();
+
+    let batches = ctx
+        .sql("SELECT COUNT(*) AS n FROM selected")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = ["+---+", "| n |", "+---+", "| 0 |", "+---+"];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn byte_bootstrap_selects_table_from_multi_table_file() {
+    let bytes = multiple_tables_file();
+    let state = bootstrap_bytes_with_options(
+        "memory://multi",
+        bytes.clone(),
+        CoveTableOptions::default().with_table_id(2),
+    )
+    .unwrap();
+    assert_eq!(state.table().table_id, 2);
+    assert_eq!(state.table().name, "second");
+
+    let state = bootstrap_bytes_with_options(
+        "memory://multi",
+        bytes,
+        CoveTableOptions::default().with_table_name(Some("public".into()), "first".into()),
+    )
+    .unwrap();
+    assert_eq!(state.table().table_id, 1);
+}
+
+#[test]
+fn byte_bootstrap_rejects_unselected_missing_and_ambiguous_tables() {
+    let err = bootstrap_bytes("memory://multi", multiple_tables_file())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("requires cove.table_id or cove.table_name"),
+        "{err}"
+    );
+
+    let err = bootstrap_bytes_with_options(
+        "memory://multi",
+        multiple_tables_file(),
+        CoveTableOptions::default().with_table_id(99),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("selected table_id 99 not found"), "{err}");
+
+    let err = bootstrap_bytes_with_options(
+        "memory://ambiguous",
+        ambiguous_table_names_file(),
+        CoveTableOptions::default().with_table_name(None, "events".into()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("selected table name events is ambiguous"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn metadata_cache_scopes_entries_by_selected_table() {
+    let bytes = multiple_tables_file();
+    let reader = MemoryRangeReader::new(bytes.clone());
+    let cache = CoveMetadataCache::default();
+
+    let first = bootstrap_range_reader_with_options(
+        "memory://multi-table-cache",
+        bytes.len() as u64,
+        &reader,
+        CoveTableOptions::default().with_table_id(1),
+        Some(&cache),
+    )
+    .await
+    .unwrap();
+    let second = bootstrap_range_reader_with_options(
+        "memory://multi-table-cache",
+        bytes.len() as u64,
+        &reader,
+        CoveTableOptions::default().with_table_id(2),
+        Some(&cache),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(first.table().table_id, 1);
+    assert_eq!(second.table().table_id, 2);
+    assert!(!Arc::ptr_eq(&first, &second));
 }
 
 #[tokio::test]
@@ -643,6 +1084,60 @@ async fn compatibility_filters_are_residual_and_correct() {
         .unwrap();
     let explain_text = pretty_format_batches(&explain).unwrap().to_string();
     assert!(explain_text.contains("FilterExec") || explain_text.contains("Filter"));
+    assert!(
+        explain_text.contains("cove_advisory_filters=1"),
+        "{explain_text}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn listing_exact_residual_policy_elides_only_proven_exact_filters() {
+    let dir = make_temp_dir("listing_exact_residual");
+    fs::write(dir.join("part1.cove"), primitive_events_file()).unwrap();
+    let ctx = SessionContext::new();
+    register_cove_listing_table_with_options(
+        &ctx,
+        "events",
+        dir.to_str().unwrap(),
+        CoveTableOptions::default()
+            .with_filter_residual_policy(FilterResidualPolicy::ElideExactWhenProven),
+    )
+    .await
+    .unwrap();
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id FROM events WHERE id = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let explain_text = pretty_format_batches(&explain).unwrap().to_string();
+    assert!(
+        explain_text.contains("cove_advisory_filters=1"),
+        "{explain_text}"
+    );
+    assert!(
+        !explain_text.contains("FilterExec"),
+        "exact pushed filter should not leave a FilterExec: {explain_text}"
+    );
+
+    let batches = ctx
+        .sql("SELECT id, name FROM events WHERE id = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let expected = [
+        "+----+------+",
+        "| id | name |",
+        "+----+------+",
+        "| 2  | beta |",
+        "+----+------+",
+    ];
+    assert_batches_eq!(expected, &batches);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -693,11 +1188,13 @@ async fn compatibility_dictionary_output_is_option_aware() {
         .collect()
         .await
         .unwrap();
-    assert!(batches.iter().all(|batch| batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<DictionaryArray<UInt32Type>>()
-        .is_some()));
+    assert!(batches.iter().all(|batch| {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .is_some()
+    }));
 
     let filtered = ctx
         .sql("SELECT name FROM items WHERE name = 'red' ORDER BY name")
@@ -1034,6 +1531,25 @@ async fn projection_order_and_exact_filter_are_correct() {
     fs::remove_file(path).unwrap();
 }
 
+#[tokio::test]
+async fn between_filter_uses_inclusive_lower_and_upper_bounds() {
+    let path = write_temp_cove("events_between", primitive_events_file());
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT id FROM events WHERE id BETWEEN 2 AND 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = ["+----+", "| id |", "+----+", "| 2  |", "+----+"];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn filter_pushdown_classifies_supported_numeric_exact_and_null_inexact() {
     let path = write_temp_cove("nullable_classification", nullable_events_file());
@@ -1059,9 +1575,24 @@ fn filter_pushdown_classifies_supported_numeric_exact_and_null_inexact() {
             TableProviderFilterPushDown::Exact
         ]
     );
-    assert!(support
-        .iter()
-        .any(|use_kind| *use_kind == TableProviderFilterPushDown::Exact));
+    assert!(support.contains(&TableProviderFilterPushDown::Exact));
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn filter_pushdown_classifies_between_as_two_exact_bounds() {
+    let path = write_temp_cove("between_classification", primitive_events_file());
+    let provider = cove_table_from_path(&path).unwrap();
+    let between = Expr::Between(Between::new(
+        Box::new(Expr::Column(Column::from_name("id"))),
+        false,
+        Box::new(Expr::Literal(ScalarValue::Int64(Some(2)), None)),
+        Box::new(Expr::Literal(ScalarValue::Int64(Some(2)), None)),
+    ));
+
+    let support = provider.supports_filters_pushdown(&[&between]).unwrap();
+
+    assert_eq!(support, vec![TableProviderFilterPushDown::Exact]);
     fs::remove_file(path).unwrap();
 }
 
@@ -1092,6 +1623,127 @@ fn filter_pushdown_classifies_varbytes_equality_exact() {
         ]
     );
     fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn sql_filter_uses_matched_coverage_metadata_for_morsel_pruning() {
+    let bytes = primitive_events_file_with_name_gamma_coverage(false);
+    let state = bootstrap_bytes("coverage_sql_gamma", bytes.clone()).unwrap();
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Binary {
+            left: Box::new(LowerExpr::Column("name".into())),
+            op: LowerOperator::Eq,
+            right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("gamma".into()))),
+        },
+        "name = 'gamma'",
+    );
+    let plan = plan_scan(&state, Some(&vec![0, 1]), vec![filter]).unwrap();
+    assert!(plan.coverage_expr.is_some());
+    let decoded = decode_scan(&state, &plan).unwrap();
+    assert_eq!(decoded.stats.morsels_pruned, 1);
+
+    let path = write_temp_cove("coverage_sql_gamma", bytes);
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let batches = ctx
+        .sql("SELECT id, name FROM events WHERE name = 'gamma'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let expected = [
+        "+----+-------+",
+        "| id | name  |",
+        "+----+-------+",
+        "| 3  | gamma |",
+        "+----+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn coverage_metadata_bad_checksum_fails_open() {
+    let bytes = primitive_events_file_with_name_gamma_coverage(true);
+    let state = bootstrap_bytes("coverage_sql_bad_checksum", bytes.clone()).unwrap();
+    let filter = lower_filter(
+        &state,
+        &LowerExpr::Binary {
+            left: Box::new(LowerExpr::Column("name".into())),
+            op: LowerOperator::Eq,
+            right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("gamma".into()))),
+        },
+        "name = 'gamma'",
+    );
+    let plan = plan_scan(&state, Some(&vec![0, 1]), vec![filter]).unwrap();
+    let decoded = decode_scan(&state, &plan).unwrap();
+    assert_eq!(decoded.stats.morsels_pruned, 0);
+
+    let path = write_temp_cove("coverage_sql_bad_checksum", bytes);
+    let ctx = SessionContext::new();
+    register_cove_file(&ctx, "events", &path).unwrap();
+
+    let (batches, morsels_pruned) = collect_sql_with_cove_metric(
+        &ctx,
+        "SELECT id, name FROM events WHERE name = 'gamma'",
+        "cove_morsels_pruned",
+    )
+    .await;
+
+    let expected = [
+        "+----+-------+",
+        "| id | name  |",
+        "+----+-------+",
+        "| 3  | gamma |",
+        "+----+-------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    assert_eq!(morsels_pruned, 0);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn sibling_coverage_cache_is_explicit_and_records_planner_hits() {
+    let bytes = primitive_events_file_with_name_gamma_coverage(false);
+    let path = write_temp_cove("coverage_cache_hit", bytes.clone());
+    let base_state = bootstrap_local_file(&path).unwrap();
+    assert!(!base_state.coverage_cache().runtime_stats().enabled);
+
+    let cache_bytes = coverage_cache_bytes_for_state(base_state.as_ref());
+    let cache_path = PathBuf::from(format!("{}.cache", path.display()));
+    fs::write(&cache_path, cache_bytes).unwrap();
+
+    let cached_state = cove_datafusion::bootstrap::bootstrap_local_file_with_options(
+        &path,
+        CoveTableOptions::default().with_sibling_coverage_cache(),
+    )
+    .unwrap();
+    assert_eq!(
+        cached_state.bootstrap_stats().coverage_cache_entries_loaded,
+        1
+    );
+    let filter = lower_filter(
+        &cached_state,
+        &LowerExpr::Binary {
+            left: Box::new(LowerExpr::Column("name".into())),
+            op: LowerOperator::Eq,
+            right: Box::new(LowerExpr::Literal(LowerLiteral::Utf8("gamma".into()))),
+        },
+        "name = 'gamma'",
+    );
+    let plan = plan_scan(&cached_state, Some(&vec![0, 1]), vec![filter]).unwrap();
+    let cache_stats = cached_state.coverage_cache().runtime_stats();
+    assert_eq!(cache_stats.hits, 1);
+    assert_eq!(cache_stats.misses, 0);
+
+    let graph = build_task_graph(&cached_state, &plan).unwrap();
+    assert_eq!(graph.morsels_pruned, 1);
+    fs::remove_file(path).unwrap();
+    fs::remove_file(cache_path).unwrap();
 }
 
 #[test]
@@ -2309,9 +2961,9 @@ fn dictionary_items_file_with_m4d_metadata() -> Vec<u8> {
 
     let mut writer = ScanProfileCoveWriter::new(catalog);
     writer.push_file_dictionary(&sample_dictionary());
-    writer.push_aggregate_synopsis(&AggregateSynopsis {
-        entries: vec![aggregate_count_entry(7, 1, 2, 0)],
-    });
+    writer.push_aggregate_synopsis(&AggregateSynopsis::from_entries(vec![
+        aggregate_count_entry(7, 1, 2, 0),
+    ]));
     writer.push_composite_zone_index(&composite_index(7, vec![1], vec![0, 0, 0]));
     writer.push_topn_summary(&topn_summary(7, 1, 0, 0, TopNDirection::Largest, 1));
     writer.push_segment(segment);
@@ -2361,9 +3013,9 @@ fn nullable_events_file_with_count() -> Vec<u8> {
     all_non_null.set_column_pages(2, vec![nullable_numcode_page(&[Some(40)])]);
 
     let mut writer = ScanProfileCoveWriter::new(catalog);
-    writer.push_aggregate_synopsis(&AggregateSynopsis {
-        entries: vec![aggregate_count_entry(11, 2, 4, 2)],
-    });
+    writer.push_aggregate_synopsis(&AggregateSynopsis::from_entries(vec![
+        aggregate_count_entry(11, 2, 4, 2),
+    ]));
     writer.push_segment(mixed);
     writer.push_segment(all_null);
     writer.push_segment(all_non_null);
@@ -2527,6 +3179,371 @@ fn topn_summary(
 }
 
 fn primitive_events_file() -> Vec<u8> {
+    primitive_events_writer().write().unwrap()
+}
+
+fn primitive_events_file_with_name_gamma_coverage(bad_checksum: bool) -> Vec<u8> {
+    let mut writer = primitive_events_writer();
+    for section in name_gamma_coverage_sections(bad_checksum) {
+        writer.push_extra_section(section);
+    }
+    writer.write().unwrap()
+}
+
+fn coverage_cache_bytes_for_state(state: &cove_datafusion::dataset_state::DatasetState) -> Vec<u8> {
+    let mut seed = Vec::new();
+    seed.extend_from_slice(state.file_id());
+    seed.extend_from_slice(&state.file_len().to_le_bytes());
+    seed.extend_from_slice(&state.footer_crc32c().to_le_bytes());
+    let digest =
+        cove_core::digest::compute_digest(cove_core::constants::DigestAlgorithm::Sha256, &seed)
+            .unwrap();
+    let mut snapshot_id = [0u8; 16];
+    snapshot_id.copy_from_slice(&digest[..16]);
+    let dataset_id = *state.file_id();
+    CoverageCacheV2 {
+        header: CoveCoverageCacheHeaderV2 {
+            cache_format_namespace_ref: 1,
+            cache_format_version_major: 2,
+            cache_format_version_minor: 0,
+            flags: 0,
+            cache_id: [7u8; 16],
+            dataset_id,
+            snapshot_id,
+            entry_count: 1,
+            created_at_us: 0,
+            producer_engine_ref: 0,
+            reserved: [0; 32],
+            checksum: 0,
+        },
+        entries: vec![CoverageCacheEntryV2 {
+            entry_id: 1,
+            dataset_id,
+            snapshot_id,
+            predicate_normal_form_ref: 1,
+            interval_normal_form_ref: u32::MAX,
+            coverage_set_ref: 1,
+            coverage_granularity: CoverageGranularityV2::Morsel,
+            proof_strength: CoverageProofStrengthV2::ExactConservative,
+            exactness: CoverageExactnessV2::Exact,
+            flags: 0,
+            actual_coverage_size_bytes: 64,
+            actual_read_cost_ns: 1,
+            created_at_us: 0,
+            valid_until_snapshot_ref: u32::MAX,
+            producer_engine_ref: 0,
+            checksum: 0,
+        }],
+    }
+    .serialize()
+    .unwrap()
+}
+
+fn name_gamma_coverage_sections(bad_checksum: bool) -> Vec<SectionPayload> {
+    let predicate_form_ref = 1;
+    let provider_id = 1;
+    let coverage_set_id = 1;
+    let snapshot_validity_ref = 1;
+    let predicate_form_section =
+        predicate_normal_form_ast_section(predicate_form_ref, 1, name_eq_gamma_ast_payload());
+
+    let provider = CoverageProviderDescriptorV2 {
+        provider_id,
+        provider_kind: CoverageProofKindV2::ValueToFragmentIndex as u16,
+        profile: PrimaryProfile::CoverageMetadata as u8,
+        granularity: CoverageGranularityV2::Morsel,
+        proof_strength: CoverageProofStrengthV2::ExactConservative,
+        exactness: CoverageExactnessV2::Exact,
+        flags: 0,
+        referenced_table_id: 1,
+        referenced_column_id: 2,
+        referenced_path_ref: u32::MAX,
+        logical_type: CoveLogicalType::Utf8 as u16,
+        collation_id: 0,
+        null_semantics: 0,
+        snapshot_validity_ref,
+        predicate_form_ref,
+        producer_ref: u32::MAX,
+        checksum: 0,
+    };
+    let coverage_set = CoverageSetV2 {
+        header: CoverageSetHeaderV2 {
+            coverage_set_id,
+            provider_id,
+            granularity: CoverageGranularityV2::Morsel,
+            proof_strength: CoverageProofStrengthV2::ExactConservative,
+            exactness: CoverageExactnessV2::Exact,
+            flags: 0,
+            predicate_form_ref,
+            snapshot_validity_ref,
+            total_fragment_count: 2,
+            covered_fragment_count: 0,
+            required_fragment_count_estimate: 0,
+            coverage_degree_ppm: 500_000,
+            tightness_degree_ppm: 1_000_000,
+            entries_offset: 0,
+            entries_length: 0,
+            checksum: 0,
+        },
+        entries: vec![CoverageSetEntryV2 {
+            target_kind: CoverageGranularityV2::Morsel,
+            flags: 0,
+            file_ref: 0,
+            table_id: 1,
+            segment_id: 1,
+            morsel_id: 0,
+            page_ref: u32::MAX,
+            object_type_id: u32::MAX,
+            path_ref: u32::MAX,
+            dimensional_bucket_ref: u32::MAX,
+            row_start: 0,
+            row_count: 0,
+            row_ordinal_bitmap_ref: u32::MAX,
+            byte_range_ref: u32::MAX,
+            checksum: 0,
+        }],
+    };
+    let coverage_set_bytes = coverage_set.serialize().unwrap();
+    let mut coverage_set_checksum = coverage_set_payload_checksum(&coverage_set_bytes);
+    if bad_checksum {
+        coverage_set_checksum ^= 1;
+    }
+    let proof = CoverageProofRecordV2 {
+        proof_id: 1,
+        provider_id,
+        coverage_set_id,
+        predicate_form_ref,
+        proof_kind: CoverageProofKindV2::ValueToFragmentIndex,
+        proof_strength: CoverageProofStrengthV2::ExactConservative,
+        exactness: CoverageExactnessV2::Exact,
+        granularity: CoverageGranularityV2::Morsel,
+        null_semantics: 0,
+        flags: 0,
+        snapshot_validity_ref,
+        coverage_set_checksum,
+        proof_payload_ref: u32::MAX,
+        checksum: 0,
+    };
+
+    vec![
+        coverage_section(
+            SectionKind::CoverageProviderRegistry,
+            1,
+            provider.serialize().to_vec(),
+        ),
+        coverage_section(SectionKind::CoverageSet, 1, coverage_set_bytes),
+        coverage_section(
+            SectionKind::CoverageProofRecord,
+            1,
+            proof.serialize().unwrap().to_vec(),
+        ),
+        predicate_form_section,
+    ]
+}
+
+fn predicate_normal_form_ast_section(
+    predicate_form_id: u32,
+    table_id: u32,
+    payload: Vec<u8>,
+) -> SectionPayload {
+    let form = PredicateNormalFormV2 {
+        predicate_form_id,
+        form_kind: PredicateFormKindV2::PredicateAst,
+        flags: 0,
+        logical_context_ref: table_id,
+        payload_offset: PredicateNormalFormV2::LEN as u64,
+        payload_length: payload.len() as u64,
+        checksum: 0,
+    };
+    let mut data = Vec::with_capacity(PredicateNormalFormV2::LEN + payload.len());
+    data.extend_from_slice(&form.serialize().unwrap());
+    data.extend_from_slice(&payload);
+    coverage_section(SectionKind::PredicateNormalForm, 1, data)
+}
+
+fn name_eq_gamma_ast_payload() -> Vec<u8> {
+    let canonical = CanonicalValue::Utf8("gamma").encode().unwrap();
+    let node_offset = PredicateAstPayloadHeaderV2::LEN;
+    let literal_offset = node_offset + PredicateAstNodeV2::LEN;
+    let operand_ref_offset = literal_offset + PredicateLiteralV2::LEN;
+    let canonical_offset = operand_ref_offset + 2 * PredicateAstOperandRefV2::LEN;
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&predicate_ast_header(
+        node_offset as u64,
+        literal_offset as u64,
+        operand_ref_offset as u64,
+    ));
+    payload.extend_from_slice(&predicate_ast_node());
+    payload.extend_from_slice(&predicate_ast_literal(
+        canonical_offset as u64,
+        canonical.len() as u32,
+    ));
+    payload.extend_from_slice(&predicate_ast_operand_ref(
+        0,
+        PredicateOperandKindV2::ColumnOrPath,
+        2,
+    ));
+    payload.extend_from_slice(&predicate_ast_operand_ref(
+        1,
+        PredicateOperandKindV2::Literal,
+        0,
+    ));
+    payload.extend_from_slice(&canonical);
+    payload
+}
+
+fn predicate_ast_header(
+    node_offset: u64,
+    literal_offset: u64,
+    operand_ref_offset: u64,
+) -> [u8; PredicateAstPayloadHeaderV2::LEN] {
+    let mut out = [0u8; PredicateAstPayloadHeaderV2::LEN];
+    out[0..4].copy_from_slice(&0u32.to_le_bytes());
+    out[4..8].copy_from_slice(&1u32.to_le_bytes());
+    out[8..12].copy_from_slice(&1u32.to_le_bytes());
+    out[20..24].copy_from_slice(&2u32.to_le_bytes());
+    out[24..32].copy_from_slice(&node_offset.to_le_bytes());
+    out[32..40].copy_from_slice(&literal_offset.to_le_bytes());
+    out[56..64].copy_from_slice(&operand_ref_offset.to_le_bytes());
+    let crc = checksum::crc32c(&out);
+    out[68..72].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+fn predicate_ast_node() -> [u8; PredicateAstNodeV2::LEN] {
+    let mut out = [0u8; PredicateAstNodeV2::LEN];
+    out[0..4].copy_from_slice(&0u32.to_le_bytes());
+    out[4..6].copy_from_slice(&(PredicateOpV2::Eq as u16).to_le_bytes());
+    out[8..10].copy_from_slice(&(CoveLogicalType::Bool as u16).to_le_bytes());
+    out[12] = PredicateNullPolicyV2::SqlWhere as u8;
+    out[14..16].copy_from_slice(&2u16.to_le_bytes());
+    out[16..20].copy_from_slice(&0u32.to_le_bytes());
+    out[20..24].copy_from_slice(&2u32.to_le_bytes());
+    out[24..28].copy_from_slice(&0u32.to_le_bytes());
+    out[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+    out[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+    let crc = checksum::crc32c(&out);
+    out[36..40].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+fn predicate_ast_literal(
+    canonical_value_offset: u64,
+    canonical_value_length: u32,
+) -> [u8; PredicateLiteralV2::LEN] {
+    let mut out = [0u8; PredicateLiteralV2::LEN];
+    out[0..4].copy_from_slice(&0u32.to_le_bytes());
+    out[4..6].copy_from_slice(&(ValueTag::Utf8 as u16).to_le_bytes());
+    out[6..8].copy_from_slice(&(CoveLogicalType::Utf8 as u16).to_le_bytes());
+    out[12..20].copy_from_slice(&canonical_value_offset.to_le_bytes());
+    out[20..24].copy_from_slice(&canonical_value_length.to_le_bytes());
+    let crc = checksum::crc32c(&out);
+    out[24..28].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+fn predicate_ast_operand_ref(
+    ordinal: u16,
+    operand_kind: PredicateOperandKindV2,
+    ref_id: u32,
+) -> [u8; PredicateAstOperandRefV2::LEN] {
+    let mut out = [0u8; PredicateAstOperandRefV2::LEN];
+    out[0..4].copy_from_slice(&0u32.to_le_bytes());
+    out[4..6].copy_from_slice(&ordinal.to_le_bytes());
+    out[6] = operand_kind as u8;
+    out[8..12].copy_from_slice(&ref_id.to_le_bytes());
+    let crc = checksum::crc32c(&out);
+    out[12..16].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+fn coverage_section(kind: SectionKind, item_count: u64, data: Vec<u8>) -> SectionPayload {
+    SectionPayload {
+        section_kind: kind as u16,
+        profile: PrimaryProfile::CoverageMetadata as u8,
+        flags: 0,
+        item_count,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: 0,
+        data,
+    }
+}
+
+fn registered_names_file(include_descriptor: bool, include_fallback: bool) -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![TableEntry {
+            table_id: 71,
+            namespace: "public".into(),
+            name: "names".into(),
+            row_count: 3,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![column(
+                1,
+                "name",
+                CoveLogicalType::Utf8,
+                CovePhysicalKind::VarBytes,
+                false,
+            )],
+        }],
+    };
+    let values = ["alpha", "beta", "gamma"];
+    let fallback = include_fallback.then(|| {
+        ColumnPagePayloadV1::build_single_node(
+            3,
+            CoveEncodingKind::VarBytes,
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            None,
+            varbytes(&values),
+        )
+        .unwrap()
+    });
+    let codec_id = if include_descriptor { 1 } else { 9001 };
+    let registered_payload = ColumnPagePayloadV1::build_registered_single_node(
+        3,
+        3,
+        CoveLogicalType::Utf8,
+        CovePhysicalKind::VarBytes,
+        codec_id,
+        2,
+        0,
+        cfs2_payload(&values),
+        fallback,
+    )
+    .unwrap();
+    let mut segment = ScanSegment::new(71, 0, 0, 3, 1);
+    segment.set_column_pages(
+        1,
+        vec![ScanPageSpec::new(3, registered_payload)
+            .with_encoding_root(CoveEncodingKind::RegisteredEncoding as u32)],
+    );
+    let mut writer = ScanProfileCoveWriter::new(catalog);
+    if include_descriptor {
+        writer.push_extra_section(SectionPayload {
+            section_kind: SectionKind::CodecExtensionRegistry as u16,
+            profile: PrimaryProfile::CodecExtension as u8,
+            flags: 0,
+            item_count: 1,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: 0,
+            optional_features: FEATURE_REGISTERED_ENCODINGS,
+            data: stable_fsst_descriptor().serialize().unwrap(),
+        });
+    }
+    writer.push_segment(segment);
+    writer.write().unwrap()
+}
+
+fn primitive_events_writer() -> ScanProfileCoveWriter {
     let catalog = TableCatalog {
         flags: 0,
         tables: vec![TableEntry {
@@ -2575,7 +3592,103 @@ fn primitive_events_file() -> Vec<u8> {
     let mut writer = ScanProfileCoveWriter::new(catalog);
     writer.push_segment(first);
     writer.push_segment(second);
-    writer.write().unwrap()
+    writer
+}
+
+fn primitive_events_file_with_scoped_feature(entry: ProfileCapabilityEntryV2) -> Vec<u8> {
+    let required_features = FEATURE_TABLE_PROFILE | FEATURE_EXTENDED_FEATURE_SET;
+    let extended = ExtendedFeatureSetV2 {
+        header: ExtendedFeatureSetHeaderV2 {
+            word_count: 2,
+            required_word_count: 2,
+            optional_word_count: 1,
+            flags: 0,
+            checksum: 0,
+        },
+        required_feature_words: vec![required_features, UNKNOWN_SCOPED_FEATURE],
+        optional_feature_words: vec![0],
+    }
+    .serialize()
+    .unwrap();
+    let matrix = ProfileCapabilityMatrixV2 {
+        header: ProfileCapabilityMatrixHeaderV2 {
+            magic: *b"PCM2",
+            version_major: 2,
+            header_len: ProfileCapabilityMatrixHeaderV2::LEN as u16,
+            entry_len: ProfileCapabilityEntryV2::LEN as u16,
+            reserved: 0,
+            entry_count: 1,
+            flags: 0,
+            entries_offset: ProfileCapabilityMatrixHeaderV2::LEN as u64,
+            entries_length: ProfileCapabilityEntryV2::LEN as u64,
+            checksum: 0,
+        },
+        entries: vec![entry],
+    }
+    .serialize()
+    .unwrap();
+
+    let mut writer = primitive_events_writer();
+    writer.push_extra_section(SectionPayload {
+        section_kind: SectionKind::ExtendedFeatureSet as u16,
+        profile: PrimaryProfile::Mixed as u8,
+        flags: 0,
+        item_count: 0,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: FEATURE_EXTENDED_FEATURE_SET,
+        optional_features: 0,
+        data: extended,
+    });
+    writer.push_extra_section(SectionPayload {
+        section_kind: SectionKind::ProfileCapabilityMatrix as u16,
+        profile: PrimaryProfile::Mixed as u8,
+        flags: 0,
+        item_count: 0,
+        row_count: 0,
+        compression: 0,
+        alignment_log2: 0,
+        required_features: 0,
+        optional_features: 0,
+        data: matrix,
+    });
+    let mut bytes = writer.write().unwrap();
+    set_scoped_feature_header_ids(&mut bytes, 2, 3);
+    bytes
+}
+
+fn scoped_feature_entry(
+    scope: FeatureScopeV2,
+    operation_kind: OperationKindV2,
+    section_id: u32,
+    target_local_ref: u64,
+) -> ProfileCapabilityEntryV2 {
+    ProfileCapabilityEntryV2 {
+        profile: PrimaryProfile::TableScan as u8,
+        scope,
+        operation_kind,
+        global_feature_word_index: 1,
+        required_mask: UNKNOWN_SCOPED_FEATURE,
+        optional_mask: 0,
+        section_id,
+        target_local_ref,
+        flags: 0,
+        reserved: 0,
+        checksum: 0,
+    }
+}
+
+fn set_scoped_feature_header_ids(
+    bytes: &mut [u8],
+    feature_set_section_id: u32,
+    profile_capability_section_id: u32,
+) {
+    bytes[76..80].copy_from_slice(&feature_set_section_id.to_le_bytes());
+    bytes[80..84].copy_from_slice(&profile_capability_section_id.to_le_bytes());
+    bytes[156..160].fill(0);
+    let header_crc = checksum::crc32c(&bytes[..HEADER_SIZE]);
+    bytes[156..160].copy_from_slice(&header_crc.to_le_bytes());
 }
 
 fn binary_events_file() -> Vec<u8> {
@@ -3051,6 +4164,47 @@ fn multiple_tables_file() -> Vec<u8> {
     ScanProfileCoveWriter::new(catalog).write().unwrap()
 }
 
+fn ambiguous_table_names_file() -> Vec<u8> {
+    let catalog = TableCatalog {
+        flags: 0,
+        tables: vec![
+            TableEntry {
+                table_id: 1,
+                namespace: "public".into(),
+                name: "events".into(),
+                row_count: 0,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                )],
+            },
+            TableEntry {
+                table_id: 2,
+                namespace: "archive".into(),
+                name: "events".into(),
+                row_count: 0,
+                primary_sort_key_count: 0,
+                clustering_key_count: 0,
+                flags: 0,
+                columns: vec![column(
+                    1,
+                    "id",
+                    CoveLogicalType::Int64,
+                    CovePhysicalKind::NumCode,
+                    false,
+                )],
+            },
+        ],
+    };
+    ScanProfileCoveWriter::new(catalog).write().unwrap()
+}
+
 fn column(
     column_id: u32,
     name: &str,
@@ -3488,6 +4642,75 @@ fn varbytes(values: &[&str]) -> Vec<u8> {
         out.extend_from_slice(value.as_bytes());
     }
     out
+}
+
+fn cfs2_payload(values: &[&str]) -> Vec<u8> {
+    let page = LogicalPage {
+        values: values
+            .iter()
+            .map(|value| Some(value.as_bytes().to_vec()))
+            .collect(),
+    };
+    encode_registered_row_bytes(b"CFS2", &page)
+}
+
+fn encode_registered_row_bytes(magic: &[u8; 4], page: &LogicalPage) -> Vec<u8> {
+    let mut value_bytes = Vec::new();
+    let mut offsets = Vec::with_capacity(page.values.len() + 1);
+    offsets.push(0u32);
+    for value in &page.values {
+        if let Some(value) = value {
+            let next = offsets.last().copied().unwrap() + value.len() as u32;
+            offsets.push(next);
+            value_bytes.extend_from_slice(value);
+        } else {
+            offsets.push(*offsets.last().unwrap());
+        }
+    }
+    let mut null_bitmap = vec![0u8; page.values.len().div_ceil(8)];
+    for (index, value) in page.values.iter().enumerate() {
+        if value.is_none() {
+            null_bitmap[index / 8] |= 1u8 << (index % 8);
+        }
+    }
+    let offsets_len = offsets.len() * 4;
+    let mut out = Vec::new();
+    out.extend_from_slice(magic);
+    out.extend_from_slice(&(page.values.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(null_bitmap.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(offsets_len as u32).to_le_bytes());
+    out.extend_from_slice(&null_bitmap);
+    for offset in offsets {
+        out.extend_from_slice(&offset.to_le_bytes());
+    }
+    out.extend_from_slice(&value_bytes);
+    out
+}
+
+fn stable_fsst_descriptor() -> CodecExtensionDescriptorV2 {
+    CodecExtensionDescriptorV2 {
+        codec_id: 1,
+        namespace: "org.coveformat.codec".into(),
+        name: "fsst-utf8".into(),
+        version_major: 2,
+        version_minor: 0,
+        codec_family: 1,
+        logical_type_mask: u64::MAX,
+        physical_kind_mask: u64::MAX,
+        requirement: CodecRequirementV2::OptionalWithFallback,
+        fallback_policy: CodecFallbackPolicyV2::CoreEncodingPayloadPresent,
+        parameter_schema_kind: 0,
+        flags: 0,
+        specification_status: CodecSpecificationStatusV2::StableRegistered,
+        required_feature_bit: 0,
+        optional_feature_bit: FEATURE_REGISTERED_ENCODINGS,
+        spec_digest_algorithm: 1,
+        spec_digest: b"COVE-FSST-UTF8-V2-SPEC-DIGEST".to_vec(),
+        conformance_vector_ref: ABSENT_REF,
+        fallback_ref: 0,
+        private_payload_ref: ABSENT_REF,
+        checksum: 0,
+    }
 }
 
 fn varbinary(values: &[&[u8]]) -> Vec<u8> {

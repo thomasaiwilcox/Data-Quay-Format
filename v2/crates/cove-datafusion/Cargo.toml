@@ -11,25 +11,35 @@ native = []
 compat = []
 covm = []
 covx = []
+covi = ["dep:cove-index"]
 dynamic-filters = []
 parquet-compare = ["datafusion/parquet"]
 
 [dependencies]
 cove-arrow = { path = "../cove-arrow" }
+cove-cache = { path = "../cove-cache" }
+cove-coverage = { path = "../cove-coverage" }
 cove-core = { path = "../cove-core" }
+cove-index = { path = "../cove-index", optional = true }
+cove-layout = { path = "../cove-layout" }
 arrow-array = "58"
+arrow-cast = "58"
+arrow-ipc = "58"
+arrow-json = "58"
+arrow-select = "58"
 arrow-schema = "58"
 async-trait = "0.1"
 datafusion = { version = "53.1.0", default-features = false, features = ["sql"] }
 datafusion-datasource = { version = "53.1.0", default-features = false }
 futures = "0.3"
 memmap2 = "0.9"
+parquet = { version = "58", default-features = false, features = ["arrow"] }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 bytes = "1"
 criterion = "0.5"
-parquet = { version = "58", default-features = false, features = ["arrow"] }
 url = "2"
 
 [[bench]]
@@ -39,3 +49,15 @@ harness = false
 [[bench]]
 name = "m7_sql_mix"
 harness = false
+
+[[bin]]
+name = "cove-explain-pruning"
+path = "src/bin/cove-explain-pruning.rs"
+
+[[bin]]
+name = "cove-plan-cost"
+path = "src/bin/cove-plan-cost.rs"
+
+[[bin]]
+name = "cove-arrow-export"
+path = "src/bin/cove-arrow-export.rs"

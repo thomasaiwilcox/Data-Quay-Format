@@ -4,6 +4,7 @@ use std::{
 };
 
 use crate::{
+    codec::CodecExtensionDescriptorV2,
     collation::CollationRegistry,
     compression,
     constants::{
@@ -24,6 +25,7 @@ use crate::{
     },
     interop::lakehouse::LakehouseHints,
     kernel::KernelCapabilities,
+    nested_schema::NestedSchemaSectionV1,
     page::ColumnPageIndex,
     page_validation::{
         validate_column_page_payload, validate_column_page_wire, validate_stats_only_constant_page,
@@ -208,6 +210,7 @@ pub(super) fn validate_shared_semantics(
             | SectionKind::CoverageProofRecord
             | SectionKind::VendorExtension
             | SectionKind::TableCatalog
+            | SectionKind::NestedSchema
             | SectionKind::TableSegmentIndex
             | SectionKind::TableSegmentData
             | SectionKind::ColumnDomain
@@ -329,9 +332,11 @@ pub(super) fn validate_cove_t_semantics(
 ) -> Result<(), CoveError> {
     let mut checked = 0u32;
     let mut catalogs = Vec::new();
+    let mut nested_schemas = Vec::new();
     let mut segment_indexes = Vec::new();
     let mut segment_payloads = Vec::new();
     let mut zone_stats_entries = Vec::new();
+    let mut codec_descriptors = Vec::new();
     let dictionary = parse_validation_dictionary(data, &validated.footer)?;
 
     for entry in &validated.footer.sections {
@@ -342,6 +347,11 @@ pub(super) fn validate_cove_t_semantics(
             SectionKind::TableCatalog => {
                 let payload = compression::section_payload(data, entry)?;
                 catalogs.push((entry.section_id, TableCatalog::parse(&payload)?));
+                checked += 1;
+            }
+            SectionKind::NestedSchema => {
+                let payload = compression::section_payload(data, entry)?;
+                nested_schemas.push((entry.section_id, NestedSchemaSectionV1::parse(&payload)?));
                 checked += 1;
             }
             SectionKind::TableSegmentIndex => {
@@ -527,6 +537,11 @@ pub(super) fn validate_cove_t_semantics(
                 zone_stats_entries.extend(ZoneStatsSection::parse(&payload)?.entries);
                 checked += 1;
             }
+            SectionKind::CodecExtensionRegistry => {
+                let payload = compression::section_payload(data, entry)?;
+                codec_descriptors.extend(CodecExtensionDescriptorV2::parse_many(&payload)?);
+                checked += 1;
+            }
             SectionKind::FileDictionaryIndex
             | SectionKind::FileDictionaryPayload
             | SectionKind::CollationRegistry
@@ -537,7 +552,6 @@ pub(super) fn validate_cove_t_semantics(
             | SectionKind::ExtensionRegistry
             | SectionKind::ProfileCapabilityMatrix
             | SectionKind::ExtendedFeatureSet
-            | SectionKind::CodecExtensionRegistry
             | SectionKind::LayoutPlan
             | SectionKind::ScanSplitIndex
             | SectionKind::PageClusterDirectory
@@ -576,10 +590,12 @@ pub(super) fn validate_cove_t_semantics(
     }
     validate_cove_t_cross_sections(
         &catalogs,
+        &nested_schemas,
         &segment_indexes,
         &segment_payloads,
         dictionary.as_ref(),
         &zone_stats_entries,
+        &codec_descriptors,
     )?;
     push_stage(
         stages,
@@ -651,10 +667,12 @@ fn is_optional_pushdown_section(kind: SectionKind) -> bool {
 
 fn validate_cove_t_cross_sections(
     catalogs: &[(u32, TableCatalog)],
+    nested_schemas: &[(u32, NestedSchemaSectionV1)],
     segment_indexes: &[(u32, TableSegmentIndex)],
     segment_payloads: &[(u32, u64, TableSegmentPayloadV1, Vec<u8>)],
     dictionary: Option<&FileDictionaryView<'_>>,
     zone_stats: &[ZoneStatsEntry],
+    codec_descriptors: &[CodecExtensionDescriptorV2],
 ) -> Result<(), CoveError> {
     if catalogs.is_empty() && segment_indexes.is_empty() && segment_payloads.is_empty() {
         return Ok(());
@@ -662,6 +680,27 @@ fn validate_cove_t_cross_sections(
     if catalogs.len() != 1 {
         return Err(CoveError::BadSchema(
             "COVE-T validation requires exactly one TableCatalog section".into(),
+        ));
+    }
+    let catalog = &catalogs[0].1;
+    if nested_schemas.len() > 1 {
+        return Err(CoveError::BadSchema(
+            "COVE-T validation supports at most one NestedSchema section".into(),
+        ));
+    }
+    let nested_schema = nested_schemas
+        .first()
+        .map(|(_section_id, nested_schema)| nested_schema);
+    if let Some(nested_schema) = nested_schema {
+        nested_schema.validate_for_catalog(catalog)?;
+    } else if catalog.tables.iter().any(|table| {
+        table
+            .columns
+            .iter()
+            .any(crate::nested_schema::column_uses_nested_schema)
+    }) {
+        return Err(CoveError::BadSchema(
+            "native nested COVE-T columns require a NestedSchema section".into(),
         ));
     }
     if segment_indexes.is_empty() && segment_payloads.is_empty() {
@@ -678,7 +717,6 @@ fn validate_cove_t_cross_sections(
     if segment_indexes.len() != 1 {
         return Err(CoveError::SegmentCorrupt);
     }
-    let catalog = &catalogs[0].1;
     let segment_index = &segment_indexes[0].1;
     let tables = catalog
         .tables
@@ -726,7 +764,17 @@ fn validate_cove_t_cross_sections(
             return Err(CoveError::SegmentCorrupt);
         }
         *rows_by_table.entry(entry.table_id).or_default() += u64::from(entry.row_count);
-        validate_segment_against_catalog(table, payload, bytes, dictionary, zone_stats)?;
+        validate_segment_against_catalog(
+            table,
+            payload,
+            bytes,
+            SegmentValidationRefs {
+                dictionary,
+                zone_stats,
+                codec_descriptors,
+                nested_schema,
+            },
+        )?;
     }
     for table in &catalog.tables {
         if rows_by_table.get(&table.table_id).copied().unwrap_or(0) != table.row_count {
@@ -739,12 +787,19 @@ fn validate_cove_t_cross_sections(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct SegmentValidationRefs<'a, 'data> {
+    dictionary: Option<&'a FileDictionaryView<'data>>,
+    zone_stats: &'a [ZoneStatsEntry],
+    codec_descriptors: &'a [CodecExtensionDescriptorV2],
+    nested_schema: Option<&'a NestedSchemaSectionV1>,
+}
+
 fn validate_segment_against_catalog(
     table: &TableEntry,
     segment: &TableSegmentPayloadV1,
     segment_bytes: &[u8],
-    dictionary: Option<&FileDictionaryView<'_>>,
-    zone_stats: &[ZoneStatsEntry],
+    refs: SegmentValidationRefs<'_, '_>,
 ) -> Result<(), CoveError> {
     if segment.header.table_id != table.table_id {
         return Err(CoveError::SegmentCorrupt);
@@ -773,14 +828,7 @@ fn validate_segment_against_catalog(
         {
             return Err(CoveError::PageCorrupt);
         }
-        validate_column_pages_against_catalog(
-            column,
-            column_dir,
-            segment,
-            segment_bytes,
-            dictionary,
-            zone_stats,
-        )?;
+        validate_column_pages_against_catalog(column, column_dir, segment, segment_bytes, refs)?;
     }
     Ok(())
 }
@@ -790,8 +838,7 @@ fn validate_column_pages_against_catalog(
     column_dir: &TableColumnDirectoryEntryV1,
     segment: &TableSegmentPayloadV1,
     segment_bytes: &[u8],
-    dictionary: Option<&FileDictionaryView<'_>>,
-    zone_stats: &[ZoneStatsEntry],
+    refs: SegmentValidationRefs<'_, '_>,
 ) -> Result<(), CoveError> {
     let page_index_start =
         usize::try_from(column_dir.page_index_offset).map_err(|_| CoveError::OffsetRange)?;
@@ -819,8 +866,13 @@ fn validate_column_pages_against_catalog(
             column_id: column.column_id,
             logical_type: column.logical,
             physical_kind: column.physical,
-            dictionary,
-            zone_stats: Some(zone_stats),
+            dictionary: refs.dictionary,
+            zone_stats: Some(refs.zone_stats),
+            codec_descriptors: refs.codec_descriptors,
+            nested_schema: refs
+                .nested_schema
+                .and_then(|schema| schema.entry(segment.header.table_id, column.column_id))
+                .map(|entry| &entry.root),
         };
         if page.page_length == 0 {
             validate_stats_only_constant_page(&context, page)?;
@@ -1157,6 +1209,8 @@ fn validate_temporal_property_pages(
             physical_kind: property.physical_kind,
             dictionary,
             zone_stats: None,
+            codec_descriptors: &[],
+            nested_schema: None,
         };
         if let Some(payload) = &page.payload {
             validate_column_page_payload(&context, &page.index_entry, payload)?;

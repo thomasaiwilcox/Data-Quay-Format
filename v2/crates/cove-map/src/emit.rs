@@ -11,11 +11,14 @@ pub(crate) fn build_cove_o_with_source_states(
     source_states: &[ObservedSourceState],
 ) -> Result<Vec<u8>, String> {
     let materialized = materialize_with_source_states(file, rows, source_states)?;
+    let nested_shapes = nested_shapes_for_model(file, &materialized)?;
+    let file_dictionary = file_dictionary_for_model(&materialized, &nested_shapes)?;
     let catalog = ObjectTypeCatalog {
         flags: 0,
         types: materialized.object_types.clone(),
     };
-    let segments = build_temporal_segments(&materialized)?;
+    let segments =
+        build_temporal_segments(&materialized, &nested_shapes, file_dictionary.as_ref())?;
     let segment_index = temporal_segment_index(&segments)?;
     let trust_manifest = trust_manifest(&segments)?;
 
@@ -32,6 +35,21 @@ pub(crate) fn build_cove_o_with_source_states(
         0,
         catalog.serialize().map_err(|err| err.to_string())?,
     ));
+    if let Some(dictionary) = &file_dictionary {
+        writer.required_features |= FEATURE_FILE_DICTIONARY;
+        writer.sections.push(dictionary_section(
+            SectionKind::FileDictionaryIndex,
+            dictionary.dictionary.len() as u64,
+            file_dictionary_index_bytes(&dictionary.dictionary),
+        ));
+        if !dictionary.dictionary.payload.is_empty() {
+            writer.sections.push(dictionary_section(
+                SectionKind::FileDictionaryPayload,
+                dictionary.dictionary.len() as u64,
+                dictionary.dictionary.payload.clone(),
+            ));
+        }
+    }
     writer.sections.push(object_section(
         SectionKind::TemporalSegmentIndex,
         segments.len() as u64,

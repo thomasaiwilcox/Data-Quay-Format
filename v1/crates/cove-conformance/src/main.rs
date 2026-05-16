@@ -467,8 +467,7 @@ fn validate_cove_map_convert_fixture(corpus: &Path, bytes: &[u8]) -> Result<(), 
                 allow_unknown_optional_extensions: true,
                 ..ValidationOptions::default()
             },
-        )
-        .map_err(|err| err)?;
+        )?;
         if value
             .get("expect_semantic_map_optional")
             .and_then(Value::as_bool)
@@ -2594,7 +2593,7 @@ fn evaluate_pruning_predicate(
             let operand = predicate
                 .get("operand")
                 .ok_or_else(|| CoveError::BadSection("not predicate missing operand".into()))?;
-            Ok(evaluate_pruning_predicate(operand, columns)?.not())
+            Ok(!evaluate_pruning_predicate(operand, columns)?)
         }
         "bloom_membership" => {
             let column = pruning_column(columns, predicate_column_id(predicate)?);

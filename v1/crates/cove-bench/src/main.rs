@@ -54,8 +54,8 @@ fn bench_canonical_int() {
 }
 
 fn bench_arrow_inversion() {
-    let row_count = 1 << 20; // 1 Mi rows
-    let cove_null = vec![0xA5u8; (row_count + 7) / 8];
+    let row_count = 1usize << 20; // 1 Mi rows
+    let cove_null = vec![0xA5u8; row_count.div_ceil(8)];
     let iters = 16;
     let start = Instant::now();
     let mut sink = 0u8;

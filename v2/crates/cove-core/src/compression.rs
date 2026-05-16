@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Section decompression layer.
+//! Cove Format (COVE) v2.0 — Section decompression layer.
 //!
 //! Implements Spec §66 codec dispatch: section payloads MAY be compressed
 //! with `None`, `LZ4`, or `Zstd`. The codec is feature-gated so that small
@@ -136,11 +136,7 @@ fn payload_from_raw<'a>(
     }
 }
 
-fn payload_raw_bytes<'a>(
-    file_data: &'a [u8],
-    offset: u64,
-    length: u64,
-) -> Result<&'a [u8], CoveError> {
+fn payload_raw_bytes(file_data: &[u8], offset: u64, length: u64) -> Result<&[u8], CoveError> {
     let end = offset.checked_add(length).ok_or(CoveError::ArithOverflow)?;
     if end as usize > file_data.len() {
         return Err(CoveError::OffsetRange);

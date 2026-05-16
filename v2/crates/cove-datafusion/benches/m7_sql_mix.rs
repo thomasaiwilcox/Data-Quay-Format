@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 #[cfg(feature = "parquet-compare")]
@@ -374,25 +376,35 @@ impl SqlMixFixture {
         write_parquet_file(&products.parquet, &products_batch(PRODUCT_ROWS));
 
         let ctx = SessionContext::new();
-        register_cove_file_with_options(&ctx, "orders_cove", &orders.cove, cove_options)
+        register_cove_file_with_options(&ctx, "orders_cove", &orders.cove, cove_options.clone())
             .expect("register orders_cove");
-        register_cove_file_with_options(&ctx, "customers_cove", &customers.cove, cove_options)
-            .expect("register customers_cove");
-        register_cove_file_with_options(&ctx, "products_cove", &products.cove, cove_options)
-            .expect("register products_cove");
+        register_cove_file_with_options(
+            &ctx,
+            "customers_cove",
+            &customers.cove,
+            cove_options.clone(),
+        )
+        .expect("register customers_cove");
+        register_cove_file_with_options(
+            &ctx,
+            "products_cove",
+            &products.cove,
+            cove_options.clone(),
+        )
+        .expect("register products_cove");
         let dictionary_options = cove_options.with_arrow_dictionary_output();
         register_cove_file_with_options(
             &ctx,
             "orders_filecode_cove",
             &orders_filecode_cove,
-            dictionary_options,
+            dictionary_options.clone(),
         )
         .expect("register orders_filecode_cove");
         register_cove_file_with_options(
             &ctx,
             "customers_filecode_cove",
             &customers_filecode_cove,
-            dictionary_options,
+            dictionary_options.clone(),
         )
         .expect("register customers_filecode_cove");
         register_cove_file_with_options(

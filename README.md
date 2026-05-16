@@ -48,8 +48,7 @@ The v2 implementation is staged and evidence-tracked rather than described by a
 single blanket compliance claim. The generated matrix in
 [`v2/conformance/capability_matrix.md`](./v2/conformance/capability_matrix.md)
 is the source of truth for which areas are modeled, parsed, validated, written,
-and exercised by corpus fixtures. At the time of this README update, it reports
-73 of 82 tracked capability rows as fully gated.
+and exercised by corpus fixtures.
 
 ## How It Works
 
@@ -123,15 +122,18 @@ payload pages are irrelevant, or when layout metadata lets nearby reads be
 coalesced.
 
 The current DataFusion adapter includes byte-range readers, mmap-backed local
-reads, range coalescing, and metrics for requested/coalesced ranges. COVE v2
-also defines I/O hints, COVE-L layout plans, scan split indexes, page cluster
+reads, range coalescing, layout-aware page-cluster coalescing, optional COVI
+candidate pruning, and metrics for requested/coalesced ranges. COVE v2 also
+defines I/O hints, COVE-L layout plans, scan split indexes, page cluster
 directories, and object-store range planning.
 
 This should be treated as a cost model, not a universal benchmark claim. The
-local benchmark report does not measure S3 or other remote object stores.
-Actual request and transfer savings depend on dataset layout, predicate
-selectivity, projected columns, object-store behavior, and whether the optional
-layout/index metadata is present and valid.
+release-gated benchmark uses a deterministic offline object-store harness that
+records object GETs, range GETs, bytes requested/returned, cold/warm cache
+state, and coalescing decisions without requiring S3 or MinIO. Live service
+performance remains environment-specific and depends on dataset layout,
+predicate selectivity, projected columns, object-store behavior, and whether
+the optional layout/index metadata is present and valid.
 
 ## v2 Standards Suite Highlights
 
@@ -148,18 +150,19 @@ independently.
   predicate and index planning.
 - **COVE-A / COVX / COVM**: acceleration indexes, sidecars, and dataset
   manifests that must preserve file truth.
-- **COVE-I**: optional `.covi` secondary index artifacts. The current repo has
-  artifact framing and parser support; full index-only payload coverage remains
-  partial in the capability matrix.
+- **COVE-I**: optional `.covi` secondary index artifacts, including artifact
+  framing, index roots, referenced-file/snapshot validity records, local block
+  containers, postings, row ordinal sets, aggregate answers, and capability
+  records.
 - **COVE-E and COVE-H**: generic engine execution-code mapping and a named
   Harbor registration. Generic COVE readers do not require Harbor.
 - **COVE-O**: optional object-temporal profile for object catalogs, temporal
   segments, deltas, branches, tombstones, and trust surfaces.
 - **COVE-MAP**: optional semantic mapping from source rows into objects,
   associations, evidence, and deterministic projection readback.
-- **COVE-CX**: registered codec-extension framework. v2 defines the path for
-  FSST-style strings, ALP-style floats, FastLanes-style integer encodings, and
-  future codecs, but current broad codec bitstream conformance is still staged.
+- **COVE-CX**: registered codec-extension framework with stable COVE-owned v2
+  bitstream identities for FSST-style UTF-8, ALP-style floats, and
+  FastLanes-style integers, plus mandatory fallback-equivalence validation.
 - **COVE-L**: layout planning, scan splits, page clusters, fast metadata
   indexes, and zero-copy maps as optional planning aids, not schema authority.
 - **COVE-R and COVE-CACHE**: runtime compatibility hints and runtime/local
@@ -179,7 +182,8 @@ Important v2 paths:
 - [`v2/crates/cove-arrow`](./v2/crates/cove-arrow): Arrow export/import and
   Parquet conversion support layered on `cove-core`.
 - [`v2/crates/cove-datafusion`](./v2/crates/cove-datafusion): DataFusion table
-  provider, file format integration, pruning, range reads, metrics, COVM/COVX
+  provider, file format integration, pruning, range reads, COVE-L planning
+  consumption, optional COVI candidate/index-only use, metrics, COVM/COVX
   bootstrap paths, and benchmarks.
 - [`v2/crates/cove-map`](./v2/crates/cove-map): reference COVE-MAP execution,
   materialization, evidence, and projection helpers.
@@ -187,10 +191,10 @@ Important v2 paths:
   registered-envelope validation.
 - [`v2/crates/cove-coverage`](./v2/crates/cove-coverage): COVE-COVERAGE
   provider and coverage-set parsing/inspection.
-- [`v2/crates/cove-layout`](./v2/crates/cove-layout): COVE-L layout and scan
-  split metadata helpers.
-- [`v2/crates/cove-index`](./v2/crates/cove-index): COVE-I artifact framing and
-  inspection/build helpers.
+- [`v2/crates/cove-layout`](./v2/crates/cove-layout): COVE-L layout, fast
+  metadata, page-cluster, and scan split metadata helpers.
+- [`v2/crates/cove-index`](./v2/crates/cove-index): COVE-I artifact framing,
+  validation, safe lookup, index-only answer, and inspection/build helpers.
 - [`v2/crates/cove-runtime`](./v2/crates/cove-runtime): COVE-R runtime
   compatibility hints.
 - [`v2/crates/cove-cache`](./v2/crates/cove-cache): runtime/local coverage-cache

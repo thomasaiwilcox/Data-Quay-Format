@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Canonical value encoding (Spec §17).
+//! Cove Format (COVE) v2.0 — Canonical value encoding (Spec §17).
 //!
 //! The canonical encoding is the byte-level identity of a value in COVE. Two
 //! values are equal in a dictionary if and only if their `(value_tag,
@@ -332,15 +332,17 @@ fn encode_tagged(value: &CanonicalValue<'_>) -> Result<Vec<u8>, CoveError> {
     Ok(out)
 }
 
+/// Encoded key/value pair used during canonical map ordering.
+type CanonicalMapEntryBytes = (Vec<u8>, Vec<u8>);
+
 /// Canonical representation of a map: a list of canonical key/value pairs.
-///
 /// Spec §17.6 requires:
 /// 1. Keys are scalar canonical-typed (no nested key types).
 /// 2. Duplicate keys are rejected.
 /// 3. Pairs are emitted in ascending key order under the column collation.
 pub fn canonicalize_map_entries(
     entries: &[(CanonicalValue<'_>, CanonicalValue<'_>)],
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CoveError> {
+) -> Result<Vec<CanonicalMapEntryBytes>, CoveError> {
     let mut sorted = Vec::with_capacity(entries.len());
     for (key, value) in entries {
         if !key.is_scalar_key() {

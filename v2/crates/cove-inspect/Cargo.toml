@@ -2,7 +2,7 @@
 name = "cove-inspect"
 version = "0.1.0"
 edition = "2021"
-description = "CLI inspector for Cove Format (COVE) v1.0 files"
+description = "CLI inspector for Cove Format (COVE) v2.0 files"
 license = "MIT"
 
 [[bin]]
@@ -11,3 +11,4 @@ path = "src/main.rs"
 
 [dependencies]
 cove-core = { path = "../cove-core" }
+serde_json = "1"

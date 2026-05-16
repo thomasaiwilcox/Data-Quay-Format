@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Column page index and page header (Spec §27).
+//! Cove Format (COVE) v2.0 — Column page index and page header (Spec §27).
 //!
 //! A *page* is the smallest physically encoded unit in a column. Each page
 //! header records its row count, null count, encoded byte length, encoding
@@ -16,8 +16,8 @@ pub const COLUMN_PAGE_INDEX_ENTRY_LEN: usize = 60;
 
 /// Spec §27.2 / §66: the low byte of `ColumnPageIndexEntryV1.flags` carries
 /// the page-level [`CompressionCodec`] identifier. Bits `0x0100..0x0800`
-/// carry the v1 payload-elision flags; the remaining high bits are reserved
-/// and MUST be zero in v1.0.
+/// carry the payload-elision flags; the remaining high bits are reserved
+/// and MUST be zero in the v2 page format.
 pub const PAGE_FLAG_CODEC_MASK: u32 = 0x0000_00FF;
 pub const PAGE_FLAG_STATS_ONLY_CONSTANT: u32 = 0x0000_0100;
 pub const PAGE_FLAG_ALL_NULL: u32 = 0x0000_0200;
@@ -337,6 +337,7 @@ impl PageIndex {
 }
 
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 mod tests {
     use super::*;
 

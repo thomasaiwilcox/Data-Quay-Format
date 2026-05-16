@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Optional indexes (Spec §30–§36).
+//! Cove Format (COVE) v2.0 — Optional indexes (Spec §30–§36).
 //!
 //! Indexes are *optional acceleration*. Spec §73 mandates that a scan MUST
 //! always be able to produce correct results even if every optional index is

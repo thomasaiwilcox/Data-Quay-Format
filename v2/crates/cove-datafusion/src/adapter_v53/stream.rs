@@ -101,6 +101,11 @@ pub(crate) struct CoveStreamMetrics {
     covx_sidecars_stale: Count,
     covx_sidecars_ignored: Count,
     sidecar_index_fallbacks: Count,
+    covel_sections_loaded: Count,
+    covel_sections_ignored: Count,
+    covel_scan_splits_loaded: Count,
+    covel_scan_splits_used: Count,
+    covel_zero_copy_maps_loaded: Count,
     pages_decoded: Count,
     rows_materialized: Count,
     rows_selected: Count,
@@ -145,6 +150,17 @@ pub(crate) struct CoveStreamMetrics {
     arrow_export_direct_transform_rows: Count,
     arrow_export_direct_constant_plainvarint_rows: Count,
     arrow_export_fallback_rows: Count,
+    zero_copy_compatible_buffers: Count,
+    zero_copy_materialized_buffers: Count,
+    zero_copy_materialized_unknown_role: Count,
+    zero_copy_materialized_null_polarity_mismatch: Count,
+    zero_copy_materialized_compressed_buffer: Count,
+    zero_copy_materialized_dictionary_mismatch: Count,
+    zero_copy_materialized_nested_layout_mismatch: Count,
+    zero_copy_materialized_insufficient_lifetime: Count,
+    zero_copy_materialized_active_visibility_overlay: Count,
+    zero_copy_materialized_selection_mismatch: Count,
+    zero_copy_materialized_export_path_mismatch: Count,
     filecode_dictionary_keys_rows: Count,
     filecode_dictionary_remapped_rows: Count,
     filecode_dictionary_values_bytes: Count,
@@ -187,6 +203,16 @@ impl CoveStreamMetrics {
                 .counter("cove_covx_sidecars_ignored", partition),
             sidecar_index_fallbacks: MetricBuilder::new(metrics)
                 .counter("cove_sidecar_index_fallbacks", partition),
+            covel_sections_loaded: MetricBuilder::new(metrics)
+                .counter("cove_covel_sections_loaded", partition),
+            covel_sections_ignored: MetricBuilder::new(metrics)
+                .counter("cove_covel_sections_ignored", partition),
+            covel_scan_splits_loaded: MetricBuilder::new(metrics)
+                .counter("cove_covel_scan_splits_loaded", partition),
+            covel_scan_splits_used: MetricBuilder::new(metrics)
+                .counter("cove_covel_scan_splits_used", partition),
+            covel_zero_copy_maps_loaded: MetricBuilder::new(metrics)
+                .counter("cove_covel_zero_copy_maps_loaded", partition),
             pages_decoded: MetricBuilder::new(metrics).counter("cove_pages_decoded", partition),
             rows_materialized: MetricBuilder::new(metrics)
                 .counter("cove_rows_materialized", partition),
@@ -269,6 +295,38 @@ impl CoveStreamMetrics {
             ),
             arrow_export_fallback_rows: MetricBuilder::new(metrics)
                 .counter("cove_arrow_export_fallback_rows", partition),
+            zero_copy_compatible_buffers: MetricBuilder::new(metrics)
+                .counter("cove_zero_copy_compatible_buffers", partition),
+            zero_copy_materialized_buffers: MetricBuilder::new(metrics)
+                .counter("cove_zero_copy_materialized_buffers", partition),
+            zero_copy_materialized_unknown_role: MetricBuilder::new(metrics)
+                .counter("cove_zero_copy_materialized_unknown_role", partition),
+            zero_copy_materialized_null_polarity_mismatch: MetricBuilder::new(metrics).counter(
+                "cove_zero_copy_materialized_null_polarity_mismatch",
+                partition,
+            ),
+            zero_copy_materialized_compressed_buffer: MetricBuilder::new(metrics)
+                .counter("cove_zero_copy_materialized_compressed_buffer", partition),
+            zero_copy_materialized_dictionary_mismatch: MetricBuilder::new(metrics)
+                .counter("cove_zero_copy_materialized_dictionary_mismatch", partition),
+            zero_copy_materialized_nested_layout_mismatch: MetricBuilder::new(metrics).counter(
+                "cove_zero_copy_materialized_nested_layout_mismatch",
+                partition,
+            ),
+            zero_copy_materialized_insufficient_lifetime: MetricBuilder::new(metrics).counter(
+                "cove_zero_copy_materialized_insufficient_lifetime",
+                partition,
+            ),
+            zero_copy_materialized_active_visibility_overlay: MetricBuilder::new(metrics).counter(
+                "cove_zero_copy_materialized_active_visibility_overlay",
+                partition,
+            ),
+            zero_copy_materialized_selection_mismatch: MetricBuilder::new(metrics)
+                .counter("cove_zero_copy_materialized_selection_mismatch", partition),
+            zero_copy_materialized_export_path_mismatch: MetricBuilder::new(metrics).counter(
+                "cove_zero_copy_materialized_export_path_mismatch",
+                partition,
+            ),
             filecode_dictionary_keys_rows: MetricBuilder::new(metrics)
                 .counter("cove_filecode_dictionary_keys_rows", partition),
             filecode_dictionary_remapped_rows: MetricBuilder::new(metrics)
@@ -299,6 +357,15 @@ impl CoveStreamMetrics {
         self.covx_sidecars_ignored.add(stats.covx_sidecars_ignored);
         self.sidecar_index_fallbacks
             .add(stats.sidecar_index_fallbacks);
+        self.covel_sections_loaded.add(stats.covel_sections_loaded);
+        self.covel_sections_ignored
+            .add(stats.covel_sections_ignored);
+        self.covel_scan_splits_loaded
+            .add(stats.covel_scan_splits_loaded);
+        self.covel_scan_splits_used
+            .add(stats.covel_scan_splits_used);
+        self.covel_zero_copy_maps_loaded
+            .add(stats.covel_zero_copy_maps_loaded);
         self.pages_decoded.add(stats.pages_decoded);
         self.rows_materialized.add(stats.rows_materialized);
         self.rows_selected.add(stats.rows_selected);
@@ -359,6 +426,28 @@ impl CoveStreamMetrics {
             .add(stats.arrow_export_direct_constant_plainvarint_rows);
         self.arrow_export_fallback_rows
             .add(stats.arrow_export_fallback_rows);
+        self.zero_copy_compatible_buffers
+            .add(stats.zero_copy_compatible_buffers);
+        self.zero_copy_materialized_buffers
+            .add(stats.zero_copy_materialized_buffers);
+        self.zero_copy_materialized_unknown_role
+            .add(stats.zero_copy_materialized_unknown_role);
+        self.zero_copy_materialized_null_polarity_mismatch
+            .add(stats.zero_copy_materialized_null_polarity_mismatch);
+        self.zero_copy_materialized_compressed_buffer
+            .add(stats.zero_copy_materialized_compressed_buffer);
+        self.zero_copy_materialized_dictionary_mismatch
+            .add(stats.zero_copy_materialized_dictionary_mismatch);
+        self.zero_copy_materialized_nested_layout_mismatch
+            .add(stats.zero_copy_materialized_nested_layout_mismatch);
+        self.zero_copy_materialized_insufficient_lifetime
+            .add(stats.zero_copy_materialized_insufficient_lifetime);
+        self.zero_copy_materialized_active_visibility_overlay
+            .add(stats.zero_copy_materialized_active_visibility_overlay);
+        self.zero_copy_materialized_selection_mismatch
+            .add(stats.zero_copy_materialized_selection_mismatch);
+        self.zero_copy_materialized_export_path_mismatch
+            .add(stats.zero_copy_materialized_export_path_mismatch);
         self.filecode_dictionary_keys_rows
             .add(stats.filecode_dictionary_keys_rows);
         self.filecode_dictionary_remapped_rows
@@ -537,7 +626,7 @@ impl Stream for CoveRecordBatchStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let metrics = this.metrics.clone();
+        let metrics = &this.metrics;
 
         match &mut this.inner {
             CoveRecordBatchStreamInner::Streaming {

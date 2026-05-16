@@ -216,7 +216,7 @@ impl PredicateNormalFormV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCoverage);
         }
         let mut ids = BTreeSet::new();
@@ -254,6 +254,670 @@ impl PredicateNormalFormV2 {
             return Err(CoveError::BadCoverage);
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateNormalFormWithPayloadV2 {
+    pub form: PredicateNormalFormV2,
+    pub payload: Vec<u8>,
+}
+
+impl PredicateNormalFormWithPayloadV2 {
+    pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if bytes.len().is_multiple_of(PredicateNormalFormV2::LEN) {
+            let forms = PredicateNormalFormV2::parse_many(bytes)?;
+            if forms.iter().all(|form| form.payload_length == 0) {
+                return Ok(forms
+                    .into_iter()
+                    .map(|form| Self {
+                        form,
+                        payload: Vec::new(),
+                    })
+                    .collect());
+            }
+        }
+
+        let first = PredicateNormalFormV2::parse(bytes)?;
+        let mut table_end = if first.payload_length == 0 {
+            bytes.len()
+        } else {
+            first.payload_offset as usize
+        };
+        if table_end == 0
+            || table_end > bytes.len()
+            || !table_end.is_multiple_of(PredicateNormalFormV2::LEN)
+        {
+            return Err(CoveError::BadCoverage);
+        }
+
+        let mut forms = Vec::new();
+        let mut ids = BTreeSet::new();
+        let mut cursor = 0usize;
+        while cursor < table_end {
+            let next = cursor
+                .checked_add(PredicateNormalFormV2::LEN)
+                .ok_or(CoveError::ArithOverflow)?;
+            if next > bytes.len() {
+                return Err(CoveError::BufferTooShort);
+            }
+            let form = PredicateNormalFormV2::parse(&bytes[cursor..next])?;
+            if !ids.insert(form.predicate_form_id) {
+                return Err(CoveError::BadCoverage);
+            }
+            if form.payload_length != 0 {
+                let end = checked_end(form.payload_offset, form.payload_length)? as usize;
+                let offset = form.payload_offset as usize;
+                if offset < next || end > bytes.len() {
+                    return Err(CoveError::BadCoverage);
+                }
+                table_end = table_end.min(offset);
+            }
+            forms.push(form);
+            cursor = next;
+        }
+
+        forms
+            .into_iter()
+            .map(|form| {
+                let payload = if form.payload_length == 0 {
+                    Vec::new()
+                } else {
+                    let offset = form.payload_offset as usize;
+                    let end = checked_end(form.payload_offset, form.payload_length)? as usize;
+                    bytes
+                        .get(offset..end)
+                        .ok_or(CoveError::BufferTooShort)?
+                        .to_vec()
+                };
+                Ok(Self { form, payload })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum PredicateOpV2 {
+    TrueLiteral = 0,
+    FalseLiteral = 1,
+    IsNull = 2,
+    IsNotNull = 3,
+    Eq = 4,
+    NotEq = 5,
+    Lt = 6,
+    LtEq = 7,
+    Gt = 8,
+    GtEq = 9,
+    Between = 10,
+    InSet = 11,
+    And = 12,
+    Or = 13,
+    Not = 14,
+    LikePrefix = 15,
+    Contains = 16,
+    IsNaN = 17,
+    IsFinite = 18,
+    FunctionCall = 19,
+    LiteralValue = 20,
+    ColumnRef = 21,
+    Extension = 255,
+}
+
+impl PredicateOpV2 {
+    pub fn from_u16(value: u16) -> Option<Self> {
+        match value {
+            0 => Some(Self::TrueLiteral),
+            1 => Some(Self::FalseLiteral),
+            2 => Some(Self::IsNull),
+            3 => Some(Self::IsNotNull),
+            4 => Some(Self::Eq),
+            5 => Some(Self::NotEq),
+            6 => Some(Self::Lt),
+            7 => Some(Self::LtEq),
+            8 => Some(Self::Gt),
+            9 => Some(Self::GtEq),
+            10 => Some(Self::Between),
+            11 => Some(Self::InSet),
+            12 => Some(Self::And),
+            13 => Some(Self::Or),
+            14 => Some(Self::Not),
+            15 => Some(Self::LikePrefix),
+            16 => Some(Self::Contains),
+            17 => Some(Self::IsNaN),
+            18 => Some(Self::IsFinite),
+            19 => Some(Self::FunctionCall),
+            20 => Some(Self::LiteralValue),
+            21 => Some(Self::ColumnRef),
+            255 => Some(Self::Extension),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PredicateNullPolicyV2 {
+    SqlWhere = 0,
+    NullExcluded = 1,
+    NullIncluded = 2,
+    NullOnly = 3,
+    NullRejected = 4,
+    ExtensionDefined = 255,
+}
+
+impl PredicateNullPolicyV2 {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::SqlWhere),
+            1 => Some(Self::NullExcluded),
+            2 => Some(Self::NullIncluded),
+            3 => Some(Self::NullOnly),
+            4 => Some(Self::NullRejected),
+            255 => Some(Self::ExtensionDefined),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PredicateOperandKindV2 {
+    Node = 0,
+    Literal = 1,
+    LiteralList = 2,
+    ColumnOrPath = 3,
+    Function = 4,
+    IntervalSet = 5,
+    Extension = 255,
+}
+
+impl PredicateOperandKindV2 {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Node),
+            1 => Some(Self::Literal),
+            2 => Some(Self::LiteralList),
+            3 => Some(Self::ColumnOrPath),
+            4 => Some(Self::Function),
+            5 => Some(Self::IntervalSet),
+            255 => Some(Self::Extension),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateAstPayloadHeaderV2 {
+    pub root_node_id: u32,
+    pub node_count: u32,
+    pub literal_count: u32,
+    pub literal_list_count: u32,
+    pub function_count: u32,
+    pub operand_ref_count: u32,
+    pub node_offset: u64,
+    pub literal_offset: u64,
+    pub literal_list_offset: u64,
+    pub function_offset: u64,
+    pub operand_ref_offset: u64,
+    pub flags: u32,
+    pub checksum: u32,
+}
+
+impl PredicateAstPayloadHeaderV2 {
+    pub const LEN: usize = 72;
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let header = Self {
+            root_node_id: read_u32(bytes, 0)?,
+            node_count: read_u32(bytes, 4)?,
+            literal_count: read_u32(bytes, 8)?,
+            literal_list_count: read_u32(bytes, 12)?,
+            function_count: read_u32(bytes, 16)?,
+            operand_ref_count: read_u32(bytes, 20)?,
+            node_offset: read_u64(bytes, 24)?,
+            literal_offset: read_u64(bytes, 32)?,
+            literal_list_offset: read_u64(bytes, 40)?,
+            function_offset: read_u64(bytes, 48)?,
+            operand_ref_offset: read_u64(bytes, 56)?,
+            flags: read_u32(bytes, 64)?,
+            checksum: read_u32(bytes, 68)?,
+        };
+        verify_crc(&bytes[..72], 68, header.checksum)?;
+        Ok(header)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateAstOperandRefV2 {
+    pub parent_node_id: u32,
+    pub ordinal: u16,
+    pub operand_kind: PredicateOperandKindV2,
+    pub flags: u8,
+    pub ref_id: u32,
+    pub checksum: u32,
+}
+
+impl PredicateAstOperandRefV2 {
+    pub const LEN: usize = 16;
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let item = Self {
+            parent_node_id: read_u32(bytes, 0)?,
+            ordinal: read_u16(bytes, 4)?,
+            operand_kind: PredicateOperandKindV2::from_u8(read_u8(bytes, 6)?)
+                .ok_or(CoveError::BadCoverage)?,
+            flags: read_u8(bytes, 7)?,
+            ref_id: read_u32(bytes, 8)?,
+            checksum: read_u32(bytes, 12)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 12, item.checksum)?;
+        Ok(item)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateAstNodeV2 {
+    pub node_id: u32,
+    pub op: PredicateOpV2,
+    pub flags: u16,
+    pub result_logical_type: u16,
+    pub collation_id: u16,
+    pub null_policy: PredicateNullPolicyV2,
+    pub reserved0: u8,
+    pub operand_count: u16,
+    pub first_operand_index: u32,
+    pub column_or_path_ref: u32,
+    pub literal_ref: u32,
+    pub function_ref: u32,
+    pub aux_ref: u32,
+    pub checksum: u32,
+}
+
+impl PredicateAstNodeV2 {
+    pub const LEN: usize = 40;
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let item = Self {
+            node_id: read_u32(bytes, 0)?,
+            op: PredicateOpV2::from_u16(read_u16(bytes, 4)?).ok_or(CoveError::BadCoverage)?,
+            flags: read_u16(bytes, 6)?,
+            result_logical_type: read_u16(bytes, 8)?,
+            collation_id: read_u16(bytes, 10)?,
+            null_policy: PredicateNullPolicyV2::from_u8(read_u8(bytes, 12)?)
+                .ok_or(CoveError::BadCoverage)?,
+            reserved0: read_u8(bytes, 13)?,
+            operand_count: read_u16(bytes, 14)?,
+            first_operand_index: read_u32(bytes, 16)?,
+            column_or_path_ref: read_u32(bytes, 20)?,
+            literal_ref: read_u32(bytes, 24)?,
+            function_ref: read_u32(bytes, 28)?,
+            aux_ref: read_u32(bytes, 32)?,
+            checksum: read_u32(bytes, 36)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 36, item.checksum)?;
+        if item.reserved0 != 0 {
+            return Err(CoveError::BadCoverage);
+        }
+        Ok(item)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateLiteralV2 {
+    pub literal_id: u32,
+    pub value_tag: u16,
+    pub logical_type: u16,
+    pub flags: u32,
+    pub canonical_value_offset: u64,
+    pub canonical_value_length: u32,
+    pub checksum: u32,
+}
+
+impl PredicateLiteralV2 {
+    pub const LEN: usize = 28;
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let item = Self {
+            literal_id: read_u32(bytes, 0)?,
+            value_tag: read_u16(bytes, 4)?,
+            logical_type: read_u16(bytes, 6)?,
+            flags: read_u32(bytes, 8)?,
+            canonical_value_offset: read_u64(bytes, 12)?,
+            canonical_value_length: read_u32(bytes, 20)?,
+            checksum: read_u32(bytes, 24)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 24, item.checksum)?;
+        checked_end(
+            item.canonical_value_offset,
+            u64::from(item.canonical_value_length),
+        )?;
+        Ok(item)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateLiteralListV2 {
+    pub literal_list_id: u32,
+    pub first_literal_index: u32,
+    pub literal_count: u32,
+    pub flags: u32,
+    pub checksum: u32,
+}
+
+impl PredicateLiteralListV2 {
+    pub const LEN: usize = 20;
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let item = Self {
+            literal_list_id: read_u32(bytes, 0)?,
+            first_literal_index: read_u32(bytes, 4)?,
+            literal_count: read_u32(bytes, 8)?,
+            flags: read_u32(bytes, 12)?,
+            checksum: read_u32(bytes, 16)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 16, item.checksum)?;
+        Ok(item)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateFunctionRefV2 {
+    pub function_ref: u32,
+    pub namespace: String,
+    pub name: String,
+    pub version_major: u16,
+    pub version_minor: u16,
+    pub deterministic: u8,
+    pub flags: u8,
+    pub required_extension_ref: u32,
+    pub checksum: u32,
+}
+
+impl PredicateFunctionRefV2 {
+    pub fn parse_one(bytes: &[u8]) -> Result<(Self, usize), CoveError> {
+        let mut cursor = Cursor::new(bytes);
+        let function_ref = cursor.u32()?;
+        let namespace_len = cursor.u16()? as usize;
+        let namespace = cursor.string(namespace_len)?;
+        let name_len = cursor.u16()? as usize;
+        let name = cursor.string(name_len)?;
+        let version_major = cursor.u16()?;
+        let version_minor = cursor.u16()?;
+        let deterministic = cursor.u8()?;
+        let flags = cursor.u8()?;
+        let required_extension_ref = cursor.u32()?;
+        let checksum_offset = cursor.position;
+        let checksum = cursor.u32()?;
+        let consumed = cursor.position;
+        verify_crc(&bytes[..consumed], checksum_offset, checksum)?;
+        if deterministic > 1 {
+            return Err(CoveError::BadCoverage);
+        }
+        Ok((
+            Self {
+                function_ref,
+                namespace,
+                name,
+                version_major,
+                version_minor,
+                deterministic,
+                flags,
+                required_extension_ref,
+                checksum,
+            },
+            consumed,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateAstPayloadV2 {
+    pub header: PredicateAstPayloadHeaderV2,
+    pub nodes: Vec<PredicateAstNodeV2>,
+    pub literals: Vec<PredicateLiteralV2>,
+    pub literal_lists: Vec<PredicateLiteralListV2>,
+    pub functions: Vec<PredicateFunctionRefV2>,
+    pub operand_refs: Vec<PredicateAstOperandRefV2>,
+}
+
+impl PredicateAstPayloadV2 {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let header = PredicateAstPayloadHeaderV2::parse(bytes)?;
+        let nodes = parse_fixed_table(
+            bytes,
+            header.node_offset,
+            header.node_count,
+            PredicateAstNodeV2::LEN,
+            PredicateAstNodeV2::parse,
+        )?;
+        let literals = parse_fixed_table(
+            bytes,
+            header.literal_offset,
+            header.literal_count,
+            PredicateLiteralV2::LEN,
+            PredicateLiteralV2::parse,
+        )?;
+        let literal_lists = parse_fixed_table(
+            bytes,
+            header.literal_list_offset,
+            header.literal_list_count,
+            PredicateLiteralListV2::LEN,
+            PredicateLiteralListV2::parse,
+        )?;
+        let operand_refs = parse_fixed_table(
+            bytes,
+            header.operand_ref_offset,
+            header.operand_ref_count,
+            PredicateAstOperandRefV2::LEN,
+            PredicateAstOperandRefV2::parse,
+        )?;
+        let functions = parse_function_table(bytes, header.function_offset, header.function_count)?;
+        let payload = Self {
+            header,
+            nodes,
+            literals,
+            literal_lists,
+            functions,
+            operand_refs,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn validate(&self) -> Result<(), CoveError> {
+        validate_unique_dense_ids(&self.nodes, |node| node.node_id)?;
+        validate_unique_dense_ids(&self.literals, |literal| literal.literal_id)?;
+        validate_unique_dense_ids(&self.literal_lists, |list| list.literal_list_id)?;
+        validate_unique_dense_ids(&self.functions, |function| function.function_ref)?;
+        if self.header.root_node_id as usize >= self.nodes.len() {
+            return Err(CoveError::BadCoverage);
+        }
+        for node in &self.nodes {
+            validate_node_operands(node, &self.operand_refs)?;
+            validate_node_arity(node)?;
+        }
+        validate_ast_acyclic(self.header.root_node_id, &self.nodes, &self.operand_refs)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PredicateNormalisationKindV2 {
+    Cnf = 0,
+    Dnf = 1,
+    FlatConjunction = 2,
+    FlatDisjunction = 3,
+}
+
+impl PredicateNormalisationKindV2 {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Cnf),
+            1 => Some(Self::Dnf),
+            2 => Some(Self::FlatConjunction),
+            3 => Some(Self::FlatDisjunction),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateNormalisedPayloadHeaderV2 {
+    pub normalisation_kind: PredicateNormalisationKindV2,
+    pub flags: u8,
+    pub reserved: u16,
+    pub clause_count: u32,
+    pub term_count: u32,
+    pub clause_offset: u64,
+    pub term_offset: u64,
+    pub checksum: u32,
+}
+
+impl PredicateNormalisedPayloadHeaderV2 {
+    pub const LEN: usize = 32;
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let item = Self {
+            normalisation_kind: PredicateNormalisationKindV2::from_u8(read_u8(bytes, 0)?)
+                .ok_or(CoveError::BadCoverage)?,
+            flags: read_u8(bytes, 1)?,
+            reserved: read_u16(bytes, 2)?,
+            clause_count: read_u32(bytes, 4)?,
+            term_count: read_u32(bytes, 8)?,
+            clause_offset: read_u64(bytes, 12)?,
+            term_offset: read_u64(bytes, 20)?,
+            checksum: read_u32(bytes, 28)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 28, item.checksum)?;
+        if item.reserved != 0 {
+            return Err(CoveError::BadCoverage);
+        }
+        Ok(item)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateClauseEntryV2 {
+    pub clause_id: u32,
+    pub first_term_index: u32,
+    pub term_count: u32,
+    pub flags: u32,
+    pub checksum: u32,
+}
+
+impl PredicateClauseEntryV2 {
+    pub const LEN: usize = 20;
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let item = Self {
+            clause_id: read_u32(bytes, 0)?,
+            first_term_index: read_u32(bytes, 4)?,
+            term_count: read_u32(bytes, 8)?,
+            flags: read_u32(bytes, 12)?,
+            checksum: read_u32(bytes, 16)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 16, item.checksum)?;
+        Ok(item)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateTermV2 {
+    pub term_id: u32,
+    pub ast_node_ref: u32,
+    pub negated: u8,
+    pub null_policy: PredicateNullPolicyV2,
+    pub proof_safe: u8,
+    pub reserved: u8,
+    pub checksum: u32,
+}
+
+impl PredicateTermV2 {
+    pub const LEN: usize = 16;
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let item = Self {
+            term_id: read_u32(bytes, 0)?,
+            ast_node_ref: read_u32(bytes, 4)?,
+            negated: read_u8(bytes, 8)?,
+            null_policy: PredicateNullPolicyV2::from_u8(read_u8(bytes, 9)?)
+                .ok_or(CoveError::BadCoverage)?,
+            proof_safe: read_u8(bytes, 10)?,
+            reserved: read_u8(bytes, 11)?,
+            checksum: read_u32(bytes, 12)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 12, item.checksum)?;
+        validate_bool(item.negated)?;
+        validate_bool(item.proof_safe)?;
+        if item.reserved != 0 {
+            return Err(CoveError::BadCoverage);
+        }
+        Ok(item)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateNormalisedPayloadV2 {
+    pub header: PredicateNormalisedPayloadHeaderV2,
+    pub clauses: Vec<PredicateClauseEntryV2>,
+    pub terms: Vec<PredicateTermV2>,
+}
+
+impl PredicateNormalisedPayloadV2 {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let header = PredicateNormalisedPayloadHeaderV2::parse(bytes)?;
+        let clauses = parse_fixed_table(
+            bytes,
+            header.clause_offset,
+            header.clause_count,
+            PredicateClauseEntryV2::LEN,
+            PredicateClauseEntryV2::parse,
+        )?;
+        let terms = parse_fixed_table(
+            bytes,
+            header.term_offset,
+            header.term_count,
+            PredicateTermV2::LEN,
+            PredicateTermV2::parse,
+        )?;
+        validate_unique_dense_ids(&clauses, |clause| clause.clause_id)?;
+        validate_unique_dense_ids(&terms, |term| term.term_id)?;
+        for clause in &clauses {
+            let end = clause
+                .first_term_index
+                .checked_add(clause.term_count)
+                .ok_or(CoveError::ArithOverflow)?;
+            if end as usize > terms.len() {
+                return Err(CoveError::BadCoverage);
+            }
+        }
+        Ok(Self {
+            header,
+            clauses,
+            terms,
+        })
     }
 }
 
@@ -344,7 +1008,7 @@ impl IntervalPredicateV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCoverage);
         }
         bytes.chunks_exact(Self::LEN).map(Self::parse).collect()
@@ -403,6 +1067,161 @@ impl IntervalPredicateV2 {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntervalPredicateSetV2 {
+    pub interval_set_id: u32,
+    pub column_or_path_ref: u32,
+    pub logical_type: u16,
+    pub collation_id: u16,
+    pub null_policy: IntervalNullPolicyV2,
+    pub flags: u8,
+    pub interval_count: u32,
+    pub intervals_offset: u64,
+    pub checksum: u32,
+}
+
+impl IntervalPredicateSetV2 {
+    pub const LEN: usize = 30;
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let item = Self {
+            interval_set_id: read_u32(bytes, 0)?,
+            column_or_path_ref: read_u32(bytes, 4)?,
+            logical_type: read_u16(bytes, 8)?,
+            collation_id: read_u16(bytes, 10)?,
+            null_policy: IntervalNullPolicyV2::from_u8(read_u8(bytes, 12)?)
+                .ok_or(CoveError::BadCoverage)?,
+            flags: read_u8(bytes, 13)?,
+            interval_count: read_u32(bytes, 14)?,
+            intervals_offset: read_u64(bytes, 18)?,
+            checksum: read_u32(bytes, 26)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 26, item.checksum)?;
+        require_present(item.column_or_path_ref)?;
+        Ok(item)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IntervalBoundPairV2 {
+    pub lower_value_ref: u32,
+    pub upper_value_ref: u32,
+    pub lower_inclusive: u8,
+    pub upper_inclusive: u8,
+    pub flags: u16,
+    pub checksum: u32,
+}
+
+impl IntervalBoundPairV2 {
+    pub const LEN: usize = 16;
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let item = Self {
+            lower_value_ref: read_u32(bytes, 0)?,
+            upper_value_ref: read_u32(bytes, 4)?,
+            lower_inclusive: read_u8(bytes, 8)?,
+            upper_inclusive: read_u8(bytes, 9)?,
+            flags: read_u16(bytes, 10)?,
+            checksum: read_u32(bytes, 12)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 12, item.checksum)?;
+        validate_bool(item.lower_inclusive)?;
+        validate_bool(item.upper_inclusive)?;
+        if item.lower_value_ref != ABSENT_ID
+            && item.upper_value_ref != ABSENT_ID
+            && item.lower_value_ref > item.upper_value_ref
+        {
+            return Err(CoveError::BadCoverage);
+        }
+        Ok(item)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiIntervalPredicatePayloadV2 {
+    pub header: IntervalPredicateSetV2,
+    pub intervals: Vec<IntervalBoundPairV2>,
+}
+
+impl MultiIntervalPredicatePayloadV2 {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let header = IntervalPredicateSetV2::parse(bytes)?;
+        let intervals = parse_fixed_table(
+            bytes,
+            header.intervals_offset,
+            header.interval_count,
+            IntervalBoundPairV2::LEN,
+            IntervalBoundPairV2::parse,
+        )?;
+        for pair in intervals.windows(2) {
+            if pair[1] <= pair[0] {
+                return Err(CoveError::BadCoverage);
+            }
+        }
+        Ok(Self { header, intervals })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedPredicateFormV2 {
+    pub encoded_predicate_id: u32,
+    pub baseline_predicate_ref: u32,
+    pub table_id: u32,
+    pub column_id: u32,
+    pub logical_type: u16,
+    pub physical_kind: u8,
+    pub encoding_kind: u16,
+    pub codec_id: u32,
+    pub flags: u32,
+    pub equivalence_kind: u8,
+    pub null_semantics: u8,
+    pub collation_id: u16,
+    pub params_offset: u64,
+    pub params_length: u64,
+    pub checksum: u32,
+}
+
+impl EncodedPredicateFormV2 {
+    pub const LEN: usize = 53;
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let item = Self {
+            encoded_predicate_id: read_u32(bytes, 0)?,
+            baseline_predicate_ref: read_u32(bytes, 4)?,
+            table_id: read_u32(bytes, 8)?,
+            column_id: read_u32(bytes, 12)?,
+            logical_type: read_u16(bytes, 16)?,
+            physical_kind: read_u8(bytes, 18)?,
+            encoding_kind: read_u16(bytes, 19)?,
+            codec_id: read_u32(bytes, 21)?,
+            flags: read_u32(bytes, 25)?,
+            equivalence_kind: read_u8(bytes, 29)?,
+            null_semantics: read_u8(bytes, 30)?,
+            collation_id: read_u16(bytes, 31)?,
+            params_offset: read_u64(bytes, 33)?,
+            params_length: read_u64(bytes, 41)?,
+            checksum: read_u32(bytes, 49)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 49, item.checksum)?;
+        if item.baseline_predicate_ref == ABSENT_ID || item.equivalence_kind > 2 {
+            return Err(CoveError::BadCoverage);
+        }
+        validate_null_semantics(item.null_semantics)?;
+        checked_end(item.params_offset, item.params_length)?;
+        Ok(item)
+    }
+
+    pub fn is_pruning_safe(&self) -> bool {
+        matches!(self.equivalence_kind, 0 | 1) && self.null_semantics != 255
     }
 }
 
@@ -488,7 +1307,7 @@ impl CoveragePlanCandidateV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCoverage);
         }
         let mut ids = BTreeSet::new();
@@ -608,7 +1427,7 @@ impl CoverageProofRecordV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCoverage);
         }
         let mut ids = BTreeSet::new();
@@ -778,7 +1597,7 @@ impl CoverageProviderDescriptorV2 {
     }
 
     pub fn parse_many(bytes: &[u8]) -> Result<Vec<Self>, CoveError> {
-        if bytes.len() % Self::LEN != 0 {
+        if !bytes.len().is_multiple_of(Self::LEN) {
             return Err(CoveError::BadCoverage);
         }
         let mut providers = Vec::new();
@@ -1050,6 +1869,36 @@ impl CoverageSetV2 {
         }
         Ok(Self { header, entries })
     }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
+        validate_coverage_entries(&self.entries)?;
+        let entries_length = self
+            .entries
+            .len()
+            .checked_mul(CoverageSetEntryV2::LEN)
+            .ok_or(CoveError::ArithOverflow)?;
+        let covered_fragment_count =
+            u64::try_from(self.entries.len()).map_err(|_| CoveError::ArithOverflow)?;
+        if covered_fragment_count > self.header.total_fragment_count {
+            return Err(CoveError::BadCoverage);
+        }
+
+        let mut header = self.header.clone();
+        header.covered_fragment_count = covered_fragment_count;
+        header.entries_offset = CoverageSetHeaderV2::LEN as u64;
+        header.entries_length =
+            u64::try_from(entries_length).map_err(|_| CoveError::ArithOverflow)?;
+
+        let total_len = CoverageSetHeaderV2::LEN
+            .checked_add(entries_length)
+            .ok_or(CoveError::ArithOverflow)?;
+        let mut out = Vec::with_capacity(total_len);
+        out.extend_from_slice(&header.serialize());
+        for entry in &self.entries {
+            out.extend_from_slice(&entry.serialize());
+        }
+        Ok(out)
+    }
 }
 
 pub fn validate_coverage_entries(entries: &[CoverageSetEntryV2]) -> Result<(), CoveError> {
@@ -1082,8 +1931,339 @@ pub fn validate_coverage_entries(entries: &[CoverageSetEntryV2]) -> Result<(), C
     Ok(())
 }
 
+pub fn coverage_union(
+    left: &[CoverageSetEntryV2],
+    right: &[CoverageSetEntryV2],
+) -> Result<Vec<CoverageSetEntryV2>, CoveError> {
+    let mut out = left.to_vec();
+    out.extend_from_slice(right);
+    out.sort();
+    out.dedup();
+    coalesce_row_ranges(out)
+}
+
+pub fn coverage_intersection(
+    left: &[CoverageSetEntryV2],
+    right: &[CoverageSetEntryV2],
+) -> Result<Vec<CoverageSetEntryV2>, CoveError> {
+    let right_set = right.iter().collect::<BTreeSet<_>>();
+    let out = left
+        .iter()
+        .filter(|entry| right_set.contains(entry))
+        .cloned()
+        .collect::<Vec<_>>();
+    validate_coverage_entries(&out)?;
+    Ok(out)
+}
+
+pub fn coverage_coarsen(
+    entries: &[CoverageSetEntryV2],
+) -> Result<Vec<CoverageSetEntryV2>, CoveError> {
+    coalesce_row_ranges(entries.to_vec())
+}
+
+pub fn coverage_refine(
+    entries: &[CoverageSetEntryV2],
+    refinement: &[CoverageSetEntryV2],
+) -> Result<Vec<CoverageSetEntryV2>, CoveError> {
+    coverage_intersection(entries, refinement)
+}
+
+fn coalesce_row_ranges(
+    mut entries: Vec<CoverageSetEntryV2>,
+) -> Result<Vec<CoverageSetEntryV2>, CoveError> {
+    entries.sort();
+    let mut out: Vec<CoverageSetEntryV2> = Vec::new();
+    for entry in entries {
+        if let Some(last) = out.last_mut() {
+            if last.target_kind == CoverageGranularityV2::RowRange
+                && entry.target_kind == CoverageGranularityV2::RowRange
+                && last.file_ref == entry.file_ref
+                && last.table_id == entry.table_id
+                && last.segment_id == entry.segment_id
+                && last.morsel_id == entry.morsel_id
+            {
+                let last_end = last
+                    .row_start
+                    .checked_add(last.row_count)
+                    .ok_or(CoveError::ArithOverflow)?;
+                if entry.row_start <= last_end {
+                    let entry_end = entry
+                        .row_start
+                        .checked_add(entry.row_count)
+                        .ok_or(CoveError::ArithOverflow)?;
+                    last.row_count = entry_end.saturating_sub(last.row_start).max(last.row_count);
+                    continue;
+                }
+            }
+        }
+        out.push(entry);
+    }
+    validate_coverage_entries(&out)?;
+    Ok(out)
+}
+
 pub fn can_use_for_pruning(header: &CoverageSetHeaderV2) -> bool {
     header.proof_strength.allows_pruning() && !header.exactness.may_under_include()
+}
+
+fn parse_fixed_table<T, F>(
+    bytes: &[u8],
+    offset: u64,
+    count: u32,
+    item_len: usize,
+    parse: F,
+) -> Result<Vec<T>, CoveError>
+where
+    F: Fn(&[u8]) -> Result<T, CoveError>,
+{
+    if count == 0 {
+        if offset != 0 {
+            return Err(CoveError::BadCoverage);
+        }
+        return Ok(Vec::new());
+    }
+    let start = usize::try_from(offset).map_err(|_| CoveError::OffsetRange)?;
+    let len = usize::try_from(count)
+        .map_err(|_| CoveError::ArithOverflow)?
+        .checked_mul(item_len)
+        .ok_or(CoveError::ArithOverflow)?;
+    let end = start.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+    if end > bytes.len() {
+        return Err(CoveError::OffsetRange);
+    }
+    bytes[start..end]
+        .chunks_exact(item_len)
+        .map(parse)
+        .collect()
+}
+
+fn parse_function_table(
+    bytes: &[u8],
+    offset: u64,
+    count: u32,
+) -> Result<Vec<PredicateFunctionRefV2>, CoveError> {
+    if count == 0 {
+        if offset != 0 {
+            return Err(CoveError::BadCoverage);
+        }
+        return Ok(Vec::new());
+    }
+    let mut cursor = usize::try_from(offset).map_err(|_| CoveError::OffsetRange)?;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let (item, consumed) = PredicateFunctionRefV2::parse_one(&bytes[cursor..])?;
+        if consumed == 0 {
+            return Err(CoveError::BadCoverage);
+        }
+        out.push(item);
+        cursor = cursor
+            .checked_add(consumed)
+            .ok_or(CoveError::ArithOverflow)?;
+        if cursor > bytes.len() {
+            return Err(CoveError::OffsetRange);
+        }
+    }
+    Ok(out)
+}
+
+fn validate_unique_dense_ids<T, F>(items: &[T], id: F) -> Result<(), CoveError>
+where
+    F: Fn(&T) -> u32,
+{
+    let mut seen = BTreeSet::new();
+    for (index, item) in items.iter().enumerate() {
+        let item_id = id(item);
+        if item_id as usize != index || !seen.insert(item_id) {
+            return Err(CoveError::BadCoverage);
+        }
+    }
+    Ok(())
+}
+
+fn validate_node_operands(
+    node: &PredicateAstNodeV2,
+    operands: &[PredicateAstOperandRefV2],
+) -> Result<(), CoveError> {
+    if node.operand_count == 0 {
+        if node.first_operand_index != ABSENT_ID {
+            return Err(CoveError::BadCoverage);
+        }
+        return Ok(());
+    }
+    if node.first_operand_index == ABSENT_ID {
+        return Err(CoveError::BadCoverage);
+    }
+    let start = node.first_operand_index as usize;
+    let end = start
+        .checked_add(node.operand_count as usize)
+        .ok_or(CoveError::ArithOverflow)?;
+    if end > operands.len() {
+        return Err(CoveError::BadCoverage);
+    }
+    for (expected, operand) in operands[start..end].iter().enumerate() {
+        if operand.parent_node_id != node.node_id || operand.ordinal as usize != expected {
+            return Err(CoveError::BadCoverage);
+        }
+    }
+    validate_mirror(
+        node,
+        operands,
+        PredicateOperandKindV2::ColumnOrPath,
+        node.column_or_path_ref,
+    )?;
+    validate_mirror(
+        node,
+        operands,
+        PredicateOperandKindV2::Literal,
+        node.literal_ref,
+    )?;
+    validate_mirror(
+        node,
+        operands,
+        PredicateOperandKindV2::Function,
+        node.function_ref,
+    )?;
+    Ok(())
+}
+
+fn validate_mirror(
+    node: &PredicateAstNodeV2,
+    operands: &[PredicateAstOperandRefV2],
+    kind: PredicateOperandKindV2,
+    mirror_ref: u32,
+) -> Result<(), CoveError> {
+    if mirror_ref == ABSENT_ID {
+        return Ok(());
+    }
+    let start = node.first_operand_index as usize;
+    let end = start + node.operand_count as usize;
+    if operands[start..end]
+        .iter()
+        .any(|operand| operand.operand_kind == kind && operand.ref_id == mirror_ref)
+    {
+        Ok(())
+    } else {
+        Err(CoveError::BadCoverage)
+    }
+}
+
+fn validate_node_arity(node: &PredicateAstNodeV2) -> Result<(), CoveError> {
+    let count = node.operand_count;
+    let valid = match node.op {
+        PredicateOpV2::TrueLiteral | PredicateOpV2::FalseLiteral => count == 0,
+        PredicateOpV2::LiteralValue | PredicateOpV2::ColumnRef => count == 1,
+        PredicateOpV2::IsNull
+        | PredicateOpV2::IsNotNull
+        | PredicateOpV2::IsNaN
+        | PredicateOpV2::IsFinite
+        | PredicateOpV2::Not => count == 1,
+        PredicateOpV2::Eq
+        | PredicateOpV2::NotEq
+        | PredicateOpV2::Lt
+        | PredicateOpV2::LtEq
+        | PredicateOpV2::Gt
+        | PredicateOpV2::GtEq
+        | PredicateOpV2::LikePrefix
+        | PredicateOpV2::Contains
+        | PredicateOpV2::InSet => count == 2,
+        PredicateOpV2::Between => count == 3,
+        PredicateOpV2::And | PredicateOpV2::Or => count >= 2,
+        PredicateOpV2::FunctionCall => count >= 1,
+        PredicateOpV2::Extension => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(CoveError::BadCoverage)
+    }
+}
+
+fn validate_ast_acyclic(
+    root_node_id: u32,
+    nodes: &[PredicateAstNodeV2],
+    operands: &[PredicateAstOperandRefV2],
+) -> Result<(), CoveError> {
+    fn visit(
+        node_id: u32,
+        nodes: &[PredicateAstNodeV2],
+        operands: &[PredicateAstOperandRefV2],
+        visiting: &mut BTreeSet<u32>,
+        visited: &mut BTreeSet<u32>,
+    ) -> Result<(), CoveError> {
+        if visited.contains(&node_id) {
+            return Ok(());
+        }
+        if !visiting.insert(node_id) {
+            return Err(CoveError::BadCoverage);
+        }
+        let node = nodes.get(node_id as usize).ok_or(CoveError::BadCoverage)?;
+        if node.node_id != node_id {
+            return Err(CoveError::BadCoverage);
+        }
+        if node.operand_count > 0 {
+            let start = node.first_operand_index as usize;
+            let end = start + node.operand_count as usize;
+            for operand in &operands[start..end] {
+                if operand.operand_kind == PredicateOperandKindV2::Node {
+                    visit(operand.ref_id, nodes, operands, visiting, visited)?;
+                }
+            }
+        }
+        visiting.remove(&node_id);
+        visited.insert(node_id);
+        Ok(())
+    }
+
+    visit(
+        root_node_id,
+        nodes,
+        operands,
+        &mut BTreeSet::new(),
+        &mut BTreeSet::new(),
+    )
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn bytes(&mut self, len: usize) -> Result<&'a [u8], CoveError> {
+        let end = self
+            .position
+            .checked_add(len)
+            .ok_or(CoveError::ArithOverflow)?;
+        if end > self.bytes.len() {
+            return Err(CoveError::BufferTooShort);
+        }
+        let out = &self.bytes[self.position..end];
+        self.position = end;
+        Ok(out)
+    }
+
+    fn string(&mut self, len: usize) -> Result<String, CoveError> {
+        std::str::from_utf8(self.bytes(len)?)
+            .map(|value| value.to_string())
+            .map_err(|_| CoveError::BadCoverage)
+    }
+
+    fn u8(&mut self) -> Result<u8, CoveError> {
+        Ok(self.bytes(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, CoveError> {
+        Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
+    }
+
+    fn u32(&mut self) -> Result<u32, CoveError> {
+        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
 }
 
 fn require_absent(value: u32) -> Result<(), CoveError> {
@@ -1268,6 +2448,28 @@ mod tests {
         let mut form = predicate_form(2);
         form.logical_context_ref = ABSENT_ID;
         assert!(matches!(form.serialize(), Err(CoveError::BadCoverage)));
+    }
+
+    #[test]
+    fn predicate_form_with_payload_preserves_payload_and_flat_compatibility() {
+        let flat = predicate_form(1).serialize().unwrap();
+        let parsed = PredicateNormalFormWithPayloadV2::parse_many(&flat).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].payload.is_empty());
+
+        let payload = b"payload".to_vec();
+        let mut form = predicate_form(2);
+        form.form_kind = PredicateFormKindV2::PredicateAst;
+        form.payload_offset = PredicateNormalFormV2::LEN as u64;
+        form.payload_length = payload.len() as u64;
+        let mut bytes = form.serialize().unwrap().to_vec();
+        bytes.extend_from_slice(&payload);
+
+        let parsed = PredicateNormalFormWithPayloadV2::parse_many(&bytes).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].form.predicate_form_id, 2);
+        assert_eq!(parsed[0].payload, payload);
+        assert!(PredicateNormalFormV2::parse_many(&bytes).is_err());
     }
 
     #[test]

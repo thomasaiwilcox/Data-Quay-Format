@@ -1,9 +1,17 @@
 //! DataFusion-agnostic scan planning.
 
 use arrow_schema::SchemaRef;
+#[cfg(feature = "covi")]
+use cove_core::{
+    canonical::CanonicalValue,
+    constants::{CoveLogicalType, ValueTag},
+};
 use cove_core::{constants::CovePhysicalKind, CoveError};
+#[cfg(feature = "covi")]
+use cove_index::execution::{CoviLookupKeyV2, CoviLookupRequestV2};
 
 use crate::{
+    coverage_plan::{CoveragePlanningIndex, CoveragePredicateExpr},
     dataset_state::DatasetState,
     execution_code,
     scan_program::{
@@ -43,7 +51,7 @@ pub enum PredicateLiteral {
 impl PredicateLiteral {
     pub fn normalized(self) -> Self {
         match self {
-            Self::Float64(value) if value == 0.0 => Self::Float64(0.0),
+            Self::Float64(0.0) => Self::Float64(0.0),
             _ => self,
         }
     }
@@ -119,11 +127,26 @@ pub enum CovePredicate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CovePredicateExpr {
+    Atom(CovePredicate),
+    And(Vec<CovePredicateExpr>),
+    Or(Vec<CovePredicateExpr>),
+}
+
+impl CovePredicateExpr {
+    pub fn atom(predicate: CovePredicate) -> Self {
+        Self::Atom(predicate)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterPlan {
     pub use_kind: CoveFilterUse,
     pub predicate_columns: Vec<usize>,
     pub display: String,
     pub predicate: Option<CovePredicate>,
+    pub predicate_expr: Option<CovePredicateExpr>,
+    pub coverage_predicate_form_ref: Option<u32>,
 }
 
 pub type PredicateProgram = Vec<FilterPlan>;
@@ -135,6 +158,23 @@ impl FilterPlan {
             predicate_columns: Vec::new(),
             display: display.into(),
             predicate: None,
+            predicate_expr: None,
+            coverage_predicate_form_ref: None,
+        }
+    }
+
+    pub fn pruning_expr(
+        predicate_columns: Vec<usize>,
+        expr: CovePredicateExpr,
+        display: impl Into<String>,
+    ) -> Self {
+        Self {
+            use_kind: CoveFilterUse::PruningOnly,
+            predicate_columns,
+            display: display.into(),
+            predicate: None,
+            predicate_expr: Some(expr),
+            coverage_predicate_form_ref: None,
         }
     }
 
@@ -148,6 +188,11 @@ impl FilterPlan {
             predicate_columns: vec![column_index],
             display: display.into(),
             predicate: Some(CovePredicate::Null { column_index, kind }),
+            predicate_expr: Some(CovePredicateExpr::atom(CovePredicate::Null {
+                column_index,
+                kind,
+            })),
+            coverage_predicate_form_ref: None,
         }
     }
 
@@ -166,6 +211,12 @@ impl FilterPlan {
                 op,
                 literal: literal.normalized(),
             }),
+            predicate_expr: Some(CovePredicateExpr::atom(CovePredicate::Numeric {
+                column_index,
+                op,
+                literal: literal.normalized(),
+            })),
+            coverage_predicate_form_ref: None,
         }
     }
 
@@ -187,15 +238,18 @@ impl FilterPlan {
         file_codes.dedup();
         canonical_values.sort();
         canonical_values.dedup();
+        let predicate = CovePredicate::FileCodeIn {
+            column_index,
+            file_codes,
+            canonical_values,
+        };
         Self {
             use_kind: CoveFilterUse::PruningOnly,
             predicate_columns: vec![column_index],
             display: display.into(),
-            predicate: Some(CovePredicate::FileCodeIn {
-                column_index,
-                file_codes,
-                canonical_values,
-            }),
+            predicate: Some(predicate.clone()),
+            predicate_expr: Some(CovePredicateExpr::atom(predicate)),
+            coverage_predicate_form_ref: None,
         }
     }
 
@@ -204,15 +258,23 @@ impl FilterPlan {
         literal: Vec<u8>,
         display: impl Into<String>,
     ) -> Self {
+        let predicate = CovePredicate::VarBytesEq {
+            column_index,
+            literal,
+        };
         Self {
             use_kind: CoveFilterUse::PruningOnly,
             predicate_columns: vec![column_index],
             display: display.into(),
-            predicate: Some(CovePredicate::VarBytesEq {
-                column_index,
-                literal,
-            }),
+            predicate: Some(predicate.clone()),
+            predicate_expr: Some(CovePredicateExpr::atom(predicate)),
+            coverage_predicate_form_ref: None,
         }
+    }
+
+    pub fn with_coverage_predicate_form_ref(mut self, predicate_form_ref: u32) -> Self {
+        self.coverage_predicate_form_ref = Some(predicate_form_ref);
+        self
     }
 }
 
@@ -224,7 +286,17 @@ pub struct ScanPlan {
     pub predicate_columns: Vec<usize>,
     pub column_plan: ColumnPlan,
     pub topn_hint: Option<TopNScanHint>,
+    pub coverage_expr: Option<CoveragePredicateExpr>,
     pub scan_program: CoveScanProgram,
+    pub covi_candidates: Option<Vec<ScanCandidateRowRange>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanCandidateRowRange {
+    pub segment_id: u32,
+    pub morsel_id: u32,
+    pub row_start: u64,
+    pub row_count: u64,
 }
 
 /// Build a single-file native scan plan. The scan projection is the only set
@@ -266,10 +338,13 @@ pub fn plan_scan(
     for filter in &mut filters {
         promote_filter_exactness(state, filter);
     }
+    let coverage_index = CoveragePlanningIndex::build(state);
+    let coverage_expr = coverage_index.attach_to_filters(&mut filters);
     let predicate_ordered = order_filters_by_cost(&mut filters);
     execution_code::validate_policy_for_filters(state, &filters)?;
     let mut scan_program = compile_scan_program(state, &filters);
     scan_program.predicate_ordered = predicate_ordered;
+    let covi_candidates = covi_candidates_for_filters(state, &filters);
     Ok(ScanPlan {
         scan_projection,
         output_schema,
@@ -277,8 +352,210 @@ pub fn plan_scan(
         predicate_columns,
         column_plan,
         topn_hint: None,
+        coverage_expr,
         scan_program,
+        covi_candidates,
     })
+}
+
+#[cfg(feature = "covi")]
+pub(crate) fn covi_candidates_for_filters(
+    state: &DatasetState,
+    filters: &[FilterPlan],
+) -> Option<Vec<ScanCandidateRowRange>> {
+    let covi = state.covi()?;
+    for filter in filters {
+        let Some(predicate) = &filter.predicate else {
+            continue;
+        };
+        let Some((column_index, keys)) = lookup_keys_for_predicate(state, predicate) else {
+            continue;
+        };
+        let column = &state.table().columns[column_index];
+        let mut rows = Vec::new();
+        let request = if keys.len() == 1 {
+            CoviLookupRequestV2::eq(
+                state.table().table_id,
+                column.column_id,
+                CoviLookupKeyV2::CanonicalValueBytes(keys[0].clone()),
+            )
+        } else {
+            CoviLookupRequestV2::membership(
+                state.table().table_id,
+                column.column_id,
+                keys.into_iter()
+                    .map(CoviLookupKeyV2::CanonicalValueBytes)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let Ok(candidates) = covi.lookup(&request) else {
+            continue;
+        };
+        rows.extend(
+            candidates
+                .row_ranges
+                .into_iter()
+                .map(|range| ScanCandidateRowRange {
+                    segment_id: range.segment_id,
+                    morsel_id: range.morsel_id,
+                    row_start: range.row_start,
+                    row_count: range.row_count,
+                }),
+        );
+        normalize_scan_candidate_ranges(&mut rows).ok()?;
+        return Some(rows);
+    }
+    None
+}
+
+#[cfg(not(feature = "covi"))]
+pub(crate) fn covi_candidates_for_filters(
+    _state: &DatasetState,
+    _filters: &[FilterPlan],
+) -> Option<Vec<ScanCandidateRowRange>> {
+    None
+}
+
+#[cfg(feature = "covi")]
+fn lookup_keys_for_predicate(
+    state: &DatasetState,
+    predicate: &CovePredicate,
+) -> Option<(usize, Vec<Vec<u8>>)> {
+    match predicate {
+        CovePredicate::FileCodeIn {
+            column_index,
+            canonical_values,
+            ..
+        } => {
+            let column = &state.table().columns[*column_index];
+            let tag = value_tag_for_logical(column.logical)?;
+            let keys = canonical_values
+                .iter()
+                .map(|value| tagged_key(tag, value.clone()))
+                .collect::<Vec<_>>();
+            Some((*column_index, keys))
+        }
+        CovePredicate::VarBytesEq {
+            column_index,
+            literal,
+        } => {
+            let column = &state.table().columns[*column_index];
+            let key = match column.logical {
+                CoveLogicalType::Utf8 => {
+                    let value = std::str::from_utf8(literal).ok()?;
+                    tagged_canonical(CanonicalValue::Utf8(value)).ok()?
+                }
+                CoveLogicalType::Binary => tagged_canonical(CanonicalValue::Bytes(literal)).ok()?,
+                _ => return None,
+            };
+            Some((*column_index, vec![key]))
+        }
+        CovePredicate::Numeric {
+            column_index,
+            op: NumericPredicateOp::Eq,
+            literal,
+        } => {
+            let column = &state.table().columns[*column_index];
+            let key = numeric_canonical_key(column.logical, *literal).ok()?;
+            Some((*column_index, vec![key]))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "covi")]
+fn normalize_scan_candidate_ranges(rows: &mut Vec<ScanCandidateRowRange>) -> Result<(), CoveError> {
+    rows.sort_by_key(|row| (row.segment_id, row.morsel_id, row.row_start));
+    let mut out: Vec<ScanCandidateRowRange> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        if row.row_count == 0 {
+            return Err(CoveError::BadCovi);
+        }
+        if let Some(last) = out.last_mut() {
+            let same_scope = last.segment_id == row.segment_id && last.morsel_id == row.morsel_id;
+            let last_end = last
+                .row_start
+                .checked_add(last.row_count)
+                .ok_or(CoveError::ArithOverflow)?;
+            if same_scope && row.row_start <= last_end {
+                let row_end = row
+                    .row_start
+                    .checked_add(row.row_count)
+                    .ok_or(CoveError::ArithOverflow)?;
+                last.row_count = row_end
+                    .checked_sub(last.row_start)
+                    .ok_or(CoveError::ArithOverflow)?;
+                continue;
+            }
+        }
+        out.push(row);
+    }
+    *rows = out;
+    Ok(())
+}
+
+#[cfg(feature = "covi")]
+fn value_tag_for_logical(logical: CoveLogicalType) -> Option<ValueTag> {
+    match logical {
+        CoveLogicalType::Utf8 => Some(ValueTag::Utf8),
+        CoveLogicalType::Binary => Some(ValueTag::Binary),
+        CoveLogicalType::Bool => Some(ValueTag::BoolTrue),
+        CoveLogicalType::Int8
+        | CoveLogicalType::Int16
+        | CoveLogicalType::Int32
+        | CoveLogicalType::Int64 => Some(ValueTag::Int64),
+        CoveLogicalType::UInt8
+        | CoveLogicalType::UInt16
+        | CoveLogicalType::UInt32
+        | CoveLogicalType::UInt64 => Some(ValueTag::UInt64),
+        CoveLogicalType::Float32 => Some(ValueTag::Float32Bits),
+        CoveLogicalType::Float64 => Some(ValueTag::Float64Bits),
+        CoveLogicalType::DateDays => Some(ValueTag::DateDays),
+        CoveLogicalType::TimestampMicros => Some(ValueTag::TimestampMicros),
+        CoveLogicalType::TimestampNanos => Some(ValueTag::TimestampNanos),
+        CoveLogicalType::Uuid => Some(ValueTag::Uuid),
+        CoveLogicalType::Json => Some(ValueTag::Json),
+        CoveLogicalType::Decimal64 => Some(ValueTag::Decimal64),
+        CoveLogicalType::Decimal128 => Some(ValueTag::Decimal128),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "covi")]
+fn tagged_canonical(value: CanonicalValue<'_>) -> Result<Vec<u8>, CoveError> {
+    let tag = value.value_tag();
+    let payload = value.encode()?;
+    Ok(tagged_key(tag, payload))
+}
+
+#[cfg(feature = "covi")]
+fn tagged_key(tag: ValueTag, payload: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + payload.len());
+    out.extend_from_slice(&(tag as u16).to_le_bytes());
+    out.extend_from_slice(&payload);
+    out
+}
+
+#[cfg(feature = "covi")]
+fn numeric_canonical_key(
+    logical: CoveLogicalType,
+    literal: PredicateLiteral,
+) -> Result<Vec<u8>, CoveError> {
+    let value = match (logical, literal) {
+        (CoveLogicalType::Int64, PredicateLiteral::Int64(value)) => CanonicalValue::Int {
+            width: 8,
+            value: i128::from(value),
+        },
+        (CoveLogicalType::UInt64, PredicateLiteral::UInt64(value)) => CanonicalValue::Uint {
+            width: 8,
+            value: u128::from(value),
+        },
+        (CoveLogicalType::Float64, PredicateLiteral::Float64(value)) => {
+            CanonicalValue::Float64(value)
+        }
+        _ => return Err(CoveError::BadCovi),
+    };
+    tagged_canonical(value)
 }
 
 fn validate_column_indexes(

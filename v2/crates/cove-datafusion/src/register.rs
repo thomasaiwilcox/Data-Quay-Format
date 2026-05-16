@@ -27,7 +27,8 @@ use crate::bootstrap::{
 };
 
 pub use crate::options::{
-    CoveTableOptions, CovmTrustPolicy, CovxDiscovery, ExecutionCodePolicy, SidecarDigestPolicy,
+    CoveTableOptions, CoviDiscovery, CovmTrustPolicy, CovxDiscovery, ExecutionCodePolicy,
+    FilterResidualPolicy, SidecarDigestPolicy,
 };
 
 /// Build a DataFusion table provider for a local `.cove` file.

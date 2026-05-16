@@ -1,0 +1,11 @@
+[package]
+name = "cove-reader"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight reader facade for the Cove Format (COVE)"
+license = "MIT"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+cove-datafusion = { path = "../cove-datafusion" }
+arrow-array = "58"

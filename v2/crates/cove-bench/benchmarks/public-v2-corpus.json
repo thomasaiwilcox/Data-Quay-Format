@@ -1,0 +1,185 @@
+{
+  "version": 1,
+  "name": "cove-v2-public-reference",
+  "profiles": {
+    "ci": {
+      "rows": 2048,
+      "purpose": "fast deterministic coverage for PR and release gates"
+    },
+    "standard": {
+      "rows": 32768,
+      "purpose": "developer-local benchmark corpus"
+    },
+    "publication": {
+      "rows": 262144,
+      "purpose": "larger public report corpus"
+    }
+  },
+  "datasets": [
+    {
+      "id": "events",
+      "kind": "arrow-generated-cove-parquet",
+      "seed": 1,
+      "artifacts": ["events.cove", "events.parquet", "events.orc", "events.covx", "events.covm", "events.covi"],
+      "columns": ["id", "amount", "bucket", "name", "active"]
+    },
+    {
+      "id": "synthetic-cache",
+      "kind": "coverage-cache-fixture",
+      "seed": 2,
+      "artifacts": ["synthetic-cache.cove", "synthetic-cache.cove.cache"],
+      "columns": ["id", "name", "active"]
+    },
+    {
+      "id": "wide-events",
+      "kind": "deterministic-wide-generated",
+      "seed": 11,
+      "base_artifacts": ["events.cove", "events.parquet"],
+      "purpose": "wide projection and full-scan workload"
+    },
+    {
+      "id": "point-lookup-events",
+      "kind": "deterministic-point-lookup-generated",
+      "seed": 12,
+      "base_artifacts": ["events.cove", "events.covi"],
+      "purpose": "single-key lookup and COVI candidate workload"
+    },
+    {
+      "id": "composite-predicate-events",
+      "kind": "deterministic-composite-predicate-generated",
+      "seed": 13,
+      "base_artifacts": ["events.cove", "events.covx", "events.covi"],
+      "purpose": "AND/OR, range, IN, and composite pruning workload"
+    },
+    {
+      "id": "coverage-events",
+      "kind": "deterministic-coverage-generated",
+      "seed": 14,
+      "base_artifacts": ["synthetic-cache.cove", "synthetic-cache.cove.cache"],
+      "purpose": "coverage proof, cache hit/miss, and stale-proof workload"
+    },
+    {
+      "id": "index-only-events",
+      "kind": "deterministic-index-only-generated",
+      "seed": 15,
+      "base_artifacts": ["events.cove", "events.covi"],
+      "purpose": "metadata aggregate and exact index-only workload"
+    },
+    {
+      "id": "dimensional-events",
+      "kind": "deterministic-dimensional-generated",
+      "seed": 16,
+      "base_artifacts": ["events.cove", "events.covm"],
+      "purpose": "dimension-style filters and manifest planning workload"
+    },
+    {
+      "id": "archive-events",
+      "kind": "deterministic-archive-generated",
+      "seed": 17,
+      "base_artifacts": ["events.cove", "events.covx"],
+      "purpose": "archive-style acceleration and cold/warm object-store workload"
+    },
+    {
+      "id": "tpc-style-events",
+      "kind": "deterministic-tpc-style-generated",
+      "seed": 18,
+      "base_artifacts": ["events.cove", "events.parquet", "events.covm"],
+      "purpose": "TPC-style generated scan, filter, and aggregate workload"
+    },
+    {
+      "id": "tpch-style",
+      "kind": "deterministic-tpch-generated",
+      "seed": 21,
+      "artifacts": ["tpch-style.cove", "tpch-style.parquet", "tpch-style.orc", "tpch-style.report.json"],
+      "purpose": "TPC-H-style generated scan, filter, and file-size workload"
+    },
+    {
+      "id": "tpcds-style",
+      "kind": "deterministic-tpcds-generated",
+      "seed": 22,
+      "artifacts": ["tpcds-style.cove", "tpcds-style.parquet", "tpcds-style.orc", "tpcds-style.report.json"],
+      "purpose": "TPC-DS-style generated projection and predicate workload"
+    },
+    {
+      "id": "medical-operational",
+      "kind": "deterministic-medical-operational-generated",
+      "seed": 23,
+      "artifacts": ["medical-operational.cove", "medical-operational.parquet", "medical-operational.orc", "medical-operational.report.json"],
+      "purpose": "medical-style operational nested-adjacent generated workload"
+    },
+    {
+      "id": "negative-corrupt",
+      "kind": "deterministic-negative-corrupt",
+      "seed": 24,
+      "artifacts": ["negative-corrupt.cove", "negative-corrupt.expected.json"],
+      "purpose": "expected-error corpus coverage"
+    },
+    {
+      "id": "canonicalisation",
+      "kind": "deterministic-canonicalisation-vectors",
+      "seed": 25,
+      "artifacts": ["canonicalisation.json"],
+      "purpose": "canonical value identity and normalization evidence"
+    },
+    {
+      "id": "semantic-mapping",
+      "kind": "deterministic-covemap-semantic-mapping",
+      "seed": 26,
+      "artifacts": ["semantic-mapping/people.covemap", "semantic-mapping/people.csv", "semantic-mapping/expected.json"],
+      "purpose": "semantic mapping conversion and evidence workload"
+    }
+  ],
+  "query_groups": [
+    "full_numeric_scan",
+    "string_category_scan",
+    "equality_filter",
+    "in_filter",
+    "range_filter",
+    "point_lookup",
+    "top_n",
+    "metadata_count_min_max",
+    "object_store_cold_warm",
+    "covm_many_file_planning",
+    "parquet_conversion_cost",
+    "orc_conversion_cost",
+    "orc_full_scan_readback",
+    "file_size_overhead",
+    "orc_file_size_overhead",
+    "covx_acceleration",
+    "covi_index_latency",
+    "covi_index_only_count",
+    "cove_map_identity",
+    "layout_scan_split",
+    "coverage_provider_lookup",
+    "coverage_cache_hit_miss_invalidation",
+    "filecode_group_by",
+    "execution_code_remap_overhead",
+    "registered_codec_decode_predicate_kernel",
+    "fallback_payload_overhead",
+    "page_cluster_range_coalescing",
+    "zero_copy_success_fallback_rate",
+    "coverage_degree_tightness",
+    "tpch_style_queries",
+    "tpcds_style_queries",
+    "medical_operational_queries",
+    "negative_corrupt_validation",
+    "canonicalisation_vectors",
+    "semantic_mapping_corpus"
+  ],
+  "required_report_fields": [
+    "planning_ns",
+    "scan_ns",
+    "end_to_end_ns",
+    "rows_materialized",
+    "elapsed_time_ns",
+    "bytes_read",
+    "request_count",
+    "fragments_visited",
+    "pages_visited",
+    "pruning_tightness",
+    "coverage_cache",
+    "index_use",
+    "memory_peak_bytes",
+    "artifact_sizes"
+  ]
+}

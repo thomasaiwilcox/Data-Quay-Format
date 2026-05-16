@@ -143,7 +143,7 @@ impl SegmentMetadataCacheKey {
             file_ordinal,
             table_id: segment_ref.table_id,
             segment_id: segment_ref.segment_id,
-            row_start: u64::from(segment_ref.row_start),
+            row_start: segment_ref.row_start,
             offset: segment_ref.offset,
             length: segment_ref.length,
         }

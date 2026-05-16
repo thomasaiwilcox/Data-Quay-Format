@@ -1,0 +1,16 @@
+[package]
+name = "cove-fuzz"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Deterministic fuzz and mutation harness for COVE v2"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+cove-cache = { path = "../cove-cache" }
+cove-codec = { path = "../cove-codec" }
+cove-coverage = { path = "../cove-coverage" }
+cove-index = { path = "../cove-index" }
+cove-layout = { path = "../cove-layout" }
+cove-runtime = { path = "../cove-runtime" }
+serde_json = "1"

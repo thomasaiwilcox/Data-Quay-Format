@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Encoded array decoding.
+//! Cove Format (COVE) v2.0 — Encoded array decoding.
 //!
 //! This module provides access to individual rows within an encoded column
 //! array, supporting the encodings described in Section 20 of the specification.
@@ -515,7 +515,8 @@ impl<'a> EncodedArray<'a> {
             CoveEncodingKind::Canonical => self.decode_canonical_row(row),
             CoveEncodingKind::Sequence
             | CoveEncodingKind::Lz4Block
-            | CoveEncodingKind::ZstdBlock => Err(CoveError::UnsupportedEncoding(format!(
+            | CoveEncodingKind::ZstdBlock
+            | CoveEncodingKind::RegisteredEncoding => Err(CoveError::UnsupportedEncoding(format!(
                 "{:?}",
                 self.encoding
             ))),

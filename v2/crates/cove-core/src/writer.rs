@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Minimal reference writer.
+//! Cove Format (COVE) v2.0 — Minimal reference writer.
 //!
 //! Produces a valid, structurally complete COVE file.
 //! The produced file satisfies the COVE-Core Minimal Profile (Section 72.1).
@@ -49,6 +49,7 @@ use crate::{
         topn::TopNSummary,
     },
     metadata,
+    nested_schema::NestedSchemaSectionV1,
     page::{
         page_uses_payload_elision, ColumnPageIndexEntryV1, PAGE_FLAG_CODEC_MASK,
         PAGE_FLAG_STATS_ONLY_CONSTANT,
@@ -191,8 +192,9 @@ mod tests {
         encoding::nested::{ListLayout, ListLayoutPayload},
         footer::CoveFooter,
         header::CoveHeaderV1,
+        nested_schema::{NestedSchemaEntryV1, NestedSchemaNodeV1, NestedSchemaSectionV1},
         page::{ColumnPageIndex, PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT},
-        page_payload::{ColumnPagePayloadV1, PageBufferKind},
+        page_payload::{ColumnPagePayloadV1, CoveEncodingNodeV1, PageBufferKind},
         postscript::CovePostscriptV1,
         reader::{validate_bytes_with_options, ValidationOptions},
         segment::TableSegmentPayloadV1,
@@ -888,15 +890,84 @@ mod tests {
                 }],
             }],
         };
-        let payload = ListLayoutPayload {
+        let nested_schema = NestedSchemaSectionV1::new(vec![NestedSchemaEntryV1 {
+            table_id: 1,
+            column_id: 1,
+            root: NestedSchemaNodeV1 {
+                name: "tags".into(),
+                logical: CoveLogicalType::List,
+                physical: CovePhysicalKind::List,
+                nullable: false,
+                precision: 0,
+                scale: 0,
+                collation_id: 0,
+                flags: 0,
+                fixed_size_list_len: 0,
+                children: vec![NestedSchemaNodeV1::scalar(
+                    "item",
+                    CoveLogicalType::Int32,
+                    CovePhysicalKind::NumCode,
+                    false,
+                )],
+            },
+        }]);
+        let layout_payload = ListLayoutPayload {
             layout: ListLayout {
                 offsets: vec![0, 2, 2, 5],
             },
             child_row_count: 5,
         };
+        let values = [10i64, 11, 12, 13, 14]
+            .into_iter()
+            .flat_map(i64::to_le_bytes)
+            .collect::<Vec<_>>();
+        let payload = ColumnPagePayloadV1::build_tree(
+            3,
+            0,
+            vec![
+                CoveEncodingNodeV1 {
+                    node_id: 0,
+                    encoding_kind: CoveEncodingKind::Canonical,
+                    logical_type: CoveLogicalType::List,
+                    physical_kind: CovePhysicalKind::List,
+                    flags: 0,
+                    logical_len: 3,
+                    child_count: 1,
+                    buffer_count: 1,
+                    params_offset: 0,
+                    params_length: 0,
+                    stats_id: 0,
+                    reserved: 0,
+                },
+                CoveEncodingNodeV1 {
+                    node_id: 1,
+                    encoding_kind: CoveEncodingKind::NumCode,
+                    logical_type: CoveLogicalType::Int32,
+                    physical_kind: CovePhysicalKind::NumCode,
+                    flags: 0,
+                    logical_len: 5,
+                    child_count: 0,
+                    buffer_count: 1,
+                    params_offset: 0,
+                    params_length: 0,
+                    stats_id: 0,
+                    reserved: 0,
+                },
+            ],
+            vec![
+                (PageBufferKind::ChildLayout, layout_payload.encode()),
+                (PageBufferKind::Values, values),
+            ],
+        )
+        .unwrap();
         let mut segment = ScanSegment::new(1, 0, 0, 3, 1);
-        segment.set_column_pages(1, vec![ScanPageSpec::new(3, payload.encode())]);
+        segment.set_column_pages(
+            1,
+            vec![ScanPageSpec::new(3, payload)
+                .with_encoding_root(CoveEncodingKind::Canonical as u32)],
+        );
         let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer.push_nested_schema(&nested_schema).unwrap();
         writer.push_segment(segment);
 
         let bytes = writer.write().unwrap();
@@ -939,11 +1010,16 @@ mod tests {
             [page.page_offset as usize..(page.page_offset + page.page_length) as usize];
         let decoded = column_page_payload(page_wire, page).unwrap();
         let decoded = ColumnPagePayloadV1::parse(&decoded).unwrap();
-        let values = decoded
-            .buffer_bytes(PageBufferKind::Values)
+        let tree = decoded.tree().unwrap();
+        let layout_descriptor = tree
+            .buffer_of_kind(PageBufferKind::ChildLayout)
             .unwrap()
             .unwrap();
-        assert_eq!(ListLayoutPayload::parse(values).unwrap(), payload);
+        let layout = decoded
+            .buffer_bytes_for_descriptor(layout_descriptor)
+            .unwrap();
+        assert_eq!(ListLayoutPayload::parse(layout).unwrap(), layout_payload);
+        assert_eq!(tree.children.len(), 1);
     }
 
     #[test]
@@ -973,6 +1049,29 @@ mod tests {
             }],
         };
         let mut writer = ScanProfileCoveWriter::new(catalog);
+        writer
+            .push_nested_schema(&NestedSchemaSectionV1::new(vec![NestedSchemaEntryV1 {
+                table_id: 1,
+                column_id: 1,
+                root: NestedSchemaNodeV1 {
+                    name: "tags".into(),
+                    logical: CoveLogicalType::List,
+                    physical: CovePhysicalKind::List,
+                    nullable: false,
+                    precision: 0,
+                    scale: 0,
+                    collation_id: 0,
+                    flags: 0,
+                    fixed_size_list_len: 0,
+                    children: vec![NestedSchemaNodeV1::scalar(
+                        "item",
+                        CoveLogicalType::Int32,
+                        CovePhysicalKind::NumCode,
+                        false,
+                    )],
+                },
+            }]))
+            .unwrap();
         writer.push_segment(ScanSegment::new(1, 0, 0, 3, 1));
         assert!(matches!(writer.write(), Err(CoveError::BadSection(_))));
     }

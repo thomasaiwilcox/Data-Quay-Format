@@ -1,6 +1,12 @@
 [workspace]
 members = [
     "crates/cove-core",
+    "crates/cove-reader",
+    "crates/cove-writer",
+    "crates/cove-convert",
+    "crates/cove-engine",
+    "crates/cove-io",
+    "crates/cove-harbor",
     "crates/cove-arrow",
     "crates/cove-datafusion",
     "crates/cove-validate",
@@ -16,5 +22,10 @@ members = [
     "crates/cove-coverage",
     "crates/cove-index",
     "crates/cove-cache",
+    "crates/cove-fuzz",
+    "vendor/orc-rust",
 ]
 resolver = "2"
+
+[patch.crates-io]
+orc-rust = { path = "vendor/orc-rust" }

@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 #[cfg(feature = "parquet-compare")]

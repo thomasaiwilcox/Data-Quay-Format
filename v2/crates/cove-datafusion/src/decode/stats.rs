@@ -15,7 +15,17 @@ pub struct DecodeStats {
     pub covx_sidecars_loaded: usize,
     pub covx_sidecars_stale: usize,
     pub covx_sidecars_ignored: usize,
+    pub covi_sidecars_loaded: usize,
+    pub covi_sidecars_stale: usize,
+    pub covi_sidecars_ignored: usize,
+    pub covi_candidate_pruned: usize,
+    pub covi_index_only_answers: usize,
     pub sidecar_index_fallbacks: usize,
+    pub covel_sections_loaded: usize,
+    pub covel_sections_ignored: usize,
+    pub covel_scan_splits_loaded: usize,
+    pub covel_scan_splits_used: usize,
+    pub covel_zero_copy_maps_loaded: usize,
     pub pages_decoded: usize,
     pub rows_materialized: usize,
     pub rows_selected: usize,
@@ -67,6 +77,17 @@ pub struct DecodeStats {
     pub arrow_export_direct_transform_rows: usize,
     pub arrow_export_direct_constant_plainvarint_rows: usize,
     pub arrow_export_fallback_rows: usize,
+    pub zero_copy_compatible_buffers: usize,
+    pub zero_copy_materialized_buffers: usize,
+    pub zero_copy_materialized_unknown_role: usize,
+    pub zero_copy_materialized_null_polarity_mismatch: usize,
+    pub zero_copy_materialized_compressed_buffer: usize,
+    pub zero_copy_materialized_dictionary_mismatch: usize,
+    pub zero_copy_materialized_nested_layout_mismatch: usize,
+    pub zero_copy_materialized_insufficient_lifetime: usize,
+    pub zero_copy_materialized_active_visibility_overlay: usize,
+    pub zero_copy_materialized_selection_mismatch: usize,
+    pub zero_copy_materialized_export_path_mismatch: usize,
     pub filecode_dictionary_keys_rows: usize,
     pub filecode_dictionary_remapped_rows: usize,
     pub filecode_dictionary_values_bytes: usize,
@@ -90,7 +111,16 @@ impl DecodeStats {
         self.covx_sidecars_loaded += stats.covx_sidecars_loaded;
         self.covx_sidecars_stale += stats.covx_sidecars_stale;
         self.covx_sidecars_ignored += stats.covx_sidecars_ignored;
+        self.covi_sidecars_loaded += stats.covi_sidecars_loaded;
+        self.covi_sidecars_stale += stats.covi_sidecars_stale;
+        self.covi_sidecars_ignored += stats.covi_sidecars_ignored;
+        self.covi_candidate_pruned += stats.covi_candidate_pruned;
+        self.covi_index_only_answers += stats.covi_index_only_answers;
         self.sidecar_index_fallbacks += stats.sidecar_index_fallbacks;
+        self.covel_sections_loaded += stats.covel_sections_loaded;
+        self.covel_sections_ignored += stats.covel_sections_ignored;
+        self.covel_scan_splits_loaded += stats.covel_scan_splits_loaded;
+        self.covel_zero_copy_maps_loaded += stats.covel_zero_copy_maps_loaded;
     }
 
     pub(crate) fn add_decode(&mut self, other: Self) {
@@ -105,7 +135,17 @@ impl DecodeStats {
         self.covx_sidecars_loaded += other.covx_sidecars_loaded;
         self.covx_sidecars_stale += other.covx_sidecars_stale;
         self.covx_sidecars_ignored += other.covx_sidecars_ignored;
+        self.covi_sidecars_loaded += other.covi_sidecars_loaded;
+        self.covi_sidecars_stale += other.covi_sidecars_stale;
+        self.covi_sidecars_ignored += other.covi_sidecars_ignored;
+        self.covi_candidate_pruned += other.covi_candidate_pruned;
+        self.covi_index_only_answers += other.covi_index_only_answers;
         self.sidecar_index_fallbacks += other.sidecar_index_fallbacks;
+        self.covel_sections_loaded += other.covel_sections_loaded;
+        self.covel_sections_ignored += other.covel_sections_ignored;
+        self.covel_scan_splits_loaded += other.covel_scan_splits_loaded;
+        self.covel_scan_splits_used += other.covel_scan_splits_used;
+        self.covel_zero_copy_maps_loaded += other.covel_zero_copy_maps_loaded;
         self.pages_decoded += other.pages_decoded;
         self.rows_materialized += other.rows_materialized;
         self.rows_selected += other.rows_selected;
@@ -159,6 +199,25 @@ impl DecodeStats {
         self.arrow_export_direct_constant_plainvarint_rows +=
             other.arrow_export_direct_constant_plainvarint_rows;
         self.arrow_export_fallback_rows += other.arrow_export_fallback_rows;
+        self.zero_copy_compatible_buffers += other.zero_copy_compatible_buffers;
+        self.zero_copy_materialized_buffers += other.zero_copy_materialized_buffers;
+        self.zero_copy_materialized_unknown_role += other.zero_copy_materialized_unknown_role;
+        self.zero_copy_materialized_null_polarity_mismatch +=
+            other.zero_copy_materialized_null_polarity_mismatch;
+        self.zero_copy_materialized_compressed_buffer +=
+            other.zero_copy_materialized_compressed_buffer;
+        self.zero_copy_materialized_dictionary_mismatch +=
+            other.zero_copy_materialized_dictionary_mismatch;
+        self.zero_copy_materialized_nested_layout_mismatch +=
+            other.zero_copy_materialized_nested_layout_mismatch;
+        self.zero_copy_materialized_insufficient_lifetime +=
+            other.zero_copy_materialized_insufficient_lifetime;
+        self.zero_copy_materialized_active_visibility_overlay +=
+            other.zero_copy_materialized_active_visibility_overlay;
+        self.zero_copy_materialized_selection_mismatch +=
+            other.zero_copy_materialized_selection_mismatch;
+        self.zero_copy_materialized_export_path_mismatch +=
+            other.zero_copy_materialized_export_path_mismatch;
         self.filecode_dictionary_keys_rows += other.filecode_dictionary_keys_rows;
         self.filecode_dictionary_remapped_rows += other.filecode_dictionary_remapped_rows;
         self.filecode_dictionary_values_bytes += other.filecode_dictionary_values_bytes;

@@ -2,7 +2,14 @@
 
 use std::collections::BTreeSet;
 
-use cove_core::{checksum, CoveError};
+use cove_core::{
+    checksum,
+    constants::{CoveLogicalType, CovePhysicalKind, SectionKind},
+    footer::{CoveFooter, CoveSectionEntryV1},
+    segment::TableSegmentIndexEntryV1,
+    table::TableEntry,
+    CoveError,
+};
 
 const ABSENT_ID: u32 = u32::MAX;
 
@@ -313,6 +320,331 @@ impl ScanSplitIndexV2 {
         out.extend_from_slice(&header.serialize());
         for entry in &self.entries {
             out.extend_from_slice(&entry.serialize());
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastMetadataIndexHeaderV2 {
+    pub entry_count: u32,
+    pub entry_len: u16,
+    pub index_kind: u8,
+    pub flags: u8,
+    pub entries_offset: u64,
+    pub entries_length: u64,
+    pub checksum: u32,
+}
+
+impl FastMetadataIndexHeaderV2 {
+    pub const LEN: usize = 28;
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let header = Self {
+            entry_count: read_u32(bytes, 0)?,
+            entry_len: read_u16(bytes, 4)?,
+            index_kind: read_u8(bytes, 6)?,
+            flags: read_u8(bytes, 7)?,
+            entries_offset: read_u64(bytes, 8)?,
+            entries_length: read_u64(bytes, 16)?,
+            checksum: read_u32(bytes, 24)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 24, header.checksum)?;
+        if header.entry_len as usize != FastMetadataIndexEntryV2::LEN {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        Ok(header)
+    }
+
+    pub fn serialize(&self) -> Result<[u8; Self::LEN], CoveError> {
+        if self.entry_len as usize != FastMetadataIndexEntryV2::LEN {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let mut out = [0u8; Self::LEN];
+        out[0..4].copy_from_slice(&self.entry_count.to_le_bytes());
+        out[4..6].copy_from_slice(&self.entry_len.to_le_bytes());
+        out[6] = self.index_kind;
+        out[7] = self.flags;
+        out[8..16].copy_from_slice(&self.entries_offset.to_le_bytes());
+        out[16..24].copy_from_slice(&self.entries_length.to_le_bytes());
+        let crc = checksum::crc32c(&out);
+        out[24..28].copy_from_slice(&crc.to_le_bytes());
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FastMetadataIndexEntryV2 {
+    pub target_kind: u16,
+    pub flags: u16,
+    pub table_id: u32,
+    pub column_id: u32,
+    pub segment_id: u32,
+    pub morsel_id: u32,
+    pub section_id: u32,
+    pub local_id: u32,
+    pub offset: u64,
+    pub length: u64,
+    pub checksum_or_crc32c: u32,
+    pub reserved: u32,
+}
+
+impl FastMetadataIndexEntryV2 {
+    pub const LEN: usize = 52;
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let entry = Self {
+            target_kind: read_u16(bytes, 0)?,
+            flags: read_u16(bytes, 2)?,
+            table_id: read_u32(bytes, 4)?,
+            column_id: read_u32(bytes, 8)?,
+            segment_id: read_u32(bytes, 12)?,
+            morsel_id: read_u32(bytes, 16)?,
+            section_id: read_u32(bytes, 20)?,
+            local_id: read_u32(bytes, 24)?,
+            offset: read_u64(bytes, 28)?,
+            length: read_u64(bytes, 36)?,
+            checksum_or_crc32c: read_u32(bytes, 44)?,
+            reserved: read_u32(bytes, 48)?,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    pub fn serialize(&self) -> Result<[u8; Self::LEN], CoveError> {
+        self.validate()?;
+        let mut out = [0u8; Self::LEN];
+        out[0..2].copy_from_slice(&self.target_kind.to_le_bytes());
+        out[2..4].copy_from_slice(&self.flags.to_le_bytes());
+        out[4..8].copy_from_slice(&self.table_id.to_le_bytes());
+        out[8..12].copy_from_slice(&self.column_id.to_le_bytes());
+        out[12..16].copy_from_slice(&self.segment_id.to_le_bytes());
+        out[16..20].copy_from_slice(&self.morsel_id.to_le_bytes());
+        out[20..24].copy_from_slice(&self.section_id.to_le_bytes());
+        out[24..28].copy_from_slice(&self.local_id.to_le_bytes());
+        out[28..36].copy_from_slice(&self.offset.to_le_bytes());
+        out[36..44].copy_from_slice(&self.length.to_le_bytes());
+        out[44..48].copy_from_slice(&self.checksum_or_crc32c.to_le_bytes());
+        out[48..52].copy_from_slice(&self.reserved.to_le_bytes());
+        Ok(out)
+    }
+
+    pub fn validate(&self) -> Result<(), CoveError> {
+        if self.target_kind > 7 {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        if self.reserved != 0 {
+            return Err(CoveError::ReservedNotZero);
+        }
+        checked_end(self.offset, self.length)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastMetadataIndexV2 {
+    pub header: FastMetadataIndexHeaderV2,
+    pub entries: Vec<FastMetadataIndexEntryV2>,
+}
+
+impl FastMetadataIndexV2 {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let header = FastMetadataIndexHeaderV2::parse(bytes)?;
+        let start = usize::try_from(header.entries_offset).map_err(|_| CoveError::OffsetRange)?;
+        let len = usize::try_from(header.entries_length).map_err(|_| CoveError::OffsetRange)?;
+        let end = start.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+        let expected = header
+            .entry_count
+            .checked_mul(FastMetadataIndexEntryV2::LEN as u32)
+            .ok_or(CoveError::ArithOverflow)? as usize;
+        if start < FastMetadataIndexHeaderV2::LEN || end != bytes.len() || len != expected {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let entries = bytes[start..end]
+            .chunks_exact(FastMetadataIndexEntryV2::LEN)
+            .map(FastMetadataIndexEntryV2::parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_fast_metadata_entries(&header, &entries)?;
+        Ok(Self { header, entries })
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
+        validate_fast_metadata_entries(&self.header, &self.entries)?;
+        let mut header = self.header.clone();
+        header.entry_count = self.entries.len() as u32;
+        header.entry_len = FastMetadataIndexEntryV2::LEN as u16;
+        header.entries_offset = FastMetadataIndexHeaderV2::LEN as u64;
+        header.entries_length = (self.entries.len() * FastMetadataIndexEntryV2::LEN) as u64;
+        let mut out = Vec::with_capacity(
+            FastMetadataIndexHeaderV2::LEN + self.entries.len() * FastMetadataIndexEntryV2::LEN,
+        );
+        out.extend_from_slice(&header.serialize()?);
+        for entry in &self.entries {
+            out.extend_from_slice(&entry.serialize()?);
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageClusterDirectoryHeaderV2 {
+    pub cluster_count: u32,
+    pub flags: u32,
+    pub checksum: u32,
+}
+
+impl PageClusterDirectoryHeaderV2 {
+    pub const LEN: usize = 12;
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let header = Self {
+            cluster_count: read_u32(bytes, 0)?,
+            flags: read_u32(bytes, 4)?,
+            checksum: read_u32(bytes, 8)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 8, header.checksum)?;
+        Ok(header)
+    }
+
+    pub fn serialize(&self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[0..4].copy_from_slice(&self.cluster_count.to_le_bytes());
+        out[4..8].copy_from_slice(&self.flags.to_le_bytes());
+        let crc = checksum::crc32c(&out);
+        out[8..12].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageClusterEntryV2 {
+    pub cluster_id: u32,
+    pub section_id: u32,
+    pub offset: u64,
+    pub length: u64,
+    pub table_id: u32,
+    pub segment_id: u32,
+    pub first_morsel_id: u32,
+    pub morsel_count: u32,
+    pub first_page_ref: u32,
+    pub page_count: u32,
+    pub preferred_read_alignment: u32,
+    pub preferred_coalesce_distance: u32,
+    pub flags: u32,
+    pub checksum: u32,
+}
+
+impl PageClusterEntryV2 {
+    pub const LEN: usize = 64;
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < Self::LEN {
+            return Err(CoveError::BufferTooShort);
+        }
+        let entry = Self {
+            cluster_id: read_u32(bytes, 0)?,
+            section_id: read_u32(bytes, 4)?,
+            offset: read_u64(bytes, 8)?,
+            length: read_u64(bytes, 16)?,
+            table_id: read_u32(bytes, 24)?,
+            segment_id: read_u32(bytes, 28)?,
+            first_morsel_id: read_u32(bytes, 32)?,
+            morsel_count: read_u32(bytes, 36)?,
+            first_page_ref: read_u32(bytes, 40)?,
+            page_count: read_u32(bytes, 44)?,
+            preferred_read_alignment: read_u32(bytes, 48)?,
+            preferred_coalesce_distance: read_u32(bytes, 52)?,
+            flags: read_u32(bytes, 56)?,
+            checksum: read_u32(bytes, 60)?,
+        };
+        verify_crc(&bytes[..Self::LEN], 60, entry.checksum)?;
+        entry.validate()?;
+        Ok(entry)
+    }
+
+    pub fn serialize(&self) -> Result<[u8; Self::LEN], CoveError> {
+        self.validate()?;
+        let mut out = [0u8; Self::LEN];
+        out[0..4].copy_from_slice(&self.cluster_id.to_le_bytes());
+        out[4..8].copy_from_slice(&self.section_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        out[16..24].copy_from_slice(&self.length.to_le_bytes());
+        out[24..28].copy_from_slice(&self.table_id.to_le_bytes());
+        out[28..32].copy_from_slice(&self.segment_id.to_le_bytes());
+        out[32..36].copy_from_slice(&self.first_morsel_id.to_le_bytes());
+        out[36..40].copy_from_slice(&self.morsel_count.to_le_bytes());
+        out[40..44].copy_from_slice(&self.first_page_ref.to_le_bytes());
+        out[44..48].copy_from_slice(&self.page_count.to_le_bytes());
+        out[48..52].copy_from_slice(&self.preferred_read_alignment.to_le_bytes());
+        out[52..56].copy_from_slice(&self.preferred_coalesce_distance.to_le_bytes());
+        out[56..60].copy_from_slice(&self.flags.to_le_bytes());
+        let crc = checksum::crc32c(&out);
+        out[60..64].copy_from_slice(&crc.to_le_bytes());
+        Ok(out)
+    }
+
+    pub fn validate(&self) -> Result<(), CoveError> {
+        if self.section_id == 0 || self.length == 0 || self.page_count == 0 {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        checked_end(self.offset, self.length)?;
+        self.first_morsel_id
+            .checked_add(self.morsel_count)
+            .ok_or(CoveError::ArithOverflow)?;
+        self.first_page_ref
+            .checked_add(self.page_count)
+            .ok_or(CoveError::ArithOverflow)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageClusterDirectoryV2 {
+    pub header: PageClusterDirectoryHeaderV2,
+    pub entries: Vec<PageClusterEntryV2>,
+}
+
+impl PageClusterDirectoryV2 {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let header = PageClusterDirectoryHeaderV2::parse(bytes)?;
+        let count = header.cluster_count as usize;
+        let entries_start = PageClusterDirectoryHeaderV2::LEN;
+        let entries_len = count
+            .checked_mul(PageClusterEntryV2::LEN)
+            .ok_or(CoveError::ArithOverflow)?;
+        let end = entries_start
+            .checked_add(entries_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        if bytes.len() != end {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let entries = bytes[entries_start..end]
+            .chunks_exact(PageClusterEntryV2::LEN)
+            .map(PageClusterEntryV2::parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_page_clusters(&header, &entries)?;
+        Ok(Self { header, entries })
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, CoveError> {
+        validate_page_clusters(&self.header, &self.entries)?;
+        let mut header = self.header.clone();
+        header.cluster_count = self.entries.len() as u32;
+        let mut out = Vec::with_capacity(
+            PageClusterDirectoryHeaderV2::LEN + self.entries.len() * PageClusterEntryV2::LEN,
+        );
+        out.extend_from_slice(&header.serialize());
+        for entry in &self.entries {
+            out.extend_from_slice(&entry.serialize()?);
         }
         Ok(out)
     }
@@ -877,6 +1209,58 @@ pub enum ZeroCopyMaterializationReasonV2 {
     ActiveVisibilityOverlay,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedLayoutPlanV2 {
+    pub plan: LayoutPlanV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedScanSplitIndexV2 {
+    pub index: ScanSplitIndexV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedZeroCopyBufferMapV2 {
+    pub map: ZeroCopyBufferMapV2,
+}
+
+impl ValidatedLayoutPlanV2 {
+    pub fn validate(
+        plan: LayoutPlanV2,
+        footer: &CoveFooter,
+        table: &TableEntry,
+        segments: &[TableSegmentIndexEntryV1],
+        page_clusters: Option<&PageClusterDirectoryV2>,
+        scan_splits: Option<&ScanSplitIndexV2>,
+    ) -> Result<Self, CoveError> {
+        validate_layout_plan_authority(&plan, footer, table, segments, page_clusters, scan_splits)?;
+        Ok(Self { plan })
+    }
+}
+
+impl ValidatedScanSplitIndexV2 {
+    pub fn validate(
+        index: ScanSplitIndexV2,
+        table: &TableEntry,
+        segments: &[TableSegmentIndexEntryV1],
+        page_clusters: Option<&PageClusterDirectoryV2>,
+    ) -> Result<Self, CoveError> {
+        validate_scan_split_authority(&index, table, segments, page_clusters)?;
+        Ok(Self { index })
+    }
+}
+
+impl ValidatedZeroCopyBufferMapV2 {
+    pub fn validate(
+        map: ZeroCopyBufferMapV2,
+        table: &TableEntry,
+        segments: &[TableSegmentIndexEntryV1],
+    ) -> Result<Self, CoveError> {
+        validate_zero_copy_map_authority(&map, table, segments)?;
+        Ok(Self { map })
+    }
+}
+
 pub fn validate_scan_splits(
     header: &ScanSplitIndexHeaderV2,
     entries: &[ScanSplitEntryV2],
@@ -892,6 +1276,407 @@ pub fn validate_scan_splits(
         checked_end(entry.row_start, entry.row_count)?;
     }
     Ok(())
+}
+
+pub fn validate_scan_split_authority(
+    index: &ScanSplitIndexV2,
+    table: &TableEntry,
+    segments: &[TableSegmentIndexEntryV1],
+    page_clusters: Option<&PageClusterDirectoryV2>,
+) -> Result<(), CoveError> {
+    validate_scan_splits(&index.header, &index.entries)?;
+    let clusters = page_clusters.map(|directory| {
+        directory
+            .entries
+            .iter()
+            .map(|entry| entry.cluster_id)
+            .collect::<BTreeSet<_>>()
+    });
+    for split in &index.entries {
+        if split.table_id != table.table_id || split.segment_count == 0 || split.morsel_count == 0 {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let first_segment_end = split
+            .first_segment_id
+            .checked_add(split.segment_count)
+            .ok_or(CoveError::ArithOverflow)?;
+        let mut remaining_morsels = split.morsel_count;
+        let mut actual_row_start = None;
+        let mut actual_row_count = 0u64;
+        for segment_id in split.first_segment_id..first_segment_end {
+            let segment = segment_by_id(segments, table.table_id, segment_id)?;
+            let start_morsel = if segment_id == split.first_segment_id {
+                split.first_morsel_id
+            } else {
+                0
+            };
+            if start_morsel >= segment.morsel_count {
+                return Err(CoveError::BadLayoutPlan);
+            }
+            let available = segment
+                .morsel_count
+                .checked_sub(start_morsel)
+                .ok_or(CoveError::ArithOverflow)?;
+            let take = available.min(remaining_morsels);
+            if take == 0 {
+                return Err(CoveError::BadLayoutPlan);
+            }
+            let start_row = segment_morsel_row_start(segment, start_morsel)?;
+            if actual_row_start.is_none() {
+                actual_row_start = Some(start_row);
+            }
+            actual_row_count = actual_row_count
+                .checked_add(segment_morsel_span_rows(segment, start_morsel, take)?)
+                .ok_or(CoveError::ArithOverflow)?;
+            remaining_morsels = remaining_morsels
+                .checked_sub(take)
+                .ok_or(CoveError::ArithOverflow)?;
+            if remaining_morsels == 0 {
+                break;
+            }
+        }
+        if remaining_morsels != 0 {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        if actual_row_start != Some(split.row_start) || actual_row_count != split.row_count {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        if split.cluster_count != 0 {
+            let Some(cluster_ids) = clusters.as_ref() else {
+                return Err(CoveError::BadLayoutPlan);
+            };
+            let cluster_end = split
+                .first_cluster_id
+                .checked_add(split.cluster_count)
+                .ok_or(CoveError::ArithOverflow)?;
+            for cluster_id in split.first_cluster_id..cluster_end {
+                if !cluster_ids.contains(&cluster_id) {
+                    return Err(CoveError::BadLayoutPlan);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_fast_metadata_entries(
+    header: &FastMetadataIndexHeaderV2,
+    entries: &[FastMetadataIndexEntryV2],
+) -> Result<(), CoveError> {
+    if header.entry_count as usize != entries.len() {
+        return Err(CoveError::BadLayoutPlan);
+    }
+    let mut prev = None;
+    let mut seen = BTreeSet::new();
+    for entry in entries {
+        entry.validate()?;
+        let key = (
+            entry.target_kind,
+            entry.table_id,
+            entry.column_id,
+            entry.segment_id,
+            entry.morsel_id,
+            entry.section_id,
+            entry.local_id,
+        );
+        if let Some(previous) = prev {
+            if key <= previous {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        if !seen.insert(key) {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        prev = Some(key);
+    }
+    Ok(())
+}
+
+pub fn validate_page_clusters(
+    header: &PageClusterDirectoryHeaderV2,
+    entries: &[PageClusterEntryV2],
+) -> Result<(), CoveError> {
+    if header.cluster_count as usize != entries.len() {
+        return Err(CoveError::BadLayoutPlan);
+    }
+    let mut cluster_ids = BTreeSet::new();
+    let mut prev_id = None;
+    for entry in entries {
+        entry.validate()?;
+        if let Some(previous) = prev_id {
+            if entry.cluster_id <= previous {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        if !cluster_ids.insert(entry.cluster_id) {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        prev_id = Some(entry.cluster_id);
+    }
+    Ok(())
+}
+
+pub fn validate_fast_metadata_authority(
+    index: &FastMetadataIndexV2,
+    footer: &CoveFooter,
+) -> Result<(), CoveError> {
+    validate_fast_metadata_entries(&index.header, &index.entries)?;
+    for entry in &index.entries {
+        let section = section_by_id(footer, entry.section_id)?;
+        let section_end = section.end_offset()?;
+        let entry_end = entry
+            .offset
+            .checked_add(entry.length)
+            .ok_or(CoveError::ArithOverflow)?;
+        if entry.offset < section.offset || entry_end > section_end {
+            return Err(CoveError::BadLayoutPlan);
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_page_cluster_authority(
+    directory: &PageClusterDirectoryV2,
+    footer: &CoveFooter,
+    table: &TableEntry,
+    segments: &[TableSegmentIndexEntryV1],
+) -> Result<(), CoveError> {
+    validate_page_clusters(&directory.header, &directory.entries)?;
+    for cluster in &directory.entries {
+        let section = section_by_id(footer, cluster.section_id)?;
+        if section.section_kind != SectionKind::TableSegmentData as u16 {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        if cluster.table_id != table.table_id {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let section_end = section.end_offset()?;
+        let cluster_end = cluster
+            .offset
+            .checked_add(cluster.length)
+            .ok_or(CoveError::ArithOverflow)?;
+        if cluster.offset < section.offset || cluster_end > section_end {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let segment = segments
+            .iter()
+            .find(|segment| {
+                segment.table_id == cluster.table_id && segment.segment_id == cluster.segment_id
+            })
+            .ok_or(CoveError::BadLayoutPlan)?;
+        let segment_end = segment
+            .offset
+            .checked_add(segment.length)
+            .ok_or(CoveError::ArithOverflow)?;
+        if cluster.offset < segment.offset || cluster_end > segment_end {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let morsel_end = cluster
+            .first_morsel_id
+            .checked_add(cluster.morsel_count)
+            .ok_or(CoveError::ArithOverflow)?;
+        if morsel_end > segment.morsel_count {
+            return Err(CoveError::BadLayoutPlan);
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_layout_plan_authority(
+    plan: &LayoutPlanV2,
+    footer: &CoveFooter,
+    table: &TableEntry,
+    segments: &[TableSegmentIndexEntryV1],
+    page_clusters: Option<&PageClusterDirectoryV2>,
+    scan_splits: Option<&ScanSplitIndexV2>,
+) -> Result<(), CoveError> {
+    validate_layout_nodes(&plan.header, &plan.nodes)?;
+    for node in &plan.nodes {
+        validate_layout_node_authority(node, footer, table, segments, page_clusters, scan_splits)?;
+    }
+    Ok(())
+}
+
+pub fn validate_zero_copy_map_authority(
+    map: &ZeroCopyBufferMapV2,
+    table: &TableEntry,
+    segments: &[TableSegmentIndexEntryV1],
+) -> Result<(), CoveError> {
+    let target_ids = map
+        .targets
+        .iter()
+        .map(|target| target.target_id)
+        .collect::<BTreeSet<_>>();
+    for entry in &map.entries {
+        if !target_ids.contains(&entry.target_id) || entry.table_id != table.table_id {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let column = table
+            .columns
+            .iter()
+            .find(|column| column.column_id == entry.column_id)
+            .ok_or(CoveError::BadLayoutPlan)?;
+        if CoveLogicalType::from_u16(entry.logical_type) != Some(column.logical)
+            || CovePhysicalKind::from_u8(entry.physical_kind) != Some(column.physical)
+        {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        let segment = segment_by_id(segments, table.table_id, entry.segment_id)?;
+        if entry.morsel_id >= segment.morsel_count || is_absent_ref(entry.page_ref) {
+            return Err(CoveError::BadLayoutPlan);
+        }
+        if entry.source_endianness != 0 {
+            return Err(CoveError::BadLayoutPlan);
+        }
+    }
+    Ok(())
+}
+
+pub fn build_default_scan_split_index(
+    table: &TableEntry,
+    segments: &[TableSegmentIndexEntryV1],
+) -> Result<ScanSplitIndexV2, CoveError> {
+    let entries = segments
+        .iter()
+        .filter(|segment| segment.table_id == table.table_id && segment.morsel_count != 0)
+        .enumerate()
+        .map(|(index, segment)| ScanSplitEntryV2 {
+            split_id: u32::try_from(index + 1).unwrap_or(u32::MAX),
+            table_id: table.table_id,
+            row_start: segment.row_start,
+            row_count: u64::from(segment.row_count),
+            first_segment_id: segment.segment_id,
+            segment_count: 1,
+            first_morsel_id: 0,
+            morsel_count: segment.morsel_count,
+            first_cluster_id: 0,
+            cluster_count: 0,
+            stats_ref: segment.stats_ref,
+            estimated_uncompressed_bytes: segment.length,
+            estimated_encoded_bytes: segment.length,
+            flags: 0,
+            checksum: 0,
+        })
+        .collect::<Vec<_>>();
+    let index = ScanSplitIndexV2 {
+        header: ScanSplitIndexHeaderV2 {
+            split_count: entries.len() as u32,
+            flags: 0,
+            checksum: 0,
+        },
+        entries,
+    };
+    validate_scan_split_authority(&index, table, segments, None)?;
+    Ok(index)
+}
+
+pub fn build_default_layout_plan(
+    table: &TableEntry,
+    segments: &[TableSegmentIndexEntryV1],
+    scan_splits: Option<&ScanSplitIndexV2>,
+) -> Result<LayoutPlanV2, CoveError> {
+    let mut nodes = Vec::with_capacity(segments.len() + 2);
+    let segment_child_start = 2u32;
+    nodes.push(LayoutPlanNodeV2 {
+        node_id: 1,
+        parent_node_id: ABSENT_ID,
+        node_kind: 0,
+        flags: 0,
+        table_id: ABSENT_ID,
+        column_id: ABSENT_ID,
+        segment_id: ABSENT_ID,
+        first_morsel_id: 0,
+        morsel_count: 0,
+        row_start: 0,
+        row_count: table.row_count,
+        section_id: 0,
+        cluster_id: 0,
+        first_child_index: 1,
+        child_count: 1,
+        stats_ref: ABSENT_ID,
+        split_ref: ABSENT_ID,
+        checksum: 0,
+    });
+    nodes.push(LayoutPlanNodeV2 {
+        node_id: 2,
+        parent_node_id: 1,
+        node_kind: 1,
+        flags: 0,
+        table_id: table.table_id,
+        column_id: ABSENT_ID,
+        segment_id: ABSENT_ID,
+        first_morsel_id: 0,
+        morsel_count: 0,
+        row_start: 0,
+        row_count: table.row_count,
+        section_id: 0,
+        cluster_id: 0,
+        first_child_index: segment_child_start,
+        child_count: segments
+            .iter()
+            .filter(|segment| segment.table_id == table.table_id)
+            .count() as u32,
+        stats_ref: ABSENT_ID,
+        split_ref: ABSENT_ID,
+        checksum: 0,
+    });
+    for segment in segments
+        .iter()
+        .filter(|segment| segment.table_id == table.table_id)
+    {
+        let split_ref = scan_splits
+            .and_then(|splits| {
+                splits
+                    .entries
+                    .iter()
+                    .find(|split| split.first_segment_id == segment.segment_id)
+                    .map(|split| split.split_id)
+            })
+            .unwrap_or(ABSENT_ID);
+        nodes.push(LayoutPlanNodeV2 {
+            node_id: u32::try_from(nodes.len() + 1).map_err(|_| CoveError::ArithOverflow)?,
+            parent_node_id: 2,
+            node_kind: 3,
+            flags: 0,
+            table_id: table.table_id,
+            column_id: ABSENT_ID,
+            segment_id: segment.segment_id,
+            first_morsel_id: 0,
+            morsel_count: segment.morsel_count,
+            row_start: segment.row_start,
+            row_count: u64::from(segment.row_count),
+            section_id: 0,
+            cluster_id: 0,
+            first_child_index: 0,
+            child_count: 0,
+            stats_ref: segment.stats_ref,
+            split_ref,
+            checksum: 0,
+        });
+    }
+    let plan = LayoutPlanV2 {
+        header: LayoutPlanHeaderV2 {
+            layout_id: 1,
+            node_count: nodes.len() as u32,
+            root_node_id: 1,
+            flags: 0,
+            checksum: 0,
+        },
+        nodes,
+    };
+    validate_layout_nodes(&plan.header, &plan.nodes)?;
+    Ok(plan)
+}
+
+fn section_by_id(footer: &CoveFooter, section_id: u32) -> Result<&CoveSectionEntryV1, CoveError> {
+    if section_id == 0 {
+        return Err(CoveError::BadLayoutPlan);
+    }
+    footer
+        .sections
+        .iter()
+        .find(|section| section.section_id == section_id)
+        .ok_or(CoveError::BadLayoutPlan)
 }
 
 pub fn validate_layout_nodes(
@@ -927,7 +1712,205 @@ pub fn validate_layout_nodes(
             return Err(CoveError::BadLayoutPlan);
         }
     }
+    for node in nodes {
+        let mut parent = node.parent_node_id;
+        let mut hops = 0usize;
+        while parent != ABSENT_ID {
+            hops += 1;
+            if hops > nodes.len() {
+                return Err(CoveError::BadLayoutPlan);
+            }
+            let parent_node = nodes
+                .iter()
+                .find(|candidate| candidate.node_id == parent)
+                .ok_or(CoveError::BadLayoutPlan)?;
+            parent = parent_node.parent_node_id;
+        }
+    }
     Ok(())
+}
+
+fn validate_layout_node_authority(
+    node: &LayoutPlanNodeV2,
+    footer: &CoveFooter,
+    table: &TableEntry,
+    segments: &[TableSegmentIndexEntryV1],
+    page_clusters: Option<&PageClusterDirectoryV2>,
+    scan_splits: Option<&ScanSplitIndexV2>,
+) -> Result<(), CoveError> {
+    if !is_absent_ref(node.table_id) && node.table_id != table.table_id {
+        return Err(CoveError::BadLayoutPlan);
+    }
+    if !is_absent_ref(node.column_id)
+        && !table
+            .columns
+            .iter()
+            .any(|column| column.column_id == node.column_id)
+    {
+        return Err(CoveError::BadLayoutPlan);
+    }
+    let segment = if !is_absent_ref(node.segment_id) {
+        Some(segment_by_id(segments, table.table_id, node.segment_id)?)
+    } else {
+        None
+    };
+    if let Some(segment) = segment {
+        if node.morsel_count != 0 {
+            let morsel_end = node
+                .first_morsel_id
+                .checked_add(node.morsel_count)
+                .ok_or(CoveError::ArithOverflow)?;
+            if morsel_end > segment.morsel_count {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        if node.row_count != 0 {
+            let row_end = checked_end(node.row_start, node.row_count)?;
+            let segment_end = checked_end(segment.row_start, u64::from(segment.row_count))?;
+            if node.row_start < segment.row_start || row_end > segment_end {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+    } else if node.row_count != 0 {
+        let row_end = checked_end(node.row_start, node.row_count)?;
+        if row_end > table.row_count {
+            return Err(CoveError::BadLayoutPlan);
+        }
+    }
+    if !is_absent_ref(node.section_id) {
+        section_by_id(footer, node.section_id)?;
+    }
+    if !is_absent_ref(node.cluster_id) {
+        let Some(directory) = page_clusters else {
+            return Err(CoveError::BadLayoutPlan);
+        };
+        if !directory
+            .entries
+            .iter()
+            .any(|cluster| cluster.cluster_id == node.cluster_id)
+        {
+            return Err(CoveError::BadLayoutPlan);
+        }
+    }
+    if !is_absent_ref(node.split_ref) {
+        let Some(splits) = scan_splits else {
+            return Err(CoveError::BadLayoutPlan);
+        };
+        if !splits
+            .entries
+            .iter()
+            .any(|split| split.split_id == node.split_ref)
+        {
+            return Err(CoveError::BadLayoutPlan);
+        }
+    }
+    match node.node_kind {
+        0 => {
+            if node.parent_node_id != ABSENT_ID {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        1 => {
+            if node.table_id != table.table_id {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        3 => {
+            if segment.is_none() {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        4 => {
+            if segment.is_none() || node.morsel_count == 0 {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        5 => {
+            if is_absent_ref(node.column_id) {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        6 => {
+            if is_absent_ref(node.cluster_id) {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        7 => {
+            if is_absent_ref(node.section_id) {
+                return Err(CoveError::BadLayoutPlan);
+            }
+        }
+        2 | 255 => {}
+        _ => return Err(CoveError::BadLayoutPlan),
+    }
+    Ok(())
+}
+
+fn segment_by_id(
+    segments: &[TableSegmentIndexEntryV1],
+    table_id: u32,
+    segment_id: u32,
+) -> Result<&TableSegmentIndexEntryV1, CoveError> {
+    segments
+        .iter()
+        .find(|segment| segment.table_id == table_id && segment.segment_id == segment_id)
+        .ok_or(CoveError::BadLayoutPlan)
+}
+
+fn segment_morsel_row_start(
+    segment: &TableSegmentIndexEntryV1,
+    morsel_id: u32,
+) -> Result<u64, CoveError> {
+    if morsel_id >= segment.morsel_count {
+        return Err(CoveError::BadLayoutPlan);
+    }
+    let offset = u64::from(morsel_id)
+        .checked_mul(u64::from(segment.morsel_row_count))
+        .ok_or(CoveError::ArithOverflow)?;
+    segment
+        .row_start
+        .checked_add(offset)
+        .ok_or(CoveError::ArithOverflow)
+}
+
+fn segment_morsel_row_count(
+    segment: &TableSegmentIndexEntryV1,
+    morsel_id: u32,
+) -> Result<u64, CoveError> {
+    let start = u64::from(morsel_id)
+        .checked_mul(u64::from(segment.morsel_row_count))
+        .ok_or(CoveError::ArithOverflow)?;
+    if start >= u64::from(segment.row_count) {
+        return Err(CoveError::BadLayoutPlan);
+    }
+    let remaining = u64::from(segment.row_count)
+        .checked_sub(start)
+        .ok_or(CoveError::ArithOverflow)?;
+    Ok(remaining.min(u64::from(segment.morsel_row_count)))
+}
+
+fn segment_morsel_span_rows(
+    segment: &TableSegmentIndexEntryV1,
+    first_morsel_id: u32,
+    morsel_count: u32,
+) -> Result<u64, CoveError> {
+    let mut rows = 0u64;
+    let end = first_morsel_id
+        .checked_add(morsel_count)
+        .ok_or(CoveError::ArithOverflow)?;
+    if end > segment.morsel_count {
+        return Err(CoveError::BadLayoutPlan);
+    }
+    for morsel_id in first_morsel_id..end {
+        rows = rows
+            .checked_add(segment_morsel_row_count(segment, morsel_id)?)
+            .ok_or(CoveError::ArithOverflow)?;
+    }
+    Ok(rows)
+}
+
+fn is_absent_ref(value: u32) -> bool {
+    value == 0 || value == ABSENT_ID
 }
 
 fn verify_crc(bytes: &[u8], checksum_offset: usize, expected: u32) -> Result<(), CoveError> {
@@ -1273,5 +2256,136 @@ mod tests {
                 ZeroCopyMaterializationReasonV2::UnknownRole
             )
         );
+    }
+
+    fn authority_table() -> cove_core::table::TableEntry {
+        cove_core::table::TableEntry {
+            table_id: 1,
+            namespace: String::new(),
+            name: "t".into(),
+            row_count: 1024,
+            primary_sort_key_count: 0,
+            clustering_key_count: 0,
+            flags: 0,
+            columns: vec![cove_core::table::ColumnEntry {
+                column_id: 1,
+                name: "c".into(),
+                logical: CoveLogicalType::UInt16,
+                physical: CovePhysicalKind::NumCode,
+                nullable: false,
+                sort_order: 0,
+                collation_id: 0,
+                precision: 0,
+                scale: 0,
+                flags: 0,
+            }],
+        }
+    }
+
+    fn authority_segments() -> Vec<TableSegmentIndexEntryV1> {
+        vec![TableSegmentIndexEntryV1 {
+            table_id: 1,
+            segment_id: 1,
+            row_start: 0,
+            row_count: 1024,
+            morsel_count: 4,
+            morsel_row_count: 256,
+            column_count: 1,
+            offset: 4096,
+            length: 8192,
+            stats_ref: 0,
+            flags: 0,
+            checksum: 0,
+        }]
+    }
+
+    fn authority_footer(sections: Vec<CoveSectionEntryV1>) -> CoveFooter {
+        CoveFooter {
+            header: cove_core::footer::CoveFooterHeaderV1 {
+                footer_magic: *b"COVF",
+                footer_version: 1,
+                header_len: cove_core::constants::FOOTER_HEADER_LEN as u16,
+                section_count: sections.len() as u32,
+                section_entry_len: cove_core::constants::SECTION_ENTRY_LEN,
+                flags: 0,
+                metadata_len: 0,
+                reserved: [0; 24],
+            },
+            sections,
+            metadata_json: Vec::new(),
+        }
+    }
+
+    fn authority_section(section_id: u32, kind: SectionKind) -> CoveSectionEntryV1 {
+        CoveSectionEntryV1 {
+            section_id,
+            section_kind: kind as u16,
+            profile: cove_core::constants::PrimaryProfile::LayoutPlanning as u8,
+            flags: 0,
+            offset: 1024,
+            length: 128,
+            uncompressed_length: 128,
+            item_count: 1,
+            row_count: 0,
+            compression: cove_core::constants::CompressionCodec::None as u8,
+            encryption: 0,
+            alignment_log2: 0,
+            reserved0: 0,
+            required_features: 0,
+            optional_features: 0,
+            crc32c: 0,
+            reserved1: 0,
+        }
+    }
+
+    #[test]
+    fn scan_split_authority_rejects_stale_ranges() {
+        let table = authority_table();
+        let segments = authority_segments();
+        let mut index = build_default_scan_split_index(&table, &segments).unwrap();
+        index.entries[0].row_count = 1023;
+        assert!(matches!(
+            validate_scan_split_authority(&index, &table, &segments, None),
+            Err(CoveError::BadLayoutPlan)
+        ));
+    }
+
+    #[test]
+    fn layout_plan_authority_rejects_missing_section_refs() {
+        let table = authority_table();
+        let segments = authority_segments();
+        let splits = build_default_scan_split_index(&table, &segments).unwrap();
+        let mut plan = build_default_layout_plan(&table, &segments, Some(&splits)).unwrap();
+        plan.nodes[2].section_id = 99;
+        let footer = authority_footer(vec![authority_section(1, SectionKind::TableSegmentData)]);
+        assert!(matches!(
+            validate_layout_plan_authority(&plan, &footer, &table, &segments, None, Some(&splits)),
+            Err(CoveError::BadLayoutPlan)
+        ));
+    }
+
+    #[test]
+    fn zero_copy_authority_rejects_missing_page_refs() {
+        let table = authority_table();
+        let segments = authority_segments();
+        let mut entry = zero_copy_entry();
+        entry.page_ref = ABSENT_ID;
+        let map = zero_copy_map(entry);
+        assert!(matches!(
+            validate_zero_copy_map_authority(&map, &table, &segments),
+            Err(CoveError::BadLayoutPlan)
+        ));
+    }
+
+    #[test]
+    fn default_covel_helpers_build_authoritative_metadata() {
+        let table = authority_table();
+        let segments = authority_segments();
+        let splits = build_default_scan_split_index(&table, &segments).unwrap();
+        validate_scan_split_authority(&splits, &table, &segments, None).unwrap();
+        let plan = build_default_layout_plan(&table, &segments, Some(&splits)).unwrap();
+        let footer = authority_footer(Vec::new());
+        validate_layout_plan_authority(&plan, &footer, &table, &segments, None, Some(&splits))
+            .unwrap();
     }
 }

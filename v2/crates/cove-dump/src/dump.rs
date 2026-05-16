@@ -1,5 +1,6 @@
 use std::{fs, path::Path};
 
+use arrow_json::writer::{LineDelimited, WriterBuilder};
 use cove_core::{
     compression,
     constants::{
@@ -8,11 +9,12 @@ use cove_core::{
     dictionary::FileDictionary,
     page::ColumnPageIndex,
     reader::{self, ValidationOptions},
-    segment::TableSegmentPayloadV1,
+    segment::{TableColumnDirectoryEntryV1, TableSegmentPayloadV1},
     table::TableCatalog,
 };
+use cove_datafusion::explain::{execute_planned_scan, plan_local_file, ExplainOptions};
 
-use crate::args::DumpMode;
+use crate::args::{DumpMode, EncodedArraySelector};
 
 pub(crate) fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result<(), String> {
     let data = fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?;
@@ -64,6 +66,17 @@ pub(crate) fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result
         DumpMode::Pages => {
             let report = semantically_validated(&data)?;
             dump_pages(&data, &report.validated, max_bytes)?;
+        }
+        DumpMode::Rows { columns } => {
+            dump_rows(path, columns)?;
+        }
+        DumpMode::Morsels => {
+            let report = semantically_validated(&data)?;
+            dump_morsels(&data, &report.validated)?;
+        }
+        DumpMode::EncodedArray(selector) => {
+            let report = semantically_validated(&data)?;
+            dump_encoded_array(&data, &report.validated, &selector, max_bytes)?;
         }
         DumpMode::Stats => {
             let validated = structurally_validated(&data)?;
@@ -163,6 +176,32 @@ pub(crate) fn dump_file(path: &Path, mode: DumpMode, max_bytes: usize) -> Result
     Ok(())
 }
 
+fn dump_rows(path: &Path, columns: Option<Vec<String>>) -> Result<(), String> {
+    let options = ExplainOptions {
+        projection: columns,
+        ..ExplainOptions::default()
+    };
+    let planned = plan_local_file(path, options).map_err(|e| format!("plan: {e}"))?;
+    let decoded = execute_planned_scan(&planned).map_err(|e| format!("decode: {e}"))?;
+    let mut writer = WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .build::<_, LineDelimited>(Vec::new());
+    for batch in &decoded.batches {
+        writer
+            .write(batch)
+            .map_err(|e| format!("json row writer: {e}"))?;
+    }
+    writer
+        .finish()
+        .map_err(|e| format!("json row writer finish: {e}"))?;
+    let bytes = writer.into_inner();
+    print!(
+        "{}",
+        String::from_utf8(bytes).map_err(|e| format!("json row writer utf8: {e}"))?
+    );
+    Ok(())
+}
+
 fn structurally_validated(data: &[u8]) -> Result<reader::ValidatedCoveFile, String> {
     reader::validate_bytes(data).map_err(|e| format!("validation: {e}"))
 }
@@ -250,6 +289,142 @@ fn dump_pages(
         }
     }
     Ok(())
+}
+
+fn dump_morsels(
+    data: &[u8],
+    validated: &cove_core::reader::ValidatedCoveFile,
+) -> Result<(), String> {
+    let segments = validated
+        .footer
+        .sections
+        .iter()
+        .filter(|section| section.section_kind == SectionKind::TableSegmentData as u16)
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        println!("(no table segment data sections)");
+        return Ok(());
+    }
+    for section in segments {
+        let segment_bytes = compression::section_payload(data, section)
+            .map_err(|e| format!("section payload: {e}"))?;
+        let segment = TableSegmentPayloadV1::parse(segment_bytes.as_ref())
+            .map_err(|e| format!("segment parse: {e}"))?;
+        println!(
+            "segment section_id={} table={} segment={} row_start={} rows={} morsels={} columns={}",
+            section.section_id,
+            segment.header.table_id,
+            segment.header.segment_id,
+            segment.header.row_start,
+            segment.header.row_count,
+            segment.header.morsel_count,
+            segment.columns.len()
+        );
+        for column in &segment.columns {
+            let page_index = parse_column_page_index(segment_bytes.as_ref(), column)?;
+            for page in &page_index.entries {
+                println!(
+                    "  morsel={} column={} rows={} non_null={} nulls={} encoding={} page_len={}",
+                    page.morsel_id,
+                    column.column_id,
+                    page.row_count,
+                    page.non_null_count,
+                    page.null_count,
+                    page.encoding_root,
+                    page.page_length,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dump_encoded_array(
+    data: &[u8],
+    validated: &cove_core::reader::ValidatedCoveFile,
+    selector: &EncodedArraySelector,
+    max_bytes: usize,
+) -> Result<(), String> {
+    let section = validated
+        .footer
+        .sections
+        .iter()
+        .find(|section| section.section_id == selector.section_id)
+        .ok_or_else(|| format!("section id {} not found", selector.section_id))?;
+    if section.section_kind != SectionKind::TableSegmentData as u16 {
+        return Err(format!(
+            "section {} is not a TableSegmentData section",
+            selector.section_id
+        ));
+    }
+    let segment_bytes =
+        compression::section_payload(data, section).map_err(|e| format!("section payload: {e}"))?;
+    let segment = TableSegmentPayloadV1::parse(segment_bytes.as_ref())
+        .map_err(|e| format!("segment parse: {e}"))?;
+    for column in &segment.columns {
+        if selector
+            .column_id
+            .map(|expected| column.column_id != expected)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let page_index = parse_column_page_index(segment_bytes.as_ref(), column)?;
+        for (page_idx, page) in page_index.entries.iter().enumerate() {
+            if selector
+                .morsel_id
+                .map(|expected| page.morsel_id != expected)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            println!(
+                "encoded_array section_id={} table={} segment={} column={} logical={:?} physical={:?} page={} morsel={} rows={} non_null={} nulls={} encoding={} offset={} len={} raw_len={} flags=0x{:08x}",
+                selector.section_id,
+                segment.header.table_id,
+                segment.header.segment_id,
+                column.column_id,
+                column.logical_type,
+                column.physical_kind,
+                page_idx,
+                page.morsel_id,
+                page.row_count,
+                page.non_null_count,
+                page.null_count,
+                page.encoding_root,
+                page.page_offset,
+                page.page_length,
+                page.uncompressed_length,
+                page.flags,
+            );
+            if page.page_length != 0 && max_bytes != 0 {
+                let start = page.page_offset as usize;
+                let end = page
+                    .page_offset
+                    .checked_add(page.page_length)
+                    .ok_or_else(|| "page payload offset overflow".to_string())?
+                    as usize;
+                let payload = compression::column_page_payload(&segment_bytes[start..end], page)
+                    .map_err(|e| format!("page payload: {e}"))?;
+                let shown = payload.len().min(max_bytes);
+                println!("  payload_len={} showing={} bytes", payload.len(), shown);
+                print_hex(&payload[..shown]);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_column_page_index(
+    segment_bytes: &[u8],
+    column: &TableColumnDirectoryEntryV1,
+) -> Result<ColumnPageIndex, String> {
+    let start = column.page_index_offset as usize;
+    let end = column
+        .page_index_offset
+        .checked_add(column.page_index_length)
+        .ok_or_else(|| "page index offset overflow".to_string())? as usize;
+    ColumnPageIndex::parse(&segment_bytes[start..end]).map_err(|e| format!("page index parse: {e}"))
 }
 
 fn dump_section_group(

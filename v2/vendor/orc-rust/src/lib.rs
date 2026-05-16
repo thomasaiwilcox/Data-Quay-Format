@@ -1,0 +1,80 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! A native Rust implementation of the [Apache ORC](https://orc.apache.org) file format,
+//! providing API's to read data into [Apache Arrow](https://arrow.apache.org) in-memory arrays.
+//!
+//! # Example read usage
+//!
+//! ```no_run
+//! # use std::fs::File;
+//! # use orc_rust::arrow_reader::ArrowReaderBuilder;
+//! let file = File::open("/path/to/file.orc").unwrap();
+//! let reader = ArrowReaderBuilder::try_new(file).unwrap().build();
+//! let record_batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+//! ```
+//!
+//! # Example write usage
+//!
+//! ```no_run
+//! # use std::fs::File;
+//! # use arrow::array::RecordBatch;
+//! # use orc_rust::arrow_writer::ArrowWriterBuilder;
+//! # fn get_record_batch() -> RecordBatch {
+//! #     unimplemented!()
+//! # }
+//! let file = File::create("/path/to/file.orc").unwrap();
+//! let batch = get_record_batch();
+//! let mut writer = ArrowWriterBuilder::new(file, batch.schema())
+//!     .try_build()
+//!     .unwrap();
+//! writer.write(&batch).unwrap();
+//! writer.close().unwrap();
+//! ```
+
+pub mod array_decoder;
+pub mod arrow_reader;
+pub mod arrow_writer;
+#[cfg(feature = "async")]
+pub mod async_arrow_reader;
+pub mod bloom_filter;
+mod column;
+pub mod compression;
+#[allow(dead_code)]
+mod encoding;
+pub mod error;
+mod memory;
+pub mod predicate;
+pub mod projection;
+#[allow(dead_code)]
+pub mod proto;
+pub mod reader;
+pub mod row_group_filter;
+pub mod row_index;
+pub mod row_selection;
+pub mod schema;
+pub mod statistics;
+pub mod stripe;
+mod writer;
+
+pub use arrow_reader::{ArrowReader, ArrowReaderBuilder};
+pub use arrow_writer::{ArrowWriter, ArrowWriterBuilder};
+#[cfg(feature = "async")]
+pub use async_arrow_reader::ArrowStreamReader;
+pub use predicate::{ComparisonOp, Predicate, PredicateValue};
+pub use row_selection::{RowSelection, RowSelector};
+pub use schema::{ArrowSchemaOptions, TimestampPrecision};

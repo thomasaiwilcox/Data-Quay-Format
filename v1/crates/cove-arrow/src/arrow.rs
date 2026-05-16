@@ -33,6 +33,9 @@ use arrow_buffer::{
 use arrow_data::{ByteView, MAX_INLINE_VIEW_LEN};
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 
+type ArrowViewParts = (ScalarBuffer<u128>, Vec<Buffer>, Option<NullBuffer>);
+type ArrowOffsetParts = (OffsetBuffer<i32>, Buffer, Option<NullBuffer>);
+
 use crate::{
     array::{CoveArrayValue, EncodedArray},
     constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind, StorageClass, ValueTag},
@@ -605,7 +608,7 @@ pub fn encoded_columns_to_arrow_arrays_with_options(
 ) -> Result<ArrowExportResult<Vec<ArrayRef>>, CoveError> {
     let owned_columns = columns
         .iter()
-        .map(|(name, array)| ArrowEncodedColumn::borrowed(*name, *array))
+        .map(|(name, array)| ArrowEncodedColumn::borrowed(name, array))
         .collect::<Vec<_>>();
     encoded_columns_to_arrow_arrays_with_owners_options(&owned_columns, selection, options)
 }
@@ -1802,7 +1805,7 @@ impl BytePayloadPlan {
         array: &EncodedArray<'_>,
         selection: ArrowRowSelection<'_>,
         data_owner: Option<&ArrowBufferOwner>,
-    ) -> Result<(ScalarBuffer<u128>, Vec<Buffer>, Option<NullBuffer>), CoveError> {
+    ) -> Result<ArrowViewParts, CoveError> {
         if matches!(selection, ArrowRowSelection::All) {
             return self.materialize_view_all_rows(array, data_owner);
         }
@@ -1843,7 +1846,7 @@ impl BytePayloadPlan {
         &self,
         array: &EncodedArray<'_>,
         data_owner: Option<&ArrowBufferOwner>,
-    ) -> Result<(ScalarBuffer<u128>, Vec<Buffer>, Option<NullBuffer>), CoveError> {
+    ) -> Result<ArrowViewParts, CoveError> {
         let row_count = usize::try_from(array.row_count).map_err(|_| CoveError::ArithOverflow)?;
         let has_nulls = match array.validity {
             Some(validity) => validity.null_count()? > 0,
@@ -2227,7 +2230,7 @@ impl BytePayloadPlan {
         &self,
         array: &EncodedArray<'_>,
         selection: ArrowRowSelection<'_>,
-    ) -> Result<Option<(OffsetBuffer<i32>, Buffer, Option<NullBuffer>)>, CoveError> {
+    ) -> Result<Option<ArrowOffsetParts>, CoveError> {
         if !matches!(self.layout, BytePayloadLayout::U32LengthPrefixed) {
             return Ok(None);
         }
@@ -3181,11 +3184,11 @@ fn direct_bytes_vec_to_arrow(
     }
 }
 
-fn fixed_width_payload_prefix<'a>(
-    data: &'a [u8],
+fn fixed_width_payload_prefix(
+    data: &[u8],
     row_count: usize,
     width: usize,
-) -> Result<&'a [u8], CoveError> {
+) -> Result<&[u8], CoveError> {
     let Some(required_len) = row_count.checked_mul(width) else {
         return Err(CoveError::ArithOverflow);
     };
@@ -3260,7 +3263,7 @@ fn retained_numcode_scalar_buffer<T: ArrowNativeType>(
         return Err(CoveError::OffsetRange);
     }
     let align = std::mem::align_of::<T>();
-    if (data.as_ptr() as usize) % align != 0 {
+    if !(data.as_ptr() as usize).is_multiple_of(align) {
         return Ok(None);
     }
     let Some(ptr) = NonNull::new(data.as_ptr() as *mut u8) else {
@@ -4520,7 +4523,7 @@ mod tests {
         .unwrap();
         let uints = result.value.as_any().downcast_ref::<UInt64Array>().unwrap();
         assert_eq!(uints.values(), &[10, 20]);
-        if (owner.as_ptr() as usize) % std::mem::align_of::<u64>() == 0 {
+        if (owner.as_ptr() as usize).is_multiple_of(std::mem::align_of::<u64>()) {
             assert_eq!(uints.to_data().buffers()[0].as_ptr(), owner.as_ptr());
         }
     }
@@ -4623,9 +4626,9 @@ mod tests {
         for pattern in 0u16..=255 {
             let mut chunk = [0u8; 8];
             let mut expected = 0u8;
-            for bit in 0..8 {
+            for (bit, slot) in chunk.iter_mut().enumerate() {
                 let value = ((pattern >> bit) & 1) as u8;
-                chunk[bit] = value;
+                *slot = value;
                 expected |= value << bit;
             }
             assert_eq!(pack_bool_chunk_8(&chunk).unwrap(), expected);

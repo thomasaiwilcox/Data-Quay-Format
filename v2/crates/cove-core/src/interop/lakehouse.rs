@@ -54,6 +54,72 @@ pub enum LakehouseOverlayDecision {
     ForbidVisibleExactness,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LakehouseFileIdentityRef {
+    pub file_id: Option<[u8; 16]>,
+    pub file_len: Option<u64>,
+    pub footer_crc32c: Option<u32>,
+    pub digest: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LakehouseRowRange {
+    pub start: u64,
+    pub len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LakehouseFileVisibility {
+    All,
+    VisibleRanges(Vec<LakehouseRowRange>),
+    DeletedRanges(Vec<LakehouseRowRange>),
+    DeletedBitmap { row_count: u64, words: Vec<u64> },
+}
+
+pub trait LakehouseVisibilityProvider {
+    fn visibility_for_file(
+        &self,
+        file: &LakehouseFileIdentityRef,
+    ) -> Result<Option<LakehouseFileVisibility>, CoveError>;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JsonLakehouseVisibilityProvider {
+    entries: Vec<(LakehouseFileIdentityRef, LakehouseFileVisibility)>,
+}
+
+impl JsonLakehouseVisibilityProvider {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|err| {
+            CoveError::BadSection(format!("invalid lakehouse visibility JSON: {err}"))
+        })?;
+        let entries = value
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                CoveError::BadSection("lakehouse visibility JSON requires files[]".into())
+            })?
+            .iter()
+            .map(parse_visibility_entry)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { entries })
+    }
+}
+
+impl LakehouseVisibilityProvider for JsonLakehouseVisibilityProvider {
+    fn visibility_for_file(
+        &self,
+        file: &LakehouseFileIdentityRef,
+    ) -> Result<Option<LakehouseFileVisibility>, CoveError> {
+        Ok(self
+            .entries
+            .iter()
+            .find(|(candidate, _)| lakehouse_file_identity_matches(candidate, file))
+            .map(|(_, visibility)| visibility.clone()))
+    }
+}
+
 impl LakehouseHints {
     const PARTITION_HEADER_LEN: usize = 36;
     const MIN_PARTITION_ENTRY_LEN: usize = 4;
@@ -348,6 +414,153 @@ impl LakehouseVisibilityOverlayRef {
         out.extend_from_slice(&reference_len.to_le_bytes());
         out.extend_from_slice(rb);
         Ok(())
+    }
+}
+
+fn parse_visibility_entry(
+    value: &serde_json::Value,
+) -> Result<(LakehouseFileIdentityRef, LakehouseFileVisibility), CoveError> {
+    let file = value.get("file").unwrap_or(value);
+    let identity = LakehouseFileIdentityRef {
+        file_id: optional_hex_16(file, "file_id")?,
+        file_len: optional_u64(file, "file_len")?,
+        footer_crc32c: optional_u64(file, "footer_crc32c")?
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| CoveError::BadSection("footer_crc32c exceeds u32".into()))?,
+        digest: optional_hex_32(file, "digest")?,
+    };
+    let visibility_value = value.get("visibility").ok_or_else(|| {
+        CoveError::BadSection("lakehouse visibility entry requires visibility".into())
+    })?;
+    Ok((identity, parse_file_visibility(visibility_value)?))
+}
+
+fn parse_file_visibility(value: &serde_json::Value) -> Result<LakehouseFileVisibility, CoveError> {
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CoveError::BadSection("lakehouse visibility requires kind".into()))?;
+    match kind {
+        "all" => Ok(LakehouseFileVisibility::All),
+        "visible_ranges" => Ok(LakehouseFileVisibility::VisibleRanges(parse_ranges(value)?)),
+        "deleted_ranges" => Ok(LakehouseFileVisibility::DeletedRanges(parse_ranges(value)?)),
+        "deleted_bitmap" => {
+            let row_count = required_u64(value, "row_count")?;
+            let words = value
+                .get("words")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| CoveError::BadSection("deleted_bitmap requires words[]".into()))?
+                .iter()
+                .map(|word| {
+                    word.as_u64().ok_or_else(|| {
+                        CoveError::BadSection("deleted_bitmap words must be u64".into())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(LakehouseFileVisibility::DeletedBitmap { row_count, words })
+        }
+        other => Err(CoveError::BadSection(format!(
+            "unsupported lakehouse visibility kind {other}"
+        ))),
+    }
+}
+
+fn parse_ranges(value: &serde_json::Value) -> Result<Vec<LakehouseRowRange>, CoveError> {
+    value
+        .get("ranges")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| CoveError::BadSection("range visibility requires ranges[]".into()))?
+        .iter()
+        .map(|range| {
+            Ok(LakehouseRowRange {
+                start: required_u64(range, "start")?,
+                len: required_u64(range, "len")?,
+            })
+        })
+        .collect()
+}
+
+fn lakehouse_file_identity_matches(
+    candidate: &LakehouseFileIdentityRef,
+    file: &LakehouseFileIdentityRef,
+) -> bool {
+    optional_identity_field_matches(candidate.file_id.as_ref(), file.file_id.as_ref())
+        && optional_identity_field_matches(candidate.file_len.as_ref(), file.file_len.as_ref())
+        && optional_identity_field_matches(
+            candidate.footer_crc32c.as_ref(),
+            file.footer_crc32c.as_ref(),
+        )
+        && optional_identity_field_matches(candidate.digest.as_ref(), file.digest.as_ref())
+}
+
+fn optional_identity_field_matches<T: Eq>(candidate: Option<&T>, actual: Option<&T>) -> bool {
+    match candidate {
+        Some(candidate) => actual.map(|actual| actual == candidate).unwrap_or(false),
+        None => true,
+    }
+}
+
+fn optional_u64(value: &serde_json::Value, key: &str) -> Result<Option<u64>, CoveError> {
+    value
+        .get(key)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| CoveError::BadSection(format!("{key} must be u64")))
+        })
+        .transpose()
+}
+
+fn required_u64(value: &serde_json::Value, key: &str) -> Result<u64, CoveError> {
+    optional_u64(value, key)?.ok_or_else(|| CoveError::BadSection(format!("{key} is required")))
+}
+
+fn optional_hex_16(value: &serde_json::Value, key: &str) -> Result<Option<[u8; 16]>, CoveError> {
+    value
+        .get(key)
+        .map(|value| {
+            let text = value
+                .as_str()
+                .ok_or_else(|| CoveError::BadSection(format!("{key} must be hex string")))?;
+            hex_array::<16>(text)
+        })
+        .transpose()
+}
+
+fn optional_hex_32(value: &serde_json::Value, key: &str) -> Result<Option<[u8; 32]>, CoveError> {
+    value
+        .get(key)
+        .map(|value| {
+            let text = value
+                .as_str()
+                .ok_or_else(|| CoveError::BadSection(format!("{key} must be hex string")))?;
+            hex_array::<32>(text)
+        })
+        .transpose()
+}
+
+fn hex_array<const N: usize>(text: &str) -> Result<[u8; N], CoveError> {
+    let text = text.trim();
+    if text.len() != N * 2 {
+        return Err(CoveError::BadSection(format!(
+            "hex value must contain {} characters",
+            N * 2
+        )));
+    }
+    let mut out = [0u8; N];
+    for (index, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
+        out[index] = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, CoveError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(CoveError::BadSection("invalid hex character".into())),
     }
 }
 

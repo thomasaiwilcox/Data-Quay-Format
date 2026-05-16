@@ -1,4 +1,4 @@
-use crate::CoveError;
+use crate::{feature_scope::FeatureUseRequestV2, CoveError};
 
 /// Options controlling the depth of validation.
 #[derive(Debug, Clone)]
@@ -170,6 +170,17 @@ pub fn validate_bytes_with_options(
         stages,
         ignored_optional_sections,
     })
+}
+
+pub fn validate_bytes_for_feature_use(
+    data: &[u8],
+    opts: ValidationOptions,
+    request: FeatureUseRequestV2,
+) -> Result<ValidationReport, CoveError> {
+    let report = validate_bytes_with_options(data, opts)?;
+    let scope_table = super::feature_scope_table_for(data, &report.validated)?;
+    scope_table.reject_unknowns_for_request(&request)?;
+    Ok(report)
 }
 
 pub(super) fn push_stage(

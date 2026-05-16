@@ -115,7 +115,7 @@ pub(super) fn selected_rows_for_morsel(
         let payload = match materialize_page_payload(
             segment_bytes,
             column,
-            &page,
+            page,
             state.page_payload_validation_policy(),
         ) {
             Ok(payload) => payload,
@@ -145,7 +145,7 @@ pub(super) fn selected_rows_for_morsel(
         } else {
             state.mounted().dictionary.as_ref()
         };
-        let array = encoded_array_for_page(&payload, &page, dictionary)?;
+        let array = encoded_array_for_page(&payload, page, dictionary)?;
         let applied = match try_apply_raw_predicate_to_selection(
             predicate,
             &array,
@@ -337,7 +337,7 @@ async fn read_page_wire<R: CoveRangeReader + ?Sized>(
     let end = start
         .checked_add(page.page_length)
         .ok_or(CoveError::ArithOverflow)?;
-    let ranges = vec![start..end];
+    let ranges = std::iter::once(start..end).collect::<Vec<_>>();
     let coalesced_plan = build_coalesced_range_plan(&ranges, state.range_coalescing())?;
     let range_stats = coalesced_plan.stats();
     stats.original_range_requests += range_stats.original_ranges;

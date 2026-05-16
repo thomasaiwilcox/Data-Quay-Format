@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 
 use super::*;
+use cove_core::index::aggregate::{DEFAULT_HLL_PRECISION, DEFAULT_KLL_K, DEFAULT_TOPK_K};
 
 /// One step in the Parquet → COVE conversion pipeline (Spec §51.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +101,8 @@ pub enum ParquetClusteringPolicy {
 pub struct ParquetConversionOptions {
     pub table_name: String,
     pub namespace: String,
+    pub source_identifier: Option<String>,
+    pub source_digest: Option<String>,
     pub morsel_row_count: u32,
     pub segment_row_count: u32,
     pub page_compression: CompressionCodec,
@@ -111,6 +114,12 @@ pub struct ParquetConversionOptions {
     pub topn_columns: Vec<String>,
     pub aggregate_policy: ParquetAggregatePolicy,
     pub aggregate_columns: Vec<String>,
+    pub aggregate_topk_columns: Vec<String>,
+    pub distinct_sketch_columns: Vec<String>,
+    pub quantile_sketch_columns: Vec<String>,
+    pub aggregate_topk_k: u32,
+    pub hll_precision: u8,
+    pub kll_k: u32,
     pub composite_zone_groups: Vec<Vec<String>>,
     pub emit_covx: bool,
     pub emit_covm: bool,
@@ -122,6 +131,8 @@ impl Default for ParquetConversionOptions {
         Self {
             table_name: "parquet_import".into(),
             namespace: "interop".into(),
+            source_identifier: None,
+            source_digest: None,
             morsel_row_count: 4096,
             segment_row_count: u32::MAX,
             page_compression: CompressionCodec::None,
@@ -133,6 +144,12 @@ impl Default for ParquetConversionOptions {
             topn_columns: Vec::new(),
             aggregate_policy: ParquetAggregatePolicy::None,
             aggregate_columns: Vec::new(),
+            aggregate_topk_columns: Vec::new(),
+            distinct_sketch_columns: Vec::new(),
+            quantile_sketch_columns: Vec::new(),
+            aggregate_topk_k: DEFAULT_TOPK_K,
+            hll_precision: DEFAULT_HLL_PRECISION,
+            kll_k: DEFAULT_KLL_K,
             composite_zone_groups: Vec::new(),
             emit_covx: false,
             emit_covm: false,
@@ -203,6 +220,16 @@ pub struct ParquetColumnReport {
 /// Machine-readable conversion report for Spec §51.5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParquetConversionReport {
+    pub source_format: String,
+    pub source_identifier: String,
+    pub source_digest: String,
+    pub conversion_policy_version: String,
+    pub timestamp_policy: String,
+    pub timezone_policy: String,
+    pub decimal_policy: String,
+    pub collation_policy: String,
+    pub canonicalization_policy: String,
+    pub row_reordering_policy: String,
     pub table_name: String,
     pub namespace: String,
     pub row_count: u64,
@@ -215,6 +242,7 @@ pub struct ParquetConversionReport {
     pub target_schema_fingerprint: String,
     pub validation_result: bool,
     pub generated_section_kinds: Vec<String>,
+    pub aggregate_synopsis_kinds: Vec<String>,
     pub unsupported_features: Vec<String>,
     pub lossy_features: Vec<String>,
     pub nested_shape_fallbacks: Vec<String>,
@@ -225,7 +253,16 @@ pub struct ParquetConversionReport {
 impl ParquetConversionReport {
     pub fn to_json_value(&self) -> Value {
         json!({
-            "source_format": "parquet",
+            "source_format": self.source_format,
+            "source_identifier": self.source_identifier,
+            "source_digest": self.source_digest,
+            "conversion_policy_version": self.conversion_policy_version,
+            "timestamp_policy": self.timestamp_policy,
+            "timezone_policy": self.timezone_policy,
+            "decimal_policy": self.decimal_policy,
+            "collation_policy": self.collation_policy,
+            "canonicalization_policy": self.canonicalization_policy,
+            "row_reordering_policy": self.row_reordering_policy,
             "table_name": self.table_name,
             "namespace": self.namespace,
             "row_count": self.row_count,
@@ -238,6 +275,7 @@ impl ParquetConversionReport {
             "target_schema_fingerprint": self.target_schema_fingerprint,
             "validation_result": self.validation_result,
             "generated_section_kinds": self.generated_section_kinds,
+            "aggregate_synopsis_kinds": self.aggregate_synopsis_kinds,
             "unsupported_features": self.unsupported_features,
             "lossy_features": self.lossy_features,
             "nested_shape_fallbacks": self.nested_shape_fallbacks,

@@ -1197,6 +1197,41 @@ A conforming reader SHOULD evaluate requiredness in this order:
 
 A reader MAY implement a stricter policy for safety, but such a policy MUST be reported as an implementation policy rather than a COVE wire-format requirement.
 
+### 11.2.2 Profile Capability Matrix
+
+`PROFILE_CAPABILITY_MATRIX` is a shared v2 section that scopes required and optional feature words to a profile, operation, section, or target-local reference. It is used when a file advertises optional profiles whose requiredness should not affect ordinary reads.
+
+```rust
+struct ProfileCapabilityMatrixHeaderV2 {
+    magic: [u8; 4],              // "PCM2"
+    version_major: u16,          // 2
+    header_len: u16,
+    entry_len: u16,
+    reserved: u16,               // 0
+    entry_count: u32,
+    flags: u32,
+    entries_offset: u64,
+    entries_length: u64,
+    checksum: u32,
+}
+
+struct ProfileCapabilityEntryV2 {
+    profile: u8,
+    scope: u8,                   // FeatureScope
+    operation_kind: u16,          // OperationKindV2 or None
+    global_feature_word_index: u32,
+    required_mask: u64,
+    optional_mask: u64,
+    section_id: u32,              // 0 when not section-scoped
+    target_local_ref: u64,        // u64::MAX when absent
+    flags: u32,
+    reserved: u32,                // 0
+    checksum: u32,
+}
+```
+
+Entries MUST be sorted by `(profile, scope, operation_kind, global_feature_word_index, section_id, target_local_ref)` and duplicate keys are invalid. `operation_kind` MUST be `None` unless `scope = OperationRequired`. `global_feature_word_index` MUST be less than the `EXTENDED_FEATURE_SET.word_count` when an extended set is present.
+
 ### 11.3 Section-Level Extended Feature Binding
 
 The low 64-bit feature words in `CoveSectionEntryV2` are sufficient for common bootstrap and section features. When section-, profile-, page-, or operation-scoped requiredness uses extended feature words, a `SECTION_FEATURE_BINDING` section provides the binary-authoritative binding. The binding section is not a way to make an unknown header-required feature safe; it applies only after header validation has succeeded.
@@ -1304,6 +1339,7 @@ enum OperationKindV2 {
 - If multiple bindings for the same target and scope mention the same global feature-word number, the effective word is the bitwise OR of those validated bindings. Bindings MUST NOT rely on local array position as semantic feature-bank identity.
 - `section_id` references a `CoveSectionEntryV2.section_id` in the same `.cove` artifact. `section_id = 0` is allowed only for profile-, artifact-, or operation-wide bindings where the payload reference identifies the target.
 - `target_local_ref` is interpreted only by the `payload_kind` and `scope`. For example, it may be a page reference, codec ID, index root ID, coverage provider ID, profile ID, or runtime hint ID. If the required interpretation is unknown, the binding MUST be treated as unsupported for that scoped operation.
+- For reference-code COVE-T/COVE-O column pages whose page index entry does not carry an explicit `page_id`, `target_local_ref` is the deterministic synthetic page reference `(column_id as u64) << 32 | morsel_id as u64`. Page indexes that carry explicit `page_id` values use that `page_id` instead.
 
 **Rules:**
 - Section-level extended feature bindings MUST be checksummed and bounds-checked before use.
@@ -1492,6 +1528,7 @@ struct CoveSectionEntryV2 {
 | 39 | INDEX_ONLY_CAPABILITY | COVE-I/COVE-A | Declarations for metadata/index-only exact or approximate query answers. |
 | 45 | SECTION_FEATURE_BINDING | shared | Section/profile/operation-scoped extended feature requiredness bindings. |
 | 46 | COVERAGE_PROOF_RECORD | COVE-COVERAGE | Proof records binding predicate forms, providers, coverage sets, validity, and proof semantics. |
+| 47 | NESTED_SCHEMA | COVE-T | Authoritative recursive child schema metadata for native List/Struct/Map table columns. |
 | 30 | ENGINE_PROFILE_REGISTRY | COVE-E | Registered engine execution profiles. |
 | 31 | EXECUTION_CODE_DESCRIPTOR | COVE-E | ExecutionCode description. |
 | 32 | EXECUTION_SCOPE_DESCRIPTOR | COVE-E | Execution scope metadata. |
@@ -2156,6 +2193,16 @@ struct CodecExtensionDescriptorV2 {
 - A codec descriptor MUST declare whether it supports equality kernels, range kernels, selection decode, direct FileCode-to-ExecutionCode remap, or only full decode through `KERNEL_CAPABILITIES` or a codec-specific capability payload.
 - A codec descriptor MUST declare any restrictions on null handling, value ordering, NaN handling, signed zero handling, byte ordering, padding bits, and final-block termination.
 - A registered codec MUST be deterministic and side-effect-free.
+
+The v2 reference suite includes three stable COVE-owned companion codec definitions:
+
+| Descriptor identity | Companion spec |
+| --- | --- |
+| `org.coveformat.codec.fsst-utf8.v2` | `docs/codecs/fsst-utf8-v2.md` |
+| `org.coveformat.codec.alp-float.v2` | `docs/codecs/alp-float-v2.md` |
+| `org.coveformat.codec.fastlanes-integer.v2` | `docs/codecs/fastlanes-integer-v2.md` |
+
+These codecs are inspired by FSST, ALP, and FastLanes families, but they are COVE-owned exact bitstreams and do not claim byte compatibility with external library formats. Broad conformance requires registered-payload/fallback equivalence for decoded logical values and null positions.
 
 
 ### 20.8.1 Registered Encoding Dispatch
@@ -4275,6 +4322,8 @@ struct CoviAggregateAnswerV2 {
 - COVE-I index roots may advertise conservative coverage, exact answer, approximate answer, or advisory capabilities. Readers MUST interpret each capability under its declared proof strength and exactness.
 - COVE-I global indexes SHOULD be referenced from COVM or an external catalog by digest and snapshot ID.
 
+**Reference-code sidecar discovery:** The reference DataFusion adapter MAY discover local optional COVE-I sidecars next to a mounted file using `file.cove.covi` before `file.covi`. Discovery is an implementation convenience only. A discovered sidecar MUST pass the same referenced-file, snapshot, schema, semantic-map, visibility, and capability validation as an explicitly supplied artifact before it can affect planning or index-only answers. Invalid, stale, missing, or unsupported discovered sidecars MUST fall back to ordinary scans unless the caller explicitly requires the index operation.
+
 ### 33.2 Secondary Index Capabilities and Index-Only Access
 
 A COVE-I or COVX index may declare operations it can answer or accelerate. Capability declarations are not enough for correctness; the index must also validate against the selected snapshot and proof semantics.
@@ -4371,12 +4420,63 @@ enum SynopsisKind {
 }
 ```
 
+`payload_offset` is section-relative. For canonical writers, all entries are
+written first, then non-empty payloads are written in entry order immediately
+after the entry table. `Count` entries MUST have `payload_length = 0`.
+
+Payload-bearing entries use this common payload header:
+
+```rust
+struct AggregatePayloadHeaderV2 {
+    magic: [u8; 4],       // "AGS2"
+    synopsis_kind: u8,    // MUST match AggregateSynopsisEntryV2.synopsis_kind
+    version: u8,          // 1
+    flags: u16,
+    item_count: u32,
+    aux0: u32,            // kind-specific parameter
+    aux1: u32,            // kind-specific parameter
+    data_length: u32,
+    checksum: u32,        // CRC-32C of header with checksum zeroed plus data
+}
+```
+
+**Payload encodings:**
+- `MinMax`: `min` then `max` as optional tagged canonical values. Each value is
+  `tag:u16`, `reserved:u16`, `length:u32`, `payload:[u8; length]`; absent is
+  encoded with `tag = u16::MAX` and `length = 0`. Both values are absent only
+  when `row_count == null_count`.
+- `Sum`: `aux0` is `NumericAggregateOverflowPolicy` (`0=checked_exact`,
+  `1=saturating`, `2=wrapping`, `3=decimal_widened`), followed by one tagged
+  canonical numeric sum. Exact SQL consumers MUST require `checked_exact`.
+- `SumAndCount`: same `aux0` policy as `Sum`; data starts with
+  `non_null_count:u64`, followed by one tagged canonical numeric sum.
+- `BoolTrueFalseCounts`: `true_count:u64`, `false_count:u64`; the two counts
+  MUST sum to `row_count - null_count`.
+- `FileCodeHistogram` and `NumCodeHistogram`: sorted `(key:u64, count:u64)`
+  records. Keys MUST be strictly ascending and counts MUST be non-zero. For
+  exact synopses, counts MUST sum to `row_count - null_count`.
+- `TopK`: `aux0` stores `k`; data is `(key:u64, count:u64)` records sorted by
+  descending count and then ascending key. `item_count <= k`.
+- `DistinctSketch`: HyperLogLog registers. `aux0` stores precision `p`; default
+  is `p = 14`. Register count MUST be `2^p`. COVE hashes canonical value bytes
+  with its deterministic 64-bit sketch hash before HLL update.
+- `QuantileSketch`: KLL compactors. `aux0` stores `k`; default is `k = 200`.
+  Data starts with `value_tag:u16`, `reserved:u16`, `level_count:u32`, followed
+  by monotonic `level_offsets:u32[level_count]`, then length-prefixed canonical
+  values. The final level offset MUST equal the value count. Compaction uses
+  deterministic tie-breaking so fixtures are reproducible.
+
 **Rules:**
-- Exact synopses MAY be used for exact query results.
+- Exact synopses MAY be used for exact query results only when visibility is
+  all-visible and no redaction policy can affect the answer.
 - Approximate synopses MUST be marked approximate.
 - Approximate synopses MUST NOT be used for exact answers.
-- Sum/sum-of-squares MUST declare overflow and decimal handling rules.
+- Payload kind MUST match `synopsis_kind`; readers MUST validate checksum,
+  payload bounds, sorted keys, duplicate keys, count totals, canonical value
+  tags/payloads, and `accuracy`.
+- Sum payloads MUST declare overflow and decimal handling rules.
 - Redacted values MUST follow declared redaction aggregation policy.
+
 **Important use cases:**
 SELECT count(*) FROM table;
 
@@ -5489,45 +5589,110 @@ Converters are adoption-critical but are not allowed to redefine COVE semantics.
 
 ## 52. Nested Columns
 
-COVE-T uses offset-based nested layouts.
+COVE-T stores native nested columns with two complementary contracts:
 
-### 52.1 List
+- a file-level `NESTED_SCHEMA` section carrying authoritative recursive child schema metadata for each top-level List/Struct/Map table column;
+- page-local `ColumnPagePayloadV1` trees carrying the row-shape buffers and child value buffers for one page.
 
-**List<T>:**
+A COVE-T file that contains a native nested column MUST advertise `FEATURE_NESTED_COLUMNS`, MUST include a `NESTED_SCHEMA` section, and MUST provide exactly one nested schema entry for every top-level nested table column. Page-local shape metadata is not sufficient to infer child names, nullability, logical/physical types, decimal metadata, collation, or fixed-size-list assertions.
+
+### 52.1 NESTED_SCHEMA Section
+
+`NESTED_SCHEMA` has section kind `47`, profile `COVE-T`, and requires `FEATURE_NESTED_COLUMNS`.
+
+```rust
+struct NestedSchemaSectionV1 {
+    magic: [u8; 4],          // "NSC1"
+    version_major: u16,      // 1
+    header_len: u16,         // 16
+    entry_count: u32,
+    reserved: u32,           // 0
+    entries: NestedSchemaEntryV1[entry_count],
+}
+
+struct NestedSchemaEntryV1 {
+    table_id: u32,
+    column_id: u32,
+    root: NestedSchemaNodeV1,
+}
+
+struct NestedSchemaNodeV1 {
+    name: utf8_u16,
+    logical_type: u16,
+    physical_kind: u8,
+    nullable: u8,            // 0 or 1
+    precision: u16,
+    scale: i16,
+    collation_id: u16,
+    child_count: u16,
+    flags: u32,
+    fixed_size_list_len: u32, // 0 unless this List represents a FixedSizeList
+    children: NestedSchemaNodeV1[child_count],
+}
+```
+
+**Rules:**
+- Entries are keyed by `(table_id, column_id)` and MUST be unique.
+- Every native top-level nested table column MUST have one matching entry.
+- A `NestedSchemaEntryV1.root` MUST match the top-level table column's name, logical type, physical kind, nullability, precision, scale, collation, and flags.
+- List nodes MUST have exactly one child.
+- Struct nodes MUST have at least one child and child names MUST be unique within the struct.
+- Map nodes MUST have exactly two children named `key` and `value`; keys MUST be scalar and non-null.
+- Scalar nodes MUST NOT have children.
+- `fixed_size_list_len` MUST be zero except on List nodes. Non-zero values assert a fixed element count per non-null parent list; the page still uses ordinary List offsets.
+
+### 52.2 Page Payload Tree Interpretation
+
+Native nested pages use the existing `ColumnPagePayloadV1` wire shape without adding fields.
+
+**Tree rules:**
+- The node list is pre-order depth-first.
+- The root node MUST be the first node and MUST have `node_id == root_node_id`.
+- Each node owns the next consecutive `buffer_count` page buffers in pre-order traversal.
+- Each node owns the next consecutive `child_count` child subtrees in pre-order traversal.
+- A container node's row-shape payload is stored in a `ChildLayout` buffer.
+- Scalar child values use existing scalar encodings and `Values` buffers.
+- A node null bitmap, when present, is stored in that node's `NullBitmap` buffer and uses COVE null polarity.
+
+### 52.3 List
+
+**List<T> page layout:**
   parent null bitmap
-  offsets: u32[row_count + 1]
-  child values: encoded array for T
+  `ChildLayout`: offsets `u32[row_count + 1]`
+  one child subtree for T
 **Rules:**
 - offsets MUST be monotonic.
 - offsets[0] MUST be 0.
-- offsets[row_count] MUST equal child element count.
+- offsets[row_count] MUST equal the child node logical length.
+- For fixed-size-list assertions, every non-null parent row MUST have the asserted element count.
 
-### 52.2 Struct
+### 52.4 Struct
 
-**Struct:**
+**Struct page layout:**
   parent null bitmap
-  child columns, each with row_count rows
+  `ChildLayout`: child row counts
+  child subtrees, each with `row_count` rows
 **Rules:**
 - Struct children share parent row count.
-- Parent null handling MUST be declared by encoding.
+- Parent null handling MUST be declared by the layout.
 
-### 52.3 Map
+### 52.5 Map
 
-**Map<K,V>:**
+**Map<K,V> page layout:**
   parent null bitmap
-  offsets: u32[row_count + 1]
-  key child column
-  value child column
+  `ChildLayout`: offsets `u32[row_count + 1]`, key/value child counts, duplicate-key policy data
+  key child subtree
+  value child subtree
 **Rules:**
 - Map keys MUST be scalar.
-- Map keys SHOULD be non-null.
-- Duplicate keys within one map value are invalid unless schema flags allow duplicates.
+- Map keys MUST be non-null.
+- Duplicate keys within one map value are invalid unless schema/layout flags allow duplicates.
 **Pushdown:**
 - Struct child fields MAY support full pushdown.
 - List/Map element bloom indexes MAY be provided.
 - Whole-list/whole-map min/max is usually unsupported.
 
-### 52.4 Fixed-Size Lists, Vectors, Tensors, and Embeddings
+### 52.6 Fixed-Size Lists, Vectors, Tensors, and Embeddings
 
 COVE-Core v2 does not define Vector, Tensor, or Embedding as additional scalar logical types. Dense vectors SHOULD be represented by existing nested or extension mechanisms rather than by adding ad hoc core scalar types.
 
@@ -6170,6 +6335,7 @@ struct FastMetadataIndexEntryV2 {
 - A mismatch between a fast metadata entry and the authoritative section invalidates the fast metadata entry.
 - If the section is optional, corrupt fast metadata MUST be ignored and readers MUST fall back to the footer and profile sections.
 - A writer MUST NOT rely on `FAST_METADATA_INDEX` as the only location for schema, page, or statistics metadata.
+- Reference readers MAY parse fast metadata through the header section id for planning acceleration, but the footer section directory remains authoritative. Valid fast metadata may reduce metadata lookup work; it MUST NOT create or override a section, page, layout node, statistic, or proof record.
 
 ### 67.3 Page Cluster Directory
 
@@ -6209,6 +6375,7 @@ struct PageClusterEntryV2 {
 - Page clusters MAY contain pages from multiple columns and morsels only when every page remains independently addressable by its `ColumnPageIndexEntryV2`.
 - Page cluster checksums MAY provide an enclosing integrity check, but each page checksum remains authoritative for page bytes.
 - Page clusters MUST NOT change row order, page row_count, null counts, or page reconstruction rules.
+- Reference readers MAY use validated page clusters as advisory range-coalescing bounds. A reader MUST preserve the original page slicing, MUST NOT read outside the validated cluster byte range, and MUST fall back to ordinary range coalescing when cluster metadata is absent, corrupt, unsupported, or inconsistent with authoritative table, segment, morsel, page, or section metadata.
 
 ### 67.4 Zero-Copy Buffer Map
 

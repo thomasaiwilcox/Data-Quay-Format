@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use std::{
     env, fs,
     io::{self, BufRead, Write},
@@ -905,32 +907,32 @@ impl ParquetCompareFixture {
                     SessionConfig::new().with_target_partitions(target_partitions),
                 )
             })
-            .unwrap_or_else(SessionContext::new);
-        register_cove_file_with_options(&ctx, "events_cove", &events_cove, cove_options)
+            .unwrap_or_default();
+        register_cove_file_with_options(&ctx, "events_cove", &events_cove, cove_options.clone())
             .expect("register events_cove");
-        register_cove_file_with_options(&ctx, "items_cove", &items_cove, cove_options)
+        register_cove_file_with_options(&ctx, "items_cove", &items_cove, cove_options.clone())
             .expect("register items_cove");
-        register_cove_file_with_options(&ctx, "wide_events_cove", &wide_cove, cove_options)
+        register_cove_file_with_options(&ctx, "wide_events_cove", &wide_cove, cove_options.clone())
             .expect("register wide_events_cove");
         register_cove_file_with_options(
             &ctx,
             "large_events_cove",
             &large_events.cove,
-            cove_options,
+            cove_options.clone(),
         )
         .expect("register large_events_cove");
         register_cove_file_with_options(
             &ctx,
             "large_events_filecode_decoded_cove",
             &large_events_filecode_cove,
-            cove_options,
+            cove_options.clone(),
         )
         .expect("register large_events_filecode_decoded_cove");
         register_cove_file_with_options(
             &ctx,
             "large_events_filecode_cove",
             &large_events_filecode_cove,
-            cove_options.with_arrow_dictionary_output(),
+            cove_options.clone().with_arrow_dictionary_output(),
         )
         .expect("register large_events_filecode_cove");
         register_cove_file_with_options(

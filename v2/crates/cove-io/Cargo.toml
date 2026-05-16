@@ -1,0 +1,13 @@
+[package]
+name = "cove-io"
+version = "0.1.0"
+edition = "2021"
+description = "Stable Rust facade for COVE v2 read, write, artifact, validation, and conversion APIs"
+license = "MIT"
+
+[dependencies]
+cove-core = { path = "../cove-core" }
+cove-reader = { path = "../cove-reader" }
+cove-writer = { path = "../cove-writer" }
+cove-convert = { path = "../cove-convert" }
+serde_json = "1"

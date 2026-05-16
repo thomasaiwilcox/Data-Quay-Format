@@ -1,5 +1,7 @@
 //! Footer and dataset bootstrap helpers for COVE-backed DataFusion datasets.
 
+#[cfg(feature = "covi")]
+mod covi;
 #[cfg(feature = "covm")]
 mod covm;
 mod local;
@@ -11,12 +13,14 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use crate::dataset_state::DatasetState;
+use crate::{dataset_state::DatasetState, options::CoveTableSelection};
 
 #[cfg(feature = "covm")]
 pub use covm::{
     bootstrap_covm_local_file_with_options, bootstrap_covm_local_file_with_options_async,
 };
+#[cfg(feature = "covi")]
+pub use local::bootstrap_bytes_with_covi_artifacts;
 pub use local::{
     bootstrap_bytes, bootstrap_bytes_with_options, bootstrap_local_file,
     bootstrap_local_file_async, bootstrap_local_file_with_options,
@@ -32,6 +36,7 @@ pub struct CoveMetadataCacheKey {
     pub file_id: [u8; 16],
     pub file_len: u64,
     pub footer_crc32c: u32,
+    pub table_selection: Option<CoveTableSelection>,
 }
 
 #[derive(Debug, Default)]
@@ -119,6 +124,7 @@ mod tests {
             file_id: *state.file_id(),
             file_len: state.file_len(),
             footer_crc32c: state.footer_crc32c(),
+            table_selection: None,
         };
 
         let _ = catch_unwind(AssertUnwindSafe(|| {

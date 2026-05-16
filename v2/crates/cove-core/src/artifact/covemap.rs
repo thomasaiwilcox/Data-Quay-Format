@@ -17,17 +17,26 @@ use crate::{
     CoveError,
 };
 
-/// Encoded length of [`CovemapHeaderV1`] in bytes.
+/// Encoded length of [`CovemapHeaderV2`] in bytes.
 pub const COVEMAP_HEADER_LEN: u16 = 98;
 
-/// Encoded length of [`CovemapSectionEntryV1`] in bytes.
+/// Encoded length of [`CovemapSectionEntryV2`] in bytes.
 pub const COVEMAP_SECTION_ENTRY_LEN: u16 = 36;
 
-/// Required `version_major` for `.covemap` v1.
-pub const COVEMAP_VERSION_MAJOR_V1: u16 = 1;
+/// Required `version_major` for newly-written `.covemap` v2 artifacts.
+pub const COVEMAP_VERSION_MAJOR_V2: u16 = 2;
 
-/// Required `version_minor` for `.covemap` v1.
-pub const COVEMAP_VERSION_MINOR_V1: u16 = 0;
+/// Required `version_minor` for newly-written `.covemap` v2 artifacts.
+pub const COVEMAP_VERSION_MINOR_V2: u16 = 0;
+
+/// Legacy pre-§70.1 section-entry layout used by early reference fixtures.
+pub const COVEMAP_LEGACY_VERSION_MAJOR_V1: u16 = 1;
+
+/// Source-compatible alias retained for existing callers.
+pub const COVEMAP_VERSION_MAJOR_V1: u16 = COVEMAP_VERSION_MAJOR_V2;
+
+/// Source-compatible alias retained for existing callers.
+pub const COVEMAP_VERSION_MINOR_V1: u16 = COVEMAP_VERSION_MINOR_V2;
 
 /// Encoded length of [`CovemapPostscriptV1`] in bytes.
 pub const COVEMAP_POSTSCRIPT_LEN: u16 = 44;
@@ -38,7 +47,7 @@ pub const COVEMAP_POSTSCRIPT_VERSION_V1: u16 = POSTSCRIPT_VERSION_V1;
 /// Size of the fixed tail after the postscript payload.
 pub const COVEMAP_POSTSCRIPT_TAIL_SIZE: usize = 2 + 2 + 4;
 
-/// Spec §70.1 fixed `CovemapHeaderV1` prefix.
+/// Spec §70.1 fixed `CovemapHeaderV2` prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CovemapHeaderV1 {
     pub magic: [u8; 4],
@@ -62,8 +71,8 @@ impl CovemapHeaderV1 {
         Self {
             magic: MAGIC_COVEMAP,
             header_len: COVEMAP_HEADER_LEN,
-            version_major: COVEMAP_VERSION_MAJOR_V1,
-            version_minor: COVEMAP_VERSION_MINOR_V1,
+            version_major: COVEMAP_VERSION_MAJOR_V2,
+            version_minor: COVEMAP_VERSION_MINOR_V2,
             flags: 0,
             mapping_id,
             required_features: FEATURE_SEMANTIC_MAP,
@@ -118,7 +127,11 @@ impl CovemapHeaderV1 {
 
         let version_major = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
         let version_minor = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-        if version_major != COVEMAP_VERSION_MAJOR_V1 || version_minor != COVEMAP_VERSION_MINOR_V1 {
+        if !matches!(
+            (version_major, version_minor),
+            (COVEMAP_VERSION_MAJOR_V2, COVEMAP_VERSION_MINOR_V2)
+                | (COVEMAP_LEGACY_VERSION_MAJOR_V1, COVEMAP_VERSION_MINOR_V2)
+        ) {
             return Err(CoveError::BadVersion);
         }
 
@@ -163,7 +176,30 @@ impl CovemapHeaderV1 {
     }
 }
 
-/// Spec §70.1 `CovemapSectionEntryV1`.
+/// Spec §70.1 `CovemapHeaderV2`.
+pub type CovemapHeaderV2 = CovemapHeaderV1;
+
+/// Spec §70.1 payload encoding registry for `.covemap` section bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CovemapPayloadEncodingV2 {
+    CoveMapJsonV2 = 1,
+    CoveMapCborV2 = 2,
+    Extension = 255,
+}
+
+impl CovemapPayloadEncodingV2 {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::CoveMapJsonV2),
+            2 => Some(Self::CoveMapCborV2),
+            255 => Some(Self::Extension),
+            _ => None,
+        }
+    }
+}
+
+/// Spec §70.1 `CovemapSectionEntryV2`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CovemapSectionEntryV1 {
     pub section_id: u32,
@@ -171,8 +207,9 @@ pub struct CovemapSectionEntryV1 {
     pub length: u64,
     pub uncompressed_length: u64,
     pub compression: u8,
+    pub payload_encoding: u8,
     pub required: bool,
-    pub reserved: u16,
+    pub reserved: u8,
     pub checksum: u32,
 }
 
@@ -184,8 +221,9 @@ impl CovemapSectionEntryV1 {
         buf[12..20].copy_from_slice(&self.length.to_le_bytes());
         buf[20..28].copy_from_slice(&self.uncompressed_length.to_le_bytes());
         buf[28] = self.compression;
-        buf[29] = u8::from(self.required);
-        buf[30..32].copy_from_slice(&self.reserved.to_le_bytes());
+        buf[29] = self.payload_encoding;
+        buf[30] = u8::from(self.required);
+        buf[31] = self.reserved;
         buf[32..36].copy_from_slice(&self.checksum.to_le_bytes());
         buf
     }
@@ -204,7 +242,13 @@ impl CovemapSectionEntryV1 {
         CompressionCodec::from_u8(compression).ok_or_else(|| {
             CoveError::BadSection(format!("unknown COVEMAP compression codec {compression}"))
         })?;
-        let required = match bytes[29] {
+        let payload_encoding = bytes[29];
+        CovemapPayloadEncodingV2::from_u8(payload_encoding).ok_or_else(|| {
+            CoveError::BadSection(format!(
+                "unknown COVEMAP payload encoding {payload_encoding}"
+            ))
+        })?;
+        let required = match bytes[30] {
             0 => false,
             1 => true,
             other => {
@@ -213,7 +257,7 @@ impl CovemapSectionEntryV1 {
                 )))
             }
         };
-        let reserved = u16::from_le_bytes(bytes[30..32].try_into().unwrap());
+        let reserved = bytes[31];
         if reserved != 0 {
             return Err(CoveError::ReservedNotZero);
         }
@@ -236,12 +280,68 @@ impl CovemapSectionEntryV1 {
             length,
             uncompressed_length,
             compression,
+            payload_encoding,
             required,
             reserved,
             checksum,
         })
     }
+
+    fn parse_legacy(bytes: &[u8]) -> Result<Self, CoveError> {
+        if bytes.len() < COVEMAP_SECTION_ENTRY_LEN as usize {
+            return Err(CoveError::BufferTooShort);
+        }
+        let bytes = &bytes[..COVEMAP_SECTION_ENTRY_LEN as usize];
+
+        let section_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let offset = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+        let length = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+        let uncompressed_length = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
+        let compression = bytes[28];
+        CompressionCodec::from_u8(compression).ok_or_else(|| {
+            CoveError::BadSection(format!("unknown COVEMAP compression codec {compression}"))
+        })?;
+        let required = match bytes[29] {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(CoveError::BadSection(format!(
+                    "legacy COVEMAP section required flag must be 0 or 1, got {other}"
+                )))
+            }
+        };
+        if u16::from_le_bytes(bytes[30..32].try_into().unwrap()) != 0 {
+            return Err(CoveError::ReservedNotZero);
+        }
+        let checksum = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
+
+        if length == 0 && uncompressed_length != 0 {
+            return Err(CoveError::BadSection(
+                "COVEMAP section length=0 requires uncompressed_length=0".into(),
+            ));
+        }
+        if compression == CompressionCodec::None as u8 && length != uncompressed_length {
+            return Err(CoveError::BadSection(
+                "COVEMAP uncompressed section must have length == uncompressed_length".into(),
+            ));
+        }
+
+        Ok(Self {
+            section_id,
+            offset,
+            length,
+            uncompressed_length,
+            compression,
+            payload_encoding: CovemapPayloadEncodingV2::CoveMapJsonV2 as u8,
+            required,
+            reserved: 0,
+            checksum,
+        })
+    }
 }
+
+/// Spec §70.1 `CovemapSectionEntryV2`.
+pub type CovemapSectionEntryV2 = CovemapSectionEntryV1;
 
 /// One section inside a `.covemap` artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,6 +474,7 @@ impl CovemapFile {
         let advertised_features = header.required_features | header.optional_features;
 
         let fixed_len = usize::from(header.header_len);
+        let legacy_entry_layout = header.version_major == COVEMAP_LEGACY_VERSION_MAJOR_V1;
         let mapping_version_len = usize::from(header.mapping_version_len);
         let entries_len = usize::try_from(header.section_count)
             .map_err(|_| CoveError::ArithOverflow)?
@@ -405,8 +506,13 @@ impl CovemapFile {
         let mut sections = Vec::with_capacity(header.section_count as usize);
         let mut entry_offset = version_end;
         for _ in 0..header.section_count {
-            let entry = CovemapSectionEntryV1::parse(&header_region[entry_offset..])?;
+            let entry = if legacy_entry_layout {
+                CovemapSectionEntryV1::parse_legacy(&header_region[entry_offset..])?
+            } else {
+                CovemapSectionEntryV1::parse(&header_region[entry_offset..])?
+            };
             validate_covemap_section_codec_feature_advertisement(advertised_features, &entry)?;
+            validate_covemap_section_payload_encoding(&entry)?;
             entry_offset = entry_offset
                 .checked_add(COVEMAP_SECTION_ENTRY_LEN as usize)
                 .ok_or(CoveError::ArithOverflow)?;
@@ -471,10 +577,16 @@ impl CovemapFile {
                 length,
                 uncompressed_length,
                 compression: section.entry.compression,
+                payload_encoding: if section.entry.payload_encoding == 0 {
+                    CovemapPayloadEncodingV2::CoveMapJsonV2 as u8
+                } else {
+                    section.entry.payload_encoding
+                },
                 required: section.entry.required,
                 reserved: 0,
                 checksum: checksum::crc32c(&encoded),
             };
+            validate_covemap_section_payload_encoding(&entry)?;
             payload_offset = payload_offset
                 .checked_add(length)
                 .ok_or(CoveError::ArithOverflow)?;
@@ -490,8 +602,8 @@ impl CovemapFile {
 
         let mut header = self.header.clone();
         header.header_len = COVEMAP_HEADER_LEN;
-        header.version_major = COVEMAP_VERSION_MAJOR_V1;
-        header.version_minor = COVEMAP_VERSION_MINOR_V1;
+        header.version_major = COVEMAP_VERSION_MAJOR_V2;
+        header.version_minor = COVEMAP_VERSION_MINOR_V2;
         header.section_count = section_count;
         header.mapping_version_len = mapping_version_len;
         header.reserved0 = 0;
@@ -555,6 +667,20 @@ impl CovemapFile {
         file.validate_map_sections()?;
         Ok(file)
     }
+
+    pub fn uses_legacy_entry_layout(&self) -> bool {
+        self.header.version_major == COVEMAP_LEGACY_VERSION_MAJOR_V1
+    }
+
+    pub fn compatibility_warnings(&self) -> Vec<&'static str> {
+        if self.uses_legacy_entry_layout() {
+            vec![
+                "legacy COVE-MAP v1-like section-entry layout accepted; reserialize to emit §70 v2 layout",
+            ]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 fn decode_section_payload<'a>(
@@ -616,6 +742,29 @@ fn validate_covemap_section_codec_feature_advertisement(
     Ok(())
 }
 
+fn validate_covemap_section_payload_encoding(
+    entry: &CovemapSectionEntryV1,
+) -> Result<(), CoveError> {
+    match CovemapPayloadEncodingV2::from_u8(entry.payload_encoding) {
+        Some(CovemapPayloadEncodingV2::CoveMapJsonV2) => Ok(()),
+        Some(CovemapPayloadEncodingV2::CoveMapCborV2)
+        | Some(CovemapPayloadEncodingV2::Extension) => {
+            if entry.required {
+                Err(CoveError::UnsupportedEncoding(format!(
+                    "required COVEMAP section {} uses unsupported payload encoding {}",
+                    entry.section_id, entry.payload_encoding
+                )))
+            } else {
+                Ok(())
+            }
+        }
+        None => Err(CoveError::BadSection(format!(
+            "unknown COVEMAP payload encoding {}",
+            entry.payload_encoding
+        ))),
+    }
+}
+
 fn covemap_codec_feature_bit(compression: u8) -> Result<u64, CoveError> {
     match CompressionCodec::from_u8(compression).ok_or_else(|| {
         CoveError::BadSection(format!("unknown COVEMAP compression codec {compression}"))
@@ -646,11 +795,12 @@ mod tests {
                         length: 0,
                         uncompressed_length: 0,
                         compression: CompressionCodec::None as u8,
+                        payload_encoding: CovemapPayloadEncodingV2::CoveMapJsonV2 as u8,
                         required: true,
                         reserved: 0,
                         checksum: 0,
                     },
-                    payload: br#"{"mapping_id":"m1","mapping_version":"example/v1"}"#.to_vec(),
+                    payload: br#"{"schema_id":"org.coveformat.covemap.v2","section_id":60,"mapping_id":"m1","mapping_version":"example/v1"}"#.to_vec(),
                 },
                 CovemapSection {
                     entry: CovemapSectionEntryV1 {
@@ -659,12 +809,13 @@ mod tests {
                         length: 0,
                         uncompressed_length: 0,
                         compression: CompressionCodec::None as u8,
+                        payload_encoding: CovemapPayloadEncodingV2::CoveMapJsonV2 as u8,
                         required: false,
                         reserved: 0,
                         checksum: 0,
                     },
                     payload:
-                        br#"{"mapping_id":"m1","mapping_version":"example/v1","functions":[]}"#
+                        br#"{"schema_id":"org.coveformat.covemap.v2","section_id":61,"mapping_id":"m1","mapping_version":"example/v1","functions":[]}"#
                             .to_vec(),
                 },
             ],
@@ -718,6 +869,7 @@ mod tests {
             length: 45,
             uncompressed_length: 45,
             compression: CompressionCodec::None as u8,
+            payload_encoding: CovemapPayloadEncodingV2::CoveMapJsonV2 as u8,
             required: true,
             reserved: 0,
             checksum: 0xDEADBEEF,
@@ -736,9 +888,38 @@ mod tests {
         assert_eq!(parsed.sections[0].entry.section_id, 60);
         assert_eq!(
             parsed.sections[1].payload,
-            br#"{"mapping_id":"m1","mapping_version":"example/v1","functions":[]}"#
+            br#"{"schema_id":"org.coveformat.covemap.v2","section_id":61,"mapping_id":"m1","mapping_version":"example/v1","functions":[]}"#
         );
         assert_eq!(parsed.postscript.file_len, bytes.len() as u64);
+    }
+
+    #[test]
+    fn legacy_entry_layout_dual_reads_and_reserializes_v2() {
+        let mut bytes = sample_file().serialize().unwrap();
+        let mut header = CovemapHeaderV1::parse(&bytes).unwrap();
+        header.version_major = COVEMAP_LEGACY_VERSION_MAJOR_V1;
+        bytes[..COVEMAP_HEADER_LEN as usize].copy_from_slice(&header.serialize());
+
+        let entries_start = COVEMAP_HEADER_LEN as usize + usize::from(header.mapping_version_len);
+        for index in 0..header.section_count as usize {
+            let offset = entries_start + index * COVEMAP_SECTION_ENTRY_LEN as usize;
+            let required = bytes[offset + 30];
+            bytes[offset + 29] = required;
+            bytes[offset + 30] = 0;
+            bytes[offset + 31] = 0;
+        }
+
+        let parsed = CovemapFile::parse(&bytes).unwrap();
+        assert!(parsed.uses_legacy_entry_layout());
+        assert_eq!(
+            parsed.sections[0].entry.payload_encoding,
+            CovemapPayloadEncodingV2::CoveMapJsonV2 as u8
+        );
+
+        let rewritten = parsed.serialize().unwrap();
+        let reparsed = CovemapFile::parse(&rewritten).unwrap();
+        assert_eq!(reparsed.header.version_major, COVEMAP_VERSION_MAJOR_V2);
+        assert!(!reparsed.uses_legacy_entry_layout());
     }
 
     #[test]
@@ -799,7 +980,7 @@ mod tests {
     #[test]
     fn standalone_map_validation_rejects_bad_payload_schema() {
         let mut file = sample_file();
-        file.sections[0].payload = br#"{"mapping_version":"example/v1","sources":[]}"#.to_vec();
+        file.sections[0].payload = br#"{"schema_id":"org.coveformat.covemap.v2","section_id":60,"mapping_version":"example/v1","sources":[]}"#.to_vec();
         let bytes = file.serialize().unwrap();
         assert_eq!(
             CovemapFile::parse_validated(&bytes),
@@ -819,8 +1000,8 @@ mod tests {
     fn file_rejects_corrupted_section_checksum() {
         let mut bytes = sample_file().serialize().unwrap();
         let payload_offset = bytes
-            .windows(br#"{"mapping_id":"m1","mapping_version":"example/v1"}"#.len())
-            .position(|window| window == br#"{"mapping_id":"m1","mapping_version":"example/v1"}"#)
+            .windows(br#"{"schema_id":"org.coveformat.covemap.v2","section_id":60,"mapping_id":"m1","mapping_version":"example/v1"}"#.len())
+            .position(|window| window == br#"{"schema_id":"org.coveformat.covemap.v2","section_id":60,"mapping_id":"m1","mapping_version":"example/v1"}"#)
             .unwrap();
         bytes[payload_offset] ^= 0xFF;
         assert_eq!(CovemapFile::parse(&bytes), Err(CoveError::ChecksumMismatch));
@@ -834,12 +1015,13 @@ mod tests {
             length: 0,
             uncompressed_length: 0,
             compression: CompressionCodec::None as u8,
+            payload_encoding: CovemapPayloadEncodingV2::CoveMapJsonV2 as u8,
             required: false,
             reserved: 0,
             checksum: 0,
         }
         .serialize();
-        bytes[29] = 2;
+        bytes[30] = 2;
         let err = CovemapSectionEntryV1::parse(&bytes).unwrap_err();
         assert!(matches!(err, CoveError::BadSection(_)));
     }

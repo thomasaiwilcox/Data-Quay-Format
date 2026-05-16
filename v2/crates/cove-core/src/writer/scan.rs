@@ -1,4 +1,5 @@
 use super::*;
+use crate::constants::FEATURE_REGISTERED_ENCODINGS;
 
 impl ScanPageSpec {
     pub fn new(row_count: u32, payload: Vec<u8>) -> Self {
@@ -364,6 +365,11 @@ impl ScanSegment {
             .flat_map(|spec| spec.pages.iter())
             .fold(0u64, |bits, page| {
                 bits | codec_feature_bit(page.compression)
+                    | if page_uses_registered_encoding(page) {
+                        FEATURE_REGISTERED_ENCODINGS
+                    } else {
+                        0
+                    }
             })
     }
 
@@ -374,6 +380,10 @@ impl ScanSegment {
             .fold(0u64, |bits, page| {
                 bits | if page_uses_payload_elision(page.flags) {
                     FEATURE_PAGE_PAYLOAD_ELISION
+                } else {
+                    0
+                } | if registered_page_requires_codec(page) {
+                    FEATURE_REGISTERED_ENCODINGS
                 } else {
                     0
                 }
@@ -400,6 +410,19 @@ fn encode_scan_page_payload(
     column: &ColumnEntry,
     spec: &ScanPageSpec,
 ) -> Result<Vec<u8>, CoveError> {
+    if column_uses_nested_feature(column) {
+        if let Ok(payload) = ColumnPagePayloadV1::parse(&spec.payload) {
+            let root = payload.root_node()?;
+            if root.logical_type == column.logical
+                && root.physical_kind == column.physical
+                && root.logical_len == spec.row_count
+                && root.encoding_kind as u32 == spec.encoding_root
+            {
+                payload.tree()?;
+                return Ok(spec.payload.clone());
+            }
+        }
+    }
     let encoding_raw = u16::try_from(spec.encoding_root).map_err(|_| {
         CoveError::UnsupportedEncoding(format!(
             "encoding_root {} does not fit a v1 encoding kind",
@@ -409,6 +432,18 @@ fn encode_scan_page_payload(
     let encoding_kind = CoveEncodingKind::from_u16(encoding_raw).ok_or_else(|| {
         CoveError::UnsupportedEncoding(format!("unknown page encoding kind {encoding_raw}"))
     })?;
+    if encoding_kind == CoveEncodingKind::RegisteredEncoding {
+        let payload = ColumnPagePayloadV1::parse(&spec.payload)?;
+        let root = payload.root_node()?;
+        if root.encoding_kind != CoveEncodingKind::RegisteredEncoding
+            || root.logical_type != column.logical
+            || root.physical_kind != column.physical
+            || root.logical_len != spec.row_count
+        {
+            return Err(CoveError::PageCorrupt);
+        }
+        return Ok(spec.payload.clone());
+    }
     let (null_bitmap, values) = if spec.null_count == 0 {
         (None, spec.payload.clone())
     } else {
@@ -423,7 +458,7 @@ fn encode_scan_page_payload(
         // INVARIANT: a writer-created non-elided mixed/null page must carry an
         // exact §27 null bitmap prefix; counts and tail bits are part of the
         // decode contract, not optional metadata.
-        if spec.row_count % 8 != 0 && validity_len != 0 {
+        if !spec.row_count.is_multiple_of(8) && validity_len != 0 {
             let valid_bits = spec.row_count % 8;
             let mask = (1u8 << valid_bits) - 1;
             if bitmap[validity_len - 1] & !mask != 0 {
@@ -447,6 +482,17 @@ fn encode_scan_page_payload(
         null_bitmap,
         values,
     )
+}
+
+fn page_uses_registered_encoding(page: &ScanPageSpec) -> bool {
+    page.encoding_root == CoveEncodingKind::RegisteredEncoding as u32
+}
+
+fn registered_page_requires_codec(page: &ScanPageSpec) -> bool {
+    if !page_uses_registered_encoding(page) {
+        return false;
+    }
+    !crate::codec::registered_page_has_fallback(&page.payload).unwrap_or(false)
 }
 
 fn default_encoding_kind(column: &ColumnEntry) -> CoveEncodingKind {
@@ -542,6 +588,8 @@ fn section_kind_feature_bits(section_kind: u16) -> u64 {
         Some(SectionKind::AggregateSynopsis) => FEATURE_AGGREGATE_SYNOPSES,
         Some(SectionKind::CompositeZoneIndex) => FEATURE_COMPOSITE_ZONES,
         Some(SectionKind::TopNZoneSummary) => FEATURE_TOPN_SUMMARIES,
+        Some(SectionKind::CodecExtensionRegistry) => FEATURE_CODEC_EXTENSION_REGISTRY,
+        Some(SectionKind::NestedSchema) => FEATURE_NESTED_COLUMNS,
         _ => 0,
     }
 }
@@ -664,6 +712,26 @@ impl ScanProfileCoveWriter {
         Ok(())
     }
 
+    pub fn push_nested_schema(
+        &mut self,
+        nested_schema: &NestedSchemaSectionV1,
+    ) -> Result<(), CoveError> {
+        nested_schema.validate_for_catalog(&self.table_catalog)?;
+        self.extra_sections.push(SectionPayload {
+            section_kind: SectionKind::NestedSchema as u16,
+            profile: PrimaryProfile::TableScan as u8,
+            flags: 0,
+            item_count: nested_schema.entries.len() as u64,
+            row_count: 0,
+            compression: 0,
+            alignment_log2: 0,
+            required_features: FEATURE_NESTED_COLUMNS,
+            optional_features: 0,
+            data: nested_schema.serialize()?,
+        });
+        Ok(())
+    }
+
     pub fn push_exact_set_index(&mut self, index: &ExactSetIndex) {
         self.push_serialized_scan_artifact(
             SectionKind::ExactSetIndex,
@@ -762,6 +830,7 @@ impl ScanProfileCoveWriter {
 
     fn prepare_inner_writer(&self) -> Result<MinimalCoveWriter, CoveError> {
         self.table_catalog.validate()?;
+        self.validate_nested_schema_sections()?;
         self.validate_segments_against_catalog()?;
 
         let tables_by_id = self
@@ -949,6 +1018,32 @@ impl ScanProfileCoveWriter {
                     table_id, declared_rows, segment_rows
                 )));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_nested_schema_sections(&self) -> Result<(), CoveError> {
+        let has_nested = nested_column_features_for_catalog(&self.table_catalog) != 0;
+        let nested_schema_sections = self
+            .extra_sections
+            .iter()
+            .filter(|section| {
+                SectionKind::from_u16(section.section_kind) == Some(SectionKind::NestedSchema)
+            })
+            .collect::<Vec<_>>();
+        if nested_schema_sections.len() > 1 {
+            return Err(CoveError::BadSchema(
+                "ScanProfileCoveWriter accepts at most one NestedSchema section".into(),
+            ));
+        }
+        if has_nested && nested_schema_sections.is_empty() {
+            return Err(CoveError::BadSchema(
+                "native nested COVE-T columns require a NestedSchema section".into(),
+            ));
+        }
+        if let Some(section) = nested_schema_sections.first() {
+            let parsed = NestedSchemaSectionV1::parse(&section.data)?;
+            parsed.validate_for_catalog(&self.table_catalog)?;
         }
         Ok(())
     }

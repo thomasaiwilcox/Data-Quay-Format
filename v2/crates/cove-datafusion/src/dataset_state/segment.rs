@@ -60,6 +60,7 @@ pub(super) fn mounted_from_metadata(
         engine_metadata,
         column_domains: Vec::new(),
         zone_stats: Vec::new(),
+        nested_schemas: Vec::new(),
         scan_indexes: Vec::new(),
         ignored_optional_sections: Vec::new(),
         covx_status: SidecarValidationStatus::NotProvided,

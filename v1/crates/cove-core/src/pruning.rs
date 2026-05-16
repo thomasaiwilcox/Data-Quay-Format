@@ -113,9 +113,17 @@ impl PruningExplanation {
         self
     }
 
-    pub fn not(mut self) -> Self {
-        self.final_outcome = self.final_outcome.not();
+    pub fn negate(mut self) -> Self {
+        self.final_outcome = !self.final_outcome;
         self
+    }
+}
+
+impl std::ops::Not for PruningExplanation {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        self.negate()
     }
 }
 
@@ -569,13 +577,10 @@ fn predicate_disjoint_from_zone(
     zone_min: &NumericStatValue,
     zone_max: &NumericStatValue,
 ) -> bool {
-    match upper_bound {
-        Some(upper_bound) => {
-            if is_strictly_below(upper_bound, zone_min, upper_inclusive) {
-                return true;
-            }
-        }
-        None => {}
+    if upper_bound
+        .is_some_and(|upper_bound| is_strictly_below(upper_bound, zone_min, upper_inclusive))
+    {
+        return true;
     }
     match lower_bound {
         Some(lower_bound) => is_strictly_above(lower_bound, zone_max, lower_inclusive),
@@ -1145,7 +1150,7 @@ mod tests {
 
         assert_eq!(left.clone().and(right.clone()).final_outcome, NoMatch);
         assert_eq!(left.clone().or(right.clone()).final_outcome, AllMatch);
-        assert_eq!(right.not().final_outcome, AllMatch);
+        assert_eq!((!right).final_outcome, AllMatch);
     }
 
     #[test]

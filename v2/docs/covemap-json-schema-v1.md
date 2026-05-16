@@ -1,9 +1,9 @@
 # COVE-MAP JSON Schema v1
 
 This is the reference implementation companion schema for JSON payloads inside
-`.covemap` artifacts and embedded `MAP_*` sections. It preserves the COVE v1
-binary framing and defines the JSON fields that `cove-map` validates, replays,
-converts, explains, and projects.
+`.covemap` artifacts and embedded `MAP_*` sections. It targets the COVE-MAP v2
+artifact framing and defines the JSON fields that `cove-map` validates,
+replays, converts, explains, and projects.
 
 ## Row Semantics
 
@@ -25,7 +25,7 @@ converts, explains, and projects.
 - `temporal_policy`: optional, defaults to `latest_committed`.
 - `conflict_policy`: optional, defaults to `reject_conflict`.
 - `property_bindings`: object property materialization rules.
-- `association_bindings`: link-object materialization rules for COVE-O v1.
+- `association_bindings`: link-object materialization rules for COVE-O v2.
 
 The reference materializer creates object rows for `Object`, `EventObject`,
 `LinkObject`, `Composite`, `Dispatched`, `KeyValueFragment`, and `Tombstone`.
@@ -154,6 +154,11 @@ Required for executable projections:
 - `columns`
 - `output_modes`
 
+Executable projection `output_modes` are `json`, `arrow`, `cove-t`, and
+`sql`. `cove-o` is accepted only as a schema declaration: table-to-object
+projection semantics are not defined by the v2 reference executor, so
+`cove-map project --format cove-o` fails closed with a precise error.
+
 Supported row grains:
 
 - `one_row_per_object`
@@ -176,6 +181,12 @@ Projection columns use:
 - `logical_type`: optional declared output type.
 - `conflict_policy`: optional, defaults to `canonical_value`.
 - `missing_policy`: optional, defaults to `null`.
+
+Missing `logical_type` defaults to `utf8`. Executable projections support
+scalar output types only: bool, signed and unsigned integer widths, float32/64,
+date days, timestamp micros/nanos, decimal64/128, utf8, binary, json, and uuid.
+Nested list/struct/map output declarations remain schema-only and are rejected
+by executable projection output paths.
 
 Supported `temporal_mode` values are `latest_committed`, `full_history`,
 `valid_time`, `observed_time`, and `commit_order`. Supported

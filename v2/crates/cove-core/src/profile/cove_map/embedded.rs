@@ -1,7 +1,11 @@
 //! Internal COVE-MAP embedded-section parsing and validation helpers.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 use super::*;
@@ -410,12 +414,31 @@ fn validate_row_semantic_rule_shape(rule: &MapRowSemanticRule) -> Result<(), Cov
         }
         _ => return Err(CoveError::MapInvalid),
     }
+    match rule.source_operation_kind {
+        SourceOperationKind::PatchProperty if rule.property_bindings.is_empty() => {
+            return Err(CoveError::MapInvalid);
+        }
+        SourceOperationKind::CloseAssociation if rule.association_bindings.is_empty() => {
+            return Err(CoveError::MapInvalid);
+        }
+        SourceOperationKind::TombstoneObject
+        | SourceOperationKind::TombstoneProperty
+        | SourceOperationKind::TombstoneAssociation
+            if rule.tombstone_target.is_none() =>
+        {
+            return Err(CoveError::MapInvalid);
+        }
+        SourceOperationKind::EvidenceOnly if rule.row_semantics_kind != "EvidenceOnly" => {
+            return Err(CoveError::MapInvalid);
+        }
+        _ => {}
+    }
     Ok(())
 }
 
 impl MapSourceCatalog {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        let root = parse_root(bytes)?;
+        let root = parse_root_for_section(SectionKind::MapSourceCatalog, bytes)?;
         let object = as_object(&root)?;
         let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
         let governance_reconciliation_policy =
@@ -431,6 +454,21 @@ impl MapSourceCatalog {
         if let Some(values) = optional_array(object, "sources")? {
             for value in values {
                 let entry = as_object(value)?;
+                validate_keys(
+                    entry,
+                    &[
+                        "source_id",
+                        "source_kind",
+                        "schema_fingerprint",
+                        "snapshot_digest",
+                        "row_identity_rules",
+                        "replay_claimed",
+                        "source_priority",
+                        "sensitivity_label",
+                        "sensitivity_rank",
+                        "access_policy_ids",
+                    ],
+                )?;
                 let row_identity_rules = string_list(entry, "row_identity_rules")?;
                 if row_identity_rules.is_empty() {
                     return Err(CoveError::MapInvalid);
@@ -465,13 +503,17 @@ impl MapSourceCatalog {
 
 impl MapFunctionRegistry {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        let root = parse_root(bytes)?;
+        let root = parse_root_for_section(SectionKind::MapFunctionRegistry, bytes)?;
         let object = as_object(&root)?;
         let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
         let mut functions = Vec::new();
         if let Some(values) = optional_array(object, "functions")? {
             for value in values {
                 let entry = as_object(value)?;
+                validate_keys(
+                    entry,
+                    &["function_id", "version", "deterministic", "dependency"],
+                )?;
                 functions.push(MapFunctionEntry {
                     function_id: required_non_empty_str(entry, "function_id")?,
                     version: required_non_empty_str(entry, "version")?,
@@ -491,16 +533,41 @@ impl MapFunctionRegistry {
 
 impl MapIdentityRuleCatalog {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        let root = parse_root(bytes)?;
+        let root = parse_root_for_section(SectionKind::MapIdentityRuleCatalog, bytes)?;
         let object = as_object(&root)?;
         let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
         let mut identity_rules = Vec::new();
         if let Some(values) = optional_array(object, "identity_rules")? {
             for value in values {
                 let entry = as_object(value)?;
+                validate_keys(
+                    entry,
+                    &[
+                        "rule_id",
+                        "object_type",
+                        "semantic_role",
+                        "confidence_class",
+                        "auto_merge",
+                        "candidate_only",
+                        "property_conflicts_declared",
+                        "function_ids",
+                        "join_keys",
+                    ],
+                )?;
                 let mut join_keys = Vec::new();
                 for join_key in required_array(entry, "join_keys")? {
                     let join_key = as_object(join_key)?;
+                    validate_keys(
+                        join_key,
+                        &[
+                            "role_id",
+                            "source_column",
+                            "logical_type",
+                            "canonicalization",
+                            "null_policy",
+                            "ordering",
+                        ],
+                    )?;
                     join_keys.push(MapJoinKeyComponent {
                         role_id: required_non_empty_str(join_key, "role_id")?,
                         source_column: required_non_empty_str(join_key, "source_column")?,
@@ -533,6 +600,7 @@ impl MapIdentityRuleCatalog {
         if let Some(values) = optional_array(object, "do_not_merge")? {
             for value in values {
                 let entry = as_object(value)?;
+                validate_keys(entry, &["left_identity", "right_identity"])?;
                 do_not_merge.push(MapDoNotMergeConstraint {
                     left_identity: required_non_empty_str(entry, "left_identity")?,
                     right_identity: required_non_empty_str(entry, "right_identity")?,
@@ -550,13 +618,35 @@ impl MapIdentityRuleCatalog {
 
 impl MapRowSemanticsCatalog {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        let root = parse_root(bytes)?;
+        let root = parse_root_for_section(SectionKind::MapRowSemanticsCatalog, bytes)?;
         let object = as_object(&root)?;
         let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
         let mut rules = Vec::new();
         if let Some(values) = optional_array(object, "rules")? {
             for value in values {
                 let entry = as_object(value)?;
+                validate_keys(
+                    entry,
+                    &[
+                        "rule_id",
+                        "source_id",
+                        "identity_rule_id",
+                        "row_semantics_kind",
+                        "kind",
+                        "source_operation_kind",
+                        "operation_kind",
+                        "assertion_kinds",
+                        "tombstone_target",
+                        "record_kind",
+                        "temporal_policy",
+                        "conflict_policy",
+                        "function_ids",
+                        "output_assertion_ids",
+                        "association_endpoints",
+                        "property_bindings",
+                        "association_bindings",
+                    ],
+                )?;
                 let property_bindings =
                     parse_property_bindings(optional_array(entry, "property_bindings")?)?;
                 let association_bindings =
@@ -565,6 +655,8 @@ impl MapRowSemanticsCatalog {
                     .or_else(|| optional_non_empty_str(entry, "kind").ok().flatten())
                     .unwrap_or_else(|| "Object".to_string());
                 validate_row_semantics_kind(&row_semantics_kind)?;
+                let source_operation_kind =
+                    parse_source_operation_kind(entry, &row_semantics_kind)?;
                 let assertion_kinds = string_list(entry, "assertion_kinds")?;
                 if assertion_kinds.is_empty() {
                     return Err(CoveError::MapInvalid);
@@ -586,6 +678,7 @@ impl MapRowSemanticsCatalog {
                     source_id: required_non_empty_str(entry, "source_id")?,
                     identity_rule_id: required_non_empty_str(entry, "identity_rule_id")?,
                     row_semantics_kind,
+                    source_operation_kind,
                     assertion_kinds,
                     tombstone_target,
                     record_kind: optional_non_empty_str(entry, "record_kind")?
@@ -620,6 +713,22 @@ fn parse_property_bindings(
         .iter()
         .map(|value| {
             let entry = as_object(value)?;
+            validate_keys(
+                entry,
+                &[
+                    "assertion_id",
+                    "property_id",
+                    "property_name",
+                    "source_column",
+                    "logical_type",
+                    "physical_kind",
+                    "value_expression",
+                    "nullable",
+                    "missing_policy",
+                    "conflict_policy",
+                    "source_priority",
+                ],
+            )?;
             Ok(MapPropertyBinding {
                 assertion_id: required_non_empty_str(entry, "assertion_id")?,
                 property_id: required_non_empty_str(entry, "property_id")?,
@@ -647,6 +756,26 @@ fn parse_property_bindings(
         .collect()
 }
 
+fn parse_source_operation_kind(
+    entry: &Map<String, Value>,
+    row_semantics_kind: &str,
+) -> Result<SourceOperationKind, CoveError> {
+    let value = optional_non_empty_str(entry, "source_operation_kind")?.or_else(|| {
+        optional_non_empty_str(entry, "operation_kind")
+            .ok()
+            .flatten()
+    });
+    let kind = match value {
+        Some(value) => SourceOperationKind::parse(&value).ok_or(CoveError::MapInvalid)?,
+        None => match row_semantics_kind {
+            "EvidenceOnly" => SourceOperationKind::EvidenceOnly,
+            "Tombstone" => SourceOperationKind::TombstoneObject,
+            _ => SourceOperationKind::Fact,
+        },
+    };
+    Ok(kind)
+}
+
 fn parse_association_bindings(
     values: Option<&Vec<Value>>,
 ) -> Result<Vec<MapAssociationBinding>, CoveError> {
@@ -657,6 +786,24 @@ fn parse_association_bindings(
         .iter()
         .map(|value| {
             let entry = as_object(value)?;
+            validate_keys(
+                entry,
+                &[
+                    "assertion_id",
+                    "association_type",
+                    "target_identity_rule_id",
+                    "source_identity_rule_id",
+                    "source_role",
+                    "target_role",
+                    "source_endpoint_expression",
+                    "target_endpoint_expression",
+                    "valid_from_expression",
+                    "valid_to_expression",
+                    "cardinality_policy",
+                    "missing_policy",
+                    "link_object_materialization",
+                ],
+            )?;
             Ok(MapAssociationBinding {
                 assertion_id: required_non_empty_str(entry, "assertion_id")?,
                 association_type: required_non_empty_str(entry, "association_type")?,
@@ -695,13 +842,26 @@ fn parse_association_bindings(
 
 impl MapAssertionLog {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        let root = parse_root(bytes)?;
+        let root = parse_root_for_section(SectionKind::MapAssertionLog, bytes)?;
         let object = as_object(&root)?;
         let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
         let mut assertions = Vec::new();
         if let Some(values) = optional_array(object, "assertions")? {
             for value in values {
                 let entry = as_object(value)?;
+                validate_keys(
+                    entry,
+                    &[
+                        "assertion_id",
+                        "output_object_id",
+                        "source_operation_kind",
+                        "operation_effect",
+                        "operation_target",
+                        "correction_of",
+                        "replacement_of",
+                        "redaction_scope",
+                    ],
+                )?;
                 assertions.push(MapAssertionEntry {
                     assertion_id: required_non_empty_str(entry, "assertion_id")?,
                     output_object_id: required_non_empty_str(entry, "output_object_id")?,
@@ -718,19 +878,21 @@ impl MapAssertionLog {
 
 impl MapIdentityEquivalenceIndex {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        let root = parse_root(bytes)?;
+        let root = parse_root_for_section(SectionKind::MapIdentityEquivalenceIndex, bytes)?;
         let object = as_object(&root)?;
         let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
         let mut equivalences = Vec::new();
         if let Some(values) = optional_array(object, "equivalences")? {
             for value in values {
                 let entry = as_object(value)?;
+                validate_keys(entry, &["left_identity", "right_identity"])?;
                 equivalences.push(MapEquivalencePair {
                     left_identity: required_non_empty_str(entry, "left_identity")?,
                     right_identity: required_non_empty_str(entry, "right_identity")?,
                 });
             }
         }
+        validate_identity_components(object)?;
         Ok(Self {
             mapping_id,
             mapping_version,
@@ -741,13 +903,48 @@ impl MapIdentityEquivalenceIndex {
 
 impl MapEvidenceIndex {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        let root = parse_root(bytes)?;
+        let root = parse_root_for_section(SectionKind::MapEvidenceIndex, bytes)?;
         let object = as_object(&root)?;
         let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
         let mut entries = Vec::new();
         if let Some(values) = optional_array(object, "entries")? {
             for value in values {
                 let entry = as_object(value)?;
+                validate_keys(
+                    entry,
+                    &[
+                        "source_id",
+                        "source_row_identity",
+                        "rule_id",
+                        "assertion_id",
+                        "output_object_id",
+                        "observed_schema_fingerprint",
+                        "observed_snapshot_digest",
+                        "source_operation_kind",
+                        "operation_effect",
+                        "operation_target",
+                        "property_id",
+                        "property_name",
+                        "suppressed",
+                        "suppressed_reason",
+                        "suppressed_value",
+                        "redacted",
+                        "redaction_scope",
+                        "correction_of",
+                        "closes_association",
+                        "expires_previous",
+                        "replacement_of",
+                        "candidate",
+                        "identity_rule_id",
+                        "object_type",
+                        "join_key_sha256",
+                    ],
+                )?;
+                let operation_metadata = entry
+                    .iter()
+                    .filter(|(key, _)| is_evidence_operation_metadata_key(key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
                 entries.push(MapEvidenceEntry {
                     source_id: required_non_empty_str(entry, "source_id")?,
                     source_row_identity: required_non_empty_str(entry, "source_row_identity")?,
@@ -762,6 +959,7 @@ impl MapEvidenceIndex {
                         entry,
                         "observed_snapshot_digest",
                     )?,
+                    operation_metadata,
                 });
             }
         }
@@ -773,15 +971,48 @@ impl MapEvidenceIndex {
     }
 }
 
+fn is_evidence_operation_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        "source_operation_kind"
+            | "operation_effect"
+            | "operation_target"
+            | "property_id"
+            | "property_name"
+            | "suppressed"
+            | "suppressed_reason"
+            | "suppressed_value"
+            | "redacted"
+            | "redaction_scope"
+            | "correction_of"
+            | "closes_association"
+            | "expires_previous"
+            | "replacement_of"
+            | "candidate"
+            | "identity_rule_id"
+            | "object_type"
+            | "join_key_sha256"
+    )
+}
+
 impl MapConversionReport {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        let root = parse_root(bytes)?;
+        let root = parse_root_for_section(SectionKind::MapConversionReport, bytes)?;
         let object = as_object(&root)?;
         let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
         let mut sources = Vec::new();
         if let Some(values) = optional_array(object, "sources")? {
             for value in values {
                 let entry = as_object(value)?;
+                validate_keys(
+                    entry,
+                    &[
+                        "source_id",
+                        "source_kind",
+                        "schema_fingerprint",
+                        "snapshot_digest",
+                    ],
+                )?;
                 sources.push(MapObservedSourceState {
                     source_id: required_non_empty_str(entry, "source_id")?,
                     schema_fingerprint: optional_non_empty_str(entry, "schema_fingerprint")?,
@@ -789,6 +1020,7 @@ impl MapConversionReport {
                 });
             }
         }
+        validate_conversion_report_details(object)?;
         Ok(Self {
             mapping_id,
             mapping_version,
@@ -799,13 +1031,30 @@ impl MapConversionReport {
 
 impl MapProjectionCatalog {
     pub fn parse(bytes: &[u8]) -> Result<Self, CoveError> {
-        let root = parse_root(bytes)?;
+        let root = parse_root_for_section(SectionKind::MapProjectionCatalog, bytes)?;
         let object = as_object(&root)?;
         let (mapping_id, mapping_version) = parse_mapping_identity(object)?;
         let mut projections = Vec::new();
         if let Some(values) = optional_array(object, "projections")? {
             for value in values {
                 let entry = as_object(value)?;
+                validate_keys(
+                    entry,
+                    &[
+                        "projection_id",
+                        "assertion_ids",
+                        "output_table",
+                        "row_grain",
+                        "anchor",
+                        "temporal_mode",
+                        "columns",
+                        "multi_value_policy",
+                        "missing_policy",
+                        "ordering",
+                        "evidence_policy",
+                        "output_modes",
+                    ],
+                )?;
                 projections.push(MapProjectionEntry {
                     projection_id: required_non_empty_str(entry, "projection_id")?,
                     assertion_ids: optional_string_list(entry, "assertion_ids")?,
@@ -875,6 +1124,7 @@ fn parse_projection_anchor(
         return Ok(None);
     };
     let anchor = as_object(anchor)?;
+    validate_keys(anchor, &["object_type", "association_type"])?;
     Ok(Some(MapProjectionAnchor {
         object_type: optional_non_empty_str(anchor, "object_type")?,
         association_type: optional_non_empty_str(anchor, "association_type")?,
@@ -892,6 +1142,7 @@ fn parse_temporal_mode(entry: &Map<String, Value>) -> Result<Option<String>, Cov
             .ok_or(CoveError::MapInvalid),
         Some(value) => {
             let mode = as_object(value)?;
+            validate_keys(mode, &["as_of"])?;
             optional_non_empty_str(mode, "as_of")
         }
     }
@@ -907,10 +1158,22 @@ fn parse_projection_columns(
         .iter()
         .map(|value| {
             let entry = as_object(value)?;
+            validate_keys(
+                entry,
+                &[
+                    "name",
+                    "value",
+                    "logical_type",
+                    "nested_shape",
+                    "conflict_policy",
+                    "missing_policy",
+                ],
+            )?;
             Ok(MapProjectionColumn {
                 name: required_non_empty_str(entry, "name")?,
                 value: required_non_empty_str(entry, "value")?,
                 logical_type: optional_non_empty_str(entry, "logical_type")?,
+                nested_shape: optional_nested_shape(entry, "nested_shape")?,
                 conflict_policy: optional_non_empty_str(entry, "conflict_policy")?
                     .unwrap_or_else(|| "canonical_value".to_string()),
                 missing_policy: optional_non_empty_str(entry, "missing_policy")?
@@ -958,7 +1221,20 @@ fn is_valid_temporal_mode(mode: &str) -> bool {
     matches!(
         mode,
         "latest_committed" | "full_history" | "valid_time" | "observed_time" | "commit_order"
-    )
+    ) || mode
+        .strip_prefix("as_of_timestamp_us:")
+        .or_else(|| mode.strip_prefix("as_of_timestamp_us="))
+        .or_else(|| mode.strip_prefix("timestamp_us:"))
+        .or_else(|| mode.strip_prefix("timestamp_us="))
+        .or_else(|| mode.strip_prefix("as_of_time:"))
+        .or_else(|| mode.strip_prefix("as_of_time="))
+        .is_some_and(|value| value.parse::<i64>().is_ok())
+        || mode
+            .strip_prefix("as_of_csn:")
+            .or_else(|| mode.strip_prefix("as_of_csn="))
+            .or_else(|| mode.strip_prefix("csn:"))
+            .or_else(|| mode.strip_prefix("csn="))
+            .is_some_and(|value| value.parse::<u64>().is_ok())
 }
 
 fn is_valid_multi_value_policy(policy: &str) -> bool {
@@ -985,8 +1261,314 @@ fn is_valid_projection_output_mode(mode: &str) -> bool {
     matches!(mode, "json" | "cove-o" | "cove-t" | "arrow" | "sql")
 }
 
-fn parse_root(bytes: &[u8]) -> Result<Value, CoveError> {
-    serde_json::from_slice(bytes).map_err(|_| CoveError::MapInvalid)
+const COVE_MAP_JSON_SCHEMA_ID: &str = "org.coveformat.covemap.v2";
+
+#[derive(Debug)]
+struct NoDuplicateValue(Value);
+
+impl<'de> Deserialize<'de> for NoDuplicateValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(NoDuplicateValueVisitor)
+    }
+}
+
+struct NoDuplicateValueVisitor;
+
+impl<'de> Visitor<'de> for NoDuplicateValueVisitor {
+    type Value = NoDuplicateValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(NoDuplicateValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(NoDuplicateValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(NoDuplicateValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(NoDuplicateValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(NoDuplicateValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(NoDuplicateValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(NoDuplicateValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(NoDuplicateValue(Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        NoDuplicateValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element::<NoDuplicateValue>()? {
+            values.push(value.0);
+        }
+        Ok(NoDuplicateValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut keys = BTreeSet::new();
+        let mut object = Map::new();
+        while let Some((key, value)) = access.next_entry::<String, NoDuplicateValue>()? {
+            if !keys.insert(key.clone()) {
+                return Err(de::Error::custom(format!("duplicate JSON key `{key}`")));
+            }
+            object.insert(key, value.0);
+        }
+        Ok(NoDuplicateValue(Value::Object(object)))
+    }
+}
+
+fn parse_root_for_section(kind: SectionKind, bytes: &[u8]) -> Result<Value, CoveError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let root = NoDuplicateValue::deserialize(&mut deserializer)
+        .map_err(|_| CoveError::MapInvalid)?
+        .0;
+    deserializer.end().map_err(|_| CoveError::MapInvalid)?;
+    let object = as_object(&root)?;
+    validate_payload_envelope(kind, object)?;
+    Ok(root)
+}
+
+fn validate_payload_envelope(
+    kind: SectionKind,
+    object: &Map<String, Value>,
+) -> Result<(), CoveError> {
+    if object.get("schema_id").and_then(Value::as_str) != Some(COVE_MAP_JSON_SCHEMA_ID) {
+        return Err(CoveError::MapInvalid);
+    }
+    if !section_id_matches(kind, object.get("section_id").ok_or(CoveError::MapInvalid)?) {
+        return Err(CoveError::MapInvalid);
+    }
+    if !object.keys().all(|key| is_allowed_root_key(kind, key)) {
+        return Err(CoveError::MapInvalid);
+    }
+    validate_extension_containers(object)?;
+    Ok(())
+}
+
+fn section_id_matches(kind: SectionKind, value: &Value) -> bool {
+    match value {
+        Value::Number(number) => number.as_u64() == Some(kind as u16 as u64),
+        Value::String(name) => {
+            name == section_kind_schema_name(kind) || name == &format!("{kind:?}")
+        }
+        _ => false,
+    }
+}
+
+fn section_kind_schema_name(kind: SectionKind) -> &'static str {
+    match kind {
+        SectionKind::MapSourceCatalog => "MAP_SOURCE_CATALOG",
+        SectionKind::MapFunctionRegistry => "MAP_FUNCTION_REGISTRY",
+        SectionKind::MapIdentityRuleCatalog => "MAP_IDENTITY_RULE_CATALOG",
+        SectionKind::MapRowSemanticsCatalog => "MAP_ROW_SEMANTICS_CATALOG",
+        SectionKind::MapAssertionLog => "MAP_ASSERTION_LOG",
+        SectionKind::MapIdentityEquivalenceIndex => "MAP_IDENTITY_EQUIVALENCE_INDEX",
+        SectionKind::MapEvidenceIndex => "MAP_EVIDENCE_INDEX",
+        SectionKind::MapConversionReport => "MAP_CONVERSION_REPORT",
+        SectionKind::MapProjectionCatalog => "MAP_PROJECTION_CATALOG",
+        _ => "UNKNOWN",
+    }
+}
+
+fn is_allowed_root_key(kind: SectionKind, key: &str) -> bool {
+    matches!(
+        key,
+        "schema_id" | "section_id" | "mapping_id" | "mapping_version" | "extension" | "extensions"
+    ) || match kind {
+        SectionKind::MapSourceCatalog => {
+            matches!(key, "governance_reconciliation_policy" | "sources")
+        }
+        SectionKind::MapFunctionRegistry => key == "functions",
+        SectionKind::MapIdentityRuleCatalog => matches!(key, "identity_rules" | "do_not_merge"),
+        SectionKind::MapRowSemanticsCatalog => key == "rules",
+        SectionKind::MapAssertionLog => key == "assertions",
+        SectionKind::MapIdentityEquivalenceIndex => matches!(key, "equivalences" | "components"),
+        SectionKind::MapEvidenceIndex => key == "entries",
+        SectionKind::MapConversionReport => matches!(
+            key,
+            "sources"
+                | "source_count"
+                | "row_count"
+                | "object_count"
+                | "association_count"
+                | "property_value_count"
+                | "candidate_match_count"
+                | "candidate_matches"
+                | "generated_artifacts"
+                | "unsupported"
+                | "operation_counts"
+                | "governance"
+        ),
+        SectionKind::MapProjectionCatalog => key == "projections",
+        _ => false,
+    }
+}
+
+fn validate_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), CoveError> {
+    for key in object.keys() {
+        if key == "extension" || key == "extensions" || allowed.iter().any(|allowed| allowed == key)
+        {
+            continue;
+        }
+        return Err(CoveError::MapInvalid);
+    }
+    validate_extension_containers(object)?;
+    Ok(())
+}
+
+fn validate_extension_containers(object: &Map<String, Value>) -> Result<(), CoveError> {
+    if let Some(extension) = object.get("extension") {
+        if !extension.is_object() {
+            return Err(CoveError::MapInvalid);
+        }
+    }
+    if let Some(extensions) = object.get("extensions") {
+        let extensions = extensions.as_object().ok_or(CoveError::MapInvalid)?;
+        for (extension_id, payload) in extensions {
+            if extension_id.trim().is_empty() || !payload.is_object() {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_identity_components(object: &Map<String, Value>) -> Result<(), CoveError> {
+    let Some(components) = optional_array(object, "components")? else {
+        return Ok(());
+    };
+    for value in components {
+        let component = as_object(value)?;
+        validate_keys(
+            component,
+            &["equivalence_id", "goid", "canonical_anchor", "members"],
+        )?;
+        if let Some(members) = optional_array(component, "members")? {
+            for value in members {
+                let member = as_object(value)?;
+                validate_keys(
+                    member,
+                    &[
+                        "source_id",
+                        "row_index",
+                        "source_row_identity",
+                        "row_rule_id",
+                        "identity_rule_id",
+                        "identity_alias",
+                        "object_type",
+                        "join_key_sha256",
+                        "row_digest",
+                    ],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_conversion_report_details(object: &Map<String, Value>) -> Result<(), CoveError> {
+    if let Some(matches) = optional_array(object, "candidate_matches")? {
+        for value in matches {
+            let candidate = as_object(value)?;
+            validate_keys(
+                candidate,
+                &[
+                    "candidate_match_id",
+                    "source_id",
+                    "source_row_identity",
+                    "row_rule_id",
+                    "identity_rule_id",
+                    "object_type",
+                    "join_key_sha256",
+                ],
+            )?;
+        }
+    }
+    if let Some(artifacts) = optional_array(object, "generated_artifacts")? {
+        parse_string_values(artifacts)?;
+    }
+    if let Some(unsupported) = optional_array(object, "unsupported")? {
+        parse_string_values(unsupported)?;
+    }
+    if let Some(operation_counts) = object.get("operation_counts") {
+        let operation_counts = as_object(operation_counts)?;
+        for (key, value) in operation_counts {
+            if SourceOperationKind::parse(key).is_none() || value.as_u64().is_none() {
+                return Err(CoveError::MapInvalid);
+            }
+        }
+    }
+    if let Some(governance) = object.get("governance") {
+        let governance = as_object(governance)?;
+        validate_keys(
+            governance,
+            &[
+                "reconciliation_policy",
+                "sources",
+                "effective_sensitivity_rank",
+                "effective_sensitivity_labels",
+                "access_policy_ids",
+            ],
+        )?;
+        if let Some(sources) = optional_array(governance, "sources")? {
+            for value in sources {
+                let source = as_object(value)?;
+                validate_keys(
+                    source,
+                    &[
+                        "source_id",
+                        "source_priority",
+                        "sensitivity_label",
+                        "sensitivity_rank",
+                        "access_policy_ids",
+                    ],
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_mapping_identity(object: &Map<String, Value>) -> Result<(String, String), CoveError> {
@@ -1042,6 +1624,29 @@ fn optional_non_empty_str(
             .filter(|value| !value.is_empty())
             .map(|value| Some(value.to_string()))
             .ok_or(CoveError::MapInvalid),
+    }
+}
+
+fn optional_nested_shape(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, CoveError> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.is_empty() {
+                Err(CoveError::MapInvalid)
+            } else {
+                Ok(Some(value.to_string()))
+            }
+        }
+        Some(Value::Object(_)) => object
+            .get(key)
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| CoveError::MapInvalid),
+        Some(_) => Err(CoveError::MapInvalid),
     }
 }
 

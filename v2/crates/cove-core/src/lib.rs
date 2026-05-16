@@ -10,15 +10,15 @@
 //! | [`constants`] | Magic bytes, feature bits, section kinds, and all spec enumerations. |
 //! | [`error`] | [`CoveError`] — the single error type for the entire library. |
 //! | [`checksum`] | CRC32C utilities (Castagnoli, per Section 8.6). |
-//! | [`header`] | [`CoveHeaderV1`] — the 160-byte v2 file header (Section 10). |
-//! | [`postscript`] | [`CovePostscriptV1`] and [`CoveSectionSpecV1`] (Section 12). |
-//! | [`footer`] | [`CoveFooter`], [`CoveFooterHeaderV1`], [`CoveSectionEntryV1`] (Section 13). |
+//! | [`header`] | [`header::CoveHeaderV1`] — the 160-byte v2 file header (Section 10). |
+//! | [`postscript`] | [`postscript::CovePostscriptV1`] and [`postscript::CoveSectionSpecV1`] (Section 12). |
+//! | [`footer`] | [`footer::CoveFooter`], [`footer::CoveFooterHeaderV1`], [`footer::CoveSectionEntryV1`] (Section 13). |
 //! | [`metadata`] | Descriptive footer metadata JSON (Section 15). |
 //! | [`dictionary`] | File dictionary types (Section 16). |
 //! | [`types`] | Logical/physical type compatibility and NumCode interpretation helpers. |
 //! | [`validity`] | [`validity::ValidityBitmap`] — null bitmap helpers (bit 1 = null). |
-//! | [`writer`] | [`MinimalCoveWriter`] — writes minimal valid COVE files. |
-//! | [`array`]      | [`array::EncodedArray`] — single-row decoder for encoded column arrays. |
+//! | [`writer`] | [`writer::MinimalCoveWriter`] — writes minimal valid COVE files. |
+//! | [`mod@array`]      | [`array::EncodedArray`] — single-row decoder for encoded column arrays. |
 //! | [`compression`] | Section decompression layer (None/LZ4/Zstd). |
 //! | [`extensions`] | [`extensions::ExtensionRegistry`] — extension registry parsing and validation. |
 //! | [`collation`]  | [`collation::CollationRegistry`] — v1 collation registry and comparison rules. |
@@ -72,6 +72,7 @@ pub mod array;
 pub mod artifact;
 pub mod canonical;
 pub mod checksum;
+pub mod codec;
 pub mod collation;
 pub mod compression;
 pub mod constants;
@@ -83,6 +84,7 @@ pub mod encoding;
 pub mod error;
 pub mod extensions;
 pub mod feature_binding;
+pub mod feature_scope;
 pub mod footer;
 pub mod header;
 pub mod index;
@@ -91,6 +93,7 @@ pub mod io_hints;
 pub mod kernel;
 pub mod metadata;
 pub mod mount;
+pub mod nested_schema;
 pub mod page;
 pub mod page_payload;
 mod page_validation;
@@ -108,9 +111,14 @@ pub mod sort;
 pub mod table;
 pub mod trust_chain;
 pub mod types;
+pub mod utility;
 pub mod validity;
 pub mod wire;
 pub mod writer;
 pub mod zone_stats;
 
 pub use error::CoveError;
+pub use profile::cove_o::{
+    read_object_surface_from_bytes, CoveAssociationMetadata, CoveObjectPropertyValue,
+    CoveObjectRecord, CoveObjectSurface,
+};

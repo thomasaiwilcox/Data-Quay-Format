@@ -10,7 +10,7 @@
 //! * [`TableSegmentIndex`] — the segment index (Spec §25.1) listing every
 //!   segment in a table with row range, morsel layout, and segment payload
 //!   location.
-//! * [`TableSegmentHeader`] — the in-segment header (Spec §25.2) with
+//! * [`TableSegmentHeaderV1`] — the in-segment header (Spec §25.2) with
 //!   bootstrap offsets to the morsel directory, column directory, page
 //!   index region, and column data region.
 //! * [`RowMorselDirectory`] — the per-segment morsel directory (Spec §26)
@@ -553,6 +553,8 @@ impl TableSegmentPayloadV1 {
                         physical_kind: column.physical_kind,
                         dictionary: None,
                         zone_stats: None,
+                        codec_descriptors: &[],
+                        nested_schema: None,
                     };
                     validate_column_page_wire(&context, &page, page_wire)?;
                 }

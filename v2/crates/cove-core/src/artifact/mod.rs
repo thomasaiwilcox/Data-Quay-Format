@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Companion artifacts (Spec §68–§69).
+//! Cove Format (COVE) v2.0 — Companion artifacts (Spec §68–§69).
 //!
 //! Sidecar artifacts that accelerate planning. Both COVX and COVM are
 //! *advisory*: a reader MUST be able to fall back to the underlying COVE file

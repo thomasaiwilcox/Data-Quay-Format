@@ -1,0 +1,10 @@
+[package]
+name = "cove-convert"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight conversion facade for the Cove Format (COVE)"
+license = "MIT"
+
+[dependencies]
+cove-arrow = { path = "../cove-arrow" }
+cove-convert-parquet = { path = "../cove-convert-parquet" }

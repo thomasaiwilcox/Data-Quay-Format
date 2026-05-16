@@ -12,7 +12,10 @@ use crate::{
     hex_encode,
     input::{read_source_inputs, validate_source_inputs, SourceRow},
     materialize_with_source_states, plan_identities,
-    project::project_rows_with_source_states,
+    project::{
+        project_cove_o_path, project_rows_with_source_states,
+        project_rows_with_source_states_output, ProjectionFormat,
+    },
     section_kind, MaterializedModel,
 };
 
@@ -42,6 +45,31 @@ pub fn projected_rows_from_paths(map: &Path, sources: &[PathBuf]) -> Result<Valu
     let inputs = read_source_inputs(sources)?;
     validate_source_inputs(&file, &inputs.states)?;
     project_rows_with_source_states(&file, &inputs.rows, &inputs.states)
+}
+
+pub fn projected_output_from_paths(
+    map: &Path,
+    sources: &[PathBuf],
+    format: ProjectionFormat,
+    projection_id: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let file = parse_map(map)?;
+    let inputs = read_source_inputs(sources)?;
+    validate_source_inputs(&file, &inputs.states)?;
+    project_rows_with_source_states_output(
+        &file,
+        &inputs.rows,
+        &inputs.states,
+        format,
+        projection_id,
+    )
+}
+
+pub fn projected_rows_from_cove_o_path(
+    object: &Path,
+    mapping: Option<&Path>,
+) -> Result<Value, String> {
+    project_cove_o_path(object, mapping)
 }
 
 pub(crate) fn parse_map(path: &Path) -> Result<CovemapFile, String> {

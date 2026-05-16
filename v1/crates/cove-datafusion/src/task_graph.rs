@@ -53,7 +53,7 @@ pub fn build_task_graph(state: &DatasetState, plan: &ScanPlan) -> Result<TaskGra
         let file_state = state.single_file_view(file_ordinal)?;
         let file_plan = state.resolved_plan_for_file(plan, file_ordinal)?;
         for (segment_index, segment) in file_state.segments().iter().enumerate() {
-            let mut row_start = segment.row_start as u64;
+            let mut row_start = segment.row_start;
             let morsel_count = segment.morsel_count();
             for morsel_id in 0..morsel_count {
                 graph.morsels_considered += 1;
@@ -143,7 +143,8 @@ fn build_lookup_rowref_task_graph(
                 if row_in_morsel >= row_count {
                     return Ok(None);
                 }
-                let row_start = u64::from(segment.row_start)
+                let row_start = segment
+                    .row_start
                     .checked_add(
                         u64::from(row.morsel_id)
                             .checked_mul(u64::from(segment.morsel_row_count))

@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — I/O hints (Spec §8.8, §67).
+//! Cove Format (COVE) v2.0 — I/O hints (Spec §8.8, §67).
 //!
 //! Optional descriptive metadata that nudges the reader toward efficient
 //! object-store / NVMe access patterns. The reader is free to ignore hints.

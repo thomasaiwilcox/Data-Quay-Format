@@ -21,6 +21,7 @@ use crate::{
         exact_set::ExactSetIndex, inverted::InvertedMorselIndex, lookup::LookupIndex,
         topn::TopNSummary,
     },
+    nested_schema::NestedSchemaSectionV1,
     profile::{
         cove_e::{
             CodeSpaceDescriptorV1, EngineMountPolicyV1, EngineProfileRegistry,
@@ -84,6 +85,7 @@ pub struct MountedCoveFile {
     pub engine_mount_policies: Vec<EngineMountPolicyV1>,
     pub column_domains: Vec<ColumnDomain>,
     pub zone_stats: Vec<ZoneStatsSection>,
+    pub nested_schemas: Vec<NestedSchemaSectionV1>,
     pub scan_indexes: Vec<MountedScanIndex>,
     pub ignored_optional_sections: Vec<IgnoredOptionalSection>,
     pub covx_status: SidecarValidationStatus,
@@ -237,6 +239,7 @@ pub fn mount_cove_file(
     };
     let column_domains = parse_column_domains(data, &footer)?;
     let zone_stats = parse_zone_stats(data, &footer)?;
+    let nested_schemas = parse_nested_schemas(data, &footer)?;
     let scan_indexes = parse_scan_indexes(data, &footer)?;
     let covx_status = validate_covx_sidecar(
         options.covx,
@@ -272,6 +275,7 @@ pub fn mount_cove_file(
         engine_metadata,
         column_domains,
         zone_stats,
+        nested_schemas,
         scan_indexes,
         ignored_optional_sections: validation.ignored_optional_sections,
         covx_status,
@@ -569,6 +573,18 @@ fn parse_zone_stats(data: &[u8], footer: &CoveFooter) -> Result<Vec<ZoneStatsSec
     Ok(out)
 }
 
+fn parse_nested_schemas(
+    data: &[u8],
+    footer: &CoveFooter,
+) -> Result<Vec<NestedSchemaSectionV1>, CoveError> {
+    let mut out = Vec::new();
+    for entry in find_sections(footer, SectionKind::NestedSchema) {
+        let payload = compression::section_payload(data, entry)?;
+        out.push(NestedSchemaSectionV1::parse(&payload)?);
+    }
+    Ok(out)
+}
+
 /// Parse every standardized COVE-E metadata section in a mounted file.
 pub fn parse_engine_metadata(
     data: &[u8],
@@ -782,6 +798,7 @@ fn validate_covm_sidecar(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn referenced_file_matches(
     file_id: [u8; 16],
     file_len: u64,

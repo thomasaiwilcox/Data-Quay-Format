@@ -38,7 +38,7 @@ pub const HEADER_LEN_V1: u16 = 160;
 /// Required value of `version_major` for COVE v2.
 pub const VERSION_MAJOR_V1: u16 = 2;
 
-/// Required value of `version_minor` for COVE v1.
+/// Required value of `version_minor` for COVE v2.
 pub const VERSION_MINOR_V1: u16 = 0;
 
 /// Required `endianness` value: 1 = little-endian.
@@ -312,6 +312,7 @@ pub enum SectionKind {
     TrustManifest = 44,
     SectionFeatureBinding = 45,
     CoverageProofRecord = 46,
+    NestedSchema = 47,
 
     // COVE-H sections (profile = 5)
     HarborMountHints = 50,
@@ -380,6 +381,7 @@ impl SectionKind {
             44 => Some(Self::TrustManifest),
             45 => Some(Self::SectionFeatureBinding),
             46 => Some(Self::CoverageProofRecord),
+            47 => Some(Self::NestedSchema),
             50 => Some(Self::HarborMountHints),
             60 => Some(Self::MapSourceCatalog),
             61 => Some(Self::MapFunctionRegistry),
@@ -615,6 +617,7 @@ pub enum CoveEncodingKind {
     VarBytes = 16,
     Lz4Block = 17,
     ZstdBlock = 18,
+    RegisteredEncoding = 19,
 }
 
 impl CoveEncodingKind {
@@ -639,6 +642,7 @@ impl CoveEncodingKind {
             16 => Some(Self::VarBytes),
             17 => Some(Self::Lz4Block),
             18 => Some(Self::ZstdBlock),
+            19 => Some(Self::RegisteredEncoding),
             _ => None,
         }
     }
@@ -881,6 +885,7 @@ mod tests {
             SectionKind::from_u16(22),
             Some(SectionKind::KernelCapabilities)
         );
+        assert_eq!(SectionKind::from_u16(47), Some(SectionKind::NestedSchema));
     }
 
     #[test]
@@ -979,7 +984,6 @@ mod tests {
     #[test]
     fn section_kind_from_u16_unknown() {
         assert_eq!(SectionKind::from_u16(0), None);
-        assert_eq!(SectionKind::from_u16(47), None);
         assert_eq!(SectionKind::from_u16(100), None);
     }
 
@@ -1191,11 +1195,15 @@ mod tests {
             CoveEncodingKind::from_u16(18),
             Some(CoveEncodingKind::ZstdBlock)
         );
+        assert_eq!(
+            CoveEncodingKind::from_u16(19),
+            Some(CoveEncodingKind::RegisteredEncoding)
+        );
     }
 
     #[test]
     fn encoding_kind_from_u16_unknown() {
-        assert_eq!(CoveEncodingKind::from_u16(19), None);
+        assert_eq!(CoveEncodingKind::from_u16(20), None);
         assert_eq!(CoveEncodingKind::from_u16(1000), None);
     }
 

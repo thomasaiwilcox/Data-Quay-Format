@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — CRC32C utilities.
+//! Cove Format (COVE) v2.0 — CRC32C utilities.
 //!
 //! COVE uses CRC32C (Castagnoli) for corruption detection (Section 8.6).
 //! CRC fields are computed over the covered byte range with the CRC field itself

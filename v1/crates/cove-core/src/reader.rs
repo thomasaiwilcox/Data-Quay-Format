@@ -214,22 +214,19 @@ fn validate_codec_feature_advertisement(
     let advertised = header.required_features | header.optional_features;
     let section_advertised = entry.required_features | entry.optional_features;
     match compression {
-        1 => {
-            if advertised & FEATURE_CODEC_LZ4 == 0 || section_advertised & FEATURE_CODEC_LZ4 == 0 {
-                return Err(CoveError::BadSection(format!(
-                    "section {} uses LZ4 compression but codec feature bit is not advertised",
-                    entry.section_id
-                )));
-            }
+        1 if advertised & FEATURE_CODEC_LZ4 == 0 || section_advertised & FEATURE_CODEC_LZ4 == 0 => {
+            return Err(CoveError::BadSection(format!(
+                "section {} uses LZ4 compression but codec feature bit is not advertised",
+                entry.section_id
+            )));
         }
-        2 => {
-            if advertised & FEATURE_CODEC_ZSTD == 0 || section_advertised & FEATURE_CODEC_ZSTD == 0
-            {
-                return Err(CoveError::BadSection(format!(
-                    "section {} uses ZSTD compression but codec feature bit is not advertised",
-                    entry.section_id
-                )));
-            }
+        2 if advertised & FEATURE_CODEC_ZSTD == 0
+            || section_advertised & FEATURE_CODEC_ZSTD == 0 =>
+        {
+            return Err(CoveError::BadSection(format!(
+                "section {} uses ZSTD compression but codec feature bit is not advertised",
+                entry.section_id
+            )));
         }
         _ => {}
     }

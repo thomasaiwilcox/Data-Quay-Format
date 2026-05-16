@@ -416,6 +416,8 @@ fn parse_temporal_property_columns(
                 physical_kind: directory.physical_kind,
                 dictionary: None,
                 zone_stats: None,
+                codec_descriptors: &[],
+                nested_schema: None,
             };
             if page.page_length == 0 {
                 validate_temporal_property_stats_only_page(&context, page)?;

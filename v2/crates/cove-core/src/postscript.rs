@@ -1,6 +1,6 @@
-//! Cove Format (COVE) v1.0 — Postscript and section spec structures.
+//! Cove Format (COVE) v2.0 — Postscript and section spec structures.
 //!
-//! Corresponds to Section 12 of the COVE v1.0 specification.
+//! Corresponds to Section 12 of the COVE v2.0 specification.
 //!
 //! The postscript occupies the final bytes of every COVE file, immediately
 //! before the trailing tag:
@@ -9,11 +9,11 @@
 //! [postscript bytes  : postscript_len bytes]
 //! [postscript_version: u16]
 //! [postscript_len    : u16]
-//! [magic             : b"COV1"]
+//! [magic             : b"COV2"]
 //! ```
 //!
 //! `postscript_len` excludes `postscript_version`, `postscript_len`, and the
-//! trailing magic.  For v1, `postscript_len` is always 64.
+//! trailing magic.  For v2, `postscript_len` is always 64.
 
 use crate::{
     checksum,
@@ -45,7 +45,7 @@ pub struct CoveSectionSpecV1 {
     pub uncompressed_length: u64,
     /// Compression codec applied to the section payload.
     pub compression: u8,
-    /// Encryption scheme — MUST be 0 (None) in v1.
+    /// Encryption scheme — MUST be 0 (None) in v2.
     pub encryption: u8,
     /// `log2` of the section's alignment (advisory).
     pub alignment_log2: u8,
@@ -53,7 +53,7 @@ pub struct CoveSectionSpecV1 {
     pub flags: u8,
     /// CRC32C of the section's on-disk bytes (after compression).
     pub crc32c: u32,
-    /// Reserved — MUST be zero in v1.
+    /// Reserved — MUST be zero in v2.
     pub reserved: u32,
 }
 
@@ -95,7 +95,7 @@ impl CoveSectionSpecV1 {
         }
         if encryption != 0 {
             return Err(CoveError::BadSection(format!(
-                "encryption must be 0 in v1, got {encryption}"
+                "encryption must be 0 in v2, got {encryption}"
             )));
         }
         if reserved != 0 {
@@ -125,7 +125,7 @@ impl CoveSectionSpecV1 {
 
 // ── CovePostscriptV1 ────────────────────────────────────────────────────────────
 
-/// Postscript size in bytes (the `postscript_len` value for v1).
+/// Postscript size in bytes (the `postscript_len` value for v2).
 pub const POSTSCRIPT_SIZE: usize = POSTSCRIPT_LEN;
 
 /// Size of the fixed tail after the postscript payload:
@@ -138,7 +138,7 @@ pub const POSTSCRIPT_TOTAL_SIZE: usize = POSTSCRIPT_SIZE + POSTSCRIPT_TAIL_SIZE;
 /// Byte offset of the CRC32C field inside the serialised postscript payload.
 const PS_CHECKSUM_OFFSET: usize = 60;
 
-/// Parsed COVE v1 postscript.
+/// Parsed COVE v2 postscript.
 ///
 /// Discovered by reading the last [`POSTSCRIPT_TOTAL_SIZE`] bytes of the file
 /// (or up to the last 64 KiB as per the spec recommendation).

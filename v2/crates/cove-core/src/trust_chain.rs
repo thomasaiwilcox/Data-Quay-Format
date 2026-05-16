@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Trust chain (Spec §63).
+//! Cove Format (COVE) v2.0 — Trust chain (Spec §63).
 //!
 //! Each COVE-O record can carry a `trust_hash` that chains to its predecessor
 //! by hashing canonical *logical* values (Spec §17), not FileCodes. This

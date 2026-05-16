@@ -6,6 +6,7 @@
 
 use crate::{
     checksum,
+    codec::RegisteredEncodingEnvelopeV2,
     constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
     retained_bytes::RetainedBytes,
     CoveError,
@@ -268,6 +269,13 @@ pub struct RetainedColumnPagePayloadV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PagePayloadTreeNode<'a> {
+    pub node: &'a CoveEncodingNodeV1,
+    pub buffers: Vec<&'a PageBufferDescriptorV1>,
+    pub children: Vec<PagePayloadTreeNode<'a>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedColumnPagePayloadParts {
     header: ColumnPagePayloadHeaderV1,
     nodes: Vec<CoveEncodingNodeV1>,
@@ -419,6 +427,181 @@ impl ColumnPagePayloadV1 {
         Ok(out)
     }
 
+    pub fn build_tree(
+        row_count: u32,
+        root_node_id: u16,
+        nodes: Vec<CoveEncodingNodeV1>,
+        buffers: Vec<(PageBufferKind, Vec<u8>)>,
+    ) -> Result<Vec<u8>, CoveError> {
+        if nodes.is_empty() {
+            return Err(CoveError::PageCorrupt);
+        }
+        let node_count = u16::try_from(nodes.len()).map_err(|_| CoveError::ArithOverflow)?;
+        let buffer_count = u16::try_from(buffers.len()).map_err(|_| CoveError::ArithOverflow)?;
+        let nodes_offset = COLUMN_PAGE_PAYLOAD_HEADER_LEN as u32;
+        let node_region_len = u32::from(node_count)
+            .checked_mul(COVE_ENCODING_NODE_LEN as u32)
+            .ok_or(CoveError::ArithOverflow)?;
+        let buffer_directory_offset = nodes_offset
+            .checked_add(node_region_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        let buffer_region_len = u32::from(buffer_count)
+            .checked_mul(PAGE_BUFFER_DESCRIPTOR_LEN as u32)
+            .ok_or(CoveError::ArithOverflow)?;
+        let buffers_offset = buffer_directory_offset
+            .checked_add(buffer_region_len)
+            .ok_or(CoveError::ArithOverflow)?;
+        let header = ColumnPagePayloadHeaderV1 {
+            magic: COLUMN_PAGE_PAYLOAD_MAGIC,
+            version_major: 1,
+            header_len: COLUMN_PAGE_PAYLOAD_HEADER_LEN as u16,
+            flags: 0,
+            root_node_id,
+            node_count,
+            buffer_count,
+            row_count,
+            nodes_offset,
+            buffer_directory_offset,
+            buffers_offset,
+            reserved: 0,
+        };
+        let mut descriptors = Vec::with_capacity(buffers.len());
+        let mut data_bytes = Vec::new();
+        for (kind, bytes) in buffers {
+            let offset = buffers_offset as u64 + data_bytes.len() as u64;
+            descriptors.push(PageBufferDescriptorV1 {
+                buffer_id: descriptors.len() as u16,
+                kind,
+                flags: 0,
+                offset,
+                length: bytes.len() as u64,
+                checksum: checksum::crc32c(&bytes),
+                reserved: 0,
+            });
+            data_bytes.extend_from_slice(&bytes);
+        }
+        let mut out = Vec::with_capacity(
+            buffers_offset as usize
+                + usize::try_from(descriptors.iter().map(|d| d.length).sum::<u64>())
+                    .map_err(|_| CoveError::ArithOverflow)?,
+        );
+        out.extend_from_slice(&header.serialize());
+        for node in &nodes {
+            out.extend_from_slice(&node.serialize());
+        }
+        for descriptor in &descriptors {
+            out.extend_from_slice(&descriptor.serialize());
+        }
+        out.extend_from_slice(&data_bytes);
+        let parsed = Self::parse(&out)?;
+        parsed.tree()?;
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_registered_single_node(
+        row_count: u32,
+        non_null_count: u32,
+        logical_type: CoveLogicalType,
+        physical_kind: CovePhysicalKind,
+        codec_id: u32,
+        codec_version_major: u16,
+        codec_version_minor: u16,
+        encoded_payload: Vec<u8>,
+        fallback_payload: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, CoveError> {
+        if non_null_count > row_count {
+            return Err(CoveError::BadCodecExtension);
+        }
+        let nodes_offset = COLUMN_PAGE_PAYLOAD_HEADER_LEN as u32;
+        let buffer_directory_offset = nodes_offset
+            .checked_add(COVE_ENCODING_NODE_LEN as u32)
+            .ok_or(CoveError::ArithOverflow)?;
+        let buffers_offset = buffer_directory_offset
+            .checked_add(PAGE_BUFFER_DESCRIPTOR_LEN as u32)
+            .ok_or(CoveError::ArithOverflow)?;
+        let envelope_offset = buffers_offset as u64;
+        let encoded_payload_offset = envelope_offset
+            .checked_add(RegisteredEncodingEnvelopeV2::LEN as u64)
+            .ok_or(CoveError::ArithOverflow)?;
+        let fallback_payload_offset = if fallback_payload.is_some() {
+            encoded_payload_offset
+                .checked_add(encoded_payload.len() as u64)
+                .ok_or(CoveError::ArithOverflow)?
+        } else {
+            0
+        };
+        let fallback_payload_length = fallback_payload
+            .as_ref()
+            .map(|payload| payload.len() as u64)
+            .unwrap_or(0);
+        let envelope = RegisteredEncodingEnvelopeV2 {
+            codec_id,
+            codec_version_major,
+            codec_version_minor,
+            logical_len: row_count,
+            non_null_count,
+            params_offset: envelope_offset as u32,
+            params_length: RegisteredEncodingEnvelopeV2::LEN as u32,
+            encoded_payload_offset,
+            encoded_payload_length: encoded_payload.len() as u64,
+            fallback_payload_offset,
+            fallback_payload_length,
+            decoded_uncompressed_length: 0,
+            flags: 0,
+            checksum: 0,
+        };
+        let mut registered_bytes = envelope.serialize()?.to_vec();
+        registered_bytes.extend_from_slice(&encoded_payload);
+        if let Some(fallback_payload) = fallback_payload {
+            registered_bytes.extend_from_slice(&fallback_payload);
+        }
+        let header = ColumnPagePayloadHeaderV1 {
+            magic: COLUMN_PAGE_PAYLOAD_MAGIC,
+            version_major: 1,
+            header_len: COLUMN_PAGE_PAYLOAD_HEADER_LEN as u16,
+            flags: 0,
+            root_node_id: 0,
+            node_count: 1,
+            buffer_count: 1,
+            row_count,
+            nodes_offset,
+            buffer_directory_offset,
+            buffers_offset,
+            reserved: 0,
+        };
+        let node = CoveEncodingNodeV1 {
+            node_id: 0,
+            encoding_kind: CoveEncodingKind::RegisteredEncoding,
+            logical_type,
+            physical_kind,
+            flags: 0,
+            logical_len: row_count,
+            child_count: 0,
+            buffer_count: 1,
+            params_offset: envelope_offset as u32,
+            params_length: RegisteredEncodingEnvelopeV2::LEN as u32,
+            stats_id: 0,
+            reserved: 0,
+        };
+        let descriptor = PageBufferDescriptorV1 {
+            buffer_id: 0,
+            kind: PageBufferKind::Other,
+            flags: 0,
+            offset: buffers_offset as u64,
+            length: registered_bytes.len() as u64,
+            checksum: checksum::crc32c(&registered_bytes),
+            reserved: 0,
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&header.serialize());
+        out.extend_from_slice(&node.serialize());
+        out.extend_from_slice(&descriptor.serialize());
+        out.extend_from_slice(&registered_bytes);
+        Self::parse(&out)?;
+        Ok(out)
+    }
+
     pub fn root_node(&self) -> Result<&CoveEncodingNodeV1, CoveError> {
         let mut roots = self
             .nodes
@@ -444,6 +627,17 @@ impl ColumnPagePayloadV1 {
         )
         .map_err(|_| CoveError::OffsetRange)?;
         Ok(Some(&self.data.as_slice()[start..end]))
+    }
+
+    pub fn buffer_bytes_for_descriptor(
+        &self,
+        descriptor: &PageBufferDescriptorV1,
+    ) -> Result<&[u8], CoveError> {
+        buffer_descriptor_bytes(self.data.as_slice(), descriptor)
+    }
+
+    pub fn tree(&self) -> Result<PagePayloadTreeNode<'_>, CoveError> {
+        payload_tree(&self.nodes, &self.buffers, self.header.root_node_id)
     }
 }
 
@@ -497,6 +691,93 @@ impl RetainedColumnPagePayloadV1 {
         .map_err(|_| CoveError::OffsetRange)?;
         Ok(Some(&self.data.as_slice()[start..end]))
     }
+
+    pub fn buffer_bytes_for_descriptor(
+        &self,
+        descriptor: &PageBufferDescriptorV1,
+    ) -> Result<&[u8], CoveError> {
+        buffer_descriptor_bytes(self.data.as_slice(), descriptor)
+    }
+
+    pub fn tree(&self) -> Result<PagePayloadTreeNode<'_>, CoveError> {
+        payload_tree(&self.nodes, &self.buffers, self.header.root_node_id)
+    }
+}
+
+impl<'a> PagePayloadTreeNode<'a> {
+    pub fn buffer_of_kind(
+        &self,
+        kind: PageBufferKind,
+    ) -> Result<Option<&'a PageBufferDescriptorV1>, CoveError> {
+        let mut matches = self
+            .buffers
+            .iter()
+            .copied()
+            .filter(|buffer| buffer.kind == kind);
+        let first = matches.next();
+        if matches.next().is_some() {
+            return Err(CoveError::PageCorrupt);
+        }
+        Ok(first)
+    }
+}
+
+fn buffer_descriptor_bytes<'a>(
+    data: &'a [u8],
+    descriptor: &PageBufferDescriptorV1,
+) -> Result<&'a [u8], CoveError> {
+    let start = usize::try_from(descriptor.offset).map_err(|_| CoveError::OffsetRange)?;
+    let len = usize::try_from(descriptor.length).map_err(|_| CoveError::OffsetRange)?;
+    let end = start.checked_add(len).ok_or(CoveError::ArithOverflow)?;
+    if end > data.len() {
+        return Err(CoveError::OffsetRange);
+    }
+    Ok(&data[start..end])
+}
+
+fn payload_tree<'a>(
+    nodes: &'a [CoveEncodingNodeV1],
+    buffers: &'a [PageBufferDescriptorV1],
+    root_node_id: u16,
+) -> Result<PagePayloadTreeNode<'a>, CoveError> {
+    if nodes.is_empty() || nodes[0].node_id != root_node_id {
+        return Err(CoveError::PageCorrupt);
+    }
+    let mut node_pos = 0usize;
+    let mut buffer_pos = 0usize;
+    let root = parse_payload_subtree(nodes, buffers, &mut node_pos, &mut buffer_pos)?;
+    if node_pos != nodes.len() || buffer_pos != buffers.len() {
+        return Err(CoveError::PageCorrupt);
+    }
+    Ok(root)
+}
+
+fn parse_payload_subtree<'a>(
+    nodes: &'a [CoveEncodingNodeV1],
+    buffers: &'a [PageBufferDescriptorV1],
+    node_pos: &mut usize,
+    buffer_pos: &mut usize,
+) -> Result<PagePayloadTreeNode<'a>, CoveError> {
+    let node = nodes.get(*node_pos).ok_or(CoveError::PageCorrupt)?;
+    *node_pos = (*node_pos).checked_add(1).ok_or(CoveError::ArithOverflow)?;
+    let buffer_count = usize::from(node.buffer_count);
+    let buffer_end = buffer_pos
+        .checked_add(buffer_count)
+        .ok_or(CoveError::ArithOverflow)?;
+    if buffer_end > buffers.len() {
+        return Err(CoveError::PageCorrupt);
+    }
+    let owned_buffers = buffers[*buffer_pos..buffer_end].iter().collect::<Vec<_>>();
+    *buffer_pos = buffer_end;
+    let mut children = Vec::with_capacity(usize::from(node.child_count));
+    for _ in 0..node.child_count {
+        children.push(parse_payload_subtree(nodes, buffers, node_pos, buffer_pos)?);
+    }
+    Ok(PagePayloadTreeNode {
+        node,
+        buffers: owned_buffers,
+        children,
+    })
 }
 
 fn parse_column_page_payload_parts(
@@ -608,6 +889,7 @@ fn parse_column_page_payload_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::nested::{ListLayout, ListLayoutPayload};
     use std::sync::Arc;
 
     #[test]
@@ -681,6 +963,80 @@ mod tests {
             retained.buffer_bytes(PageBufferKind::Values).unwrap(),
             Some(&b"\x02\0\0\0hi\x03\0\0\0bye"[..])
         );
+    }
+
+    #[test]
+    fn nested_tree_payload_assigns_buffers_by_preorder_ownership() {
+        let layout = ListLayoutPayload {
+            layout: ListLayout {
+                offsets: vec![0, 2, 2, 4],
+            },
+            child_row_count: 4,
+        };
+        let values = [10i64, 11, 12, 13]
+            .into_iter()
+            .flat_map(i64::to_le_bytes)
+            .collect::<Vec<_>>();
+        let bytes = ColumnPagePayloadV1::build_tree(
+            3,
+            0,
+            vec![
+                CoveEncodingNodeV1 {
+                    node_id: 0,
+                    encoding_kind: CoveEncodingKind::Canonical,
+                    logical_type: CoveLogicalType::List,
+                    physical_kind: CovePhysicalKind::List,
+                    flags: 0,
+                    logical_len: 3,
+                    child_count: 1,
+                    buffer_count: 1,
+                    params_offset: 0,
+                    params_length: 0,
+                    stats_id: 0,
+                    reserved: 0,
+                },
+                CoveEncodingNodeV1 {
+                    node_id: 1,
+                    encoding_kind: CoveEncodingKind::NumCode,
+                    logical_type: CoveLogicalType::Int32,
+                    physical_kind: CovePhysicalKind::NumCode,
+                    flags: 0,
+                    logical_len: 4,
+                    child_count: 0,
+                    buffer_count: 1,
+                    params_offset: 0,
+                    params_length: 0,
+                    stats_id: 0,
+                    reserved: 0,
+                },
+            ],
+            vec![
+                (PageBufferKind::ChildLayout, layout.encode()),
+                (PageBufferKind::Values, values.clone()),
+            ],
+        )
+        .unwrap();
+
+        let payload = ColumnPagePayloadV1::parse(&bytes).unwrap();
+        let tree = payload.tree().unwrap();
+        assert_eq!(tree.node.node_id, 0);
+        assert_eq!(tree.children.len(), 1);
+        assert!(tree
+            .buffer_of_kind(PageBufferKind::Values)
+            .unwrap()
+            .is_none());
+        let root_layout = tree
+            .buffer_of_kind(PageBufferKind::ChildLayout)
+            .unwrap()
+            .and_then(|descriptor| payload.buffer_bytes_for_descriptor(descriptor).ok())
+            .unwrap();
+        assert_eq!(ListLayoutPayload::parse(root_layout).unwrap(), layout);
+        let child_values = tree.children[0]
+            .buffer_of_kind(PageBufferKind::Values)
+            .unwrap()
+            .and_then(|descriptor| payload.buffer_bytes_for_descriptor(descriptor).ok())
+            .unwrap();
+        assert_eq!(child_values, values.as_slice());
     }
 
     #[test]

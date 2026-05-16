@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Engine and execution profiles.
+//! Cove Format (COVE) v2.0 — Engine and execution profiles.
 //!
 //! * [`cove_e`] — Spec §38–§43: generic engine profile.
 //! * [`cove_h`] — Spec §44: Harbor profile (registered implementation).

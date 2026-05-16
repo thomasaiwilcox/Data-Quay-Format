@@ -1223,6 +1223,10 @@ fn build_zone_stats_entry(
     )))
 }
 
+type FileCodeDomainStats = (u32, u32, u32, u32, bool);
+type ScalarZoneStats = (StatKind, Vec<u8>, Vec<u8>, u32, u32, ZoneStatFlags);
+
+#[allow(clippy::too_many_arguments)]
 fn zone_entry(
     column: &ConvertedColumn,
     row_count: usize,
@@ -1255,7 +1259,7 @@ fn filecode_domain_stats(
     column: &ConvertedColumn,
     start: usize,
     len: usize,
-) -> Result<Option<(u32, u32, u32, u32, bool)>, CoveError> {
+) -> Result<Option<FileCodeDomainStats>, CoveError> {
     let MaterializedValues::FileCode(values) = &column.values else {
         return Ok(None);
     };
@@ -1295,7 +1299,7 @@ fn scalar_min_max_stats(
     column: &ConvertedColumn,
     start: usize,
     len: usize,
-) -> Result<Option<(StatKind, Vec<u8>, Vec<u8>, u32, u32, ZoneStatFlags)>, CoveError> {
+) -> Result<Option<ScalarZoneStats>, CoveError> {
     let rows = column.non_null_indices(start, len)?;
     if rows.is_empty() {
         return Ok(None);
@@ -1348,7 +1352,7 @@ fn numcode_min_max_stats(
     logical: CoveLogicalType,
     source_kind: SourceColumnKind,
     rows: &[usize],
-) -> Result<Option<(StatKind, Vec<u8>, Vec<u8>, u32, u32, ZoneStatFlags)>, CoveError> {
+) -> Result<Option<ScalarZoneStats>, CoveError> {
     let slice = rows.iter().map(|row| values[*row]).collect::<Vec<_>>();
     match logical {
         CoveLogicalType::Int8
@@ -1514,12 +1518,12 @@ fn build_acceleration_artifacts(
             && (unique_keys.len() <= 4096 || unique_keys.len().saturating_mul(2) <= row_count);
         let declared_lookup = point_lookup.contains(&column.entry.name);
 
-        if should_emit_exact_set(options.acceleration_policy, declared_lookup, low_or_medium)
-            && key_kind.is_some()
-        {
-            artifacts
-                .exact_sets
-                .push(build_exact_set(column, &unique_keys, key_kind.unwrap())?);
+        if let Some(kind) = key_kind {
+            if should_emit_exact_set(options.acceleration_policy, declared_lookup, low_or_medium) {
+                artifacts
+                    .exact_sets
+                    .push(build_exact_set(column, &unique_keys, kind)?);
+            }
         }
         if declared_lookup {
             if let Some(kind) = key_kind {

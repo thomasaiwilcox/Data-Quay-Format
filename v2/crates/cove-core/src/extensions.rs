@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Extension registry and descriptor payloads
+//! Cove Format (COVE) v2.0 — Extension registry and descriptor payloads
 //! (Spec §§45-47).
 
 use crate::{

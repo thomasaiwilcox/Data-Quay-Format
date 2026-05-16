@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — descriptive footer metadata JSON.
+//! Cove Format (COVE) v2.0 — descriptive footer metadata JSON.
 //!
 //! Spec §15: footer metadata JSON is optional, descriptive, and non-authoritative.
 //! Binary metadata remains the source of truth for offsets, schema, checksums,

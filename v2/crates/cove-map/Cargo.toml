@@ -4,8 +4,51 @@ version = "0.1.0"
 edition = "2021"
 description = "Reference COVE-MAP local tooling CLI"
 license = "MIT"
+autobins = false
 
 [dependencies]
+arrow-array = "58"
+arrow-ipc = "58"
+arrow-json = "58"
+arrow-schema = "58"
 cove-core = { path = "../cove-core" }
+icu_casemap = { version = "2.2", features = ["compiled_data"] }
+icu_normalizer = "2.2"
 serde_json = "1"
 sha2 = "0.10"
+
+[[bin]]
+name = "cove-map"
+path = "src/main.rs"
+
+[[bin]]
+name = "cove-map-validate"
+path = "src/bin/cove-map-validate.rs"
+
+[[bin]]
+name = "cove-map-preview"
+path = "src/bin/cove-map-preview.rs"
+
+[[bin]]
+name = "cove-map-convert"
+path = "src/bin/cove-map-convert.rs"
+
+[[bin]]
+name = "cove-map-explain"
+path = "src/bin/cove-map-explain.rs"
+
+[[bin]]
+name = "cove-map-diff"
+path = "src/bin/cove-map-diff.rs"
+
+[[bin]]
+name = "cove-map-test"
+path = "src/bin/cove-map-test.rs"
+
+[[bin]]
+name = "cove-map-plan-keys"
+path = "src/bin/cove-map-plan-keys.rs"
+
+[[bin]]
+name = "cove-map-project"
+path = "src/bin/cove-map-project.rs"

@@ -1,6 +1,6 @@
-//! Cove Format (COVE) v1.0 — Footer and section directory.
+//! Cove Format (COVE) v2.0 — Footer and section directory.
 //!
-//! Corresponds to Section 13 of the COVE v1.0 specification.
+//! Corresponds to Section 13 of the COVE v2.0 specification.
 //!
 //! The footer immediately follows the last section payload and contains:
 //!
@@ -15,7 +15,7 @@ use crate::{
     checksum,
     constants::{
         CompressionCodec, PrimaryProfile, SectionKind, FOOTER_HEADER_LEN, FOOTER_VERSION_V1,
-        KNOWN_FEATURE_BITS_MASK, MAGIC_COVE_FOOTER, METADATA_LEN_MAX, SECTION_ENTRY_LEN,
+        MAGIC_COVE_FOOTER, METADATA_LEN_MAX, SECTION_ENTRY_LEN,
     },
     error::CoveError,
     metadata::MetadataJson,
@@ -31,21 +31,21 @@ pub const FOOTER_HEADER_SIZE: usize = FOOTER_HEADER_LEN;
 /// Corresponds to `CoveFooterHeaderV1` in Section 13 of the specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoveFooterHeaderV1 {
-    /// Footer magic — must be `b"COVF"`.
+    /// Footer magic — must be `b"CV2F"`.
     pub footer_magic: [u8; 4],
-    /// Footer version — must be 1.
+    /// Footer version — must be 2.
     pub footer_version: u16,
     /// Byte length of this header structure, used for forward compatibility.
     pub header_len: u16,
     /// Number of section directory entries that follow this header.
     pub section_count: u32,
-    /// Byte length of each section directory entry (76 for v1).
+    /// Byte length of each section directory entry (76 for v2).
     pub section_entry_len: u16,
     /// Footer-level flags.
     pub flags: u16,
     /// Byte length of the optional JSON metadata blob that follows the directory.
     pub metadata_len: u32,
-    /// Reserved — MUST be zero in v1.
+    /// Reserved — MUST be zero in v2.
     pub reserved: [u8; 24],
 }
 
@@ -165,7 +165,7 @@ pub struct CoveSectionEntryV1 {
     pub row_count: u64,
     /// Compression codec.
     pub compression: u8,
-    /// Encryption scheme — MUST be 0 in v1.
+    /// Encryption scheme — MUST be 0 in v2.
     pub encryption: u8,
     /// `log2` of the section's alignment (advisory).
     pub alignment_log2: u8,
@@ -245,12 +245,8 @@ impl CoveSectionEntryV1 {
         }
         if encryption != 0 {
             return Err(CoveError::BadSection(format!(
-                "section {section_id}: encryption must be 0 in v1, got {encryption}"
+                "section {section_id}: encryption must be 0 in v2, got {encryption}"
             )));
-        }
-        let unknown_required = required_features & !KNOWN_FEATURE_BITS_MASK;
-        if unknown_required != 0 {
-            return Err(CoveError::UnknownRequiredFeature(unknown_required));
         }
         if reserved0 != 0 || reserved1 != 0 {
             return Err(CoveError::ReservedNotZero);
@@ -347,7 +343,7 @@ impl CoveFooter {
         })
     }
 
-    /// Compute the CRC32C of the footer bytes as produced by [`serialize`].
+    /// Compute the CRC32C of the footer bytes as produced by [`Self::serialize`].
     ///
     /// Use this to fill the `crc32c` field of the postscript's footer spec.
     pub fn compute_crc(&self) -> u32 {
@@ -636,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn section_entry_rejects_unknown_required_feature_bit() {
+    fn section_entry_preserves_unknown_required_feature_bit_for_scoped_validation() {
         let entry = CoveSectionEntryV1 {
             section_id: 1,
             section_kind: SectionKind::FileDictionaryIndex as u16,
@@ -656,10 +652,8 @@ mod tests {
             crc32c: 0,
             reserved1: 0,
         };
-        assert!(matches!(
-            CoveSectionEntryV1::parse(&entry.serialize()),
-            Err(CoveError::UnknownRequiredFeature(_))
-        ));
+        let parsed = CoveSectionEntryV1::parse(&entry.serialize()).unwrap();
+        assert_eq!(parsed.required_features, entry.required_features);
     }
 
     #[test]

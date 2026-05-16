@@ -8,6 +8,7 @@
 
 mod bloom;
 mod object_catalog;
+mod readback;
 mod segment;
 mod segment_index;
 mod temporal;
@@ -29,6 +30,12 @@ pub use object_catalog::{
     PROPERTY_FLAG_ASSOCIATION_TYPE, PROPERTY_FLAG_ASSOCIATION_VALID_FROM,
     PROPERTY_FLAG_ASSOCIATION_VALID_TO, PROPERTY_FLAG_BOOL_DECLARED_NUMERIC,
     PROPERTY_FLAG_EVIDENCE_REF, PROPERTY_FLAG_MAPPING_RULE_REF,
+};
+pub use readback::{
+    read_object_surface_from_bytes, read_object_surface_from_bytes_with_options,
+    reconstruct_object_states, CoveAssociationMetadata, CoveObjectPropertyValue,
+    CoveObjectReadOptions, CoveObjectReconstructionOptions, CoveObjectRecord, CoveObjectState,
+    CoveObjectSurface, CoveObjectTemporalCut, CoveObjectTombstoneStatus,
 };
 pub(crate) use segment::{
     validate_temporal_property_page_elision_features, validate_temporal_property_stats_only_page,

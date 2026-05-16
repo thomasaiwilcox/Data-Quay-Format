@@ -1,4 +1,4 @@
-//! Cove Format (COVE) v1.0 — Kernel capability descriptor (Spec §21).
+//! Cove Format (COVE) v2.0 — Kernel capability descriptor (Spec §21).
 //!
 //! A *kernel capability* describes what an engine-specific decode kernel can
 //! do beyond the canonical decode path: vectorisation hints, fused predicate

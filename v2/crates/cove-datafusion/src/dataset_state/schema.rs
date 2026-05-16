@@ -1,8 +1,11 @@
 use arrow_schema::Schema;
 use cove_arrow::arrow::{
-    arrow_data_type_for_column_export_options, ArrowExportOptions, ArrowFidelitySeverity,
+    arrow_data_type_for_column_export_options, arrow_data_type_for_nested_schema_node,
+    ArrowExportOptions, ArrowFidelitySeverity,
 };
-use cove_core::{table::TableEntry, CoveError};
+use cove_core::{
+    constants::CovePhysicalKind, nested_schema::NestedSchemaSectionV1, table::TableEntry, CoveError,
+};
 
 use super::FileMetadata;
 
@@ -48,18 +51,35 @@ pub(super) fn validate_schema_compatible_files(files: &[FileMetadata]) -> Result
 pub(super) fn schema_for_table(
     table: &TableEntry,
     has_file_dictionary: bool,
+    nested_schemas: &[NestedSchemaSectionV1],
     arrow_export_options: ArrowExportOptions,
 ) -> Result<Schema, CoveError> {
     let fields = table
         .columns
         .iter()
         .map(|column| {
-            let result = arrow_data_type_for_column_export_options(
-                column.logical,
+            let result = if matches!(
                 column.physical,
-                has_file_dictionary,
-                arrow_export_options,
-            )?;
+                CovePhysicalKind::List | CovePhysicalKind::Struct | CovePhysicalKind::Map
+            ) {
+                let nested = nested_schemas
+                    .iter()
+                    .find_map(|section| section.entry(table.table_id, column.column_id))
+                    .ok_or_else(|| {
+                        CoveError::BadSchema(format!(
+                            "nested column {}.{} is missing NestedSchema metadata",
+                            table.table_id, column.column_id
+                        ))
+                    })?;
+                arrow_data_type_for_nested_schema_node(&nested.root, arrow_export_options)?
+            } else {
+                arrow_data_type_for_column_export_options(
+                    column.logical,
+                    column.physical,
+                    has_file_dictionary,
+                    arrow_export_options,
+                )?
+            };
             if result
                 .report
                 .issues

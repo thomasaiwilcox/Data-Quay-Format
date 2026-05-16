@@ -5,44 +5,35 @@ use arrow_buffer::alloc::Allocation;
 use crate::constants::CoveLogicalType;
 
 /// Policy for exporting FileCode-backed scalar columns to Arrow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ArrowDictionaryPolicy {
     /// Decode FileCodes to their logical values before building the Arrow array.
     DecodeValues,
     /// Export FileCodes as Arrow dictionary keys when values are representable.
+    #[default]
     DictionaryKeys,
 }
 
-impl Default for ArrowDictionaryPolicy {
-    fn default() -> Self {
-        Self::DictionaryKeys
-    }
-}
-
 /// Policy for exporting COVE variable byte payloads to Arrow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ArrowVarBytesExportPolicy {
     /// Materialise COVE length-prefixed bytes into standard Arrow Utf8/Binary
     /// offset/value buffers.
+    #[default]
     Standard,
     /// Export COVE length-prefixed bytes as legal Arrow Utf8View/BinaryView
     /// arrays. The backing buffer must own or retain the COVE values bytes.
     View,
 }
 
-impl Default for ArrowVarBytesExportPolicy {
-    fn default() -> Self {
-        Self::Standard
-    }
-}
-
 /// Policy for validating COVE byte payloads before constructing Arrow Utf8.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ArrowStringValidationPolicy {
     /// Validate all materialized non-null rows while exporting.
+    #[default]
     Strict,
     /// Validate on the first export, but allow an outer caller to replace this
     /// with [`ArrowStringValidationPolicy::TrustedPageProof`] once it has
@@ -52,12 +43,6 @@ pub enum ArrowStringValidationPolicy {
     /// Trust a caller-supplied page-level proof that every non-null row slice is
     /// valid UTF-8.
     TrustedPageProof,
-}
-
-impl Default for ArrowStringValidationPolicy {
-    fn default() -> Self {
-        Self::Strict
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

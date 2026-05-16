@@ -8,7 +8,7 @@ mod pruning;
 mod selection;
 mod stats;
 
-use std::{borrow::Cow, path::Path, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, path::Path, sync::Arc};
 
 use arrow_array::{
     types::UInt32Type, Array, ArrayRef, DictionaryArray, RecordBatch, RecordBatchOptions,
@@ -19,14 +19,16 @@ use cove_arrow::arrow::{
     encoded_filecode_array_to_arrow_dictionary_remapped,
     encoded_filecode_array_to_arrow_dictionary_with_values,
     file_dictionary_entries_compatible_with_logical, file_dictionary_values_to_arrow,
-    filecode_dictionary_value_export_options, ArrowBufferOwner, ArrowDictionaryPolicy,
-    ArrowExportOptions, ArrowRowSelection, ArrowStringValidationPolicy, ArrowVarBytesExportPolicy,
+    filecode_dictionary_value_export_options, nested_page_payload_to_arrow_array, ArrowBufferOwner,
+    ArrowDictionaryPolicy, ArrowExportOptions, ArrowRowSelection, ArrowStringValidationPolicy,
+    ArrowVarBytesExportPolicy,
 };
 use cove_core::{
     array::{CoveArrayValue, EncodedArray, PreparedEncodedArray},
     compression,
     constants::{CoveEncodingKind, CoveLogicalType, CovePhysicalKind},
     index::{lookup::LookupKeyKind, topn::TopNDirection},
+    nested_schema::NestedSchemaNodeV1,
     page::{
         page_uses_payload_elision, ColumnPageIndex, ColumnPageIndexEntryV1, PAGE_FLAG_ALL_NON_NULL,
         PAGE_FLAG_ALL_NULL, PAGE_FLAG_STATS_ONLY_CONSTANT,
@@ -42,6 +44,7 @@ use cove_core::{
     validity::ValidityBitmap,
     wire, CoveError,
 };
+use cove_layout::{ZeroCopyCompatibilityV2, ZeroCopyMaterializationReasonV2};
 
 use crate::{
     dataset_state::{DatasetBootstrapStats, DatasetState},
@@ -52,9 +55,9 @@ use crate::{
     },
     prune,
     range_reader::{
-        build_coalesced_range_plan, read_coalesced_range_buffers_for_plan, CoveRangeReader,
-        LocalFileRangeReader, MemoryRangeReader, MmapFileRangeReader, RangeReadKind, RangeReadMode,
-        RangeReadPlan,
+        build_layout_aware_coalesced_range_plan, read_coalesced_range_buffers_for_plan,
+        CoveRangeReader, LocalFileRangeReader, MemoryRangeReader, MmapFileRangeReader,
+        RangeReadKind, RangeReadMode, RangeReadPlan,
     },
     task_graph::ScanTask,
 };
@@ -74,8 +77,8 @@ use predicates::apply_predicate_to_selection;
 pub(crate) use predicates::numeric_lookup_key;
 use predicates::{plan_has_exact_row_predicate, plan_has_residual};
 use pruning::{
-    apply_overlay_to_selection, selected_rows_for_morsel, selected_rows_for_morsel_metadata,
-    should_prune_morsel, should_prune_morsel_metadata,
+    apply_overlay_to_selection, covi_morsel_pruned, selected_rows_for_morsel,
+    selected_rows_for_morsel_metadata, should_prune_morsel, should_prune_morsel_metadata,
 };
 use selection::{DecodeScratch, Selection, SelectionMask};
 
@@ -291,6 +294,11 @@ pub(crate) fn decode_local_dataset_scan_tasks_with_sink<S: DecodeSink + ?Sized>(
     let mut stats = DecodeStats {
         scan_tasks: tasks.len(),
         scan_partitions: usize::from(partition_index == 0) * partition_count,
+        covel_scan_splits_used: tasks
+            .iter()
+            .filter_map(|task| task.split_id.map(|split_id| (task.file_ordinal, split_id)))
+            .collect::<BTreeSet<_>>()
+            .len(),
         ..DecodeStats::default()
     };
     if partition_index == 0 {
@@ -407,7 +415,9 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
             &plan,
         ) {
             stats.morsels_considered += 1;
-            let row_start = u64::from(segment.header.row_start)
+            let row_start = segment
+                .header
+                .row_start
                 .checked_add(u64::from(morsel.first_row_in_segment))
                 .ok_or(CoveError::ArithOverflow)?;
             if state.file(0)?.visibility().morsel_all_hidden(
@@ -419,9 +429,21 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
                 stats.overlay_morsels_pruned += 1;
                 continue;
             }
+            if covi_morsel_pruned(
+                &plan,
+                segment.header.segment_id,
+                morsel.morsel_id,
+                row_start,
+                morsel.row_count,
+            ) {
+                stats.morsels_pruned += 1;
+                stats.covi_candidate_pruned += 1;
+                continue;
+            }
             if prune::morsel_pruned(state, segment.header.segment_id, morsel.morsel_id, &plan)?
                 || should_prune_morsel(
                     state,
+                    segment_ref,
                     &prepared_segment,
                     morsel.morsel_id,
                     &plan,
@@ -436,6 +458,7 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
                 state,
                 segment_bytes,
                 &prepared_segment,
+                segment_ref,
                 segment.header.segment_id,
                 morsel.morsel_id,
                 &plan,
@@ -487,10 +510,17 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
                 let column = &state.table().columns[*projection_index];
                 let segment_column = prepared_segment.column(column.column_id)?;
                 let page = prepared_segment.page_for_morsel(segment_column, morsel.morsel_id)?;
+                state.reject_table_scan_page_feature_use(segment_ref, page)?;
                 let payload = materialize_page_payload(
                     segment_bytes,
                     column,
-                    &page,
+                    page,
+                    state.pruning().codec_descriptors.as_slice(),
+                    state
+                        .mounted()
+                        .dictionary
+                        .as_ref()
+                        .map(|dictionary| dictionary.len()),
                     state.page_payload_validation_policy(),
                 )?;
                 stats.pages_decoded += usize::from(page.page_length != 0);
@@ -519,6 +549,7 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
             let arrow_options = state.arrow_export_options();
             let column_refs = arrow_encoded_columns_for_payloads(
                 state,
+                segment.header.segment_id,
                 &columns,
                 &encoded_columns,
                 &page_indexes,
@@ -545,6 +576,14 @@ pub(crate) fn decode_scan_to_sink<S: DecodeSink + ?Sized>(
 }
 
 fn plan_selects_no_rows(plan: &ScanPlan) -> bool {
+    if plan
+        .covi_candidates
+        .as_ref()
+        .map(Vec::is_empty)
+        .unwrap_or(false)
+    {
+        return true;
+    }
     plan.filters.iter().any(|filter| {
         matches!(
             filter.predicate,
@@ -666,7 +705,8 @@ async fn decode_scan_with_reader_to_sink_cached<
             &plan,
         ) {
             stats.morsels_considered += 1;
-            let row_start = u64::from(segment_ref.row_start)
+            let row_start = segment_ref
+                .row_start
                 .checked_add(u64::from(morsel.first_row_in_segment))
                 .ok_or(CoveError::ArithOverflow)?;
             if state.file(0)?.visibility().morsel_all_hidden(
@@ -678,9 +718,21 @@ async fn decode_scan_with_reader_to_sink_cached<
                 stats.overlay_morsels_pruned += 1;
                 continue;
             }
+            if covi_morsel_pruned(
+                &plan,
+                segment_ref.segment_id,
+                morsel.morsel_id,
+                row_start,
+                morsel.row_count,
+            ) {
+                stats.morsels_pruned += 1;
+                stats.covi_candidate_pruned += 1;
+                continue;
+            }
             if prune::morsel_pruned(state, segment_ref.segment_id, morsel.morsel_id, &plan)?
                 || should_prune_morsel_metadata(
                     state,
+                    segment_ref,
                     &segment,
                     morsel.morsel_id,
                     &plan,
@@ -736,11 +788,13 @@ async fn decode_scan_with_reader_to_sink_cached<
             let mut page_indexes = Vec::with_capacity(plan.scan_projection.len());
             let mut columns = Vec::with_capacity(plan.scan_projection.len());
             let mut ranges = Vec::new();
+            let mut range_hints = Vec::new();
             let mut range_slots = Vec::with_capacity(plan.scan_projection.len());
             for projection_index in &plan.scan_projection {
                 let column = &state.table().columns[*projection_index];
                 let segment_column = segment.column(column.column_id)?;
                 let page = segment.page_for_morsel(segment_column, morsel.morsel_id)?;
+                state.reject_table_scan_page_feature_use(segment_ref, page)?;
                 if page.page_length == 0 {
                     range_slots.push(None);
                 } else {
@@ -752,6 +806,12 @@ async fn decode_scan_with_reader_to_sink_cached<
                         .checked_add(page.page_length)
                         .ok_or(CoveError::ArithOverflow)?;
                     range_slots.push(Some(ranges.len()));
+                    range_hints.push(state.range_cluster_hint(
+                        segment_ref.segment_id,
+                        morsel.morsel_id,
+                        start,
+                        end,
+                    ));
                     ranges.push(start..end);
                 }
                 stats.pages_decoded += usize::from(page.page_length != 0);
@@ -759,7 +819,11 @@ async fn decode_scan_with_reader_to_sink_cached<
                 columns.push(column);
             }
 
-            let coalesced_plan = build_coalesced_range_plan(&ranges, state.range_coalescing())?;
+            let coalesced_plan = build_layout_aware_coalesced_range_plan(
+                &ranges,
+                &range_hints,
+                state.range_coalescing(),
+            )?;
             let range_stats = coalesced_plan.stats();
             record_range_plan(
                 RangeReadPlan::choose(
@@ -798,6 +862,12 @@ async fn decode_scan_with_reader_to_sink_cached<
                     column,
                     page,
                     wire,
+                    state.pruning().codec_descriptors.as_slice(),
+                    state
+                        .mounted()
+                        .dictionary
+                        .as_ref()
+                        .map(|dictionary| dictionary.len()),
                     state.page_payload_validation_policy(),
                 )?);
             }
@@ -816,6 +886,7 @@ async fn decode_scan_with_reader_to_sink_cached<
             let arrow_options = state.arrow_export_options();
             let column_refs = arrow_encoded_columns_for_payloads(
                 state,
+                segment_ref.segment_id,
                 &columns,
                 &encoded_columns,
                 &page_indexes,
@@ -895,7 +966,8 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
         for task in &tasks[task_start..task_end] {
             stats.morsels_considered += 1;
             let morsel = segment.morsel(task.morsel_id)?;
-            let row_start = u64::from(segment_ref.row_start)
+            let row_start = segment_ref
+                .row_start
                 .checked_add(u64::from(morsel.first_row_in_segment))
                 .ok_or(CoveError::ArithOverflow)?;
             if state.file(0)?.visibility().morsel_all_hidden(
@@ -907,9 +979,21 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
                 stats.overlay_morsels_pruned += 1;
                 continue;
             }
+            if covi_morsel_pruned(
+                &plan,
+                segment_ref.segment_id,
+                morsel.morsel_id,
+                row_start,
+                morsel.row_count,
+            ) {
+                stats.morsels_pruned += 1;
+                stats.covi_candidate_pruned += 1;
+                continue;
+            }
             if prune::morsel_pruned(state, segment_ref.segment_id, morsel.morsel_id, &plan)?
                 || should_prune_morsel_metadata(
                     state,
+                    segment_ref,
                     &segment,
                     morsel.morsel_id,
                     &plan,
@@ -977,11 +1061,13 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
             let mut page_indexes = Vec::with_capacity(plan.scan_projection.len());
             let mut columns = Vec::with_capacity(plan.scan_projection.len());
             let mut ranges = Vec::new();
+            let mut range_hints = Vec::new();
             let mut range_slots = Vec::with_capacity(plan.scan_projection.len());
             for projection_index in &plan.scan_projection {
                 let column = &state.table().columns[*projection_index];
                 let segment_column = segment.column(column.column_id)?;
                 let page = segment.page_for_morsel(segment_column, morsel.morsel_id)?;
+                state.reject_table_scan_page_feature_use(segment_ref, page)?;
                 if page.page_length == 0 {
                     range_slots.push(None);
                 } else {
@@ -993,6 +1079,12 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
                         .checked_add(page.page_length)
                         .ok_or(CoveError::ArithOverflow)?;
                     range_slots.push(Some(ranges.len()));
+                    range_hints.push(state.range_cluster_hint(
+                        segment_ref.segment_id,
+                        morsel.morsel_id,
+                        start,
+                        end,
+                    ));
                     ranges.push(start..end);
                 }
                 stats.pages_decoded += usize::from(page.page_length != 0);
@@ -1000,7 +1092,11 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
                 columns.push(column);
             }
 
-            let coalesced_plan = build_coalesced_range_plan(&ranges, state.range_coalescing())?;
+            let coalesced_plan = build_layout_aware_coalesced_range_plan(
+                &ranges,
+                &range_hints,
+                state.range_coalescing(),
+            )?;
             let range_stats = coalesced_plan.stats();
             record_range_plan(
                 RangeReadPlan::choose(
@@ -1039,6 +1135,12 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
                     column,
                     page,
                     wire,
+                    state.pruning().codec_descriptors.as_slice(),
+                    state
+                        .mounted()
+                        .dictionary
+                        .as_ref()
+                        .map(|dictionary| dictionary.len()),
                     state.page_payload_validation_policy(),
                 )?);
             }
@@ -1057,6 +1159,7 @@ async fn decode_scan_with_reader_tasks_to_sink_cached<
             let arrow_options = state.arrow_export_options();
             let column_refs = arrow_encoded_columns_for_payloads(
                 state,
+                segment_ref.segment_id,
                 &columns,
                 &encoded_columns,
                 &page_indexes,
@@ -1361,6 +1464,7 @@ mod tests {
         assert_eq!(options.local_file_read_policy(), LocalFileReadPolicy::Mmap);
         assert_eq!(
             options
+                .clone()
                 .with_strict_arrow_string_validation()
                 .arrow_export_options()
                 .string_validation_policy,
@@ -1580,6 +1684,8 @@ mod tests {
             &column,
             &page,
             Some(RetainedBytes::from_vec(payload.clone())),
+            &[],
+            None,
             PagePayloadValidationPolicy::Trusted,
         )
         .is_ok());
@@ -1588,6 +1694,8 @@ mod tests {
                 &column,
                 &page,
                 Some(RetainedBytes::from_vec(payload)),
+                &[],
+                None,
                 PagePayloadValidationPolicy::Strict,
             )
             .unwrap_err(),
@@ -1607,6 +1715,8 @@ mod tests {
             &column,
             &page,
             Some(RetainedBytes::from_vec(payload.clone())),
+            &[],
+            None,
             PagePayloadValidationPolicy::Trusted,
         )
         .is_ok());
@@ -1615,6 +1725,8 @@ mod tests {
                 &column,
                 &page,
                 Some(RetainedBytes::from_vec(payload)),
+                &[],
+                None,
                 PagePayloadValidationPolicy::Strict,
             )
             .unwrap_err(),
@@ -1751,8 +1863,11 @@ mod tests {
             &[DecodedArrowColumn {
                 name: "word",
                 array: &array,
+                payload: None,
+                nested_schema: None,
                 data_owner: None,
                 utf8_proof_key: None,
+                zero_copy: None,
             }],
             &selection,
             schema,
@@ -1770,5 +1885,218 @@ mod tests {
         assert_eq!(strings.len(), 2);
         assert_eq!(strings.value(0), "a");
         assert_eq!(strings.value(1), "ccc");
+    }
+
+    #[test]
+    fn compatible_zero_copy_map_records_direct_export_metric() {
+        let values = Arc::new(varbytes(&["alpha", "beta"]));
+        let array = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            2,
+            CoveEncodingKind::VarBytes,
+            None,
+            values.as_slice(),
+            None,
+        );
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "word",
+            arrow_schema::DataType::Utf8View,
+            false,
+        )]));
+        let state = DatasetState::from_bytes("zero-copy", primitive_events_file()).unwrap();
+        let selection = Selection::AllRows { len: 2 };
+        let mut stats = DecodeStats::default();
+
+        let result = record_batch_for_selection(
+            &state,
+            &[DecodedArrowColumn {
+                name: "word",
+                array: &array,
+                payload: None,
+                nested_schema: None,
+                data_owner: Some(arrow_buffer_owner(Arc::clone(&values))),
+                utf8_proof_key: None,
+                zero_copy: Some(ZeroCopyCompatibilityV2::Compatible),
+            }],
+            &selection,
+            schema,
+            arrow_view_options(),
+            None,
+            &mut stats,
+        )
+        .unwrap();
+
+        assert_eq!(result.value.num_rows(), 2);
+        assert_eq!(
+            result.value.column(0).data_type(),
+            &arrow_schema::DataType::Utf8View
+        );
+        assert_eq!(stats.zero_copy_compatible_buffers, 1);
+        assert_eq!(stats.zero_copy_materialized_buffers, 0);
+    }
+
+    #[test]
+    fn compatible_zero_copy_map_with_selection_materializes_owned_view() {
+        let values = Arc::new(varbytes(&["alpha", "hidden", "beta"]));
+        let array = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            3,
+            CoveEncodingKind::VarBytes,
+            None,
+            values.as_slice(),
+            None,
+        );
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "word",
+            arrow_schema::DataType::Utf8View,
+            false,
+        )]));
+        let state = DatasetState::from_bytes("zero-copy", primitive_events_file()).unwrap();
+        let selection = Selection::RowIndices(vec![0, 2]);
+        let mut stats = DecodeStats::default();
+
+        let result = record_batch_for_selection(
+            &state,
+            &[DecodedArrowColumn {
+                name: "word",
+                array: &array,
+                payload: None,
+                nested_schema: None,
+                data_owner: Some(arrow_buffer_owner(Arc::clone(&values))),
+                utf8_proof_key: None,
+                zero_copy: Some(ZeroCopyCompatibilityV2::Compatible),
+            }],
+            &selection,
+            schema,
+            arrow_view_options(),
+            None,
+            &mut stats,
+        )
+        .unwrap();
+
+        let strings = result
+            .value
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringViewArray>()
+            .unwrap();
+        assert_eq!(strings.value(0), "alpha");
+        assert_eq!(strings.value(1), "beta");
+        assert_eq!(stats.zero_copy_compatible_buffers, 0);
+        assert_eq!(stats.zero_copy_materialized_buffers, 1);
+        assert_eq!(stats.zero_copy_materialized_selection_mismatch, 1);
+    }
+
+    #[test]
+    fn incompatible_zero_copy_maps_record_materialization_reasons() {
+        for reason in [
+            ZeroCopyMaterializationReasonV2::CompressedBuffer,
+            ZeroCopyMaterializationReasonV2::NullPolarityMismatch,
+            ZeroCopyMaterializationReasonV2::DictionaryMismatch,
+            ZeroCopyMaterializationReasonV2::NestedLayoutMismatch,
+            ZeroCopyMaterializationReasonV2::InsufficientLifetime,
+            ZeroCopyMaterializationReasonV2::UnknownRole,
+            ZeroCopyMaterializationReasonV2::ActiveVisibilityOverlay,
+        ] {
+            let stats = export_with_zero_copy_decision(Some(
+                ZeroCopyCompatibilityV2::MaterializeRequired(reason),
+            ));
+            assert_eq!(stats.zero_copy_compatible_buffers, 0, "{reason:?}");
+            assert_eq!(stats.zero_copy_materialized_buffers, 1, "{reason:?}");
+            assert_eq!(zero_copy_reason_count(&stats, reason), 1, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn no_zero_copy_map_view_output_is_not_counted_as_attempted() {
+        let stats = export_with_zero_copy_decision(None);
+        assert_eq!(stats.zero_copy_compatible_buffers, 0);
+        assert_eq!(stats.zero_copy_materialized_buffers, 0);
+    }
+
+    fn export_with_zero_copy_decision(decision: Option<ZeroCopyCompatibilityV2>) -> DecodeStats {
+        let values = Arc::new(varbytes(&["alpha", "beta"]));
+        let array = EncodedArray::new(
+            CoveLogicalType::Utf8,
+            CovePhysicalKind::VarBytes,
+            2,
+            CoveEncodingKind::VarBytes,
+            None,
+            values.as_slice(),
+            None,
+        );
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "word",
+            arrow_schema::DataType::Utf8View,
+            false,
+        )]));
+        let state = DatasetState::from_bytes("zero-copy", primitive_events_file()).unwrap();
+        let selection = Selection::AllRows { len: 2 };
+        let mut stats = DecodeStats::default();
+        let result = record_batch_for_selection(
+            &state,
+            &[DecodedArrowColumn {
+                name: "word",
+                array: &array,
+                payload: None,
+                nested_schema: None,
+                data_owner: Some(arrow_buffer_owner(Arc::clone(&values))),
+                utf8_proof_key: None,
+                zero_copy: decision,
+            }],
+            &selection,
+            schema,
+            arrow_view_options(),
+            None,
+            &mut stats,
+        )
+        .unwrap();
+        let strings = result
+            .value
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringViewArray>()
+            .unwrap();
+        assert_eq!(strings.value(0), "alpha");
+        assert_eq!(strings.value(1), "beta");
+        stats
+    }
+
+    fn arrow_view_options() -> ArrowExportOptions {
+        ArrowExportOptions {
+            varbytes_policy: ArrowVarBytesExportPolicy::View,
+            ..ArrowExportOptions::default()
+        }
+    }
+
+    fn zero_copy_reason_count(
+        stats: &DecodeStats,
+        reason: ZeroCopyMaterializationReasonV2,
+    ) -> usize {
+        match reason {
+            ZeroCopyMaterializationReasonV2::UnknownRole => {
+                stats.zero_copy_materialized_unknown_role
+            }
+            ZeroCopyMaterializationReasonV2::NullPolarityMismatch => {
+                stats.zero_copy_materialized_null_polarity_mismatch
+            }
+            ZeroCopyMaterializationReasonV2::CompressedBuffer => {
+                stats.zero_copy_materialized_compressed_buffer
+            }
+            ZeroCopyMaterializationReasonV2::DictionaryMismatch => {
+                stats.zero_copy_materialized_dictionary_mismatch
+            }
+            ZeroCopyMaterializationReasonV2::NestedLayoutMismatch => {
+                stats.zero_copy_materialized_nested_layout_mismatch
+            }
+            ZeroCopyMaterializationReasonV2::InsufficientLifetime => {
+                stats.zero_copy_materialized_insufficient_lifetime
+            }
+            ZeroCopyMaterializationReasonV2::ActiveVisibilityOverlay => {
+                stats.zero_copy_materialized_active_visibility_overlay
+            }
+        }
     }
 }

@@ -5,7 +5,7 @@
 //! histograms, etc.) without mutating the host. Per Spec §68:
 //!
 //! * The file ends with the pattern
-//!   `[postscript bytes][postscript_version: u16][postscript_len: u16][magic: "CVX1"]`.
+//!   `[postscript bytes][postscript_version: u16][postscript_len: u16][magic: "CVX2"]`.
 //! * The header is [`CovxHeaderV1`] (Spec §68.1) and carries an
 //!   `accelerator_id`, a `referenced_file_count`, and a CRC32C checksum.
 //! * Each referenced file is described by a [`CovxReferencedFileV1`]
@@ -36,10 +36,10 @@ use crate::error::CoveError;
 ///       + created_at_us(8) + reserved(40) + checksum(4) = 86.
 pub const COVX_HEADER_LEN: u16 = 86;
 
-/// Required `version_major` for COVX v1.
+/// Required artifact header `version_major` for COVX v2.
 pub const COVX_VERSION_MAJOR_V1: u16 = 1;
 
-/// Required `version_minor` for COVX v1.
+/// Required artifact header `version_minor` for COVX v2.
 pub const COVX_VERSION_MINOR_V1: u16 = 0;
 
 /// Encoded length of [`CovxPostscriptV1`] in bytes (implementation-defined
@@ -50,7 +50,7 @@ pub const COVX_VERSION_MINOR_V1: u16 = 0;
 ///       + entries_len(8) + file_len(8) + flags(4) + checksum(4) = 48.
 pub const COVX_POSTSCRIPT_LEN: u16 = 48;
 
-/// Postscript version field value for COVX v1.
+/// Postscript version field value for COVX v2.
 pub const COVX_POSTSCRIPT_VERSION_V1: u16 = POSTSCRIPT_VERSION_V1;
 
 /// Size of the fixed tail after the postscript payload (`version` +
@@ -62,15 +62,15 @@ pub const COVX_POSTSCRIPT_TAIL_SIZE: usize = 2 + 2 + 4;
 /// Spec §68.1 `CovxHeaderV1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CovxHeaderV1 {
-    /// Magic bytes — MUST equal [`MAGIC_COVX`] (`"CVX1"`).
+    /// Magic bytes — MUST equal [`MAGIC_COVX`] (`"CVX2"`).
     pub magic: [u8; 4],
-    /// Header length in bytes — MUST equal [`COVX_HEADER_LEN`] for v1.
+    /// Header length in bytes — MUST equal [`COVX_HEADER_LEN`] for the v2 artifact.
     pub header_len: u16,
-    /// Major version — MUST equal [`COVX_VERSION_MAJOR_V1`] for v1.
+    /// Major version — MUST equal [`COVX_VERSION_MAJOR_V1`] for the v2 artifact.
     pub version_major: u16,
-    /// Minor version — MUST equal [`COVX_VERSION_MINOR_V1`] for v1.
+    /// Minor version — MUST equal [`COVX_VERSION_MINOR_V1`] for the v2 artifact.
     pub version_minor: u16,
-    /// Header flags (reserved for future use; v1 readers ignore unknown bits).
+    /// Header flags reserved for future artifact versions.
     pub flags: u32,
     /// Stable identifier for this accelerator instance.
     pub accelerator_id: [u8; 16],
@@ -78,7 +78,7 @@ pub struct CovxHeaderV1 {
     pub referenced_file_count: u32,
     /// Creation timestamp in microseconds since the Unix epoch.
     pub created_at_us: i64,
-    /// Reserved — MUST be zero in v1.
+    /// Reserved — MUST be zero in the v2 artifact.
     pub reserved: [u8; 40],
     /// CRC32C of the 86-byte header with this `checksum` field zeroed.
     pub checksum: u32,
@@ -278,7 +278,7 @@ impl CovxReferencedFileV1 {
 /// Implementation-defined postscript payload for a COVX file.
 ///
 /// Spec §68 standardises only the trailing framing
-/// `[postscript bytes][version u16][len u16][magic "CVX1"]`. This struct is
+/// `[postscript bytes][version u16][len u16][magic "CVX2"]`. This struct is
 /// the on-disk shape this implementation writes for the postscript bytes.
 /// It bootstraps the reader by recording where the header and the
 /// referenced-file array live within the file.

@@ -14,7 +14,7 @@ use datafusion::{
 use crate::{
     adapter_v53::{
         exec::CoveExec,
-        filter::{classify_filter, filter_use_is_pushed},
+        filter::{classify_filters, filter_use_is_pushed},
     },
     dataset_state::DatasetState,
     planner::{plan_scan, CoveFilterUse, TopNScanHint},
@@ -86,10 +86,16 @@ impl TableProvider for CoveTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let filter_plans = filters
-            .iter()
-            .map(|filter| classify_filter(&self.state, filter))
-            .collect::<Vec<_>>();
+        let mut filter_plans = Vec::new();
+        for filter in filters {
+            let mut lowering = classify_filters(&self.state, filter);
+            if lowering.fallbacks != 0 {
+                return Err(DataFusionError::Plan(format!(
+                    "COVE DataFusion native provider received unsupported pushed filter: {filter}"
+                )));
+            }
+            filter_plans.append(&mut lowering.filters);
+        }
         if let Some(filter) = filter_plans
             .iter()
             .find(|filter| !filter_use_is_pushed(filter.use_kind))
@@ -112,13 +118,21 @@ impl TableProvider for CoveTableProvider {
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         Ok(filters
             .iter()
-            .map(
-                |filter| match classify_filter(&self.state, filter).use_kind {
-                    CoveFilterUse::Unsupported => TableProviderFilterPushDown::Unsupported,
-                    CoveFilterUse::PruningOnly => TableProviderFilterPushDown::Inexact,
-                    CoveFilterUse::FullRowPredicateExact => TableProviderFilterPushDown::Exact,
-                },
-            )
+            .map(|filter| {
+                let lowering = classify_filters(&self.state, filter);
+                if lowering.fallbacks != 0 || lowering.filters.is_empty() {
+                    return TableProviderFilterPushDown::Unsupported;
+                }
+                if lowering
+                    .filters
+                    .iter()
+                    .all(|filter| filter.use_kind == CoveFilterUse::FullRowPredicateExact)
+                {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
             .collect())
     }
 

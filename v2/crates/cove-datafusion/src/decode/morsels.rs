@@ -98,10 +98,7 @@ impl SegmentMetadata {
 
         let mut prepared_columns = Vec::with_capacity(columns.len());
         let mut column_positions = Vec::with_capacity(columns.len());
-        for (position, (directory, page_index)) in columns
-            .into_iter()
-            .zip(page_indexes.into_iter())
-            .enumerate()
+        for (position, (directory, page_index)) in columns.into_iter().zip(page_indexes).enumerate()
         {
             let mut page_positions_by_morsel = vec![None; morsel_positions_by_id.len()];
             for (page_position, page) in page_index.entries.iter().enumerate() {

@@ -169,7 +169,7 @@ impl SelectionMask {
                 let index = word_index
                     .checked_mul(64)
                     .and_then(|base| base.checked_add(bit))
-                    .ok_or(CoveError::ArithOverflow)?;
+                    .ok_or_else(|| CoveError::ArithOverflow)?;
                 if index < self.len {
                     rows.push(u32::try_from(index).map_err(|_| CoveError::ArithOverflow)?);
                 }

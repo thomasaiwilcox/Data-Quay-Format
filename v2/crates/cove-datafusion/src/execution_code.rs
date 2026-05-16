@@ -108,7 +108,7 @@ pub fn support_for_mounted_file(mounted: &MountedCoveFile) -> ExecutionCodeSuppo
         };
     };
     if descriptor.code_kind != ExecutionCodeKind::DictionaryKey
-        || descriptor.code_width_bits != 32
+        || !portable_dictionary_key_width(descriptor.code_width_bits)
         || descriptor.byte_order != 0
         || !matches!(
             descriptor.null_code_policy,
@@ -150,6 +150,10 @@ pub fn support_for_mounted_file(mounted: &MountedCoveFile) -> ExecutionCodeSuppo
     }
 }
 
+fn portable_dictionary_key_width(width_bits: u16) -> bool {
+    matches!(width_bits, 8 | 16 | 32 | 64)
+}
+
 fn filters_need_execution_codes(filters: &[FilterPlan]) -> bool {
     filters.iter().any(|filter| {
         matches!(
@@ -160,4 +164,19 @@ fn filters_need_execution_codes(filters: &[FilterPlan]) -> bool {
             }) if !canonical_values.is_empty()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_dictionary_key_widths_match_arrow_dictionary_keys() {
+        for width in [8, 16, 32, 64] {
+            assert!(portable_dictionary_key_width(width));
+        }
+        for width in [0, 1, 24, 128] {
+            assert!(!portable_dictionary_key_width(width));
+        }
+    }
 }

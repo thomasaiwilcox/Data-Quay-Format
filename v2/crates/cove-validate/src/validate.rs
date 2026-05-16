@@ -3,6 +3,7 @@ use std::path::Path;
 use cove_core::{
     artifact::covemap::CovemapFile,
     constants::{MAGIC_COVE, MAGIC_COVEMAP},
+    feature_scope::FeatureUseRequestV2,
     reader::{self, ValidationOptions},
 };
 
@@ -20,9 +21,18 @@ pub(crate) fn validate_paths(args: &CliArgs) -> bool {
                 print!(",");
             }
             first = false;
-            validate_file_json(Path::new(path), args.validation.clone(), args.explain)
+            validate_file_json(
+                Path::new(path),
+                args.validation.clone(),
+                args.feature_use.clone(),
+                args.explain,
+            )
         } else {
-            validate_file_text(Path::new(path), args.validation.clone())
+            validate_file_text(
+                Path::new(path),
+                args.validation.clone(),
+                args.feature_use.clone(),
+            )
         };
         if !ok {
             all_ok = false;
@@ -37,7 +47,12 @@ pub(crate) fn validate_paths(args: &CliArgs) -> bool {
 /// Machine-readable validation output (Spec §73, §76): emits one JSON object
 /// per file with `path`, `ok`, optional `error_code`, and (when --explain)
 /// the validated header/footer summary.
-fn validate_file_json(path: &Path, opts: ValidationOptions, explain: bool) -> bool {
+fn validate_file_json(
+    path: &Path,
+    opts: ValidationOptions,
+    feature_use: Option<FeatureUseRequestV2>,
+    explain: bool,
+) -> bool {
     let path_str = path.display().to_string();
     let data = match std::fs::read(path) {
         Ok(d) => d,
@@ -61,7 +76,7 @@ fn validate_file_json(path: &Path, opts: ValidationOptions, explain: bool) -> bo
         );
     }
 
-    match reader::validate_bytes_with_options(&data, opts) {
+    match validate_cove_bytes(&data, opts, feature_use) {
         Ok(report) => {
             let info = &report.validated;
             print!(
@@ -186,7 +201,11 @@ fn json_str(s: &str) -> String {
 }
 
 /// Validate a single COVE file. Returns `true` if valid.
-fn validate_file_text(path: &Path, opts: ValidationOptions) -> bool {
+fn validate_file_text(
+    path: &Path,
+    opts: ValidationOptions,
+    feature_use: Option<FeatureUseRequestV2>,
+) -> bool {
     let display = path.display();
     print!("Validating {display} ... ");
 
@@ -209,7 +228,7 @@ fn validate_file_text(path: &Path, opts: ValidationOptions) -> bool {
         return false;
     }
 
-    match reader::validate_bytes_with_options(&data, opts) {
+    match validate_cove_bytes(&data, opts, feature_use) {
         Ok(report) => {
             let mode = if report.semantic_checked {
                 "semantic"
@@ -255,6 +274,17 @@ fn validate_file_text(path: &Path, opts: ValidationOptions) -> bool {
     }
 }
 
+fn validate_cove_bytes(
+    data: &[u8],
+    opts: ValidationOptions,
+    feature_use: Option<FeatureUseRequestV2>,
+) -> Result<reader::ValidationReport, cove_core::CoveError> {
+    match feature_use {
+        Some(request) => reader::validate_bytes_for_feature_use(data, opts, request),
+        None => reader::validate_bytes_with_options(data, opts),
+    }
+}
+
 fn validate_covemap_bytes(
     data: &[u8],
     semantic: bool,
@@ -278,6 +308,9 @@ fn validate_covemap_file(data: &[u8], semantic: bool, verify_digests: bool) -> b
             println!("  file_len        : {} bytes", data.len());
             println!("  mapping_version : {}", file.mapping_version);
             println!("  section_count   : {}", file.sections.len());
+            for warning in file.compatibility_warnings() {
+                eprintln!("  [WARN] {warning}");
+            }
             if verify_digests {
                 eprintln!(
                     "  [NOTE] --verify-digests is not applicable to COVEMAP artifacts (skipped)"

@@ -1,3 +1,5 @@
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -26,6 +28,48 @@ pub fn convert_parquet_bytes(
         "crc32c:{:08x}",
         checksum::crc32c(format!("{schema:?}").as_bytes())
     );
+    let reader = builder
+        .with_batch_size(options.morsel_row_count as usize)
+        .build()
+        .map_err(|error| CoveError::BadSection(format!("cannot build parquet reader: {error}")))?;
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch.map_err(|error| {
+            CoveError::BadSection(format!("cannot read parquet batch: {error}"))
+        })?);
+    }
+    convert_arrow_record_batches(
+        "parquet",
+        source_schema_fingerprint,
+        schema,
+        batches,
+        options,
+    )
+}
+
+/// Convert Arrow record batches into a semantically valid COVE-T scan-profile
+/// file using the same writer, statistics, dictionary, and acceleration path as
+/// the Parquet converter.
+pub fn convert_arrow_record_batches<I>(
+    source_format: impl Into<String>,
+    source_schema_fingerprint: String,
+    schema: SchemaRef,
+    batches: I,
+    options: &ParquetConversionOptions,
+) -> Result<ParquetConversionResult, CoveError>
+where
+    I: IntoIterator<Item = RecordBatch>,
+{
+    if options.morsel_row_count == 0 {
+        return Err(CoveError::BadSchema(
+            "morsel_row_count must be greater than zero".into(),
+        ));
+    }
+    if options.segment_row_count == 0 {
+        return Err(CoveError::BadSchema(
+            "segment_row_count must be greater than zero".into(),
+        ));
+    }
     let mut columns = schema
         .fields()
         .iter()
@@ -33,16 +77,15 @@ pub fn convert_parquet_bytes(
         .map(|(index, field)| ConvertedColumn::from_field(index as u32 + 1, field))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let reader = builder
-        .with_batch_size(options.morsel_row_count as usize)
-        .build()
-        .map_err(|error| CoveError::BadSection(format!("cannot build parquet reader: {error}")))?;
-
     let mut total_rows = 0usize;
-    for batch in reader {
-        let batch = batch.map_err(|error| {
-            CoveError::BadSection(format!("cannot read parquet batch: {error}"))
-        })?;
+    for batch in batches {
+        if batch.num_columns() != columns.len() {
+            return Err(CoveError::BadSchema(format!(
+                "source batch has {} columns but schema declares {}",
+                batch.num_columns(),
+                columns.len()
+            )));
+        }
         total_rows = total_rows
             .checked_add(batch.num_rows())
             .ok_or(CoveError::ArithOverflow)?;
@@ -85,6 +128,20 @@ pub fn convert_parquet_bytes(
     );
 
     let mut writer = ScanProfileCoveWriter::new(table_catalog);
+    let nested_entries = columns
+        .iter()
+        .filter_map(|column| {
+            column.nested.as_ref().map(|nested| NestedSchemaEntryV1 {
+                table_id: 1,
+                column_id: column.entry.column_id,
+                root: nested.schema.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if !nested_entries.is_empty() {
+        writer.push_nested_schema(&NestedSchemaSectionV1::new(nested_entries))?;
+        notes.push("Emitted native COVE-T NestedSchema metadata".into());
+    }
     if let Some(dictionary) = &dictionary {
         writer.push_file_dictionary(dictionary);
         notes.push(format!(
@@ -182,6 +239,27 @@ pub fn convert_parquet_bytes(
                 .unwrap_or_else(|| format!("Unknown({})", entry.section_kind))
         })
         .collect::<Vec<_>>();
+    let aggregate_synopsis_kinds = acceleration
+        .aggregates
+        .iter()
+        .flat_map(|synopsis| {
+            synopsis.entries.iter().enumerate().map(|(index, entry)| {
+                let payload = synopsis
+                    .payload_for_entry(index)
+                    .map(aggregate_payload_summary)
+                    .unwrap_or_else(|| "missing-payload".into());
+                format!(
+                    "column_id={}, kind={:?}, accuracy={:?}, rows={}, nulls={}, {}",
+                    entry.column_id,
+                    entry.synopsis_kind,
+                    entry.accuracy,
+                    entry.row_count,
+                    entry.null_count,
+                    payload
+                )
+            })
+        })
+        .collect::<Vec<_>>();
 
     if columns.iter().any(|column| {
         matches!(
@@ -234,12 +312,29 @@ pub fn convert_parquet_bytes(
         plan.push(ConversionStep::EmitOptionalCovmCovx);
     }
     validate_plan(&plan)?;
+    let source_format = source_format.into();
 
     Ok(ParquetConversionResult {
         cove_bytes,
         covx_bytes: sidecars.covx_bytes,
         covm_bytes: sidecars.covm_bytes,
         report: ParquetConversionReport {
+            source_format: source_format.clone(),
+            source_identifier: options
+                .source_identifier
+                .clone()
+                .unwrap_or_else(|| source_format.clone()),
+            source_digest: options
+                .source_digest
+                .clone()
+                .unwrap_or_else(|| source_schema_fingerprint.clone()),
+            conversion_policy_version: "cove-reference-v2.0".into(),
+            timestamp_policy: "preserve-logical-timestamps".into(),
+            timezone_policy: "preserve-source-timezone-metadata-or-naive".into(),
+            decimal_policy: "preserve-precision-scale-or-lossless-canonical".into(),
+            collation_policy: "preserve-source-collation-or-bytewise".into(),
+            canonicalization_policy: "cove-canonical-v2".into(),
+            row_reordering_policy: "preserve-source-order".into(),
             table_name: options.table_name.clone(),
             namespace: options.namespace.clone(),
             row_count,
@@ -253,6 +348,7 @@ pub fn convert_parquet_bytes(
             target_schema_fingerprint,
             validation_result: true,
             generated_section_kinds,
+            aggregate_synopsis_kinds,
             unsupported_features,
             lossy_features,
             nested_shape_fallbacks: columns

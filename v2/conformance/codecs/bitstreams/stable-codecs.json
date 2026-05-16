@@ -1,0 +1,19 @@
+{
+  "codecs": [
+    {
+      "descriptor": "org.coveformat.codec.fsst-utf8.v2",
+      "magic": "CFS2",
+      "fallback_equivalence_required": true
+    },
+    {
+      "descriptor": "org.coveformat.codec.alp-float.v2",
+      "magic": "CAF2",
+      "fallback_equivalence_required": true
+    },
+    {
+      "descriptor": "org.coveformat.codec.fastlanes-integer.v2",
+      "magic": "CFI2",
+      "fallback_equivalence_required": true
+    }
+  ]
+}

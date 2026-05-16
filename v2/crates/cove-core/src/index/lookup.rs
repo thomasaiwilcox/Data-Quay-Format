@@ -152,7 +152,7 @@ impl LookupIndex {
             .checked_mul(LOOKUP_INDEX_ENTRY_LEN as u64)
             .ok_or(CoveError::ArithOverflow)?;
         if header.entries_length != expected_entries_len
-            || rowref_bytes.len() % RowRef::ENCODED_LEN != 0
+            || !rowref_bytes.len().is_multiple_of(RowRef::ENCODED_LEN)
         {
             return Err(CoveError::BadIndex);
         }
